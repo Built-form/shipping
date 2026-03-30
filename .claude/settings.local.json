@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:help.daasity.com)",
+      "WebFetch(domain:spapi.cyou)",
+      "WebFetch(domain:www.hopted.com)",
+      "WebFetch(domain:sellercentral.amazon.com)",
+      "WebFetch(domain:docs.datavirtuality.com)",
+      "Bash(node -e \":*)",
+      "Bash(npm install:*)",
+      "Read(//c/nvm4w/**)",
+      "Read(//c//**)"
+    ]
+  }
+}

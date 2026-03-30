@@ -1,0 +1,129 @@
+service: shipping-serverless
+
+frameworkVersion: '3'
+useDotenv: true
+
+provider:
+  name: aws
+  runtime: nodejs18.x
+  region: eu-north-1
+  memorySize: 512
+  timeout: 900
+  apiGateway:
+    binaryMediaTypes:
+      - 'application/json'
+      - '*/*'
+  httpApi:
+    cors: true
+    authorizers:
+      googleJwtAuthorizer:
+        type: jwt
+        identitySource: $request.header.Authorization
+        issuerUrl: https://accounts.google.com
+        audience:
+          - '1085148951708-8qfkho7ilq084vvpo52jvc6fgg9ecdjt.apps.googleusercontent.com'
+  environment:
+    DB_HOST: ${env:DB_HOST}
+    DB_USER: ${env:DB_USER}
+    DB_PASSWORD: ${env:DB_PASSWORD}
+    DB_NAME: ${env:DB_NAME}
+    DB_PORT: ${env:DB_PORT}
+    MINTSOFT_API_KEY: ${env:MINTSOFT_API_KEY}
+    ASANA_PAT: ${env:ASANA_PAT}
+    AMAZON_SP_CLIENT_ID: ${env:AMAZON_SP_CLIENT_ID}
+    AMAZON_SP_CLIENT_SECRET: ${env:AMAZON_SP_CLIENT_SECRET}
+    AMAZON_SP_REFRESH_TOKEN: ${env:AMAZON_SP_REFRESH_TOKEN}
+    AMAZON_SP_CLIENT_ID_HW: ${env:AMAZON_SP_CLIENT_ID_HW}
+    AMAZON_SP_CLIENT_SECRET_HW: ${env:AMAZON_SP_CLIENT_SECRET_HW}
+    AMAZON_SP_REFRESH_TOKEN_HW: ${env:AMAZON_SP_REFRESH_TOKEN_HW}
+
+package:
+  individually: true
+  patterns:
+    - '!.env'
+    - '!.git/**'
+    - '!node_modules/.cache/**'
+
+functions:
+  ordersApi:
+    handler: orders.handler
+    events:
+      - httpApi:
+          path: /api/v1/orders
+          method: GET
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/orders
+          method: POST
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/orders/{proxy+}
+          method: GET
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/orders/{proxy+}
+          method: PUT
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/orders/{proxy+}
+          method: PATCH
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/orders/{proxy+}
+          method: POST
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/orders/{proxy+}
+          method: DELETE
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/containers/{proxy+}
+          method: POST
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/containers/{proxy+}
+          method: PATCH
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/stock-snapshots/sum
+          method: GET
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/stock-snapshots/sum/all-asins
+          method: GET
+          authorizer:
+            name: googleJwtAuthorizer
+
+  stockSnapshot:
+    handler: stock-snapshot.handler
+    events:
+      - schedule:
+          rate: rate(1 hour)
+          enabled: true
+
+  amazonStockSnapshot:
+    handler: amazon-stock-snapshot.handler
+    events:
+      - schedule:
+          rate: rate(6 hours)
+          enabled: true
+
+  importAsanaOrders:
+    handler: import-asana-orders.handler
+    events:
+      - schedule:
+          rate: rate(1 minute)
+          enabled: true
+
+#plugins:
+#  - serverless-offline
