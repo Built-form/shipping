@@ -1,23 +1,17 @@
-/**
- * Maps the status for "Goods on Sea" items.
- * @returns {string} The mapped status.
- */
 function mapGoodsOnSeaStatus() {
     return 'ON_SEA';
 }
 
-/**
- * Maps the status for general orders based on the goods status.
- * @param {string} goodsStatus - The raw goods status from Asana.
- * @returns {string} The mapped order status.
- */
-function mapOrdersStatus(goodsStatus) {
+function mapGoodsOnAirStatus() {
+    return 'ON_AIR';
+}
+
+function mapOrdersStatus(goodsStatus, artworkSentDate) {
     const s = (goodsStatus || '').toLowerCase().trim();
-    if (s.includes('ready')) return 'READY_AT_FACTORY';
+    if (s === 'partial ready') return 'PARTIAL_READY';
+    if (s === 'ready') return 'READY';
+    if (artworkSentDate) return 'IN_PRODUCTION';
     return 'PO_SENT';
 }
 
-module.exports = {
-    mapGoodsOnSeaStatus,
-    mapOrdersStatus,
-};
+module.exports = { mapGoodsOnSeaStatus, mapGoodsOnAirStatus, mapOrdersStatus };

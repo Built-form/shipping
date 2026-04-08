@@ -1,40 +1,23 @@
 const serverless = require('serverless-http');
 require('dotenv').config();
 const express = require('express');
-const mysql = require('mysql2/promise');
 const cors = require('cors');
 const compression = require('compression');
 const { v4: uuidv4 } = require('uuid');
+const { getPool } = require('./db');
+const log = require('./logger');
 
 const app = express();
 
-// 1. Middleware
+// ── Middleware ────────────────────────────────────────────────────────────
 app.use(compression());
 app.use(cors());
 app.use(express.json());
 
-// ── Ensure allowed_emails table exists (runs lazily on first auth check) ──
-let _ensureAllowedEmailsPromise;
-function ensureAllowedEmailsTable() {
-    if (!_ensureAllowedEmailsPromise) {
-        _ensureAllowedEmailsPromise = (async () => {
-            const conn = await pool.getConnection();
-            try {
-                await conn.execute(`
-                    CREATE TABLE IF NOT EXISTS allowed_emails (
-                        email VARCHAR(255) NOT NULL PRIMARY KEY,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                `);
-            } finally {
-                conn.release();
-            }
-        })();
-    }
-    return _ensureAllowedEmailsPromise;
-}
+// Database pool — declared before middleware that depends on it
+const pool = getPool();
 
-// ── Email whitelist middleware ─────────────────────────────────────────────
+// ── Email whitelist middleware ────────────────────────────────────────────
 const IS_LOCAL = process.env.IS_OFFLINE || process.env.NODE_ENV === 'development';
 
 app.use(async (req, res, next) => {
@@ -49,7 +32,6 @@ app.use(async (req, res, next) => {
             return res.status(401).json({ error: 'Unauthorized: no email in token.' });
         }
 
-        await ensureAllowedEmailsTable();
         const connection = await pool.getConnection();
         try {
             const [rows] = await connection.execute(
@@ -66,7 +48,7 @@ app.use(async (req, res, next) => {
         req.userEmail = email.toLowerCase();
         next();
     } catch (err) {
-        console.error('[auth-middleware]', err);
+        log.error('[auth-middleware]', err);
         res.status(500).json({ error: 'Internal authentication error.' });
     }
 });
@@ -81,20 +63,8 @@ app.use((req, res, next) => {
     next();
 });
 
-// 2. Database Configuration
-const pool = mysql.createPool({
-    host: process.env.DB_HOST,
-    user: process.env.DB_USER,
-    password: process.env.DB_PASSWORD,
-    database: process.env.DB_NAME,
-    port: process.env.DB_PORT || 3306,
-    ssl: { rejectUnauthorized: false },
-    waitForConnections: true,
-    connectionLimit: 5,
-    queueLimit: 0,
-});
+// ── Constants ────────────────────────────────────────────────────────────
 
-// ── Status → dates key mapping ────────────────────────────────────────────
 const STATUS_DATE_KEY = {
     PLANNING: 'planned',
     PO_RAISED: 'ordered',
@@ -106,56 +76,49 @@ const STATUS_DATE_KEY = {
     COMPLETED: 'completed',
 };
 
-// ── Ensure orders table exists ────────────────────────────────────────────
-let _ensureOrdersTablePromise;
-function ensureOrdersTable() {
-    if (!_ensureOrdersTablePromise) {
-        _ensureOrdersTablePromise = (async () => {
-            const conn = await pool.getConnection();
-            try {
-                await conn.execute(`
-                    CREATE TABLE IF NOT EXISTS orders (
-                        id VARCHAR(50) NOT NULL PRIMARY KEY,
-                        asin VARCHAR(20),
-                        product_name VARCHAR(255),
-                        quantity INT NOT NULL DEFAULT 0,
-                        status VARCHAR(30) NOT NULL DEFAULT 'PLANNING',
-                        po_number VARCHAR(100),
-                        supplier VARCHAR(255),
-                        container_number VARCHAR(100),
-                        vessel_name VARCHAR(255),
-                        eta DATE,
-                        cbm_per_unit DECIMAL(10,6),
-                        pack_size INT,
-                        cbm_per_pack DECIMAL(10,6),
-                        notes TEXT,
-                        dates JSON,
-                        location VARCHAR(255),
-                        containerized_location VARCHAR(255),
-                        expected_shipping_date DATE,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                        INDEX idx_status (status),
-                        INDEX idx_container (container_number)
-                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-                `);
-            } finally {
-                conn.release();
-            }
-        })();
-    }
-    return _ensureOrdersTablePromise;
-}
+const ALL_STATUSES = [
+    'SCHEDULED', 'PO_SENT', 'CONSOLIDATED', 'ON_SEA', 'ON_AIR', 'IN_WAREHOUSE', 'MINTSOFT',
+];
 
-// ── Helpers ───────────────────────────────────────────────────────────────
+const ASIN_PATTERN = /^[A-Z0-9]{10}$/;
+const QUERY_TIMEOUT_MS = 10_000;
+
+const UPDATABLE_FIELDS = {
+    asin: 'asin', productName: 'product_name', quantity: 'quantity',
+    poNumber: 'po_number', supplier: 'supplier', containerNumber: 'container_number',
+    vesselName: 'vessel_name', eta: 'eta', cbmPerUnit: 'cbm_per_unit',
+    packSize: 'pack_size', cbmPerPack: 'cbm_per_pack', notes: 'notes',
+    location: 'location', containerizedLocation: 'containerized_location',
+    expectedShippingDate: 'expected_shipping_date',
+};
+
+const ORDER_INSERT_COLS = `(id, asin, product_name, quantity, status, po_number, supplier,
+    container_number, vessel_name, eta, cbm_per_unit, pack_size, cbm_per_pack, notes, dates)`;
+const ORDER_INSERT_PLACEHOLDERS = '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)';
+
+// ── Helpers ──────────────────────────────────────────────────────────────
 
 function generateOrderId() {
     return `ORD-${uuidv4().slice(0, 8).toUpperCase()}`;
 }
 
+function parseDates(raw) {
+    if (typeof raw === 'string') return JSON.parse(raw) || {};
+    return raw || {};
+}
+
+function setDateKey(dates, status) {
+    const key = STATUS_DATE_KEY[status];
+    if (key) dates[key] = new Date().toISOString();
+    return dates;
+}
+
+function formatDate(val) {
+    if (!val) return null;
+    return val.toISOString?.().slice(0, 10) ?? val;
+}
+
 function rowToOrder(row) {
-    let dates = row.dates;
-    if (typeof dates === 'string') dates = JSON.parse(dates);
     return {
         id: row.id,
         asin: row.asin || null,
@@ -166,184 +129,257 @@ function rowToOrder(row) {
         supplier: row.supplier || null,
         containerNumber: row.container_number || null,
         vesselName: row.vessel_name || null,
-        eta: row.eta ? row.eta.toISOString?.().slice(0, 10) ?? row.eta : null,
+        eta: formatDate(row.eta),
         cbmPerUnit: row.cbm_per_unit != null ? Number(row.cbm_per_unit) : null,
         packSize: row.pack_size != null ? Number(row.pack_size) : null,
         cbmPerPack: row.cbm_per_pack != null ? Number(row.cbm_per_pack) : null,
         notes: row.notes || null,
-        dates: dates || {},
+        dates: parseDates(row.dates),
         location: row.location || null,
         containerizedLocation: row.containerized_location || null,
-        expectedShippingDate: row.expected_shipping_date ? (row.expected_shipping_date.toISOString?.().slice(0, 10) ?? row.expected_shipping_date) : null,
+        expectedShippingDate: formatDate(row.expected_shipping_date),
     };
 }
 
-function setDateKey(dates, status) {
-    const key = STATUS_DATE_KEY[status];
-    if (key) dates[key] = new Date().toISOString();
-    return dates;
+function orderInsertValues(order, id, status, dates, quantity) {
+    return [
+        id,
+        order.asin || null,
+        order.product_name || null,
+        quantity ?? order.quantity ?? 0,
+        status,
+        order.po_number || null,
+        order.supplier || null,
+        order.container_number || null,
+        order.vessel_name || null,
+        order.eta || null,
+        order.cbm_per_unit ?? null,
+        order.pack_size ?? null,
+        order.cbm_per_pack ?? null,
+        order.notes || null,
+        JSON.stringify(dates),
+    ];
 }
 
-// ── 1. GET /api/v1/orders — Get all orders ────────────────────────────────
-app.get('/api/v1/orders', async (req, res) => {
-    let connection;
+async function withConnection(fn) {
+    const connection = await pool.getConnection();
     try {
-        await ensureOrdersTable();
-        connection = await pool.getConnection();
-        const [rows] = await connection.query('SELECT * FROM orders ORDER BY created_at DESC');
-        res.json({ data: rows.map(rowToOrder) });
-    } catch (error) {
-        console.error('[GET /orders]', error);
-        res.status(500).json({ error: 'An internal error occurred.' });
+        return await fn(connection);
     } finally {
-        if (connection) connection.release();
+        connection.release();
     }
-});
+}
 
-// ── 2. POST /api/v1/orders — Create a new order ──────────────────────────
-app.post('/api/v1/orders', async (req, res) => {
-    let connection;
-    try {
-        await ensureOrdersTable();
-        const b = req.body || {};
-        const id = generateOrderId();
-        const status = 'PLANNING';
-        const dates = setDateKey({}, status);
+function withTimeout(promise, ms, label = 'Query') {
+    let timer;
+    const timeout = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    });
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
 
-        connection = await pool.getConnection();
-        await connection.execute(
-            `INSERT INTO orders (id, asin, product_name, quantity, status, po_number, supplier,
-                container_number, vessel_name, eta, cbm_per_unit, pack_size, cbm_per_pack, notes, dates)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [
-                id,
-                b.asin || null,
-                b.productName || null,
-                b.quantity || 0,
-                status,
-                b.poNumber || null,
-                b.supplier || null,
-                b.containerNumber || null,
-                b.vesselName || null,
-                b.eta || null,
-                b.cbmPerUnit ?? null,
-                b.packSize ?? null,
-                b.cbmPerPack ?? null,
-                b.notes || null,
-                JSON.stringify(dates),
-            ]
-        );
+function parseAsin(raw) {
+    if (!raw) return null;
+    const cleaned = String(raw).trim().toUpperCase();
+    return ASIN_PATTERN.test(cleaned) ? cleaned : null;
+}
 
-        const [rows] = await connection.query('SELECT * FROM orders WHERE id = ?', [id]);
-        res.status(201).json(rowToOrder(rows[0]));
-    } catch (error) {
-        console.error('[POST /orders]', error);
-        res.status(500).json({ error: 'An internal error occurred.' });
-    } finally {
-        if (connection) connection.release();
-    }
-});
-
-// ── 3. PUT /api/v1/orders/:id — Update an order ──────────────────────────
-app.put('/api/v1/orders/:id', async (req, res) => {
-    let connection;
-    try {
-        await ensureOrdersTable();
-        const { id } = req.params;
-        const b = req.body || {};
-
-        connection = await pool.getConnection();
-
-        const [existing] = await connection.query('SELECT * FROM orders WHERE id = ?', [id]);
-        if (!existing.length) {
-            return res.status(404).json({ error: `Order ${id} not found.` });
-        }
-
-        const fields = [];
-        const values = [];
-
-        const updatable = {
-            asin: 'asin', productName: 'product_name', quantity: 'quantity',
-            poNumber: 'po_number', supplier: 'supplier', containerNumber: 'container_number',
-            vesselName: 'vessel_name', eta: 'eta', cbmPerUnit: 'cbm_per_unit',
-            packSize: 'pack_size', cbmPerPack: 'cbm_per_pack', notes: 'notes',
-            location: 'location', containerizedLocation: 'containerized_location', expectedShippingDate: 'expected_shipping_date',
+function aggregateAmazonStock(rows) {
+    const byCountry = {};
+    const totals = {
+        amazon_fulfillable: 0, amazon_inbound_working: 0,
+        amazon_inbound_shipped: 0, amazon_inbound_receiving: 0, amazon_reserved: 0,
+    };
+    for (const row of rows) {
+        const country = row.country?.trim().toUpperCase();
+        if (!country) continue;
+        const entry = {
+            fulfillable: Number(row.amazon_fulfillable || 0),
+            inbound_working: Number(row.amazon_inbound_working || 0),
+            inbound_shipped: Number(row.amazon_inbound_shipped || 0),
+            inbound_receiving: Number(row.amazon_inbound_receiving || 0),
+            reserved: Number(row.amazon_reserved || 0),
         };
+        byCountry[country] = entry;
+        totals.amazon_fulfillable       += entry.fulfillable;
+        totals.amazon_inbound_working   += entry.inbound_working;
+        totals.amazon_inbound_shipped   += entry.inbound_shipped;
+        totals.amazon_inbound_receiving += entry.inbound_receiving;
+        totals.amazon_reserved          += entry.reserved;
+    }
+    totals.amazon_total = totals.amazon_fulfillable + totals.amazon_inbound_working
+        + totals.amazon_inbound_shipped + totals.amazon_inbound_receiving + totals.amazon_reserved;
+    return { byCountry, totals };
+}
 
-        for (const [key, col] of Object.entries(updatable)) {
-            if (b[key] !== undefined) {
-                fields.push(`${col} = ?`);
-                values.push(b[key]);
+function mapGoodsOnSeaRow(r) {
+    return {
+        id: r.id,
+        productName: r.product_name,
+        quantity: Number(r.quantity),
+        eta: formatDate(r.eta),
+        containerNumber: r.container_number || null,
+        supplier: r.supplier || null,
+        poNumber: r.po_number || null,
+        dates: parseDates(r.dates),
+    };
+}
+
+function mapGoodsOnAirRow(r) {
+    return {
+        id: r.id,
+        productName: r.product_name,
+        quantity: Number(r.quantity),
+        eta: formatDate(r.eta),
+        containerNumber: r.container_number || null,
+        supplier: r.supplier || null,
+        poNumber: r.po_number || null,
+        dates: parseDates(r.dates),
+    };
+}
+
+function mapOrderBreakdownRow(r) {
+    return {
+        id: r.id,
+        productName: r.product_name,
+        quantity: Number(r.quantity),
+        status: r.status,
+        poNumber: r.po_number || null,
+        supplier: r.supplier || null,
+        dates: parseDates(r.dates),
+    };
+}
+
+function buildOrderStatusMap(rows) {
+    const orders = Object.fromEntries(ALL_STATUSES.map(s => [s, 0]));
+    for (const row of rows) {
+        orders[row.status] = Number(row.total_quantity || 0);
+    }
+    return orders;
+}
+
+// ── 1. GET /api/v1/orders ────────────────────────────────────────────────
+app.get('/api/v1/orders', async (req, res) => {
+    try {
+        const rows = await withConnection(async (conn) => {
+            const [rows] = await conn.query('SELECT * FROM orders ORDER BY created_at DESC');
+            return rows;
+        });
+        res.status(200).json({ data: rows.map(rowToOrder) });
+    } catch (error) {
+        log.error('[GET /orders]', error);
+        res.status(500).json({ error: 'An internal error occurred.' });
+    }
+});
+
+// ── 2. POST /api/v1/orders ───────────────────────────────────────────────
+app.post('/api/v1/orders', async (req, res) => {
+    try {
+        const order = await withConnection(async (conn) => {
+            const b = req.body || {};
+            const id = generateOrderId();
+            const status = 'PLANNING';
+            const dates = setDateKey({}, status);
+
+            await conn.execute(
+                `INSERT INTO orders ${ORDER_INSERT_COLS} VALUES ${ORDER_INSERT_PLACEHOLDERS}`,
+                [
+                    id, b.asin || null, b.productName || null, b.quantity || 0, status,
+                    b.poNumber || null, b.supplier || null, b.containerNumber || null,
+                    b.vesselName || null, b.eta || null, b.cbmPerUnit ?? null,
+                    b.packSize ?? null, b.cbmPerPack ?? null, b.notes || null,
+                    JSON.stringify(dates),
+                ]
+            );
+
+            const [rows] = await conn.query('SELECT * FROM orders WHERE id = ?', [id]);
+            return rowToOrder(rows[0]);
+        });
+        res.status(201).json(order);
+    } catch (error) {
+        log.error('[POST /orders]', error);
+        res.status(500).json({ error: 'An internal error occurred.' });
+    }
+});
+
+// ── 3. PUT /api/v1/orders/:id ────────────────────────────────────────────
+app.put('/api/v1/orders/:id', async (req, res) => {
+    try {
+        const result = await withConnection(async (conn) => {
+            const { id } = req.params;
+            const b = req.body || {};
+
+            const [existing] = await conn.query('SELECT * FROM orders WHERE id = ?', [id]);
+            if (!existing.length) return { notFound: id };
+
+            const fields = [];
+            const values = [];
+
+            for (const [key, col] of Object.entries(UPDATABLE_FIELDS)) {
+                if (b[key] !== undefined) {
+                    fields.push(`${col} = ?`);
+                    values.push(b[key]);
+                }
             }
-        }
 
-        if (b.dates !== undefined) {
-            fields.push('dates = ?');
-            values.push(JSON.stringify(b.dates));
-        }
+            if (b.dates !== undefined) {
+                fields.push('dates = ?');
+                values.push(JSON.stringify(b.dates));
+            }
 
-        if (fields.length === 0) {
-            return res.status(400).json({ error: 'No fields to update.' });
-        }
+            if (fields.length === 0) return { noFields: true };
 
-        values.push(id);
-        await connection.execute(`UPDATE orders SET ${fields.join(', ')} WHERE id = ?`, values);
+            values.push(id);
+            await conn.execute(`UPDATE orders SET ${fields.join(', ')} WHERE id = ?`, values);
 
-        const [rows] = await connection.query('SELECT * FROM orders WHERE id = ?', [id]);
-        res.json(rowToOrder(rows[0]));
+            const [rows] = await conn.query('SELECT * FROM orders WHERE id = ?', [id]);
+            return { order: rowToOrder(rows[0]) };
+        });
+
+        if (result.notFound) return res.status(404).json({ error: `Order ${result.notFound} not found.` });
+        if (result.noFields) return res.status(400).json({ error: 'No fields to update.' });
+        res.json(result.order);
     } catch (error) {
-        console.error('[PUT /orders/:id]', error);
+        log.error('[PUT /orders/:id]', error);
         res.status(500).json({ error: 'An internal error occurred.' });
-    } finally {
-        if (connection) connection.release();
     }
 });
 
-// ── 4. PATCH /api/v1/orders/:id/status — Move order to new status ────────
+// ── 4. PATCH /api/v1/orders/:id/status ───────────────────────────────────
 app.patch('/api/v1/orders/:id/status', async (req, res) => {
-    let connection;
     try {
-        await ensureOrdersTable();
-        const { id } = req.params;
         const { status } = req.body || {};
+        if (!status) return res.status(400).json({ error: 'status is required.' });
 
-        if (!status) {
-            return res.status(400).json({ error: 'status is required.' });
-        }
+        const result = await withConnection(async (conn) => {
+            const { id } = req.params;
 
-        connection = await pool.getConnection();
+            const [existing] = await conn.query('SELECT * FROM orders WHERE id = ?', [id]);
+            if (!existing.length) return { notFound: id };
 
-        const [existing] = await connection.query('SELECT * FROM orders WHERE id = ?', [id]);
-        if (!existing.length) {
-            return res.status(404).json({ error: `Order ${id} not found.` });
-        }
+            const dates = parseDates(existing[0].dates);
+            setDateKey(dates, status);
 
-        let dates = existing[0].dates;
-        if (typeof dates === 'string') dates = JSON.parse(dates);
-        dates = dates || {};
-        setDateKey(dates, status);
+            await conn.execute(
+                'UPDATE orders SET status = ?, dates = ? WHERE id = ?',
+                [status, JSON.stringify(dates), id]
+            );
 
-        await connection.execute(
-            'UPDATE orders SET status = ?, dates = ? WHERE id = ?',
-            [status, JSON.stringify(dates), id]
-        );
+            const [rows] = await conn.query('SELECT * FROM orders WHERE id = ?', [id]);
+            return { order: rowToOrder(rows[0]) };
+        });
 
-        const [rows] = await connection.query('SELECT * FROM orders WHERE id = ?', [id]);
-        res.json(rowToOrder(rows[0]));
+        if (result.notFound) return res.status(404).json({ error: `Order ${result.notFound} not found.` });
+        res.json(result.order);
     } catch (error) {
-        console.error('[PATCH /orders/:id/status]', error);
+        log.error('[PATCH /orders/:id/status]', error);
         res.status(500).json({ error: 'An internal error occurred.' });
-    } finally {
-        if (connection) connection.release();
     }
 });
 
-// ── 5. POST /api/v1/orders/:id/split — Split order into container ────────
+// ── 5. POST /api/v1/orders/:id/split ─────────────────────────────────────
 app.post('/api/v1/orders/:id/split', async (req, res) => {
-    let connection;
     try {
-        await ensureOrdersTable();
-        const { id } = req.params;
         const { splitQuantity, containerNumber } = req.body || {};
 
         if (!splitQuantity || splitQuantity <= 0) {
@@ -353,80 +389,55 @@ app.post('/api/v1/orders/:id/split', async (req, res) => {
             return res.status(400).json({ error: 'containerNumber is required.' });
         }
 
-        connection = await pool.getConnection();
-        await connection.beginTransaction();
+        const result = await withConnection(async (conn) => {
+            await conn.beginTransaction();
+            try {
+                const [existing] = await conn.query('SELECT * FROM orders WHERE id = ?', [req.params.id]);
+                if (!existing.length) {
+                    await conn.rollback();
+                    return { notFound: req.params.id };
+                }
 
-        try {
-            const [existing] = await connection.query('SELECT * FROM orders WHERE id = ?', [id]);
-            if (!existing.length) {
-                await connection.rollback();
-                return res.status(404).json({ error: `Order ${id} not found.` });
+                const original = existing[0];
+                if (splitQuantity >= original.quantity) {
+                    await conn.rollback();
+                    return { badQuantity: true };
+                }
+
+                await conn.execute('UPDATE orders SET quantity = ? WHERE id = ?',
+                    [original.quantity - splitQuantity, req.params.id]);
+
+                const newId = generateOrderId();
+                const newDates = setDateKey({ ...parseDates(original.dates) }, 'CONTAINERIZED');
+
+                await conn.execute(
+                    `INSERT INTO orders ${ORDER_INSERT_COLS} VALUES ${ORDER_INSERT_PLACEHOLDERS}`,
+                    orderInsertValues({ ...original, container_number: containerNumber }, newId, 'CONTAINERIZED', newDates, splitQuantity)
+                );
+
+                await conn.commit();
+
+                const [updatedOrig] = await conn.query('SELECT * FROM orders WHERE id = ?', [req.params.id]);
+                const [newOrder] = await conn.query('SELECT * FROM orders WHERE id = ?', [newId]);
+                return { originalOrder: rowToOrder(updatedOrig[0]), newOrder: rowToOrder(newOrder[0]) };
+            } catch (err) {
+                await conn.rollback();
+                throw err;
             }
+        });
 
-            const original = existing[0];
-            if (splitQuantity >= original.quantity) {
-                await connection.rollback();
-                return res.status(400).json({ error: 'splitQuantity must be less than the original order quantity.' });
-            }
-
-            const newQty = original.quantity - splitQuantity;
-            await connection.execute('UPDATE orders SET quantity = ? WHERE id = ?', [newQty, id]);
-
-            const newId = generateOrderId();
-            let originalDates = original.dates;
-            if (typeof originalDates === 'string') originalDates = JSON.parse(originalDates);
-            const newDates = { ...(originalDates || {}) };
-            setDateKey(newDates, 'CONTAINERIZED');
-
-            await connection.execute(
-                `INSERT INTO orders (id, asin, product_name, quantity, status, po_number, supplier,
-                    container_number, vessel_name, eta, cbm_per_unit, pack_size, cbm_per_pack, notes, dates)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                [
-                    newId,
-                    original.asin,
-                    original.product_name,
-                    splitQuantity,
-                    'CONTAINERIZED',
-                    original.po_number,
-                    original.supplier,
-                    containerNumber,
-                    original.vessel_name,
-                    original.eta,
-                    original.cbm_per_unit,
-                    original.pack_size,
-                    original.cbm_per_pack,
-                    original.notes,
-                    JSON.stringify(newDates),
-                ]
-            );
-
-            await connection.commit();
-
-            const [updatedOrig] = await connection.query('SELECT * FROM orders WHERE id = ?', [id]);
-            const [newOrder] = await connection.query('SELECT * FROM orders WHERE id = ?', [newId]);
-
-            res.json({
-                originalOrder: rowToOrder(updatedOrig[0]),
-                newOrder: rowToOrder(newOrder[0]),
-            });
-        } catch (err) {
-            await connection.rollback();
-            throw err;
-        }
+        if (result.notFound) return res.status(404).json({ error: `Order ${result.notFound} not found.` });
+        if (result.badQuantity) return res.status(400).json({ error: 'splitQuantity must be less than the original order quantity.' });
+        res.status(201).json(result);
     } catch (error) {
-        console.error('[POST /orders/:id/split]', error);
+        log.error('[POST /orders/:id/split]', error);
         res.status(500).json({ error: 'An internal error occurred.' });
-    } finally {
-        if (connection) connection.release();
     }
 });
 
-// ── 6. POST /api/v1/containers/pack — Bulk pack orders into container ────
+// ── 6. POST /api/v1/containers/pack ──────────────────────────────────────
 app.post('/api/v1/containers/pack', async (req, res) => {
-    let connection;
     try {
-        await ensureOrdersTable();
         const { containerNumber, vesselName, eta, packs } = req.body || {};
 
         if (!containerNumber) {
@@ -436,192 +447,128 @@ app.post('/api/v1/containers/pack', async (req, res) => {
             return res.status(400).json({ error: 'packs array is required and must not be empty.' });
         }
 
-        connection = await pool.getConnection();
-        await connection.beginTransaction();
+        const result = await withConnection(async (conn) => {
+            await conn.beginTransaction();
+            try {
+                const affected = [];
 
-        try {
-            const affected = [];
+                for (const pack of packs) {
+                    const { orderId, qty } = pack;
+                    if (!orderId || !qty || qty <= 0) {
+                        await conn.rollback();
+                        return { badPack: true };
+                    }
 
-            for (const pack of packs) {
-                const { orderId, qty } = pack;
-                if (!orderId || !qty || qty <= 0) {
-                    await connection.rollback();
-                    return res.status(400).json({ error: `Invalid pack entry: orderId and qty > 0 required.` });
+                    const [existing] = await conn.query('SELECT * FROM orders WHERE id = ?', [orderId]);
+                    if (!existing.length) {
+                        await conn.rollback();
+                        return { notFound: orderId };
+                    }
+
+                    const order = existing[0];
+
+                    if (qty === order.quantity) {
+                        // Full pack — update in place
+                        const dates = setDateKey(parseDates(order.dates), 'CONTAINERIZED');
+                        await conn.execute(
+                            `UPDATE orders SET status = 'CONTAINERIZED', container_number = ?, vessel_name = ?, eta = ?, dates = ? WHERE id = ?`,
+                            [containerNumber, vesselName || null, eta || null, JSON.stringify(dates), orderId]
+                        );
+                        affected.push(orderId);
+                    } else if (qty < order.quantity) {
+                        // Partial pack — split
+                        await conn.execute('UPDATE orders SET quantity = ? WHERE id = ?',
+                            [order.quantity - qty, orderId]);
+                        affected.push(orderId);
+
+                        const newId = generateOrderId();
+                        const newDates = setDateKey({ ...parseDates(order.dates) }, 'CONTAINERIZED');
+
+                        await conn.execute(
+                            `INSERT INTO orders ${ORDER_INSERT_COLS} VALUES ${ORDER_INSERT_PLACEHOLDERS}`,
+                            orderInsertValues(
+                                { ...order, container_number: containerNumber, vessel_name: vesselName || null, eta: eta || null },
+                                newId, 'CONTAINERIZED', newDates, qty
+                            )
+                        );
+                        affected.push(newId);
+                    } else {
+                        await conn.rollback();
+                        return { qtyExceeds: { qty, orderId, orderQty: order.quantity } };
+                    }
                 }
 
-                const [existing] = await connection.query('SELECT * FROM orders WHERE id = ?', [orderId]);
-                if (!existing.length) {
-                    await connection.rollback();
-                    return res.status(404).json({ error: `Order ${orderId} not found.` });
-                }
+                await conn.commit();
 
-                const order = existing[0];
+                const ph = affected.map(() => '?').join(',');
+                const [rows] = await conn.query(
+                    `SELECT * FROM orders WHERE id IN (${ph}) ORDER BY created_at DESC`, affected
+                );
+                return { data: rows.map(rowToOrder) };
+            } catch (err) {
+                await conn.rollback();
+                throw err;
+            }
+        });
 
-                if (qty === order.quantity) {
-                    // Full pack — update in place
-                    let dates = order.dates;
-                    if (typeof dates === 'string') dates = JSON.parse(dates);
-                    dates = dates || {};
-                    setDateKey(dates, 'CONTAINERIZED');
+        if (result.badPack) return res.status(400).json({ error: 'Invalid pack entry: orderId and qty > 0 required.' });
+        if (result.notFound) return res.status(404).json({ error: `Order ${result.notFound} not found.` });
+        if (result.qtyExceeds) {
+            const { qty, orderId, orderQty } = result.qtyExceeds;
+            return res.status(400).json({ error: `qty (${qty}) exceeds order ${orderId} quantity (${orderQty}).` });
+        }
+        res.json(result);
+    } catch (error) {
+        log.error('[POST /containers/pack]', error);
+        res.status(500).json({ error: 'An internal error occurred.' });
+    }
+});
 
-                    await connection.execute(
-                        `UPDATE orders SET status = 'CONTAINERIZED', container_number = ?, vessel_name = ?, eta = ?, dates = ? WHERE id = ?`,
-                        [containerNumber, vesselName || null, eta || null, JSON.stringify(dates), orderId]
-                    );
+// ── 7. PATCH /api/v1/containers/:containerNumber/status ──────────────────
+app.patch('/api/v1/containers/:containerNumber/status', async (req, res) => {
+    try {
+        const { status } = req.body || {};
+        if (!status) return res.status(400).json({ error: 'status is required.' });
 
-                    affected.push(orderId);
-                } else if (qty < order.quantity) {
-                    // Partial pack — split
-                    const newQty = order.quantity - qty;
-                    await connection.execute('UPDATE orders SET quantity = ? WHERE id = ?', [newQty, orderId]);
-                    affected.push(orderId);
+        const result = await withConnection(async (conn) => {
+            const { containerNumber } = req.params;
+            const [orders] = await conn.query(
+                'SELECT * FROM orders WHERE container_number = ?', [containerNumber]
+            );
+            if (!orders.length) return { notFound: containerNumber };
 
-                    const newId = generateOrderId();
-                    let originalDates = order.dates;
-                    if (typeof originalDates === 'string') originalDates = JSON.parse(originalDates);
-                    const newDates = { ...(originalDates || {}) };
-                    setDateKey(newDates, 'CONTAINERIZED');
-
-                    await connection.execute(
-                        `INSERT INTO orders (id, asin, product_name, quantity, status, po_number, supplier,
-                            container_number, vessel_name, eta, cbm_per_unit, pack_size, cbm_per_pack, notes, dates)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                        [
-                            newId,
-                            order.asin,
-                            order.product_name,
-                            qty,
-                            'CONTAINERIZED',
-                            order.po_number,
-                            order.supplier,
-                            containerNumber,
-                            vesselName || null,
-                            eta || null,
-                            order.cbm_per_unit,
-                            order.pack_size,
-                            order.cbm_per_pack,
-                            order.notes,
-                            JSON.stringify(newDates),
-                        ]
-                    );
-
-                    affected.push(newId);
-                } else {
-                    await connection.rollback();
-                    return res.status(400).json({ error: `qty (${qty}) exceeds order ${orderId} quantity (${order.quantity}).` });
-                }
+            for (const order of orders) {
+                const dates = setDateKey(parseDates(order.dates), status);
+                await conn.execute(
+                    'UPDATE orders SET status = ?, dates = ? WHERE id = ?',
+                    [status, JSON.stringify(dates), order.id]
+                );
             }
 
-            await connection.commit();
-
-            // Fetch all affected orders
-            const ph = affected.map(() => '?').join(',');
-            const [rows] = await connection.query(`SELECT * FROM orders WHERE id IN (${ph})`, affected);
-            res.json({ data: rows.map(rowToOrder) });
-        } catch (err) {
-            await connection.rollback();
-            throw err;
-        }
-    } catch (error) {
-        console.error('[POST /containers/pack]', error);
-        res.status(500).json({ error: 'An internal error occurred.' });
-    } finally {
-        if (connection) connection.release();
-    }
-});
-
-// ── 7. PATCH /api/v1/containers/:containerNumber/status — Move container ──
-app.patch('/api/v1/containers/:containerNumber/status', async (req, res) => {
-    let connection;
-    try {
-        await ensureOrdersTable();
-        const { containerNumber } = req.params;
-        const { status } = req.body || {};
-
-        if (!status) {
-            return res.status(400).json({ error: 'status is required.' });
-        }
-
-        connection = await pool.getConnection();
-
-        const [orders] = await connection.query(
-            'SELECT * FROM orders WHERE container_number = ?', [containerNumber]
-        );
-
-        if (!orders.length) {
-            return res.status(404).json({ error: `No orders found for container ${containerNumber}.` });
-        }
-
-        for (const order of orders) {
-            let dates = order.dates;
-            if (typeof dates === 'string') dates = JSON.parse(dates);
-            dates = dates || {};
-            setDateKey(dates, status);
-
-            await connection.execute(
-                'UPDATE orders SET status = ?, dates = ? WHERE id = ?',
-                [status, JSON.stringify(dates), order.id]
+            const [updated] = await conn.query(
+                'SELECT * FROM orders WHERE container_number = ?', [containerNumber]
             );
-        }
+            return { data: updated.map(rowToOrder) };
+        });
 
-        const [updated] = await connection.query(
-            'SELECT * FROM orders WHERE container_number = ?', [containerNumber]
-        );
-        res.json({ data: updated.map(rowToOrder) });
+        if (result.notFound) return res.status(404).json({ error: `No orders found for container ${result.notFound}.` });
+        res.status(200).json(result);
     } catch (error) {
-        console.error('[PATCH /containers/:containerNumber/status]', error);
+        log.error('[PATCH /containers/:containerNumber/status]', error);
         res.status(500).json({ error: 'An internal error occurred.' });
-    } finally {
-        if (connection) connection.release();
     }
 });
 
-
-// ─── Constants ────────────────────────────────────────────────────────────────
-
-const ASIN_PATTERN = /^[A-Z0-9]{10}$/;
-const QUERY_TIMEOUT_MS = 10_000;
-
-/**
- * Wraps a promise with a timeout. Rejects if not settled within ms.
- */
-function withTimeout(promise, ms, label = 'Query') {
-    let timer;
-    const timeout = new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
-    });
-    return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
-}
-
-/**
- * Parse and validate an ASIN from raw input. Returns the clean ASIN or null.
- */
-function parseAsin(raw) {
-    if (!raw) return null;
-    const cleaned = String(raw).trim().toUpperCase();
-    return ASIN_PATTERN.test(cleaned) ? cleaned : null;
-}
-
-// ─── Route handler ────────────────────────────────────────────────────────────
-
+// ── 8. GET /api/v1/stock-snapshots/sum ───────────────────────────────────
 app.get('/api/v1/stock-snapshots/sum', async (req, res) => {
-    res.set('Cache-Control', 'private, max-age=60');
-
     try {
         const cleanAsin = parseAsin(req.query.asin);
-
         if (!cleanAsin) {
-            return res.status(400).json({
-                error: 'A valid 10-character alphanumeric ASIN is required.',
-            });
+            return res.status(400).json({ error: 'A valid 10-character alphanumeric ASIN is required.' });
         }
 
-        // Get latest snapshot dates (fallback to last available from any source)
         const [
-            [msTodayRows],
-            [amzTodayRows],
-            [msFallbackRows],
-            [amzFallbackRows],
+            [msTodayRows], [amzTodayRows], [msFallbackRows], [amzFallbackRows],
         ] = await withTimeout(
             Promise.all([
                 pool.query(`SELECT MAX(date_ran) as latest FROM stock_snapshots WHERE asin = ? AND date_ran = CURDATE()`, [cleanAsin]),
@@ -629,17 +576,14 @@ app.get('/api/v1/stock-snapshots/sum', async (req, res) => {
                 pool.query(`SELECT MAX(date_ran) as latest FROM stock_snapshots WHERE asin = ?`, [cleanAsin]),
                 pool.query(`SELECT MAX(date_ran) as latest FROM amazon_stock_country_snapshots WHERE asin = ?`, [cleanAsin]),
             ]),
-            QUERY_TIMEOUT_MS,
-            'Date lookup'
+            QUERY_TIMEOUT_MS, 'Date lookup'
         );
 
-        let msDate = msTodayRows[0]?.latest ?? msFallbackRows[0]?.latest ?? null;
-        let amzDate = amzTodayRows[0]?.latest ?? amzFallbackRows[0]?.latest ?? null;
-
-        // Parallel data fetch
+        const msDate = msTodayRows[0]?.latest ?? msFallbackRows[0]?.latest ?? null;
+        const amzDate = amzTodayRows[0]?.latest ?? amzFallbackRows[0]?.latest ?? null;
         const days = parseInt(req.query.days, 10) || 30;
 
-        const [msRows, amzRows, orderRows, onSeaRows, msHistoryRows, amzHistoryRows] = await withTimeout(
+        const [msRows, amzRows, orderRows, onSeaRows, onAirRows, ordersBreakdownRows, msHistoryRows, amzHistoryRows] = await withTimeout(
             Promise.all([
                 msDate
                     ? pool.query(
@@ -673,19 +617,26 @@ app.get('/api/v1/stock-snapshots/sum', async (req, res) => {
                     : Promise.resolve([]),
 
                 pool.query(
-                    `SELECT status,
-                            CAST(COALESCE(SUM(quantity), 0) AS UNSIGNED) as total_quantity
-                     FROM orders
-                     WHERE asin = ?
-                     GROUP BY status`,
+                    `SELECT status, CAST(COALESCE(SUM(quantity), 0) AS UNSIGNED) as total_quantity
+                     FROM orders WHERE asin = ? GROUP BY status`,
                     [cleanAsin]
                 ).then(([rows]) => rows),
 
                 pool.query(
-                    `SELECT id, product_name, quantity, eta, container_number, supplier, po_number
-                     FROM orders
-                     WHERE asin = ? AND status = 'ON_SEA'
-                     ORDER BY eta ASC`,
+                    `SELECT id, product_name, quantity, eta, container_number, supplier, po_number, dates
+                     FROM orders WHERE asin = ? AND status = 'ON_SEA' ORDER BY eta ASC`,
+                    [cleanAsin]
+                ).then(([rows]) => rows),
+
+                pool.query(
+                    `SELECT id, product_name, quantity, eta, container_number, supplier, po_number, dates
+                     FROM orders WHERE asin = ? AND status = 'ON_AIR' ORDER BY eta ASC`,
+                    [cleanAsin]
+                ).then(([rows]) => rows),
+
+                pool.query(
+                    `SELECT id, product_name, quantity, status, po_number, supplier, dates
+                     FROM orders WHERE asin = ? AND status NOT IN ('ON_SEA', 'ON_AIR') ORDER BY created_at DESC`,
                     [cleanAsin]
                 ).then(([rows]) => rows),
 
@@ -697,8 +648,7 @@ app.get('/api/v1/stock-snapshots/sum', async (req, res) => {
                         CAST(COALESCE(SUM(quarantine), 0) AS UNSIGNED)   as quarantine
                      FROM stock_snapshots
                      WHERE asin = ? AND date_ran >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
-                     GROUP BY date_ran
-                     ORDER BY date_ran`,
+                     GROUP BY date_ran ORDER BY date_ran`,
                     [cleanAsin, days]
                 ).then(([rows]) => rows),
 
@@ -711,45 +661,14 @@ app.get('/api/v1/stock-snapshots/sum', async (req, res) => {
                         CAST(COALESCE(SUM(reserved), 0) AS UNSIGNED)          as reserved
                      FROM amazon_stock_country_snapshots
                      WHERE asin = ? AND date_ran >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
-                     GROUP BY date_ran
-                     ORDER BY date_ran`,
+                     GROUP BY date_ran ORDER BY date_ran`,
                     [cleanAsin, days]
                 ).then(([rows]) => rows),
             ]),
-            QUERY_TIMEOUT_MS,
-            'Data fetch'
+            QUERY_TIMEOUT_MS, 'Data fetch'
         );
 
-        const amazon_stock_by_country = {};
-        const totals = { amazon_fulfillable: 0, amazon_inbound_working: 0, amazon_inbound_shipped: 0, amazon_inbound_receiving: 0, amazon_reserved: 0 };
-        for (const row of amzRows) {
-            const country = row.country?.trim().toUpperCase();
-            if (!country) continue;
-            const entry = {
-                fulfillable: Number(row.amazon_fulfillable || 0),
-                inbound_working: Number(row.amazon_inbound_working || 0),
-                inbound_shipped: Number(row.amazon_inbound_shipped || 0),
-                inbound_receiving: Number(row.amazon_inbound_receiving || 0),
-                reserved: Number(row.amazon_reserved || 0),
-            };
-            amazon_stock_by_country[country] = entry;
-            totals.amazon_fulfillable       += entry.fulfillable;
-            totals.amazon_inbound_working   += entry.inbound_working;
-            totals.amazon_inbound_shipped   += entry.inbound_shipped;
-            totals.amazon_inbound_receiving += entry.inbound_receiving;
-            totals.amazon_reserved          += entry.reserved;
-        }
-        totals.amazon_total = totals.amazon_fulfillable + totals.amazon_inbound_working + totals.amazon_inbound_shipped + totals.amazon_inbound_receiving + totals.amazon_reserved;
-
-        const ALL_STATUSES = [
-            'SCHEDULED', 'PO_SENT', 'UNDER_PRODUCTION', 'READY_AT_FACTORY',
-            'CONSOLIDATED', 'ON_SEA', 'IN_WAREHOUSE', 'MINTSOFT',
-        ];
-        const orders = Object.fromEntries(ALL_STATUSES.map(s => [s, 0]));
-        for (const row of orderRows) {
-            orders[row.status] = Number(row.total_quantity || 0);
-        }
-
+        const { byCountry: amazon_stock_by_country, totals } = aggregateAmazonStock(amzRows);
         const msStats = msRows[0] || {};
 
         res.json({
@@ -762,16 +681,10 @@ app.get('/api/v1/stock-snapshots/sum', async (req, res) => {
                 mintsoft_quarantine: Number(msStats.total_quarantine || 0),
                 ...totals,
                 amazon_stock_by_country,
-                orders,
-                goods_on_sea: onSeaRows.map(r => ({
-                    id: r.id,
-                    productName: r.product_name,
-                    quantity: Number(r.quantity),
-                    eta: r.eta ? (r.eta.toISOString?.().slice(0, 10) ?? r.eta) : null,
-                    containerNumber: r.container_number || null,
-                    supplier: r.supplier || null,
-                    poNumber: r.po_number || null,
-                })),
+                orders: buildOrderStatusMap(orderRows),
+                goods_on_sea: onSeaRows.map(mapGoodsOnSeaRow),
+                goods_on_air: onAirRows.map(mapGoodsOnAirRow),
+                orders_breakdown: ordersBreakdownRows.map(mapOrderBreakdownRow),
                 history: {
                     mintsoft: msHistoryRows.map(r => ({
                         date: r.date_ran,
@@ -792,31 +705,24 @@ app.get('/api/v1/stock-snapshots/sum', async (req, res) => {
             },
         });
     } catch (error) {
-        console.error('[GET /stock-snapshots/sum]', error);
-
+        log.error('[GET /stock-snapshots/sum]', error);
         const status = error.message?.includes('timed out') ? 504 : 500;
         res.status(status).json({ error: 'An internal error occurred.' });
     }
 });
 
-// ── 8. GET /api/v1/stock-snapshots/sum/all-asins — Full summary for each ASIN ──
+// ── 9. GET /api/v1/stock-snapshots/sum/all-asins ─────────────────────────
 app.get('/api/v1/stock-snapshots/sum/all-asins', async (_req, res) => {
-    res.set('Cache-Control', 'private, max-age=60');
-
     try {
-        // Get all distinct ASINs from all three tables
         const [
-            [asinsFromOrders],
-            [asinsFromMintsoft],
-            [asinsFromAmazon],
+            [asinsFromOrders], [asinsFromMintsoft], [asinsFromAmazon],
         ] = await withTimeout(
             Promise.all([
                 pool.query(`SELECT DISTINCT asin FROM orders WHERE asin IS NOT NULL AND asin != ''`),
                 pool.query(`SELECT DISTINCT asin FROM stock_snapshots WHERE asin IS NOT NULL AND asin != ''`),
                 pool.query(`SELECT DISTINCT asin FROM amazon_stock_country_snapshots WHERE asin IS NOT NULL AND asin != ''`),
             ]),
-            QUERY_TIMEOUT_MS,
-            'ASIN list fetch'
+            QUERY_TIMEOUT_MS, 'ASIN list fetch'
         );
 
         const allAsins = new Set([
@@ -825,43 +731,44 @@ app.get('/api/v1/stock-snapshots/sum/all-asins', async (_req, res) => {
             ...asinsFromAmazon.map(r => r.asin),
         ]);
 
-        // Batch fetch all data for all ASINs
         const [
-            [msDates],
-            [amzDates],
-            [orderStats],
-            [onSeaOrders],
-            [msLatestRows],
-            [amzLatestRows],
+            [msDates], [amzDates], [orderStats], [onSeaOrders], [onAirOrders], [allOrdersRows], [msLatestRows], [amzLatestRows],
         ] = await withTimeout(
             Promise.all([
-                // Latest mintsoft dates by ASIN
                 pool.query(`
                     SELECT asin, MAX(date_ran) as latest
                     FROM stock_snapshots WHERE asin IS NOT NULL AND asin != ''
                     GROUP BY asin ORDER BY asin
                 `),
-                // Latest amazon dates by ASIN
                 pool.query(`
                     SELECT asin, MAX(date_ran) as latest
                     FROM amazon_stock_country_snapshots WHERE asin IS NOT NULL AND asin != ''
                     GROUP BY asin ORDER BY asin
                 `),
-                // Orders by status and ASIN
                 pool.query(`
                     SELECT asin, status,
                            CAST(COALESCE(SUM(quantity), 0) AS UNSIGNED) as total_quantity
                     FROM orders WHERE asin IS NOT NULL
                     GROUP BY asin, status
                 `),
-                // All goods on sea
                 pool.query(`
-                    SELECT asin, id, product_name, quantity, eta, container_number, supplier, po_number
+                    SELECT asin, id, product_name, quantity, eta, container_number, supplier, po_number, dates
                     FROM orders
                     WHERE status = 'ON_SEA' AND asin IS NOT NULL
                     ORDER BY asin, eta ASC
                 `),
-                // Latest mintsoft snapshots
+                pool.query(`
+                    SELECT asin, id, product_name, quantity, eta, container_number, supplier, po_number, dates
+                    FROM orders
+                    WHERE status = 'ON_AIR' AND asin IS NOT NULL
+                    ORDER BY asin, eta ASC
+                `),
+                pool.query(`
+                    SELECT asin, id, product_name, quantity, status, po_number, supplier, dates
+                    FROM orders
+                    WHERE status NOT IN ('ON_SEA', 'ON_AIR') AND asin IS NOT NULL
+                    ORDER BY asin, created_at DESC
+                `),
                 pool.query(`
                     WITH LatestDates AS (
                         SELECT asin, MAX(date_ran) as latest FROM stock_snapshots
@@ -876,7 +783,6 @@ app.get('/api/v1/stock-snapshots/sum/all-asins', async (_req, res) => {
                     JOIN LatestDates ld ON s.asin = ld.asin AND s.date_ran = ld.latest
                     GROUP BY s.asin, s.date_ran
                 `),
-                // Latest amazon snapshots by country
                 pool.query(`
                     WITH LatestDates AS (
                         SELECT asin, MAX(date_ran) as latest FROM amazon_stock_country_snapshots
@@ -893,19 +799,13 @@ app.get('/api/v1/stock-snapshots/sum/all-asins', async (_req, res) => {
                     GROUP BY a.asin, a.country, a.date_ran
                 `),
             ]),
-            QUERY_TIMEOUT_MS,
-            'Batch data fetch'
+            QUERY_TIMEOUT_MS, 'Batch data fetch'
         );
 
-        // Aggregate in-memory
         const msDatesMap = Object.fromEntries(msDates.map(r => [r.asin, r.latest]));
         const amzDatesMap = Object.fromEntries(amzDates.map(r => [r.asin, r.latest]));
 
         const results = {};
-        const ALL_STATUSES = [
-            'SCHEDULED', 'PO_SENT', 'UNDER_PRODUCTION', 'READY_AT_FACTORY',
-            'CONSOLIDATED', 'ON_SEA', 'IN_WAREHOUSE', 'MINTSOFT',
-        ];
 
         for (const asin of allAsins) {
             if (!asin || !parseAsin(asin)) continue;
@@ -914,34 +814,10 @@ app.get('/api/v1/stock-snapshots/sum/all-asins', async (_req, res) => {
             const amzByCountry = amzLatestRows.filter(r => r.asin === asin);
             const ordersByStatus = orderStats.filter(r => r.asin === asin);
             const seaOrders = onSeaOrders.filter(r => r.asin === asin);
+            const airOrders = onAirOrders.filter(r => r.asin === asin);
+            const ordersBreakdown = allOrdersRows.filter(r => r.asin === asin);
 
-            // Aggregate amazon by country
-            const amazon_stock_by_country = {};
-            const totals = { amazon_fulfillable: 0, amazon_inbound_working: 0, amazon_inbound_shipped: 0, amazon_inbound_receiving: 0, amazon_reserved: 0 };
-            for (const row of amzByCountry) {
-                const country = row.country?.trim().toUpperCase();
-                if (!country) continue;
-                const entry = {
-                    fulfillable: Number(row.amazon_fulfillable || 0),
-                    inbound_working: Number(row.amazon_inbound_working || 0),
-                    inbound_shipped: Number(row.amazon_inbound_shipped || 0),
-                    inbound_receiving: Number(row.amazon_inbound_receiving || 0),
-                    reserved: Number(row.amazon_reserved || 0),
-                };
-                amazon_stock_by_country[country] = entry;
-                totals.amazon_fulfillable       += entry.fulfillable;
-                totals.amazon_inbound_working   += entry.inbound_working;
-                totals.amazon_inbound_shipped   += entry.inbound_shipped;
-                totals.amazon_inbound_receiving += entry.inbound_receiving;
-                totals.amazon_reserved          += entry.reserved;
-            }
-            totals.amazon_total = totals.amazon_fulfillable + totals.amazon_inbound_working + totals.amazon_inbound_shipped + totals.amazon_inbound_receiving + totals.amazon_reserved;
-
-            // Build orders by status
-            const orders = Object.fromEntries(ALL_STATUSES.map(s => [s, 0]));
-            for (const row of ordersByStatus) {
-                orders[row.status] = Number(row.total_quantity || 0);
-            }
+            const { byCountry: amazon_stock_by_country, totals } = aggregateAmazonStock(amzByCountry);
 
             results[asin] = {
                 mintsoft_date: msDatesMap[asin] || null,
@@ -952,30 +828,24 @@ app.get('/api/v1/stock-snapshots/sum/all-asins', async (_req, res) => {
                 mintsoft_quarantine: Number(msStats.total_quarantine || 0),
                 ...totals,
                 amazon_stock_by_country,
-                orders,
-                goods_on_sea: seaOrders.map(r => ({
-                    id: r.id,
-                    productName: r.product_name,
-                    quantity: Number(r.quantity),
-                    eta: r.eta ? (r.eta.toISOString?.().slice(0, 10) ?? r.eta) : null,
-                    containerNumber: r.container_number || null,
-                    supplier: r.supplier || null,
-                    poNumber: r.po_number || null,
-                })),
+                orders: buildOrderStatusMap(ordersByStatus),
+                goods_on_sea: seaOrders.map(mapGoodsOnSeaRow),
+                goods_on_air: airOrders.map(mapGoodsOnAirRow),
+                orders_breakdown: ordersBreakdown.map(mapOrderBreakdownRow),
             };
         }
 
         res.json({ data: results });
     } catch (error) {
-        console.error('[GET /stock-snapshots/sum/all-asins]', error);
+        log.error('[GET /stock-snapshots/sum/all-asins]', error);
         const status = error.message?.includes('timed out') ? 504 : 500;
         res.status(status).json({ error: 'An internal error occurred.' });
     }
 });
 
-// ── Serverless export ─────────────────────────────────────────────────────
+// ── Serverless export ────────────────────────────────────────────────────
 const serverlessApp = serverless(app, {
-    binary: ['application/json', 'image/*', 'application/javascript']
+    binary: ['application/json', 'image/*', 'application/javascript'],
 });
 
 module.exports.handler = async (event, context) => {
@@ -986,6 +856,6 @@ module.exports.handler = async (event, context) => {
 if (require.main === module) {
     const PORT = process.env.ORDERS_PORT || 3001;
     app.listen(PORT, () => {
-        console.log(`Orders API running on http://localhost:${PORT}`);
+        log.info(`Orders API running on http://localhost:${PORT}`);
     });
 }

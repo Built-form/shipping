@@ -9,7 +9,25 @@
       "Bash(node -e \":*)",
       "Bash(npm install:*)",
       "Read(//c/nvm4w/**)",
-      "Read(//c//**)"
+      "Read(//c//**)",
+      "Bash(for f:*)",
+      "Bash(do echo:*)",
+      "Read(//c/Users/OpsLondon/shipping/**)",
+      "Bash(done)",
+      "Bash(grep -E '\\\\.js$|utils')",
+      "Bash(grep -n \"require.*utils\" /c/Users/OpsLondon/shipping/*.js)",
+      "Bash(grep -l \"const log\" *.js)",
+      "Bash(grep -n \"getPool\\\\|new.*Pool\\\\|mysql.createPool\" /c/Users/OpsLondon/shipping/*.js)",
+      "Bash(grep -n \"const axios\" /c/Users/OpsLondon/shipping/*.js)",
+      "Bash(ls c:/Users/OpsLondon/shipping/*.js)",
+      "Bash(where.exe node:*)",
+      "Bash(cmd.exe /c \"where node\")",
+      "Bash(cmd.exe /c \"node -v\")",
+      "Bash(\"/c/Program Files/nodejs/node.exe\" -e \":*)",
+      "Bash('/c/Program Files/nodejs/node.exe' -e ':*)"
+    ],
+    "additionalDirectories": [
+      "C:\\Users\\OpsLondon\\joshdex"
     ]
   }
 }

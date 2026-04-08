@@ -1,7 +1,7 @@
 'use strict';
 
 const axios = require('axios');
-require('dotenv').config();
+require('dotenv').config(); // Ensure dotenv is loaded first
 const log = require('./logger');
 const { getPool } = require('./db');
 // Note: Database table creation should ideally be handled by a migration script
@@ -29,7 +29,7 @@ const REGIONS = {
     EU: {
         endpoint: 'https://sellingpartnerapi-eu.amazon.com',
         marketplaces: {
-            UK: 'A1F83G8C2ARO7P', DE: 'A1PA6795UKMFR9',
+            DE: 'A1PA6795UKMFR9', UK: 'A1F83G8C2ARO7P',
             FR: 'A13V1IB3VIYZZH', ES: 'A1RKKUPIHCS9HS', IT: 'APJ6JRA9NG5V4',
         },
     },
@@ -159,9 +159,19 @@ const handler = async () => {
                     const rows = await fetchInventoryHealthReport(tokenManager, endpoint, marketplaceId, `${account.name}/${code}`);
 
                     const byAsin = {};
+                    const seenAsinFnsku = new Set();
                     for (const row of rows) {
                         const asin = row['asin'] || '';
                         if (!asin) continue;
+                        const fnsku = (row['fnsku'] || '').trim();
+                        const isBprefix = fnsku.toUpperCase().startsWith('B');
+                        // Skip B-prefix in FR/ES/IT — Pan-European duplicates only
+                        // In DE/UK, B-prefix is genuine local stock — always sum with X-prefix
+                        if (isBprefix && code !== 'DE' && code !== 'UK') continue;
+                        // Skip duplicate ASIN+FNSKU rows — only count the first occurrence
+                        const key = `${asin}:${fnsku}`;
+                        if (seenAsinFnsku.has(key)) continue;
+                        seenAsinFnsku.add(key);
                         if (!byAsin[asin]) {
                             byAsin[asin] = {
                                 fnsku: row['fnsku'] || '', sku: row['sku'] || '',

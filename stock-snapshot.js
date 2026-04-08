@@ -2,7 +2,8 @@ require('dotenv').config();
 const log = require('./logger');
 const { getPool } = require('./db');
 const { getProductsByJfCode, getProductStock } = require('./mintsoft');
-
+// Note: Database table creation should ideally be handled by a migration script
+// and not within the Lambda handler for production environments.
 // ── JF codes + ASINs loaded from landed_costs table ──────────────────────────
 async function loadJfCodes(conn) {
     const [rows] = await conn.execute(
@@ -18,30 +19,7 @@ async function loadJfCodes(conn) {
 
 // ── Ensure table exists ────────────────────────────────────────────────────────
 async function ensureTable(conn) {
-    await conn.execute(`
-        CREATE TABLE IF NOT EXISTS stock_snapshots (
-            id           INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-            date_ran     DATE         NOT NULL,
-            jf_code      VARCHAR(255) NOT NULL,
-            asin         VARCHAR(50)  NOT NULL DEFAULT '',
-            sku          VARCHAR(255) NOT NULL DEFAULT '',
-            product_id   INT          NOT NULL,
-            warehouse_id INT          NOT NULL DEFAULT 0,
-            stock_level  INT          NOT NULL DEFAULT 0,
-            available    INT          NOT NULL DEFAULT 0,
-            allocated    INT          NOT NULL DEFAULT 0,
-            quarantine   INT          NOT NULL DEFAULT 0,
-            created_at   TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
-            INDEX idx_jf_date (jf_code, date_ran),
-            INDEX idx_asin (asin),
-            INDEX idx_asin_date (asin, date_ran),
-            INDEX idx_date_ran (date_ran)
-        )
-    `);
-
-    // Migrate: add columns that may be missing from earlier schema
-    // NOTE: Consider moving schema migrations into an isolated deploy script
-    // instead of running ALTER TABLE on every Lambda invocation.
+    // Assuming 'stock_snapshots' table is managed by migrations.
     const migrations = [
         `ALTER TABLE stock_snapshots ADD COLUMN asin VARCHAR(50) NOT NULL DEFAULT '' AFTER jf_code`,
         `ALTER TABLE stock_snapshots ADD COLUMN warehouse_id INT NOT NULL DEFAULT 0 AFTER product_id`,
@@ -78,7 +56,7 @@ const handler = async () => {
     }
 
     const dateRan = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
-    const db = getPool();
+    const db = await getPool().getConnection();
 
     try {
         await ensureTable(db);
@@ -161,6 +139,8 @@ const handler = async () => {
     } catch (err) {
         log.error('Fatal error during snapshot', err);
         throw err;
+    } finally {
+        db.release();
     }
 };
 

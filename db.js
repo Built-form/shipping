@@ -25,7 +25,4 @@ async function closePool() {
     }
 }
 
-module.exports = {
-    getPool,
-    closePool,
-};
+module.exports = { getPool, closePool };
