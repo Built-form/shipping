@@ -90,12 +90,19 @@ Deployed on **AWS Lambda** (Node.js 18) behind **API Gateway HTTP API** with Goo
 ### Order Status Lifecycle
 
 ```
-PLANNING --> PO_RAISED --> MANUFACTURING --> READY --> CONTAINERIZED --> IN_TRANSIT --> DELIVERED --> COMPLETED
-                                                           |
-                                              (split / bulk pack)
-                                              creates new order rows
-                                              with container_number
+PO_SENT --> IN_PRODUCTION --> READY --> ON_SEA  --> (delivered)
+                                    \-> ON_AIR  --> (delivered)
 ```
+
+Statuses are set during Asana import via `statusMappers.js`:
+
+| Asana field | Result |
+|---|---|
+| Goods Status = `"ready"` | `READY` |
+| Artwork Confirmed Date set | `IN_PRODUCTION` |
+| Otherwise | `PO_SENT` |
+
+Goods on Sea records are always `ON_SEA`. Goods on Air records are always `ON_AIR`.
 
 ---
 
@@ -127,7 +134,7 @@ shipping/
 | `ordersApi` | `orders.js` | HTTP API (all `/api/v1/*` routes) | REST API for orders, containers, and stock summaries |
 | `stockSnapshot` | `stock-snapshot.js` | `rate(1 hour)` | Snapshots Mintsoft warehouse stock by JF code |
 | `amazonStockSnapshot` | `amazon-stock-snapshot.js` | `rate(6 hours)` | Snapshots Amazon FBA inventory per marketplace/country |
-| `importAsanaOrders` | `import-asana-orders.js` | `rate(1 minute)` | Syncs orders from two Asana projects into the `orders` table |
+| `importAsanaOrders` | `import-asana-orders.js` | `rate(1 minute)` | Syncs orders from three Asana projects (Goods on Sea, Goods on Air, Orders) into the `orders` table |
 
 ---
 
@@ -159,6 +166,15 @@ All endpoints require a Google JWT `Authorization` header (bypassed in local dev
 | `GET` | `/api/v1/stock-snapshots/sum?asin=...&days=30` | Aggregated stock summary for a single ASIN (Mintsoft + Amazon + orders + history) |
 | `GET` | `/api/v1/stock-snapshots/sum/all-asins` | Full stock summary for every known ASIN |
 
+#### Stock snapshot response fields
+
+| Field | Description |
+|---|---|
+| `orders` | Map of `{ status: totalQuantity }` across all statuses |
+| `goods_on_sea` | Array of individual `ON_SEA` order rows (with `dates`) |
+| `goods_on_air` | Array of individual `ON_AIR` order rows (with `dates`) |
+| `orders_breakdown` | Array of all other order rows (`PO_SENT`, `IN_PRODUCTION`, `READY`) with `dates` |
+
 ---
 
 ## Database Tables
@@ -182,7 +198,7 @@ Main table for tracking shipments through their lifecycle.
 | `pack_size` | DECIMAL | Units per pack |
 | `cbm_per_pack` | DECIMAL | Cubic metres per pack |
 | `notes` | TEXT | Free-text notes |
-| `dates` | JSON | Timestamped status transitions (`{ planned: "...", shipped: "..." }`) |
+| `dates` | JSON | Timestamped status transitions — keys include `ordered`, `estimated_ready`, `shipped`, `eta` depending on source |
 | `location` | VARCHAR | Current physical location |
 | `containerized_location` | VARCHAR | Location when containerized |
 | `expected_shipping_date` | DATE | Planned shipping date |
@@ -250,9 +266,10 @@ Reference table mapping JF codes to ASINs (used by `stock-snapshot.js` to know w
 - **Auth:** Personal Access Token (PAT)
 - **Used by:** `import-asana-orders.js` via `asanaService.js`
 - **Projects:**
-  - `1210568539171010` -- Goods on Sea (container tracking)
-  - `1210599256348524` -- Orders (PO tracking)
-- **Sync behavior:** Full replace (truncates `orders` table, re-imports everything). Only truncates after validating data was fetched.
+  - `1210568539171010` — Goods on Sea → status `ON_SEA`
+  - `1210880888784849` — Goods on Air → status `ON_AIR`
+  - `1210599256348524` — Orders → status derived from `Goods Status` + `Artwork Confirmed Date`
+- **Sync behavior:** Full replace (truncates `orders` table, re-imports all three projects). Only truncates after validating at least one project returned data.
 
 ---
 

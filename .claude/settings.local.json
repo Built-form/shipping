@@ -24,7 +24,13 @@
       "Bash(cmd.exe /c \"where node\")",
       "Bash(cmd.exe /c \"node -v\")",
       "Bash(\"/c/Program Files/nodejs/node.exe\" -e \":*)",
-      "Bash('/c/Program Files/nodejs/node.exe' -e ':*)"
+      "Bash('/c/Program Files/nodejs/node.exe' -e ':*)",
+      "Bash(cmd.exe /c \"cd /d C:\\\\Users\\\\OpsLondon\\\\shipping && node -e \\\\\"const{getPool}=require\\('./db'\\);async function c\\(\\){const p=getPool\\(\\);const[r]=await p.execute\\('SELECT asin,country,account,date,ending_balance,effective_balance FROM amazon_oos_daily WHERE asin=? ORDER BY date DESC LIMIT 20',['B0CSG5F5K2']\\);console.log\\('rows:',r.length\\);r.forEach\\(x=>console.log\\(x.account,x.country,String\\(x.date\\).slice\\(0,10\\),'end:',x.ending_balance,'eff:',x.effective_balance\\)\\);const[s]=await p.execute\\('SELECT asin,country,total_quantity FROM amazon_stock_country_snapshots WHERE asin=? ORDER BY date_ran DESC LIMIT 10',['B0CSG5F5K2']\\);console.log\\('snaps:',s.length\\);s.forEach\\(x=>console.log\\(x.country,'qty:',x.total_quantity\\)\\);process.exit\\(0\\)}c\\(\\).catch\\(e=>{console.error\\(e.message\\);process.exit\\(1\\)}\\);\\\\\"\")",
+      "Bash(node -e ':*)",
+      "Bash(\"/c/Program Files/nodejs/node.exe\" amazon-oos-report.js collect)",
+      "Bash(ls -la /c/Users/OpsLondon/shipping/*.js)",
+      "Bash(grep -r \"amazon_stock_country_snapshots\\\\|amazon_oos_daily\" /c/Users/OpsLondon/shipping/*.js)",
+      "Bash(curl -s \"http://localhost:3001/api/v1/stock-snapshots/oos-dates?asin=B0G1TG6XHT\")"
     ],
     "additionalDirectories": [
       "C:\\Users\\OpsLondon\\joshdex"

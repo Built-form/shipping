@@ -36,6 +36,7 @@ provider:
     AMAZON_SP_CLIENT_ID_HW: ${env:AMAZON_SP_CLIENT_ID_HW}
     AMAZON_SP_CLIENT_SECRET_HW: ${env:AMAZON_SP_CLIENT_SECRET_HW}
     AMAZON_SP_REFRESH_TOKEN_HW: ${env:AMAZON_SP_REFRESH_TOKEN_HW}
+    SHIPSGO_API_KEY: ${env:SHIPSGO_API_KEY}
 
 package:
   individually: true
@@ -103,6 +104,21 @@ functions:
           method: GET
           authorizer:
             name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/stock-snapshots/fnskus
+          method: GET
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/stock-snapshots/asana-tasks
+          method: GET
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/stock-snapshots/oos-dates
+          method: GET
+          authorizer:
+            name: googleJwtAuthorizer
 
   stockSnapshot:
     handler: stock-snapshot.handler
@@ -118,6 +134,13 @@ functions:
           rate: rate(6 hours)
           enabled: true
 
+  amazonStockSnapshotV2:
+    handler: amazon-stock-snapshot-v2.handler
+    events:
+      - schedule:
+          rate: rate(6 hours)
+          enabled: true
+
   importAsanaOrders:
     handler: import-asana-orders.handler
     events:
@@ -125,25 +148,36 @@ functions:
           rate: rate(5 minutes)
           enabled: true
 
-  oosReportRequest:
-    handler: amazon-oos-report.requestHandler
+  updateShipsGoEta:
+    handler: update-shipsgo-eta.handler
     events:
       - schedule:
-          rate: cron(0 6 * * ? *)
+          rate: cron(55 8 * * ? *)
+          enabled: true
+      - schedule:
+          rate: cron(55 11 * * ? *)
+          enabled: true
+      - schedule:
+          rate: cron(55 14 * * ? *)
+          enabled: true
+      - schedule:
+          rate: cron(55 17 * * ? *)
           enabled: true
 
-  oosReportCollect15:
-    handler: amazon-oos-report.collectHandler
+  updateImportedDates:
+    handler: update-imported-dates.handler
     events:
       - schedule:
-          rate: cron(15 6 * * ? *)
+          rate: cron(0 9 * * ? *)
           enabled: true
-
-  oosReportCollect30:
-    handler: amazon-oos-report.collectHandler
-    events:
       - schedule:
-          rate: cron(30 6 * * ? *)
+          rate: cron(0 12 * * ? *)
+          enabled: true
+      - schedule:
+          rate: cron(0 15 * * ? *)
+          enabled: true
+      - schedule:
+          rate: cron(0 18 * * ? *)
           enabled: true
 
 #plugins:

@@ -25,10 +25,14 @@ async function importGoodsOnSea(conn, rows) {
         const etaRaw = row['ETA to Port'];
         const eta = etaRaw ? etaRaw.slice(0, 10) : null;
         const sailingRaw = row['Sailing Date'];
+        const deliveryDateRaw = row['Delivery Date'];
+        const deliveryDate = deliveryDateRaw ? deliveryDateRaw.slice(0, 10) : null;
 
+        const artworkDateRaw = row['Artwork Confirmed Date'];
         const dates = {};
         if (sailingRaw) dates.shipped = new Date(sailingRaw).toISOString();
         if (eta) dates.eta = new Date(eta).toISOString();
+        if (artworkDateRaw) dates.artwork_confirmed = new Date(artworkDateRaw).toISOString();
 
         batches.push([
             id.trim(),
@@ -42,20 +46,21 @@ async function importGoodsOnSea(conn, rows) {
             eta,
             parseFloat(row['CBM/Line']) || null,
             JSON.stringify(dates),
+            deliveryDate,
         ]);
     }
 
     // Execute batch inserts
     for (let i = 0; i < batches.length; i += BATCH_SIZE) {
         const batch = batches.slice(i, i + BATCH_SIZE);
-        const placeholders = batch.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').join(',');
+        const placeholders = batch.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').join(',');
         const values = batch.flat();
 
         try {
             await conn.execute(
                 `INSERT INTO orders
                     (id, asin, product_name, quantity, status, po_number, supplier,
-                     container_number, eta, cbm_per_unit, dates)
+                     container_number, eta, cbm_per_unit, dates, delivery_date)
                  VALUES ${placeholders}`,
                 values
             );
@@ -141,9 +146,11 @@ async function importOrders(conn, rows) {
         const status = mapOrdersStatus(row['Goods Status'], row['Artwork Confirmed Date']);
         const poDateRaw = row['PO Placed'];
         const estimatedReadyRaw = row['Estimated Ready Date'];
+        const artworkDateRaw = row['Artwork Confirmed Date'];
         const dates = {};
         if (poDateRaw) dates.ordered = new Date(poDateRaw).toISOString();
         if (estimatedReadyRaw) dates.estimated_ready = new Date(estimatedReadyRaw).toISOString();
+        if (artworkDateRaw) dates.artwork_confirmed = new Date(artworkDateRaw).toISOString();
 
         const totalCbm = parseFloat(row['Total CBM.']);
         const units = parseInt(row['Units Ordered'], 10);
@@ -218,6 +225,14 @@ exports.handler = async (event) => {
         // Validate before truncating
         if (!seaRows.length && !airRows.length && !orderRows.length) {
             throw new Error('No data fetched from Asana projects — aborting to preserve existing data');
+        }
+
+        // Ensure delivery_date column exists
+        try {
+            await conn.execute('ALTER TABLE orders ADD COLUMN delivery_date DATE NULL');
+            console.log('Added delivery_date column.');
+        } catch (e) {
+            // Column already exists — ignore
         }
 
         // Only truncate after successful fetch

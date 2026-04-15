@@ -9,7 +9,11 @@
       "Read(//c/Users/OpsLondon/joshdex/**)",
       "Bash(curl -s https://www.google.com/search?q=amazon+sp-api+GET_AFN_INVENTORY_DATA_BY_COUNTRY+report+columns+fields)",
       "Bash(curl -s https://www.google.com/search?q=amazon+sp-api+GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA+columns+fields+report)",
-      "Bash(curl -s https://www.google.com/search?q=amazon+sp-api+GET_FBA_FULFILLMENT_CURRENT_INVENTORY_DATA+columns+fields)"
+      "Bash(curl -s https://www.google.com/search?q=amazon+sp-api+GET_FBA_FULFILLMENT_CURRENT_INVENTORY_DATA+columns+fields)",
+      "Bash(cmd.exe /c \"npx serverless info 2>&1\")",
+      "Bash(cmd.exe /c \"node node_modules/.bin/serverless info 2>&1\")",
+      "Bash(cmd.exe /c \"npx serverless info\")",
+      "Bash(curl -s -X POST http://localhost:3001/api/v1/orders/asana-task -H \"Content-Type: application/json\" -d '{\"sku\":\"TEST-SKU\",\"asin\":\"B01M2BT92T\",\"carrier\":\"DPD\",\"region\":\"UK\",\"jf_hw_code\":\"JF0982\",\"qty_required\":287}')"
     ]
   }
 }

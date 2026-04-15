@@ -73,4 +73,31 @@ async function getProductStock(productId) {
     });
 }
 
-module.exports = { getProductsByJfCode, getProductStock };
+async function getProductDetails(productId) {
+    const res = await mintsoftClient.get(`/Product/${productId}`, {
+        params: { ...mintsoftClient.defaults.params }
+    });
+
+    if (!res.data) throw new Error(`No details for Product ID ${productId}`);
+
+    const p = res.data;
+    return {
+        productId: p.ID,
+        sku: p.SKU || '',
+        weight: p.Weight ?? 0,
+        height: p.Height ?? 0,
+        width: p.Width ?? 0,
+        depth: p.Depth ?? 0,
+        cartonQty: p.CartonQuantity ?? 0,
+    };
+}
+
+async function getProductCartons(productId) {
+    const res = await mintsoftClient.get(`/Product/${productId}/Cartons`, {
+        params: { ...mintsoftClient.defaults.params }
+    });
+    if (!res.data) return [];
+    return Array.isArray(res.data) ? res.data : [res.data];
+}
+
+module.exports = { getProductsByJfCode, getProductStock, getProductDetails, getProductCartons };

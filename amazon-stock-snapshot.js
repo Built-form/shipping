@@ -81,7 +81,7 @@ async function requestReport(tokenManager, endpoint, reportType, marketplaceIds)
     return res.data.reportId;
 }
 
-async function pollReport(tokenManager, endpoint, reportId, label, maxWaitMs = 120000) {
+async function pollReport(tokenManager, endpoint, reportId, label, maxWaitMs = 300000) {
     const start = Date.now();
     while (Date.now() - start < maxWaitMs) {
         const token = await tokenManager.getToken();
@@ -159,7 +159,6 @@ const handler = async () => {
                     const rows = await fetchInventoryHealthReport(tokenManager, endpoint, marketplaceId, `${account.name}/${code}`);
 
                     const byAsin = {};
-                    const seenAsinFnsku = new Set();
                     for (const row of rows) {
                         const asin = row['asin'] || '';
                         if (!asin) continue;
@@ -168,19 +167,16 @@ const handler = async () => {
                         // Skip B-prefix in FR/ES/IT — Pan-European duplicates only
                         // In DE/UK, B-prefix is genuine local stock — always sum with X-prefix
                         if (isBprefix && code !== 'DE' && code !== 'UK') continue;
-                        // Skip duplicate ASIN+FNSKU rows — only count the first occurrence
-                        const key = `${asin}:${fnsku}`;
-                        if (seenAsinFnsku.has(key)) continue;
-                        seenAsinFnsku.add(key);
                         if (!byAsin[asin]) {
                             byAsin[asin] = {
-                                fnsku: row['fnsku'] || '', sku: row['sku'] || '',
+                                fnsku: fnsku, sku: row['sku'] || '',
                                 condition_type: row['condition'] || '',
                                 fulfillable: 0, inbound_working: 0,
                                 inbound_shipped: 0, inbound_receiving: 0, reserved: 0,
                             };
                         }
                         const a = byAsin[asin];
+                        if (!a.condition_type && row['condition']) a.condition_type = row['condition'];
                         a.fulfillable       += parseInt(row['available'] || '0', 10);
                         a.inbound_working   += parseInt(row['inbound-working'] || '0', 10);
                         a.inbound_shipped   += parseInt(row['inbound-shipped'] || '0', 10);
@@ -219,42 +215,70 @@ const handler = async () => {
 
         await Promise.all(ACCOUNTS.map(account => processAccount(account)));
 
-        // Fallback: if all failed, copy last available snapshot to today
-        if (results.success.length === 0 && results.failed.length > 0) {
-            log.warn('All marketplaces failed — falling back to last available snapshot');
+        // Per-marketplace fallback: copy last available data for any marketplace that failed
+        const failedMarketplaces = results.failed.map(f => f.marketplace.replace('-health-report', ''));
+        for (const label of failedMarketplaces) {
+            const [, country] = label.split('/');
+            if (!country) continue;
 
             const [lastDate] = await conn.query(
-                `SELECT MAX(date_ran) as last_date FROM amazon_stock_country_snapshots WHERE date_ran < ?`,
+                `SELECT MAX(date_ran) as last_date FROM amazon_stock_country_snapshots WHERE date_ran < ? AND country = ?`,
+                [dateRan, country]
+            );
+            if (!lastDate[0]?.last_date) continue;
+
+            const prevDate = lastDate[0].last_date;
+            log.info(`[${label}] Failed — copying ${country} data from ${prevDate}`);
+            await conn.execute(
+                `INSERT INTO amazon_stock_country_snapshots
+                 (date_ran, country, asin, fnsku, sku, condition_type,
+                  fulfillable, inbound_working, inbound_shipped, inbound_receiving, reserved)
+                 SELECT ?, country, asin, fnsku, sku, condition_type,
+                        fulfillable, inbound_working, inbound_shipped, inbound_receiving, reserved
+                 FROM amazon_stock_country_snapshots WHERE date_ran = ? AND country = ?
+                 ON DUPLICATE KEY UPDATE
+                    fnsku = VALUES(fnsku), sku = VALUES(sku),
+                    condition_type = VALUES(condition_type),
+                    fulfillable = VALUES(fulfillable),
+                    inbound_working = VALUES(inbound_working),
+                    inbound_shipped = VALUES(inbound_shipped),
+                    inbound_receiving = VALUES(inbound_receiving),
+                    reserved = VALUES(reserved)`,
+                [dateRan, prevDate, country]
+            );
+        }
+
+        // Backfill: fill ALL gaps (including interior) by rippling forward one day at a time.
+        // Each iteration finds rows where date D exists but D+1 is missing (and D+1 <= today),
+        // then inserts D+1 carrying forward the last known values. Repeats until no gaps remain.
+        let totalBackfilled = 0;
+        for (let i = 0; i < 100; i++) {
+            const [result] = await conn.execute(
+                `INSERT INTO amazon_stock_country_snapshots
+                 (date_ran, country, asin, fnsku, sku, condition_type,
+                  fulfillable, inbound_working, inbound_shipped, inbound_receiving, reserved)
+                 SELECT DATE_ADD(s.date_ran, INTERVAL 1 DAY),
+                        s.country, s.asin, s.fnsku, s.sku, s.condition_type,
+                        0, s.inbound_working, s.inbound_shipped, s.inbound_receiving, 0
+                 FROM amazon_stock_country_snapshots s
+                 LEFT JOIN amazon_stock_country_snapshots nxt
+                     ON nxt.date_ran = DATE_ADD(s.date_ran, INTERVAL 1 DAY)
+                     AND nxt.country = s.country AND nxt.asin = s.asin
+                 WHERE nxt.asin IS NULL
+                   AND DATE_ADD(s.date_ran, INTERVAL 1 DAY) <= ?
+                 ON DUPLICATE KEY UPDATE
+                    fulfillable = 0,
+                    inbound_working = VALUES(inbound_working),
+                    inbound_shipped = VALUES(inbound_shipped),
+                    inbound_receiving = VALUES(inbound_receiving),
+                    reserved = 0`,
                 [dateRan]
             );
-
-            if (lastDate[0]?.last_date) {
-                const yesterday = lastDate[0].last_date;
-                log.info(`Copying data from ${yesterday} to ${dateRan}`);
-
-                await conn.execute(
-                    `INSERT INTO amazon_stock_country_snapshots
-                     (date_ran, country, asin, fnsku, sku, condition_type,
-                      fulfillable, inbound_working, inbound_shipped, inbound_receiving, reserved)
-                     SELECT ?, country, asin, fnsku, sku, condition_type,
-                            fulfillable, inbound_working, inbound_shipped, inbound_receiving, reserved
-                     FROM amazon_stock_country_snapshots WHERE date_ran = ?
-                     ON DUPLICATE KEY UPDATE
-                        fnsku = VALUES(fnsku), sku = VALUES(sku),
-                        condition_type = VALUES(condition_type),
-                        fulfillable = VALUES(fulfillable),
-                        inbound_working = VALUES(inbound_working),
-                        inbound_shipped = VALUES(inbound_shipped),
-                        inbound_receiving = VALUES(inbound_receiving),
-                        reserved = VALUES(reserved)`,
-                    [dateRan, yesterday]
-                );
-
-                log.info('Fallback snapshot copied');
-                results.fallback = `Used data from ${yesterday}`;
-            } else {
-                log.warn('No previous snapshot available for fallback');
-            }
+            if (result.affectedRows === 0) break;
+            totalBackfilled += result.affectedRows;
+        }
+        if (totalBackfilled > 0) {
+            log.info(`[Backfill] Carried forward ${totalBackfilled} rows filling gaps up to ${dateRan}`);
         }
 
         log.info(`Done — ${results.success.length} OK, ${results.failed.length} failed.`);
