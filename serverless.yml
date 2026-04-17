@@ -127,19 +127,57 @@ functions:
           rate: rate(1 hour)
           enabled: true
 
-  amazonStockSnapshot:
-    handler: amazon-stock-snapshot.handler
+  # ── Amazon Stock Snapshot v3 (per account+region jobs) ──
+  amazonStockSnapshotV3:
+    handler: amazon-stock-snapshot-v3.handler
     events:
+      # JFA — regions sequential, 15 min gaps
       - schedule:
-          rate: rate(6 hours)
+          rate: cron(0 1 * * ? *)
           enabled: true
-
-  amazonStockSnapshotV2:
-    handler: amazon-stock-snapshot-v2.handler
-    events:
+          input: '{"account":"JFA","country":"DE"}'
       - schedule:
-          rate: rate(6 hours)
+          rate: cron(15 1 * * ? *)
           enabled: true
+          input: '{"account":"JFA","country":"UK"}'
+      - schedule:
+          rate: cron(30 1 * * ? *)
+          enabled: true
+          input: '{"account":"JFA","country":"FR"}'
+      - schedule:
+          rate: cron(45 1 * * ? *)
+          enabled: true
+          input: '{"account":"JFA","country":"ES"}'
+      - schedule:
+          rate: cron(0 2 * * ? *)
+          enabled: true
+          input: '{"account":"JFA","country":"IT"}'
+      # Hangerworld — runs in parallel with JFA (same times, separate account)
+      - schedule:
+          rate: cron(0 1 * * ? *)
+          enabled: true
+          input: '{"account":"Hangerworld","country":"DE"}'
+      - schedule:
+          rate: cron(15 1 * * ? *)
+          enabled: true
+          input: '{"account":"Hangerworld","country":"UK"}'
+      - schedule:
+          rate: cron(30 1 * * ? *)
+          enabled: true
+          input: '{"account":"Hangerworld","country":"FR"}'
+      - schedule:
+          rate: cron(45 1 * * ? *)
+          enabled: true
+          input: '{"account":"Hangerworld","country":"ES"}'
+      - schedule:
+          rate: cron(0 2 * * ? *)
+          enabled: true
+          input: '{"account":"Hangerworld","country":"IT"}'
+      # Backfill runs after all jobs complete
+      - schedule:
+          rate: cron(15 2 * * ? *)
+          enabled: true
+          input: '{"job":"backfill"}'
 
   importAsanaOrders:
     handler: import-asana-orders.handler

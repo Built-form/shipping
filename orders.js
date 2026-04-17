@@ -571,15 +571,19 @@ app.get('/api/v1/stock-snapshots/sum', async (req, res) => {
         if (!cleanAsin) {
             return res.status(400).json({ error: 'A valid 10-character alphanumeric ASIN is required.' });
         }
+        const company = (req.query.company || '').trim();
+        if (!company) {
+            return res.status(400).json({ error: 'company query parameter is required.' });
+        }
 
         const [
             [msTodayRows], [amzTodayRows], [msFallbackRows], [amzFallbackRows],
         ] = await withTimeout(
             Promise.all([
                 pool.query(`SELECT MAX(date_ran) as latest FROM stock_snapshots WHERE asin = ? AND date_ran = CURDATE()`, [cleanAsin]),
-                pool.query(`SELECT MAX(date_ran) as latest FROM amazon_stock_country_snapshots WHERE asin = ? AND date_ran = CURDATE()`, [cleanAsin]),
+                pool.query(`SELECT MAX(date_ran) as latest FROM amazon_stock_country_snapshots WHERE asin = ? AND company = ? AND date_ran = CURDATE()`, [cleanAsin, company]),
                 pool.query(`SELECT MAX(date_ran) as latest FROM stock_snapshots WHERE asin = ?`, [cleanAsin]),
-                pool.query(`SELECT MAX(date_ran) as latest FROM amazon_stock_country_snapshots WHERE asin = ?`, [cleanAsin]),
+                pool.query(`SELECT MAX(date_ran) as latest FROM amazon_stock_country_snapshots WHERE asin = ? AND company = ?`, [cleanAsin, company]),
             ]),
             QUERY_TIMEOUT_MS, 'Date lookup'
         );
@@ -615,9 +619,9 @@ app.get('/api/v1/stock-snapshots/sum', async (req, res) => {
                             CAST(COALESCE(SUM(inbound_receiving), 0) AS UNSIGNED) as amazon_inbound_receiving,
                             CAST(COALESCE(SUM(reserved), 0) AS UNSIGNED)          as amazon_reserved
                          FROM amazon_stock_country_snapshots
-                         WHERE date_ran = ? AND asin = ?
+                         WHERE date_ran = ? AND asin = ? AND company = ?
                          GROUP BY country`,
-                        [amzDate, cleanAsin]
+                        [amzDate, cleanAsin, company]
                     ).then(([rows]) => rows)
                     : Promise.resolve([]),
 
@@ -665,9 +669,9 @@ app.get('/api/v1/stock-snapshots/sum', async (req, res) => {
                         CAST(COALESCE(SUM(inbound_receiving), 0) AS UNSIGNED) as inbound_receiving,
                         CAST(COALESCE(SUM(reserved), 0) AS UNSIGNED)          as reserved
                      FROM amazon_stock_country_snapshots
-                     WHERE asin = ? AND date_ran >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
+                     WHERE asin = ? AND company = ? AND date_ran >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
                      GROUP BY date_ran ORDER BY date_ran`,
-                    [cleanAsin, days]
+                    [cleanAsin, company, days]
                 ).then(([rows]) => rows),
 
                 pool.query(
@@ -728,15 +732,20 @@ app.get('/api/v1/stock-snapshots/sum', async (req, res) => {
 });
 
 // ── 9. GET /api/v1/stock-snapshots/sum/all-asins ─────────────────────────
-app.get('/api/v1/stock-snapshots/sum/all-asins', async (_req, res) => {
+app.get('/api/v1/stock-snapshots/sum/all-asins', async (req, res) => {
     try {
+        const company = (req.query.company || '').trim();
+        if (!company) {
+            return res.status(400).json({ error: 'company query parameter is required.' });
+        }
+
         const [
             [asinsFromOrders], [asinsFromMintsoft], [asinsFromAmazon],
         ] = await withTimeout(
             Promise.all([
                 pool.query(`SELECT DISTINCT asin FROM orders WHERE asin IS NOT NULL AND asin != ''`),
                 pool.query(`SELECT DISTINCT asin FROM stock_snapshots WHERE asin IS NOT NULL AND asin != ''`),
-                pool.query(`SELECT DISTINCT asin FROM amazon_stock_country_snapshots WHERE asin IS NOT NULL AND asin != ''`),
+                pool.query(`SELECT DISTINCT asin FROM amazon_stock_country_snapshots WHERE asin IS NOT NULL AND asin != '' AND company = ?`, [company]),
             ]),
             QUERY_TIMEOUT_MS, 'ASIN list fetch'
         );
@@ -758,9 +767,9 @@ app.get('/api/v1/stock-snapshots/sum/all-asins', async (_req, res) => {
                 `),
                 pool.query(`
                     SELECT asin, MAX(date_ran) as latest
-                    FROM amazon_stock_country_snapshots WHERE asin IS NOT NULL AND asin != ''
+                    FROM amazon_stock_country_snapshots WHERE asin IS NOT NULL AND asin != '' AND company = ?
                     GROUP BY asin ORDER BY asin
-                `),
+                `, [company]),
                 pool.query(`
                     SELECT asin, status,
                            CAST(COALESCE(SUM(quantity), 0) AS UNSIGNED) as total_quantity
@@ -802,7 +811,8 @@ app.get('/api/v1/stock-snapshots/sum/all-asins', async (_req, res) => {
                 pool.query(`
                     WITH LatestDates AS (
                         SELECT asin, MAX(date_ran) as latest FROM amazon_stock_country_snapshots
-                        WHERE asin IS NOT NULL AND asin != '' GROUP BY asin
+                        WHERE asin IS NOT NULL AND asin != '' AND company = ?
+                        GROUP BY asin
                     )
                     SELECT a.asin, a.country, a.date_ran,
                            CAST(COALESCE(SUM(a.fulfillable), 0) AS UNSIGNED) as amazon_fulfillable,
@@ -812,8 +822,9 @@ app.get('/api/v1/stock-snapshots/sum/all-asins', async (_req, res) => {
                            CAST(COALESCE(SUM(a.reserved), 0) AS UNSIGNED) as amazon_reserved
                     FROM amazon_stock_country_snapshots a
                     JOIN LatestDates ld ON a.asin = ld.asin AND a.date_ran = ld.latest
+                    WHERE a.company = ?
                     GROUP BY a.asin, a.country, a.date_ran
-                `),
+                `, [company, company]),
                 pool.query(`
                     SELECT sst.asin, sst.carton_cbm, mc.carton_qty as units_per_ctn
                     FROM storage_shipping_tags sst
@@ -877,16 +888,20 @@ app.get('/api/v1/stock-snapshots/fnskus', async (req, res) => {
         if (!cleanAsin) {
             return res.status(400).json({ error: 'A valid 10-character alphanumeric ASIN is required.' });
         }
+        const company = (req.query.company || '').trim();
+        if (!company) {
+            return res.status(400).json({ error: 'company query parameter is required.' });
+        }
 
         const [rows] = await withTimeout(
             pool.query(
                 `SELECT country, sku, fnsku
                  FROM amazon_stock_country_snapshots
-                 WHERE asin = ? AND date_ran = (
-                     SELECT MAX(date_ran) FROM amazon_stock_country_snapshots WHERE asin = ?
+                 WHERE asin = ? AND company = ? AND date_ran = (
+                     SELECT MAX(date_ran) FROM amazon_stock_country_snapshots WHERE asin = ? AND company = ?
                  )
                  ORDER BY country, sku, fnsku`,
-                [cleanAsin, cleanAsin]
+                [cleanAsin, company, cleanAsin, company]
             ),
             QUERY_TIMEOUT_MS, 'FNSKU lookup'
         );
@@ -971,13 +986,15 @@ app.get('/api/v1/stock-snapshots/oos-dates', async (req, res) => {
     try {
         const { asin } = req.query;
         if (!asin) return res.status(400).json({ error: 'asin query parameter is required.' });
+        const company = (req.query.company || '').trim();
+        if (!company) return res.status(400).json({ error: 'company query parameter is required.' });
 
         const [rows] = await pool.execute(
             `SELECT country, date_ran AS date
-             FROM amazon_stock_country_snapshots
-             WHERE asin = ? AND fulfillable = 0
+             FROM amazon_stock_raw_snapshots
+             WHERE asin = ? AND company = ? AND fulfillable = 0
              ORDER BY country, date_ran`,
-            [asin]
+            [asin, company]
         );
 
         // Group by territory
