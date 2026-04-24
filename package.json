@@ -2,7 +2,7 @@
   "name": "shipping-serverless",
   "version": "1.0.0",
   "description": "Shipping & Orders Pipeline API",
-  "main": "orders.js",
+  "main": "src/handlers/orders.js",
   "dependencies": {
     "axios": "^1.0.0",
     "compression": "^1.8.1",
@@ -19,7 +19,7 @@
     "serverless-offline": "^13.9.0"
   },
   "scripts": {
-    "dev": "node orders.js",
+    "dev": "node src/handlers/orders.js",
     "deploy": "serverless deploy",
     "offline": "serverless offline"
   }

@@ -1,7 +1,7 @@
 require('dotenv').config();
-const log = require('./logger');
-const { getPool } = require('./db');
-const { getProductsByJfCode, getProductStock } = require('./mintsoft');
+const log = require('../lib/logger');
+const { getPool } = require('../db');
+const { getProductsByJfCode, getProductStock } = require('../services/mintsoft');
 // Note: Database table creation should ideally be handled by a migration script
 // and not within the Lambda handler for production environments.
 // ── JF codes + ASINs loaded from landed_costs table ──────────────────────────
@@ -146,7 +146,7 @@ const handler = async () => {
 
 exports.handler = handler;
 
-// Allow direct execution: node stock-snapshot.js
+// Allow direct execution: node src/handlers/mintsoft-snapshot.js
 if (require.main === module) {
     handler().then(result => {
         log.info('Result:', JSON.stringify(result, null, 2));

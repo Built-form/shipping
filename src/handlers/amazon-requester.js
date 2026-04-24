@@ -1,13 +1,13 @@
 'use strict';
 
 require('dotenv').config();
-const log = require('./logger');
-const { getPool } = require('./db');
+const log = require('../lib/logger');
+const { getPool } = require('../db');
 const {
     ACCOUNT_NAMES, COUNTRY_CODES, REPORT_TYPES, SP_REPORT_TYPE,
     getMarketplace, getEndpoint, getTokenManager, requestReport,
     rateLimitedRequest,
-} = require('./amazon-stock-shared');
+} = require('../services/amazon-stock-shared');
 
 // Fires one SP-API POST /reports request per (account, country, report_type),
 // plus one pan_eu per account. Inserts each into amazon_report_jobs.
@@ -154,7 +154,7 @@ const handler = async () => {
 exports.handler = handler;
 
 // ── CLI ────────────────────────────────────────────────────────────────────────
-// node amazon-stock-snapshot-requester.js
+// node src/handlers/amazon-requester.js
 if (require.main === module) {
     handler().then(r => {
         log.info('Result:', r.body);

@@ -9,12 +9,12 @@
 //   node reprocess-country.js IT JFA
 
 require('dotenv').config();
-const { getPool } = require('./db');
+const { getPool } = require('../src/db');
 const {
     REPORT_TYPES, getMarketplace, getTokenManager,
     downloadReport, parseTsvReport, fetchInventorySummaries,
     writeSnapshots,
-} = require('./amazon-stock-shared');
+} = require('../src/services/amazon-stock-shared');
 
 const COUNTRY = process.argv[2] || 'DE';
 const ACCOUNT = process.argv[3] || 'JFA';
@@ -67,7 +67,7 @@ const ACCOUNT = process.argv[3] || 'JFA';
 
     // Phase B: HTTP (no DB connection held)
     const tokenManager = getTokenManager(ACCOUNT);
-    const endpoint = require('./amazon-stock-shared').getEndpoint();
+    const endpoint = require('../src/services/amazon-stock-shared').getEndpoint();
 
     console.log(`\n[download] active listings...`);
     const listingTsv = await downloadReport(tokenManager, endpoint, active_doc);

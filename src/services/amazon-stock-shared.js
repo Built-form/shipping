@@ -1,7 +1,7 @@
 'use strict';
 
 const axios = require('axios');
-const log = require('./logger');
+const log = require('../lib/logger');
 
 // ── Accounts ────────────────────────────────────────────────────────────────────
 const ACCOUNTS = {

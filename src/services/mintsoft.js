@@ -1,5 +1,5 @@
 const axios = require('axios');
-const log = require('./logger');
+const log = require('../lib/logger');
 require('dotenv').config();
 
 const MINTSOFT_API_KEY = process.env.MINTSOFT_API_KEY;

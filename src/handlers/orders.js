@@ -5,8 +5,8 @@ const cors = require('cors');
 const compression = require('compression');
 const axios = require('axios');
 const { v4: uuidv4 } = require('uuid');
-const { getPool } = require('./db');
-const log = require('./logger');
+const { getPool } = require('../db');
+const log = require('../lib/logger');
 
 const app = express();
 

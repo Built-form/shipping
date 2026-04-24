@@ -1,8 +1,8 @@
 require('dotenv').config();
-const { getPool, closePool } = require('./db');
-const { fetchAsanaProject } = require('./asanaService');
-const { transformAsanaToCSV } = require('./asanaTransformer');
-const { mapGoodsOnSeaStatus, mapGoodsOnAirStatus, mapOrdersStatus } = require('./statusMappers');
+const { getPool, closePool } = require('../db');
+const { fetchAsanaProject } = require('../services/asana-service');
+const { transformAsanaToCSV } = require('../services/asana-transformer');
+const { mapGoodsOnSeaStatus, mapGoodsOnAirStatus, mapOrdersStatus } = require('../domain/status-mappers');
 
 // Note: Database table creation should ideally be handled by a migration script
 // and not within the Lambda handler for production environments.

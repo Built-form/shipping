@@ -47,7 +47,7 @@ package:
 
 functions:
   ordersApi:
-    handler: orders.handler
+    handler: src/handlers/orders.handler
     reservedConcurrency: 20
     events:
       - httpApi:
@@ -127,7 +127,7 @@ functions:
             name: googleJwtAuthorizer
 
   stockSnapshot:
-    handler: stock-snapshot.handler
+    handler: src/handlers/mintsoft-snapshot.handler
     reservedConcurrency: 2
     events:
       - schedule:
@@ -139,7 +139,7 @@ functions:
   # in today's batch. First run of the day kicks off; subsequent runs pick up
   # any that didn't make it through (e.g. rate-limited, Lambda timed out).
   amazonStockRequester:
-    handler: amazon-stock-snapshot-requester.handler
+    handler: src/handlers/amazon-requester.handler
     timeout: 600
     reservedConcurrency: 2
     events:
@@ -149,7 +149,7 @@ functions:
 
   # ── Amazon Stock Snapshot: collector (polls + processes one unit per run) ──
   amazonStockCollector:
-    handler: amazon-stock-snapshot-collector.handler
+    handler: src/handlers/amazon-collector.handler
     reservedConcurrency: 2
     events:
       - schedule:
@@ -162,7 +162,7 @@ functions:
           input: '{"job":"backfill"}'
 
   importAsanaOrders:
-    handler: import-asana-orders.handler
+    handler: src/handlers/import-asana-orders.handler
     reservedConcurrency: 2
     events:
       - schedule:
@@ -170,7 +170,7 @@ functions:
           enabled: true
 
   updateShipsGoEta:
-    handler: update-shipsgo-eta.handler
+    handler: src/handlers/update-shipsgo-eta.handler
     reservedConcurrency: 2
     events:
       - schedule:
@@ -187,7 +187,7 @@ functions:
           enabled: true
 
   updateImportedDates:
-    handler: update-imported-dates.handler
+    handler: src/handlers/update-imported-dates.handler
     reservedConcurrency: 2
     events:
       - schedule:

@@ -2,8 +2,8 @@
 
 require('dotenv').config();
 const crypto = require('crypto');
-const log = require('./logger');
-const { getPool } = require('./db');
+const log = require('../lib/logger');
+const { getPool } = require('../db');
 // SP-API phases (downloads, inventory summaries) can run longer than MySQL's
 // `wait_timeout` (see db.js), which kills an idle connection mid-call. So we
 // release the pool connection before the long HTTP work and reacquire a fresh
@@ -14,7 +14,7 @@ const {
     checkReport, downloadReport, parseTsvReport,
     fetchInventorySummaries, getMarketplace,
     writeSnapshots, copyFailedFromPrevious, runBackfill,
-} = require('./amazon-stock-shared');
+} = require('../services/amazon-stock-shared');
 
 // Collector: polls outstanding report jobs, then processes one (account, country)
 // unit per invocation. Designed to run every 2–5 minutes.
@@ -409,8 +409,8 @@ const handler = async (event = {}) => {
 exports.handler = handler;
 
 // ── CLI ────────────────────────────────────────────────────────────────────────
-// node amazon-stock-snapshot-collector.js
-// node amazon-stock-snapshot-collector.js backfill
+// node src/handlers/amazon-collector.js
+// node src/handlers/amazon-collector.js backfill
 if (require.main === module) {
     const [,, arg1] = process.argv;
     const event = arg1 === 'backfill' ? { job: 'backfill' } : {};
