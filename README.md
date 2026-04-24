@@ -1,5 +1,11 @@
 # Shipping & Orders Pipeline
 
+![Node](https://img.shields.io/badge/node-18-339933?logo=node.js&logoColor=white)
+![AWS Lambda](https://img.shields.io/badge/AWS-Lambda-FF9900?logo=awslambda&logoColor=white)
+![Serverless](https://img.shields.io/badge/Serverless-v3-FD5750?logo=serverless&logoColor=white)
+![MySQL](https://img.shields.io/badge/MySQL-RDS-4479A1?logo=mysql&logoColor=white)
+![Region](https://img.shields.io/badge/region-eu--north--1-informational)
+
 A serverless backend that tracks the full lifecycle of product shipments — from purchase order through manufacturing, containerisation, ocean transit, and warehouse arrival. It aggregates stock data from **Mintsoft** (3PL warehouse), **Amazon SP-API** (FBA inventory), and **Asana** (order management) into a single MySQL database exposed via a REST API.
 
 Deployed on **AWS Lambda** (Node.js 18) behind **API Gateway HTTP API** with Google JWT authentication, managed by the **Serverless Framework v3**.
@@ -8,57 +14,60 @@ Deployed on **AWS Lambda** (Node.js 18) behind **API Gateway HTTP API** with Goo
 
 ## Architecture
 
-```
-                              Scheduled Lambdas (EventBridge cron)
-    +---------------+ +----------------+ +-----------------+ +----------------+ +-----------------+
-    | importAsana   | | stockSnapshot  | | amazonRequester | | amazonCollector| | updateShipsGoEta|
-    | Orders        | | (Mintsoft)     | | (SP-API fire)   | | (SP-API poll)  | | updateImported  |
-    | every 5 min   | | every 1 hour   | | hourly 07-21Z   | | every 3 min    | | Dates (4x/day)  |
-    +-------+-------+ +-------+--------+ +--------+--------+ +--------+-------+ +--------+--------+
-            |                 |                   |                   |                  |
-            v                 v                   v                   v                  v
-         Asana           Mintsoft REST        Amazon SP-API       Amazon SP-API       ShipsGo API
-         REST            (Product/Stock)      POST /reports       GET /documents      (container ETAs
-                                                                                        -> Asana)
+```mermaid
+flowchart LR
+    subgraph sources["External Sources"]
+        direction TB
+        Asana[Asana<br/>Orders &amp; POs]
+        Mint[Mintsoft<br/>3PL Warehouse]
+        SPAPI[Amazon SP-API<br/>FBA Inventory]
+        Ships[ShipsGo<br/>Container ETAs]
+    end
 
-            +------------------+-----------------+------------------+----------------+
-                                                 |
-                                                 v
-                                        +--------------------+
-                                        |    MySQL (RDS)     |
-                                        |--------------------|
-                                        | orders             |
-                                        | stock_snapshots    |
-                                        | amazon_stock_      |
-                                        |   country_snapshots|
-                                        | amazon_stock_      |
-                                        |   raw_snapshots    |
-                                        | amazon_active_     |
-                                        |   listings         |
-                                        | amazon_report_jobs |
-                                        | allowed_emails     |
-                                        | landed_costs       |
-                                        +--------+-----------+
-                                                 |
-                                                 v
-                                        +--------------------+
-                                        |   ordersApi        |
-                                        |   (Express on      |
-                                        |    Lambda + ALB    |
-                                        |    via HTTP API)   |
-                                        +--------+-----------+
-                                                 |
-                                                 v
-                                        +--------------------+
-                                        | API Gateway        |
-                                        | (HTTP API + JWT)   |
-                                        +--------+-----------+
-                                                 |
-                                                 v
-                                        +--------------------+
-                                        |  Frontend Client   |
-                                        |  (Google OAuth)    |
-                                        +--------------------+
+    subgraph lambdas["Scheduled Lambdas · EventBridge cron"]
+        direction TB
+        L1[importAsanaOrders<br/><i>every 5 min</i>]
+        L2[stockSnapshot<br/><i>every 1 hour</i>]
+        L3[amazonRequester<br/><i>hourly 07–21 UTC</i>]
+        L4[amazonCollector<br/><i>every 3 min</i>]
+        L5[updateShipsGoEta<br/><i>4× daily</i>]
+        L6[updateImportedDates<br/><i>4× daily</i>]
+    end
+
+    DB[("MySQL · RDS<br/>orders · stock_snapshots<br/>amazon_stock_*<br/>amazon_report_jobs<br/>landed_costs · allowed_emails")]
+
+    subgraph api["API Layer"]
+        direction TB
+        Express[ordersApi<br/>Express on Lambda]
+        Gateway[API Gateway<br/>HTTP API + JWT]
+    end
+
+    Client[Frontend Client<br/>Google OAuth]
+
+    Asana --> L1
+    Mint  --> L2
+    SPAPI --> L3
+    SPAPI --> L4
+    Ships --> L5
+    L5 -. writes ETA back .-> Asana
+
+    L1 --> DB
+    L2 --> DB
+    L3 --> DB
+    L4 --> DB
+    L6 --> DB
+
+    DB --> Express --> Gateway --> Client
+
+    classDef src fill:#fef3c7,stroke:#b45309,color:#78350f;
+    classDef fn  fill:#dbeafe,stroke:#1d4ed8,color:#1e3a8a;
+    classDef store fill:#ede9fe,stroke:#6d28d9,color:#4c1d95;
+    classDef edge fill:#dcfce7,stroke:#15803d,color:#14532d;
+
+    class Asana,Mint,SPAPI,Ships src;
+    class L1,L2,L3,L4,L5,L6 fn;
+    class DB store;
+    class Express,Gateway,Client edge;
 ```
 
 ### Amazon snapshot: two-phase design
@@ -70,40 +79,91 @@ SP-API reports are asynchronous (Amazon takes 2–10+ min to generate each one),
 
 Both Lambdas consume shared logic from [src/services/amazon-stock-shared.js](src/services/amazon-stock-shared.js).
 
+```mermaid
+sequenceDiagram
+    autonumber
+    participant R as amazonRequester<br/>(hourly)
+    participant J as amazon_report_jobs
+    participant SP as Amazon SP-API
+    participant C as amazonCollector<br/>(every 3 min)
+    participant DB as snapshot tables
+
+    rect rgb(219, 234, 254)
+    Note over R,SP: Phase 1 — fire report requests
+    R->>J: find missing (account, country, report_type)
+    R->>SP: POST /reports
+    SP-->>R: reportId
+    R->>J: insert row · status = REQUESTED
+    end
+
+    Note over SP: Amazon generates report<br/>2–10+ min (async)
+
+    rect rgb(220, 252, 231)
+    Note over C,DB: Phase 2 — poll, download, process
+    loop every 3 min
+        C->>J: read REQUESTED jobs
+        C->>SP: GET report status
+        alt report ready
+            SP-->>C: documentId
+            C->>SP: GET /documents
+            C->>J: status = DONE
+            C->>DB: write snapshot rows<br/>(one (account, country) unit)
+            C->>J: status = PROCESSED
+        else still pending
+            Note over C: skip · retry next cycle
+        end
+    end
+    end
+```
+
 ### Data flow
 
-```
-  Asana                Mintsoft              Amazon SP-API
-  (source of truth     (3PL warehouse       (FBA inventory
-   for POs &            stock levels)        reports + API)
-   shipments)
-    |                      |                       |
-    | every 5 min          | every 1 hour          | hourly fire +
-    v                      v                       | 3-min poll/process
-+-----------------------------------------------------------+
-|                       MySQL                               |
-|                                                           |
-|  orders               stock_snapshots    amazon_stock_    |
-|  - id, asin           - jf_code, asin    country_snapshots|
-|  - status             - sku, warehouse   - country, asin  |
-|  - quantity           - stock levels     - fnsku (CSV)    |
-|  - container_number   - available        - fulfillable    |
-|  - dates (JSON)       - allocated        - inbound_*      |
-|  - eta, supplier      - quarantine       - reserved       |
-+----------------------------+------------------------------+
-                             |
-                             v
-                     Orders REST API
-                    /api/v1/orders
-                    /api/v1/containers
-                    /api/v1/stock-snapshots/*
+```mermaid
+flowchart TB
+    A["<b>Asana</b><br/>source of truth<br/>POs &amp; shipments"]
+    M["<b>Mintsoft</b><br/>3PL warehouse<br/>stock levels"]
+    SP["<b>Amazon SP-API</b><br/>FBA inventory<br/>reports + API"]
+
+    O["<b>orders</b><br/>id · asin · status · qty<br/>container · vessel · eta<br/>dates (JSON)"]
+    S["<b>stock_snapshots</b><br/>jf_code · sku · warehouse<br/>stock_level · available<br/>allocated · quarantine"]
+    AC["<b>amazon_stock_country_snapshots</b><br/>country · asin · fnsku (CSV)<br/>fulfillable · inbound_* · reserved"]
+    AR["<b>amazon_stock_raw_snapshots</b><br/>pre-dedup per-FNSKU rows"]
+    AL["<b>amazon_active_listings</b><br/>SKU ↔ FNSKU mapping<br/>status · price"]
+
+    API["<b>REST API</b><br/>/api/v1/orders<br/>/api/v1/containers<br/>/api/v1/stock-snapshots/*"]
+
+    A  -->|every 5 min| O
+    M  -->|every 1 hour| S
+    SP -->|fire hourly<br/>poll every 3 min| AC
+    SP --> AR
+    SP --> AL
+
+    O  --> API
+    S  --> API
+    AC --> API
+    AL --> API
+
+    classDef src fill:#fef3c7,stroke:#b45309,color:#78350f;
+    classDef tbl fill:#ede9fe,stroke:#6d28d9,color:#4c1d95;
+    classDef api fill:#dcfce7,stroke:#15803d,color:#14532d;
+
+    class A,M,SP src;
+    class O,S,AC,AR,AL tbl;
+    class API api;
 ```
 
 ### Order status lifecycle
 
-```
-PO_SENT --> IN_PRODUCTION --> READY --> ON_SEA  --> (delivered)
-                                    \-> ON_AIR  --> (delivered)
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> PO_SENT : new order
+    PO_SENT --> IN_PRODUCTION : Artwork Confirmed Date set
+    IN_PRODUCTION --> READY : Goods Status = "ready"
+    READY --> ON_SEA : in Goods on Sea project
+    READY --> ON_AIR : in Goods on Air project
+    ON_SEA --> [*] : delivered
+    ON_AIR --> [*] : delivered
 ```
 
 Statuses are derived during Asana import via [src/domain/status-mappers.js](src/domain/status-mappers.js):
@@ -210,7 +270,8 @@ All endpoints require a Google JWT `Authorization` header (bypassed in local dev
 
 #### Per-country latest-date semantics
 
-Because the Amazon snapshot is written to the database one country at a time over a ~30-minute window each morning, the stock-snapshot endpoints resolve the **latest snapshot date per `(asin, country)`** rather than a single date per ASIN. A country that already wrote today's data shows today; a country still waiting in the collector queue continues showing yesterday. This prevents the partial-refresh "disappearing countries" artefact.
+> [!NOTE]
+> Because the Amazon snapshot is written to the database one country at a time over a ~30-minute window each morning, the stock-snapshot endpoints resolve the **latest snapshot date per `(asin, country)`** rather than a single date per ASIN. A country that already wrote today's data shows today; a country still waiting in the collector queue continues showing yesterday. This prevents the partial-refresh "disappearing countries" artefact.
 
 ---
 
