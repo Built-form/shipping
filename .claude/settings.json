@@ -13,7 +13,15 @@
       "Bash(cmd.exe /c \"npx serverless info 2>&1\")",
       "Bash(cmd.exe /c \"node node_modules/.bin/serverless info 2>&1\")",
       "Bash(cmd.exe /c \"npx serverless info\")",
-      "Bash(curl -s -X POST http://localhost:3001/api/v1/orders/asana-task -H \"Content-Type: application/json\" -d '{\"sku\":\"TEST-SKU\",\"asin\":\"B01M2BT92T\",\"carrier\":\"DPD\",\"region\":\"UK\",\"jf_hw_code\":\"JF0982\",\"qty_required\":287}')"
+      "Bash(curl -s -X POST http://localhost:3001/api/v1/orders/asana-task -H \"Content-Type: application/json\" -d '{\"sku\":\"TEST-SKU\",\"asin\":\"B01M2BT92T\",\"carrier\":\"DPD\",\"region\":\"UK\",\"jf_hw_code\":\"JF0982\",\"qty_required\":287}')",
+      "PowerShell($env:Path = \"C:\\\\Program Files\\\\nodejs;$env:Path\"; node _check-hw-health.js)",
+      "PowerShell($env:Path = \"C:\\\\Program Files\\\\nodejs;$env:Path\"; node _check-hw.js)",
+      "PowerShell($env:Path = \"C:\\\\Program Files\\\\nodejs;$env:Path\"; node reprocess-country.js DE Hangerworld)",
+      "PowerShell($env:Path = \"C:\\\\Program Files\\\\nodejs;$env:Path\"; foreach \\($c in @\\('UK','FR','ES','IT'\\)\\) { foreach \\($a in @\\('JFA','Hangerworld'\\)\\) { node reprocess-country.js $c $a } }; node reprocess-country.js DE JFA)",
+      "PowerShell($env:Path = \"C:\\\\Program Files\\\\nodejs;$env:Path\"; node _reprocess-all.js)",
+      "PowerShell(Get-Process -Id \\(Get-WmiObject Win32_Process -Filter \"CommandLine LIKE '%reprocess%'\" | Select-Object -ExpandProperty ProcessId\\) -ErrorAction SilentlyContinue | Select-Object Id,StartTime,CPU)",
+      "PowerShell(Get-WmiObject Win32_Process -Filter \"Name='node.exe'\")",
+      "PowerShell($env:Path = \"C:\\\\Program Files\\\\nodejs;$env:Path\"; node _reprocess-hw-test.js)"
     ]
   }
 }

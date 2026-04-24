@@ -12,7 +12,16 @@ function getPool() {
             port: process.env.DB_PORT || 3306,
             ssl: { rejectUnauthorized: false },
             waitForConnections: true,
-            connectionLimit: 5,
+            connectionLimit: 1,
+            // Return DATE columns as 'YYYY-MM-DD' strings rather than Date
+            // objects. Otherwise mysql2 builds the Date at Node's local-tz
+            // midnight, which on a BST client shifts a UTC DATE back by a day
+            // when rendered via .toISOString(). DATETIME/TIMESTAMP still come
+            // back as Date objects.
+            dateStrings: ['DATE'],
+        });
+        pool.on('connection', (conn) => {
+            conn.query('SET SESSION wait_timeout = 80, SESSION interactive_timeout = 80');
         });
     }
     return pool;

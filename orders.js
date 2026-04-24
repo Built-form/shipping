@@ -612,16 +612,22 @@ app.get('/api/v1/stock-snapshots/sum', async (req, res) => {
 
                 amzDate
                     ? pool.query(
-                        `SELECT country,
-                            CAST(COALESCE(SUM(fulfillable), 0) AS UNSIGNED)       as amazon_fulfillable,
-                            CAST(COALESCE(SUM(inbound_working), 0) AS UNSIGNED)   as amazon_inbound_working,
-                            CAST(COALESCE(SUM(inbound_shipped), 0) AS UNSIGNED)   as amazon_inbound_shipped,
-                            CAST(COALESCE(SUM(inbound_receiving), 0) AS UNSIGNED) as amazon_inbound_receiving,
-                            CAST(COALESCE(SUM(reserved), 0) AS UNSIGNED)          as amazon_reserved
-                         FROM amazon_stock_country_snapshots
-                         WHERE date_ran = ? AND asin = ? AND company = ?
-                         GROUP BY country`,
-                        [amzDate, cleanAsin, company]
+                        `SELECT a.country,
+                            CAST(COALESCE(SUM(a.fulfillable), 0) AS UNSIGNED)       as amazon_fulfillable,
+                            CAST(COALESCE(SUM(a.inbound_working), 0) AS UNSIGNED)   as amazon_inbound_working,
+                            CAST(COALESCE(SUM(a.inbound_shipped), 0) AS UNSIGNED)   as amazon_inbound_shipped,
+                            CAST(COALESCE(SUM(a.inbound_receiving), 0) AS UNSIGNED) as amazon_inbound_receiving,
+                            CAST(COALESCE(SUM(a.reserved), 0) AS UNSIGNED)          as amazon_reserved
+                         FROM amazon_stock_country_snapshots a
+                         JOIN (
+                             SELECT country, MAX(date_ran) AS latest
+                             FROM amazon_stock_country_snapshots
+                             WHERE asin = ? AND company = ?
+                             GROUP BY country
+                         ) ld ON ld.country = a.country AND a.date_ran = ld.latest
+                         WHERE a.asin = ? AND a.company = ?
+                         GROUP BY a.country`,
+                        [cleanAsin, company, cleanAsin, company]
                     ).then(([rows]) => rows)
                     : Promise.resolve([]),
 
@@ -675,10 +681,11 @@ app.get('/api/v1/stock-snapshots/sum', async (req, res) => {
                 ).then(([rows]) => rows),
 
                 pool.query(
-                    `SELECT carton_cbm, mc.carton_qty as units_per_ctn
-                     FROM storage_shipping_tags sst
-                     LEFT JOIN mintsoft_carton_sizes mc ON mc.asin = sst.asin
-                     WHERE sst.asin = ?`,
+                    `SELECT carton_qty AS units_per_ctn,
+                            (height * width * depth) / 1000000 AS carton_cbm
+                     FROM mintsoft_carton_sizes
+                     WHERE asin = ?
+                     LIMIT 1`,
                     [cleanAsin]
                 ).then(([rows]) => rows),
             ]),
@@ -810,9 +817,9 @@ app.get('/api/v1/stock-snapshots/sum/all-asins', async (req, res) => {
                 `),
                 pool.query(`
                     WITH LatestDates AS (
-                        SELECT asin, MAX(date_ran) as latest FROM amazon_stock_country_snapshots
+                        SELECT asin, country, MAX(date_ran) as latest FROM amazon_stock_country_snapshots
                         WHERE asin IS NOT NULL AND asin != '' AND company = ?
-                        GROUP BY asin
+                        GROUP BY asin, country
                     )
                     SELECT a.asin, a.country, a.date_ran,
                            CAST(COALESCE(SUM(a.fulfillable), 0) AS UNSIGNED) as amazon_fulfillable,
@@ -821,15 +828,16 @@ app.get('/api/v1/stock-snapshots/sum/all-asins', async (req, res) => {
                            CAST(COALESCE(SUM(a.inbound_receiving), 0) AS UNSIGNED) as amazon_inbound_receiving,
                            CAST(COALESCE(SUM(a.reserved), 0) AS UNSIGNED) as amazon_reserved
                     FROM amazon_stock_country_snapshots a
-                    JOIN LatestDates ld ON a.asin = ld.asin AND a.date_ran = ld.latest
+                    JOIN LatestDates ld ON a.asin = ld.asin AND a.country = ld.country AND a.date_ran = ld.latest
                     WHERE a.company = ?
                     GROUP BY a.asin, a.country, a.date_ran
                 `, [company, company]),
                 pool.query(`
-                    SELECT sst.asin, sst.carton_cbm, mc.carton_qty as units_per_ctn
-                    FROM storage_shipping_tags sst
-                    LEFT JOIN mintsoft_carton_sizes mc ON mc.asin = sst.asin
-                    WHERE sst.asin IS NOT NULL AND sst.asin != ''
+                    SELECT asin,
+                           carton_qty AS units_per_ctn,
+                           (height * width * depth) / 1000000 AS carton_cbm
+                    FROM mintsoft_carton_sizes
+                    WHERE asin IS NOT NULL AND asin != ''
                 `),
             ]),
             QUERY_TIMEOUT_MS, 'Batch data fetch'
@@ -893,29 +901,133 @@ app.get('/api/v1/stock-snapshots/fnskus', async (req, res) => {
             return res.status(400).json({ error: 'company query parameter is required.' });
         }
 
-        const [rows] = await withTimeout(
+        // Authoritative pairs: amazon_active_listings has one row per listed
+        // SKU with its FNSKU, no Pan-EU dedup — every marketplace SKU survives.
+        // first_seen uses MIN(created_at) (timestamp) not MIN(date_ran) (date)
+        // so SKUs in a same-date snapshot still order by insertion time.
+        const activeListingsQuery = withTimeout(
             pool.query(
-                `SELECT country, sku, fnsku
-                 FROM amazon_stock_country_snapshots
-                 WHERE asin = ? AND company = ? AND date_ran = (
-                     SELECT MAX(date_ran) FROM amazon_stock_country_snapshots WHERE asin = ? AND company = ?
-                 )
-                 ORDER BY country, sku, fnsku`,
-                [cleanAsin, company, cleanAsin, company]
+                `SELECT al.country, al.sku, al.fnsku, fs.first_seen
+                 FROM amazon_active_listings al
+                 JOIN (
+                     SELECT sku, MIN(created_at) AS first_seen
+                     FROM amazon_active_listings
+                     WHERE asin = ? AND company = ?
+                     GROUP BY sku
+                 ) fs ON fs.sku = al.sku
+                 WHERE al.asin = ? AND al.company = ?
+                   AND al.date_ran = (SELECT MAX(date_ran) FROM amazon_active_listings
+                                      WHERE asin = ? AND company = ?)`,
+                [cleanAsin, company, cleanAsin, company, cleanAsin, company]
             ),
-            QUERY_TIMEOUT_MS, 'FNSKU lookup'
+            QUERY_TIMEOUT_MS, 'FNSKU lookup (active_listings)'
         );
 
-        const byCountry = {};
-        for (const row of rows) {
+        // Orphan FNSKUs: physical inventory pools (re-stickered/return units)
+        // that exist without an active listing. CSV-packed per country row.
+        // Latest row is picked per country so a mid-run refresh (some countries
+        // on today, others still on yesterday) doesn't drop the stragglers.
+        const countrySnapshotsQuery = withTimeout(
+            pool.query(
+                `SELECT a.country, a.sku, a.fnsku
+                 FROM amazon_stock_country_snapshots a
+                 JOIN (
+                     SELECT country, MAX(date_ran) AS latest
+                     FROM amazon_stock_country_snapshots
+                     WHERE asin = ? AND company = ?
+                     GROUP BY country
+                 ) ld ON ld.country = a.country AND a.date_ran = ld.latest
+                 WHERE a.asin = ? AND a.company = ?`,
+                [cleanAsin, company, cleanAsin, company]
+            ),
+            QUERY_TIMEOUT_MS, 'FNSKU lookup (country_snapshots)'
+        );
+
+        const [[alRows], [csRows]] = await Promise.all([activeListingsQuery, countrySnapshotsQuery]);
+
+        const splitCsv = v => (v || '').split(',').map(s => s.trim()).filter(Boolean);
+        const toMs = d => (d ? new Date(d).getTime() : 0);
+
+        // Per-country fallback FNSKU set from country_snapshots + any non-empty
+        // fnskus in active_listings. Used when a listing row has no fnsku of
+        // its own (common: all SKUs for an ASIN share one FNSKU pool).
+        const fnskusByCountry = new Map();
+        const csPositional = new Map(); // `${country}|${sku}` → fnsku (same index in CSV)
+
+        for (const row of csRows) {
             const country = row.country?.trim().toUpperCase();
-            const sku = row.sku?.trim() || null;
-            const fnsku = row.fnsku?.trim() || null;
-            if (!country || !fnsku) continue;
+            if (!country) continue;
+            if (!fnskusByCountry.has(country)) fnskusByCountry.set(country, new Set());
+            const skus = splitCsv(row.sku);
+            const fnskus = splitCsv(row.fnsku);
+            for (const f of fnskus) fnskusByCountry.get(country).add(f);
+            const pairCount = Math.min(skus.length, fnskus.length);
+            for (let i = 0; i < pairCount; i++) {
+                csPositional.set(`${country}|${skus[i]}`, fnskus[i]);
+            }
+        }
+        for (const row of alRows) {
+            const country = row.country?.trim().toUpperCase();
+            const fnsku = (row.fnsku || '').trim();
+            if (country && fnsku) {
+                if (!fnskusByCountry.has(country)) fnskusByCountry.set(country, new Set());
+                fnskusByCountry.get(country).add(fnsku);
+            }
+        }
+
+        const byCountry = {};
+        const seenPairs = new Set();
+        const pairKey = (c, s, f) => `${c}|${s || ''}|${f || ''}`;
+
+        const sortedAl = [...alRows].sort((a, b) => {
+            const diff = toMs(b.first_seen) - toMs(a.first_seen);
+            if (diff) return diff;
+            const ca = (a.country || '').toUpperCase();
+            const cb = (b.country || '').toUpperCase();
+            if (ca !== cb) return ca.localeCompare(cb);
+            return (a.sku || '').localeCompare(b.sku || '');
+        });
+
+        for (const row of sortedAl) {
+            const country = row.country?.trim().toUpperCase();
+            if (!country) continue;
+            const sku = (row.sku || '').trim() || null;
+            const rowFnsku = (row.fnsku || '').trim();
             if (!byCountry[country]) byCountry[country] = [];
-            const exists = byCountry[country].some(p => p.sku === sku && p.fnsku === fnsku);
-            if (!exists) {
+
+            // Resolve fnsku(s) for this SKU: listing's own → positional from CS
+            // → country's unique FNSKU → all country FNSKUs (cartesian) → null.
+            const countryFnskus = fnskusByCountry.get(country);
+            const resolved = [];
+            if (rowFnsku) {
+                resolved.push(rowFnsku);
+            } else if (csPositional.has(`${country}|${sku}`)) {
+                resolved.push(csPositional.get(`${country}|${sku}`));
+            } else if (countryFnskus && countryFnskus.size === 1) {
+                resolved.push([...countryFnskus][0]);
+            } else if (countryFnskus && countryFnskus.size > 1) {
+                resolved.push(...countryFnskus);
+            } else {
+                resolved.push(null);
+            }
+
+            for (const fnsku of resolved) {
+                const key = pairKey(country, sku, fnsku);
+                if (seenPairs.has(key)) continue;
+                seenPairs.add(key);
                 byCountry[country].push({ sku, fnsku });
+            }
+        }
+
+        // Orphan FNSKUs with no matching SKU in active_listings — surface them
+        // so callers can still see the stock pool.
+        for (const [country, fnskus] of fnskusByCountry) {
+            for (const fnsku of fnskus) {
+                const alreadyPaired = [...seenPairs].some(k => k.startsWith(`${country}|`) && k.endsWith(`|${fnsku}`));
+                if (alreadyPaired) continue;
+                if (!byCountry[country]) byCountry[country] = [];
+                byCountry[country].push({ sku: null, fnsku });
+                seenPairs.add(pairKey(country, null, fnsku));
             }
         }
 
@@ -940,38 +1052,48 @@ app.get('/api/v1/stock-snapshots/asana-tasks', async (req, res) => {
 
         const headers = { Authorization: `Bearer ${pat}` };
 
-        // List tasks directly from each project (avoids search index delay)
-        const tasksByCountry = {};
-        await Promise.all(
-            Object.entries(ASANA_REPLENISHMENT_PROJECTS).map(async ([country, projectId]) => {
-                const { data: { data: tasks } } = await axios.get(
-                    `${ASANA_BASE}/projects/${projectId}/tasks`,
-                    {
-                        headers,
-                        params: {
-                            'opt_fields': 'name,completed,memberships.section.name,custom_fields.name,custom_fields.display_value',
-                        },
-                    }
-                );
+        const opt_fields = 'name,completed,memberships.section.name,custom_fields.name,custom_fields.display_value';
 
-                const matched = tasks.filter(t =>
-                    (t.custom_fields || []).some(cf => cf.name === 'asin' && cf.display_value === cleanAsin)
-                );
-                if (matched.length > 0) {
-                    tasksByCountry[country] = matched.map(t => ({
-                        gid: t.gid,
-                        name: t.name,
-                        completed: t.completed,
-                        section: t.memberships?.[0]?.section?.name || null,
-                        custom_fields: Object.fromEntries(
-                            (t.custom_fields || [])
-                                .filter(cf => cf.display_value)
-                                .map(cf => [cf.name, cf.display_value])
-                        ),
-                    }));
-                }
+        const matchesAsin = t =>
+            (t.custom_fields || []).some(cf => cf.name === 'ASIN' && cf.display_value === cleanAsin);
+
+        const sources = [
+            { projectId: ASANA_REPLENISHMENT_PROJECT_ID },
+            ...ASANA_ADDITIONAL_SOURCES,
+        ];
+
+        const fetched = await Promise.all(
+            sources.map(async ({ projectId }) => {
+                const [{ data: { data: meta } }, { data: { data: srcTasks } }] = await Promise.all([
+                    axios.get(`${ASANA_BASE}/projects/${projectId}?opt_fields=name`, { headers }),
+                    axios.get(`${ASANA_BASE}/projects/${projectId}/tasks`, { headers, params: { opt_fields } }),
+                ]);
+                return { listName: meta.name, tasks: srcTasks };
             })
         );
+
+        const tasksByCountry = {};
+        for (const { listName, tasks: srcTasks } of fetched) {
+            for (const t of srcTasks.filter(matchesAsin)) {
+                const section = t.memberships?.[0]?.section?.name || null;
+                const country = resolveSectionCountry(section);
+                if (!country) continue;
+
+                if (!tasksByCountry[country]) tasksByCountry[country] = [];
+                tasksByCountry[country].push({
+                    gid: t.gid,
+                    name: `${listName} — ${t.name}`,
+                    completed: t.completed,
+                    section,
+                    list: listName,
+                    custom_fields: Object.fromEntries(
+                        (t.custom_fields || [])
+                            .filter(cf => cf.display_value)
+                            .map(cf => [cf.name, cf.display_value])
+                    ),
+                });
+            }
+        }
 
         res.json({ asin: cleanAsin, tasks_by_country: tasksByCountry });
     } catch (error) {
@@ -1002,9 +1124,7 @@ app.get('/api/v1/stock-snapshots/oos-dates', async (req, res) => {
         for (const row of rows) {
             const country = row.country;
             if (!byTerritory[country]) byTerritory[country] = [];
-            byTerritory[country].push(row.date instanceof Date
-                ? row.date.toISOString().slice(0, 10)
-                : String(row.date).slice(0, 10));
+            byTerritory[country].push(formatDate(row.date));
         }
 
         res.json({ asin, oos_dates: byTerritory });
@@ -1014,20 +1134,120 @@ app.get('/api/v1/stock-snapshots/oos-dates', async (req, res) => {
     }
 });
 
+// ── 13. GET /api/v1/stock-snapshots/active-listings ────────────────────
+app.get('/api/v1/stock-snapshots/active-listings', async (req, res) => {
+    try {
+        const cleanAsin = parseAsin(req.query.asin);
+        if (!cleanAsin) {
+            return res.status(400).json({ error: 'A valid 10-character alphanumeric ASIN is required.' });
+        }
+        const company = (req.query.company || '').trim();
+        if (!company) {
+            return res.status(400).json({ error: 'company query parameter is required.' });
+        }
+
+        const [[latestRows], [historyRows]] = await withTimeout(
+            Promise.all([
+                pool.query(
+                    `SELECT a.country, a.sku, a.fnsku, a.product_name, a.status, a.price, a.date_ran
+                     FROM amazon_active_listings a
+                     JOIN (
+                         SELECT country, MAX(date_ran) AS latest
+                         FROM amazon_active_listings
+                         WHERE asin = ? AND company = ?
+                         GROUP BY country
+                     ) ld ON ld.country = a.country AND a.date_ran = ld.latest
+                     WHERE a.asin = ? AND a.company = ?
+                     ORDER BY a.country, a.sku`,
+                    [cleanAsin, company, cleanAsin, company]
+                ),
+                pool.query(
+                    `SELECT date_ran, country, sku, fnsku, product_name, status, price
+                     FROM amazon_active_listings
+                     WHERE asin = ? AND company = ?
+                     ORDER BY date_ran DESC, country, sku`,
+                    [cleanAsin, company]
+                ),
+            ]),
+            QUERY_TIMEOUT_MS, 'Active listings lookup'
+        );
+
+        const currentByCountry = {};
+        for (const row of latestRows) {
+            const country = row.country?.trim().toUpperCase();
+            if (!country) continue;
+            if (!currentByCountry[country]) currentByCountry[country] = [];
+            currentByCountry[country].push({
+                sku: row.sku,
+                fnsku: row.fnsku,
+                product_name: row.product_name,
+                status: row.status,
+                price: Number(row.price),
+            });
+        }
+
+        const history = historyRows.map(row => ({
+            date: formatDate(row.date_ran),
+            country: row.country,
+            sku: row.sku,
+            fnsku: row.fnsku,
+            product_name: row.product_name,
+            status: row.status,
+            price: Number(row.price),
+        }));
+
+        const latestDateRaw = latestRows.reduce((max, r) => {
+            const t = r.date_ran ? new Date(r.date_ran).getTime() : 0;
+            return t > max ? t : max;
+        }, 0);
+
+        res.json({
+            asin: cleanAsin,
+            company,
+            latest_date: latestDateRaw ? formatDate(new Date(latestDateRaw)) : null,
+            current: currentByCountry,
+            history,
+        });
+    } catch (error) {
+        log.error('[GET /stock-snapshots/active-listings]', error);
+        const status = error.message?.includes('timed out') ? 504 : 500;
+        res.status(status).json({ error: 'An internal error occurred.' });
+    }
+});
+
 // ── Asana: Add Dispatch Task ─────────────────────────────────────────────
 const ASANA_BASE = 'https://app.asana.com/api/1.0';
 
-const ASANA_REPLENISHMENT_PROJECTS = {
-    UK: '1214003962428764',
-    DE: '1214003962428781',
-    FR: '1214003962428776',
-    IT: '1214003962428786',
-    ES: '1214003962428791',
+const ASANA_REPLENISHMENT_PROJECT_ID = '1214003962428764';
+const ASANA_REPLENISHMENT_REGIONS = ['UK', 'DE', 'FR', 'IT', 'ES'];
+
+const COUNTRY_NAME_TO_CODE = {
+    UK: 'UK', GB: 'UK', BRITAIN: 'UK', 'UNITED KINGDOM': 'UK', ENGLAND: 'UK',
+    DE: 'DE', GERMANY: 'DE', DEUTSCHLAND: 'DE',
+    FR: 'FR', FRANCE: 'FR',
+    IT: 'IT', ITALY: 'IT', ITALIA: 'IT',
+    ES: 'ES', SPAIN: 'ES', ESPANA: 'ES',
 };
+
+function resolveSectionCountry(section) {
+    if (!section) return null;
+    const upper = section.toUpperCase();
+    for (const [name, code] of Object.entries(COUNTRY_NAME_TO_CODE)) {
+        const re = new RegExp(`(^|[^A-Z])${name}([^A-Z]|$)`);
+        if (re.test(upper)) return code;
+    }
+    return null;
+}
+
+// Additional Asana projects to surface tasks from, grouped by project name.
+const ASANA_ADDITIONAL_SOURCES = [
+    { projectId: '1204907541333306' },
+    { projectId: '1208741186098190' },
+];
 
 // Body key → Asana custom field display name
 const FIELD_KEY_TO_NAME = {
-    asin:                  'asin',
+    asin:                  'ASIN',
     publish_date:          'Publish Date',
     jf_hw_code:            'JF / HW Code',
     fnsku:                 'FNSKU',
@@ -1106,6 +1326,75 @@ async function findOrCreateSection(projectId, carrier, pat) {
     return newSection.gid;
 }
 
+app.get('/api/v1/orders/asana-tasks', async (req, res) => {
+    try {
+        const pat = process.env.ASANA_PAT;
+        if (!pat) return res.status(500).json({ error: 'ASANA_PAT not configured.' });
+
+        const headers = { Authorization: `Bearer ${pat}` };
+        const queryProjectId = (req.query.projectId || '').trim();
+        const projectIds = queryProjectId
+            ? [queryProjectId]
+            : [ASANA_REPLENISHMENT_PROJECT_ID, ...ASANA_ADDITIONAL_SOURCES.map(s => s.projectId)];
+
+        const tasks = [];
+        for (const pid of projectIds) {
+            let offset = null;
+            do {
+                const params = {
+                    limit: 100,
+                    opt_fields: 'name,completed,created_at,modified_at,memberships.section.name,memberships.section.gid,custom_fields.name,custom_fields.display_value,custom_fields.text_value,custom_fields.number_value,custom_fields.enum_value.name',
+                };
+                if (offset) params.offset = offset;
+                const { data } = await axios.get(
+                    `${ASANA_BASE}/projects/${pid}/tasks`,
+                    { headers, params }
+                );
+                for (const t of (data.data || [])) tasks.push({ ...t, _projectId: pid });
+                offset = data.next_page?.offset || null;
+            } while (offset);
+        }
+
+        const flat = tasks.map(t => {
+            const m = (t.memberships || []).find(x => x.section) || {};
+            const cfByName = {};
+            for (const cf of (t.custom_fields || [])) {
+                cfByName[cf.name] = cf.display_value
+                    ?? cf.text_value
+                    ?? cf.number_value
+                    ?? cf.enum_value?.name
+                    ?? null;
+            }
+            return {
+                gid: t.gid,
+                project_id: t._projectId,
+                name: t.name,
+                completed: !!t.completed,
+                created_at: t.created_at,
+                modified_at: t.modified_at,
+                section_gid: m.section?.gid || null,
+                section_name: m.section?.name || null,
+                asin: cfByName['ASIN'] || null,
+                fnsku: cfByName['FNSKU'] || null,
+                custom_fields: cfByName,
+            };
+        });
+
+        const bySection = {};
+        for (const t of flat) {
+            const key = t.section_name || '(no section)';
+            if (!bySection[key]) bySection[key] = [];
+            bySection[key].push(t);
+        }
+
+        res.json({ projectIds, total: flat.length, tasks: flat, by_section: bySection });
+    } catch (error) {
+        log.error('[GET /api/v1/orders/asana-tasks]', error);
+        const msg = error.response?.data?.errors?.[0]?.message || error.message;
+        res.status(error.response?.status || 500).json({ error: msg });
+    }
+});
+
 app.post('/api/v1/orders/asana-task', async (req, res) => {
     try {
         const pat = process.env.ASANA_PAT;
@@ -1113,22 +1402,22 @@ app.post('/api/v1/orders/asana-task', async (req, res) => {
 
         const { sku, asin, carrier, region, ...fields } = req.body;
         if (!sku) return res.status(400).json({ error: 'sku is required.' });
-        if (!carrier) return res.status(400).json({ error: 'carrier is required.' });
 
         const regionKey = (region || 'UK').toUpperCase();
-        const projectId = ASANA_REPLENISHMENT_PROJECTS[regionKey];
-        if (!projectId) {
+        if (!ASANA_REPLENISHMENT_REGIONS.includes(regionKey)) {
             return res.status(400).json({
-                error: `Invalid region "${regionKey}". Valid: ${Object.keys(ASANA_REPLENISHMENT_PROJECTS).join(', ')}`,
+                error: `Invalid region "${regionKey}". Valid: ${ASANA_REPLENISHMENT_REGIONS.join(', ')}`,
             });
         }
 
-        // Fetch custom fields from the project (by name, so it works on duplicates)
+        const projectId = ASANA_REPLENISHMENT_PROJECT_ID;
+        const carrierTrimmed = (carrier || '').trim();
+        const sectionName = carrierTrimmed ? `${regionKey} - ${carrierTrimmed}` : regionKey;
+
         const fieldsByName = await fetchProjectCustomFields(projectId, pat);
         const custom_fields = buildCustomFields({ asin, ...fields }, fieldsByName);
 
-        // Find or create section for this carrier
-        const sectionGid = await findOrCreateSection(projectId, carrier, pat);
+        const sectionGid = await findOrCreateSection(projectId, sectionName, pat);
 
         // Create the task
         const { data: { data: task } } = await axios.post(
@@ -1144,7 +1433,7 @@ app.post('/api/v1/orders/asana-task', async (req, res) => {
             { headers: { Authorization: `Bearer ${pat}` } }
         );
 
-        res.status(201).json({ task_gid: task.gid, sku: task.name, asin: asin || null, region: regionKey, section: carrier });
+        res.status(201).json({ task_gid: task.gid, sku: task.name, asin: asin || null, region: regionKey, section: sectionName });
     } catch (error) {
         log.error('[POST /api/v1/orders/asana-task]', error);
         const msg = error.response?.data?.errors?.[0]?.message || error.message;

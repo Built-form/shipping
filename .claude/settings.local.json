@@ -30,7 +30,9 @@
       "Bash(\"/c/Program Files/nodejs/node.exe\" amazon-oos-report.js collect)",
       "Bash(ls -la /c/Users/OpsLondon/shipping/*.js)",
       "Bash(grep -r \"amazon_stock_country_snapshots\\\\|amazon_oos_daily\" /c/Users/OpsLondon/shipping/*.js)",
-      "Bash(curl -s \"http://localhost:3001/api/v1/stock-snapshots/oos-dates?asin=B0G1TG6XHT\")"
+      "Bash(curl -s \"http://localhost:3001/api/v1/stock-snapshots/oos-dates?asin=B0G1TG6XHT\")",
+      "PowerShell($env:Path = \"C:\\\\Program Files\\\\nodejs;$env:Path\"; node _alter-cols.js)",
+      "PowerShell($env:Path = \"C:\\\\Program Files\\\\nodejs;$env:Path\"; node _reprocess-all.js)"
     ],
     "additionalDirectories": [
       "C:\\Users\\OpsLondon\\joshdex"

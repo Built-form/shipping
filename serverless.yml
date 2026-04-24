@@ -48,6 +48,7 @@ package:
 functions:
   ordersApi:
     handler: orders.handler
+    reservedConcurrency: 20
     events:
       - httpApi:
           path: /api/v1/orders
@@ -119,68 +120,50 @@ functions:
           method: GET
           authorizer:
             name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/stock-snapshots/active-listings
+          method: GET
+          authorizer:
+            name: googleJwtAuthorizer
 
   stockSnapshot:
     handler: stock-snapshot.handler
+    reservedConcurrency: 2
     events:
       - schedule:
           rate: rate(1 hour)
           enabled: true
 
-  # ── Amazon Stock Snapshot v3 (per account+region jobs) ──
-  amazonStockSnapshotV3:
-    handler: amazon-stock-snapshot-v3.handler
+  # ── Amazon Stock Snapshot: requester ──
+  # Runs hourly. Idempotent: only fires POST /reports for missing/FAILED jobs
+  # in today's batch. First run of the day kicks off; subsequent runs pick up
+  # any that didn't make it through (e.g. rate-limited, Lambda timed out).
+  amazonStockRequester:
+    handler: amazon-stock-snapshot-requester.handler
+    timeout: 600
+    reservedConcurrency: 2
     events:
-      # JFA — regions sequential, 15 min gaps
       - schedule:
-          rate: cron(0 1 * * ? *)
+          rate: cron(0 7-21 * * ? *)
           enabled: true
-          input: '{"account":"JFA","country":"DE"}'
+
+  # ── Amazon Stock Snapshot: collector (polls + processes one unit per run) ──
+  amazonStockCollector:
+    handler: amazon-stock-snapshot-collector.handler
+    reservedConcurrency: 2
+    events:
       - schedule:
-          rate: cron(15 1 * * ? *)
+          rate: cron(0/3 7-21 * * ? *)
           enabled: true
-          input: '{"account":"JFA","country":"UK"}'
+      # Daily backfill sweep after all units should be processed
       - schedule:
-          rate: cron(30 1 * * ? *)
-          enabled: true
-          input: '{"account":"JFA","country":"FR"}'
-      - schedule:
-          rate: cron(45 1 * * ? *)
-          enabled: true
-          input: '{"account":"JFA","country":"ES"}'
-      - schedule:
-          rate: cron(0 2 * * ? *)
-          enabled: true
-          input: '{"account":"JFA","country":"IT"}'
-      # Hangerworld — runs in parallel with JFA (same times, separate account)
-      - schedule:
-          rate: cron(0 1 * * ? *)
-          enabled: true
-          input: '{"account":"Hangerworld","country":"DE"}'
-      - schedule:
-          rate: cron(15 1 * * ? *)
-          enabled: true
-          input: '{"account":"Hangerworld","country":"UK"}'
-      - schedule:
-          rate: cron(30 1 * * ? *)
-          enabled: true
-          input: '{"account":"Hangerworld","country":"FR"}'
-      - schedule:
-          rate: cron(45 1 * * ? *)
-          enabled: true
-          input: '{"account":"Hangerworld","country":"ES"}'
-      - schedule:
-          rate: cron(0 2 * * ? *)
-          enabled: true
-          input: '{"account":"Hangerworld","country":"IT"}'
-      # Backfill runs after all jobs complete
-      - schedule:
-          rate: cron(15 2 * * ? *)
+          rate: cron(30 21 * * ? *)
           enabled: true
           input: '{"job":"backfill"}'
 
   importAsanaOrders:
     handler: import-asana-orders.handler
+    reservedConcurrency: 2
     events:
       - schedule:
           rate: rate(5 minutes)
@@ -188,6 +171,7 @@ functions:
 
   updateShipsGoEta:
     handler: update-shipsgo-eta.handler
+    reservedConcurrency: 2
     events:
       - schedule:
           rate: cron(55 8 * * ? *)
@@ -204,6 +188,7 @@ functions:
 
   updateImportedDates:
     handler: update-imported-dates.handler
+    reservedConcurrency: 2
     events:
       - schedule:
           rate: cron(0 9 * * ? *)
