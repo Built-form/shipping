@@ -26,12 +26,12 @@ flowchart LR
 
     subgraph lambdas["Scheduled Lambdas · EventBridge cron"]
         direction TB
-        L1[importAsanaOrders<br/><i>every 5 min</i>]
-        L2[stockSnapshot<br/><i>every 1 hour</i>]
-        L3[amazonRequester<br/><i>hourly 07–21 UTC</i>]
-        L4[amazonCollector<br/><i>every 3 min</i>]
-        L5[updateShipsGoEta<br/><i>4× daily</i>]
-        L6[updateImportedDates<br/><i>4× daily</i>]
+        L1[importAsanaOrders<br/>every 5 min]
+        L2[stockSnapshot<br/>every 1 hour]
+        L3[amazonRequester<br/>hourly 07–21 UTC]
+        L4[amazonCollector<br/>every 3 min]
+        L5[updateShipsGoEta<br/>4× daily]
+        L6[updateImportedDates<br/>4× daily]
     end
 
     DB[("MySQL · RDS<br/>orders · stock_snapshots<br/>amazon_stock_*<br/>amazon_report_jobs<br/>landed_costs · allowed_emails")]
@@ -58,16 +58,6 @@ flowchart LR
     L6 --> DB
 
     DB --> Express --> Gateway --> Client
-
-    classDef src fill:#fef3c7,stroke:#b45309,color:#78350f;
-    classDef fn  fill:#dbeafe,stroke:#1d4ed8,color:#1e3a8a;
-    classDef store fill:#ede9fe,stroke:#6d28d9,color:#4c1d95;
-    classDef edge fill:#dcfce7,stroke:#15803d,color:#14532d;
-
-    class Asana,Mint,SPAPI,Ships src;
-    class L1,L2,L3,L4,L5,L6 fn;
-    class DB store;
-    class Express,Gateway,Client edge;
 ```
 
 ### Amazon snapshot: two-phase design
@@ -88,17 +78,14 @@ sequenceDiagram
     participant C as amazonCollector<br/>(every 3 min)
     participant DB as snapshot tables
 
-    rect rgb(219, 234, 254)
     Note over R,SP: Phase 1 — fire report requests
     R->>J: find missing (account, country, report_type)
     R->>SP: POST /reports
     SP-->>R: reportId
     R->>J: insert row · status = REQUESTED
-    end
 
     Note over SP: Amazon generates report<br/>2–10+ min (async)
 
-    rect rgb(220, 252, 231)
     Note over C,DB: Phase 2 — poll, download, process
     loop every 3 min
         C->>J: read REQUESTED jobs
@@ -113,28 +100,33 @@ sequenceDiagram
             Note over C: skip · retry next cycle
         end
     end
-    end
 ```
 
 ### Data flow
 
 ```mermaid
 flowchart TB
-    A["<b>Asana</b><br/>source of truth<br/>POs &amp; shipments"]
-    M["<b>Mintsoft</b><br/>3PL warehouse<br/>stock levels"]
-    SP["<b>Amazon SP-API</b><br/>FBA inventory<br/>reports + API"]
+    subgraph srcs["Sources"]
+        direction LR
+        A["Asana<br/>source of truth<br/>POs &amp; shipments"]
+        M["Mintsoft<br/>3PL warehouse<br/>stock levels"]
+        SP["Amazon SP-API<br/>FBA inventory<br/>reports + API"]
+    end
 
-    O["<b>orders</b><br/>id · asin · status · qty<br/>container · vessel · eta<br/>dates (JSON)"]
-    S["<b>stock_snapshots</b><br/>jf_code · sku · warehouse<br/>stock_level · available<br/>allocated · quarantine"]
-    AC["<b>amazon_stock_country_snapshots</b><br/>country · asin · fnsku (CSV)<br/>fulfillable · inbound_* · reserved"]
-    AR["<b>amazon_stock_raw_snapshots</b><br/>pre-dedup per-FNSKU rows"]
-    AL["<b>amazon_active_listings</b><br/>SKU ↔ FNSKU mapping<br/>status · price"]
+    subgraph tbls["MySQL Tables"]
+        direction LR
+        O["orders<br/>id · asin · status · qty<br/>container · vessel · eta<br/>dates (JSON)"]
+        S["stock_snapshots<br/>jf_code · sku · warehouse<br/>stock_level · available<br/>allocated · quarantine"]
+        AC["amazon_stock_country_snapshots<br/>country · asin · fnsku (CSV)<br/>fulfillable · inbound_* · reserved"]
+        AR["amazon_stock_raw_snapshots<br/>pre-dedup per-FNSKU rows"]
+        AL["amazon_active_listings<br/>SKU ↔ FNSKU mapping<br/>status · price"]
+    end
 
-    API["<b>REST API</b><br/>/api/v1/orders<br/>/api/v1/containers<br/>/api/v1/stock-snapshots/*"]
+    API["REST API<br/>/api/v1/orders<br/>/api/v1/containers<br/>/api/v1/stock-snapshots/*"]
 
     A  -->|every 5 min| O
     M  -->|every 1 hour| S
-    SP -->|fire hourly<br/>poll every 3 min| AC
+    SP -->|fire hourly · poll every 3 min| AC
     SP --> AR
     SP --> AL
 
@@ -142,14 +134,6 @@ flowchart TB
     S  --> API
     AC --> API
     AL --> API
-
-    classDef src fill:#fef3c7,stroke:#b45309,color:#78350f;
-    classDef tbl fill:#ede9fe,stroke:#6d28d9,color:#4c1d95;
-    classDef api fill:#dcfce7,stroke:#15803d,color:#14532d;
-
-    class A,M,SP src;
-    class O,S,AC,AR,AL tbl;
-    class API api;
 ```
 
 ### Order status lifecycle
