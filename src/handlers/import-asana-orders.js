@@ -8,6 +8,75 @@ const { mapGoodsOnSeaStatus, mapGoodsOnAirStatus, mapOrdersStatus } = require('.
 // and not within the Lambda handler for production environments.
 // For this refactoring, the CREATE TABLE statement is removed from the handler.
 
+// Mirror every importer-attached order line as a PO-level audit event.
+// Assumes the audit_log table was created lazily by the orders handler — we
+// run CREATE TABLE IF NOT EXISTS here too so the importer is safe to invoke
+// in isolation (e.g. a cold environment where /api/v1/orders has never been
+// hit yet). Batched 200 rows per INSERT to keep the round-trip count low.
+async function auditImporterAttachments(conn) {
+    await conn.execute(`
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id BIGINT NOT NULL AUTO_INCREMENT,
+            entity_type VARCHAR(32) NOT NULL,
+            entity_id INT NOT NULL,
+            action VARCHAR(16) NOT NULL,
+            before_json JSON NULL,
+            after_json JSON NULL,
+            user_email VARCHAR(255) NULL,
+            created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (id),
+            KEY idx_entity (entity_type, entity_id, created_at)
+        )
+    `);
+
+    const [linkedRows] = await conn.query(`
+        SELECT id, purchase_order_id, jf_code, asin, product_name,
+               quantity, po_number, supplier
+          FROM orders
+         WHERE purchase_order_id IS NOT NULL AND deleted_at IS NULL
+    `);
+    if (!linkedRows.length) return 0;
+
+    const BATCH = 200;
+    let total = 0;
+    for (let i = 0; i < linkedRows.length; i += BATCH) {
+        const batch = linkedRows.slice(i, i + BATCH);
+        const placeholders = batch.map(() => '(?, ?, ?, ?, ?, ?)').join(',');
+        const values = [];
+        for (const r of batch) {
+            const payload = {
+                orderId: r.id,
+                jfCode: r.jf_code || null,
+                asin: r.asin || null,
+                productName: r.product_name || null,
+                quantity: r.quantity ?? null,
+                poNumber: r.po_number || null,
+                supplier: r.supplier || null,
+                source: 'asana-importer',
+            };
+            values.push(
+                'purchase_order',
+                r.purchase_order_id,
+                'order_attached',
+                null,
+                JSON.stringify(payload),
+                null,
+            );
+        }
+        try {
+            await conn.execute(
+                `INSERT INTO audit_log (entity_type, entity_id, action, before_json, after_json, user_email)
+                 VALUES ${placeholders}`,
+                values
+            );
+            total += batch.length;
+        } catch (err) {
+            console.warn(`  Audit batch error: ${err.message}`);
+        }
+    }
+    return total;
+}
+
 // ── Import ────────────────────────────────────────────────────────────────
 async function importGoodsOnSea(conn, rows) {
     let inserted = 0, skipped = 0;
@@ -19,6 +88,10 @@ async function importGoodsOnSea(conn, rows) {
         if (!id) {
             id = row['PO Number'] || row['ASIN'] || `sea-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`;
         }
+        // Populated by update-imported-dates.js (synced from GIGO Container No.)
+        const externalContainerNumber = row['External Container Number']
+            ? row['External Container Number'].trim()
+            : null;
 
         const containerNumber = row['Section/Column'];
         const status = mapGoodsOnSeaStatus(row['Container Status']);
@@ -27,12 +100,19 @@ async function importGoodsOnSea(conn, rows) {
         const sailingRaw = row['Sailing Date'];
         const deliveryDateRaw = row['Delivery Date'];
         const deliveryDate = deliveryDateRaw ? deliveryDateRaw.slice(0, 10) : null;
+        const mfgDateRaw = row['MFG DATE'];
+        const mfgDate = mfgDateRaw ? mfgDateRaw.slice(0, 10) : null;
+        const expDateRaw = row['EXP DATE'];
+        const expDate = expDateRaw ? expDateRaw.slice(0, 10) : null;
+        const arrivedRaw = row['Arrived'];
+        const arrivedDate = arrivedRaw ? arrivedRaw.slice(0, 10) : null;
 
         const artworkDateRaw = row['Artwork Confirmed Date'];
+        const sailingDate = sailingRaw ? sailingRaw.slice(0, 10) : null;
+        const artworkDate = artworkDateRaw ? artworkDateRaw.slice(0, 10) : null;
+        // dates JSON is now state-transitions only (manufacturing, ready,
+        // consolidated, etc.). Scalar Asana dates write to flat columns.
         const dates = {};
-        if (sailingRaw) dates.shipped = new Date(sailingRaw).toISOString();
-        if (eta) dates.eta = new Date(eta).toISOString();
-        if (artworkDateRaw) dates.artwork_confirmed = new Date(artworkDateRaw).toISOString();
 
         batches.push([
             id.trim(),
@@ -47,20 +127,33 @@ async function importGoodsOnSea(conn, rows) {
             parseFloat(row['CBM/Line']) || null,
             JSON.stringify(dates),
             deliveryDate,
+            row['LOT number'] ? row['LOT number'].trim() : null,
+            mfgDate,
+            expDate,
+            row['Delivery Time'] ? row['Delivery Time'].trim() : null,
+            row['Container Status'] ? row['Container Status'].trim() : null,
+            row['Booking Status'] ? row['Booking Status'].trim() : null,
+            arrivedDate,
+            externalContainerNumber,
+            sailingDate,
+            artworkDate,
         ]);
     }
 
     // Execute batch inserts
     for (let i = 0; i < batches.length; i += BATCH_SIZE) {
         const batch = batches.slice(i, i + BATCH_SIZE);
-        const placeholders = batch.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').join(',');
+        const placeholders = batch.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').join(',');
         const values = batch.flat();
 
         try {
             await conn.execute(
                 `INSERT INTO orders
-                    (id, asin, product_name, quantity, status, po_number, supplier,
-                     container_number, eta, cbm_per_unit, dates, delivery_date)
+                    (jf_code, asin, product_name, quantity, status, po_number, supplier,
+                     container_number, eta, order_cbm, dates, delivery_date,
+                     lot_number, mfg_date, exp_date, delivery_time,
+                     container_status, booking_status, arrived_date, external_container_number,
+                     shipped_date, artwork_confirmed_date)
                  VALUES ${placeholders}`,
                 values
             );
@@ -89,10 +182,8 @@ async function importGoodsOnAir(conn, rows) {
         const etaRaw = row['ETA to Port'];
         const eta = etaRaw ? etaRaw.slice(0, 10) : null;
         const departureRaw = row['Departure Date'];
-
+        const departureDate = departureRaw ? departureRaw.slice(0, 10) : null;
         const dates = {};
-        if (departureRaw) dates.shipped = new Date(departureRaw).toISOString();
-        if (eta) dates.eta = new Date(eta).toISOString();
 
         batches.push([
             id.trim(),
@@ -106,19 +197,20 @@ async function importGoodsOnAir(conn, rows) {
             eta,
             parseFloat(row['CBM/Line']) || null,
             JSON.stringify(dates),
+            departureDate,
         ]);
     }
 
     for (let i = 0; i < batches.length; i += BATCH_SIZE) {
         const batch = batches.slice(i, i + BATCH_SIZE);
-        const placeholders = batch.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').join(',');
+        const placeholders = batch.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').join(',');
         const values = batch.flat();
 
         try {
             await conn.execute(
                 `INSERT INTO orders
-                    (id, asin, product_name, quantity, status, po_number, supplier,
-                     container_number, eta, cbm_per_unit, dates)
+                    (jf_code, asin, product_name, quantity, status, po_number, supplier,
+                     container_number, eta, order_cbm, dates, shipped_date)
                  VALUES ${placeholders}`,
                 values
             );
@@ -147,10 +239,10 @@ async function importOrders(conn, rows) {
         const poDateRaw = row['PO Placed'];
         const estimatedReadyRaw = row['Estimated Ready Date'];
         const artworkDateRaw = row['Artwork Confirmed Date'];
+        const orderedDate = poDateRaw ? poDateRaw.slice(0, 10) : null;
+        const estimatedReadyDate = estimatedReadyRaw ? estimatedReadyRaw.slice(0, 10) : null;
+        const artworkConfirmedDate = artworkDateRaw ? artworkDateRaw.slice(0, 10) : null;
         const dates = {};
-        if (poDateRaw) dates.ordered = new Date(poDateRaw).toISOString();
-        if (estimatedReadyRaw) dates.estimated_ready = new Date(estimatedReadyRaw).toISOString();
-        if (artworkDateRaw) dates.artwork_confirmed = new Date(artworkDateRaw).toISOString();
 
         const totalCbm = parseFloat(row['Total CBM.']);
         const units = parseInt(row['Units Ordered'], 10);
@@ -170,20 +262,25 @@ async function importOrders(conn, rows) {
             containerNumber ? containerNumber.trim() : null,
             cbmPerUnit,
             JSON.stringify(dates),
+            row['Port'] ? row['Port'].trim() : null,
+            orderedDate,
+            estimatedReadyDate,
+            artworkConfirmedDate,
         ]);
     }
 
     // Execute batch inserts
     for (let i = 0; i < batches.length; i += BATCH_SIZE) {
         const batch = batches.slice(i, i + BATCH_SIZE);
-        const placeholders = batch.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').join(',');
+        const placeholders = batch.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').join(',');
         const values = batch.flat();
 
         try {
             await conn.execute(
                 `INSERT INTO orders
-                    (id, asin, product_name, quantity, status, po_number, supplier,
-                     container_number, cbm_per_unit, dates)
+                    (jf_code, asin, product_name, quantity, status, po_number, supplier,
+                     container_number, cbm_per_unit, dates, port,
+                     ordered_date, estimated_ready_date, artwork_confirmed_date)
                  VALUES ${placeholders}`,
                 values
             );
@@ -227,12 +324,38 @@ exports.handler = async (event) => {
             throw new Error('No data fetched from Asana projects — aborting to preserve existing data');
         }
 
-        // Ensure delivery_date column exists
-        try {
-            await conn.execute('ALTER TABLE orders ADD COLUMN delivery_date DATE NULL');
-            console.log('Added delivery_date column.');
-        } catch (e) {
-            // Column already exists — ignore
+        // Ensure columns exist (idempotent — ignore if already present)
+        const columnsToAdd = [
+            'ALTER TABLE orders ADD COLUMN delivery_date DATE NULL',
+            'ALTER TABLE orders ADD COLUMN lot_number VARCHAR(255) NULL',
+            'ALTER TABLE orders ADD COLUMN mfg_date DATE NULL',
+            'ALTER TABLE orders ADD COLUMN exp_date DATE NULL',
+            'ALTER TABLE orders ADD COLUMN delivery_time VARCHAR(100) NULL',
+            'ALTER TABLE orders ADD COLUMN container_status VARCHAR(100) NULL',
+            'ALTER TABLE orders ADD COLUMN booking_status VARCHAR(100) NULL',
+            'ALTER TABLE orders ADD COLUMN arrived_date DATE NULL',
+            'ALTER TABLE orders ADD COLUMN external_container_number VARCHAR(255) NULL',
+            'ALTER TABLE orders ADD COLUMN order_cbm DECIMAL(10,3) NULL',
+            'ALTER TABLE orders ADD COLUMN port VARCHAR(255) NULL',
+            'ALTER TABLE orders ADD COLUMN carton_cbm DECIMAL(10,6) NULL',
+            'ALTER TABLE orders ADD COLUMN units_per_carton INT NULL',
+            'ALTER TABLE orders ADD COLUMN pack_size VARCHAR(100) NULL',
+            'ALTER TABLE orders ADD COLUMN scheduled_date DATE NULL',
+            'ALTER TABLE orders ADD COLUMN po_date DATE NULL',
+            'ALTER TABLE orders ADD COLUMN qc_status VARCHAR(100) NULL',
+            'ALTER TABLE orders ADD COLUMN qc_date DATE NULL',
+            'ALTER TABLE orders ADD COLUMN qc_invoice_number VARCHAR(100) NULL',
+            'ALTER TABLE orders ADD COLUMN purchase_order_id INT NULL',
+            'ALTER TABLE orders ADD COLUMN unit_price DECIMAL(10,4) NULL',
+            'ALTER TABLE orders ADD COLUMN actual_ready_date DATE NULL',
+            'ALTER TABLE orders ADD COLUMN estimated_departure_date DATE NULL',
+            'ALTER TABLE orders ADD COLUMN shipped_date DATE NULL',
+            'ALTER TABLE orders ADD COLUMN ordered_date DATE NULL',
+            'ALTER TABLE orders ADD COLUMN estimated_ready_date DATE NULL',
+            'ALTER TABLE orders ADD COLUMN artwork_confirmed_date DATE NULL',
+        ];
+        for (const ddl of columnsToAdd) {
+            try { await conn.execute(ddl); } catch (e) { /* already exists */ }
         }
 
         // Only truncate after successful fetch
@@ -252,12 +375,49 @@ exports.handler = async (event) => {
         const orderResult = await importOrders(conn, orderRows);
         console.log(`  Inserted: ${orderResult.inserted}, Skipped: ${orderResult.skipped}`);
 
+        // Auto-create purchase_orders for any po_number we don't have yet,
+        // then re-resolve orders.purchase_order_id by joining on po_number.
+        // The TRUNCATE above wipes purchase_order_id every cycle — without
+        // this, the link would only exist briefly between runs.
+        console.log('Linking orders → purchase_orders by po_number...');
+        const [poInsert] = await conn.execute(`
+            INSERT INTO purchase_orders (po_number, supplier)
+            SELECT po_number, MAX(supplier) AS supplier
+              FROM orders
+             WHERE po_number IS NOT NULL AND po_number <> ''
+               AND po_number NOT IN (SELECT po_number FROM purchase_orders)
+             GROUP BY po_number
+        `);
+        const [linkResult] = await conn.execute(`
+            UPDATE orders o
+              JOIN purchase_orders po ON po.po_number = o.po_number
+               SET o.purchase_order_id = po.id
+             WHERE o.po_number IS NOT NULL AND o.po_number <> ''
+        `);
+        console.log(`  Created ${poInsert.affectedRows} new POs, linked ${linkResult.affectedRows} orders.`);
+
+        // Mirror each newly-linked row as a PO-level order_attached audit
+        // event so the PO's audit trail captures the importer's re-link
+        // sweep. Historically the importer was excluded from audit because
+        // it TRUNCATEd orders every 10 min (per src/handlers/orders.js:46),
+        // but the schedule is now disabled and re-links typically happen
+        // manually — so the audit growth is bounded by manual invocations.
+        // If the schedule is re-enabled, revisit (e.g. dedupe by (po_id,
+        // order_id) or downsample to changes only).
+        const attachedAudited = await auditImporterAttachments(conn);
+        console.log(`  Audited ${attachedAudited} order_attached events.`);
+
         return {
             statusCode: 200,
             body: JSON.stringify({
                 sea: seaResult,
                 air: airResult,
                 orders: orderResult,
+                purchaseOrders: {
+                    created: poInsert.affectedRows,
+                    ordersLinked: linkResult.affectedRows,
+                    auditEvents: attachedAudited,
+                },
             }),
         };
     } catch (err) {

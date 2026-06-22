@@ -4,8 +4,9 @@ require('dotenv').config();
 const log = require('../lib/logger');
 const { getPool } = require('../db');
 const {
-    ACCOUNT_NAMES, COUNTRY_CODES, REPORT_TYPES, SP_REPORT_TYPE,
-    getMarketplace, getEndpoint, getTokenManager, requestReport,
+    ACCOUNT_NAMES, REPORT_TYPES, SP_REPORT_TYPE,
+    getAccountCountries, getMarketplace, getEndpoint,
+    getRegionForCountry, getTokenManager, requestReport,
     rateLimitedRequest,
 } = require('../services/amazon-stock-shared');
 
@@ -86,11 +87,9 @@ async function fireOne(pool, { batchDate, account, country, reportType, marketpl
 }
 
 async function requestAccount(pool, accountName, batchDate, existing) {
-    const tokenManager = getTokenManager(accountName);
-    const endpoint = getEndpoint();
     const results = { success: 0, failed: 0, skipped: 0 };
 
-    // ── Pan-EU (account-wide) ──────────────────────────────────────────────
+    // ── Pan-EU (account-wide, EU region) ───────────────────────────────────
     if (shouldSkip(existing, accountName, 'ALL', REPORT_TYPES.PAN_EU)) {
         results.skipped++;
     } else {
@@ -98,14 +97,19 @@ async function requestAccount(pool, accountName, batchDate, existing) {
             batchDate, account: accountName, country: 'ALL',
             reportType: REPORT_TYPES.PAN_EU,
             marketplaceId: 'A1PA6795UKMFR9',
-            tokenManager, endpoint,
+            tokenManager: getTokenManager(accountName, 'EU'),
+            endpoint: getEndpoint(),
         });
         results[r]++;
     }
 
     // ── Active Listings + Health per country ───────────────────────────────
-    for (const countryCode of COUNTRY_CODES) {
-        const { marketplaceId } = getMarketplace(countryCode);
+    // Each country resolves its own region (endpoint + refresh token): EU
+    // marketplaces hit the EU endpoint, US hits NA. Only the countries the
+    // account actually sells in are requested.
+    for (const countryCode of getAccountCountries(accountName)) {
+        const { marketplaceId, endpoint } = getMarketplace(countryCode);
+        const tokenManager = getTokenManager(accountName, getRegionForCountry(countryCode));
 
         for (const reportType of [REPORT_TYPES.ACTIVE_LISTINGS, REPORT_TYPES.HEALTH]) {
             if (shouldSkip(existing, accountName, countryCode, reportType)) {

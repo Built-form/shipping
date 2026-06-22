@@ -33,6 +33,47 @@ async function ensureTable(conn) {
     }
 }
 
+// ── Per-JF-code snapshot (reusable) ────────────────────────────────────────────
+// Fetches Mintsoft stock for one JF code and upserts stock_snapshots rows for
+// today's dateRan. Used by both the scheduled batch run and the live
+// post-receive refresh in orders.js.
+async function snapshotJfCode(conn, jfCode, asin = '') {
+    const dateRan = new Date().toISOString().slice(0, 10);
+    const products = await getProductsByJfCode(jfCode);
+    const stocks = [];
+    for (const { productId, sku } of products) {
+        const warehouseStocks = await getProductStock(productId);
+        stocks.push({ sku, productId, warehouseStocks });
+    }
+
+    for (const { sku, productId, warehouseStocks } of stocks) {
+        for (const { warehouseId, stockLevel, available, allocated, quarantine } of warehouseStocks) {
+            const [existing] = await conn.execute(
+                `SELECT id FROM stock_snapshots WHERE date_ran = ? AND sku = ? AND warehouse_id = ? LIMIT 1`,
+                [dateRan, sku, warehouseId]
+            );
+
+            if (existing.length > 0) {
+                await conn.execute(
+                    `UPDATE stock_snapshots
+                     SET jf_code = ?, asin = ?, product_id = ?, stock_level = ?, available = ?, allocated = ?, quarantine = ?
+                     WHERE id = ?`,
+                    [jfCode, asin, productId, stockLevel, available, allocated, quarantine, existing[0].id]
+                );
+            } else {
+                await conn.execute(
+                    `INSERT INTO stock_snapshots
+                        (date_ran, jf_code, asin, sku, product_id, warehouse_id, stock_level, available, allocated, quarantine)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                    [dateRan, jfCode, asin, sku, productId, warehouseId, stockLevel, available, allocated, quarantine]
+                );
+            }
+        }
+    }
+
+    return stocks;
+}
+
 // ── Retry helper ───────────────────────────────────────────────────────────────
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 2000;
@@ -77,53 +118,20 @@ const handler = async () => {
             const batch = jfCodes.slice(i, i + BATCH_SIZE);
 
             const settled = await Promise.allSettled(
-                batch.map(async ({ jfCode, asin }) => {
-                    return withRetry(async () => {
-                        const products = await getProductsByJfCode(jfCode);
-                        const allStocks = [];
-                        for (const { productId, sku } of products) {
-                            const warehouseStocks = await getProductStock(productId);
-                            allStocks.push({ sku, productId, warehouseStocks });
-                        }
-                        return { jfCode, asin, stocks: allStocks };
-                    }, jfCode);
-                })
+                batch.map(({ jfCode, asin }) =>
+                    withRetry(() => snapshotJfCode(db, jfCode, asin), jfCode)
+                        .then(stocks => ({ jfCode, stocks }))
+                )
             );
 
-            // Write results to DB
-            for (const result of settled) {
+            for (let idx = 0; idx < settled.length; idx++) {
+                const result = settled[idx];
                 if (result.status === 'fulfilled') {
-                    const { jfCode, asin, stocks } = result.value;
-
-                    for (const { sku, productId, warehouseStocks } of stocks) {
-                        for (const { warehouseId, stockLevel, available, allocated, quarantine } of warehouseStocks) {
-                            const [existing] = await db.execute(
-                                `SELECT id FROM stock_snapshots WHERE date_ran = ? AND sku = ? AND warehouse_id = ? LIMIT 1`,
-                                [dateRan, sku, warehouseId]
-                            );
-
-                            if (existing.length > 0) {
-                                await db.execute(
-                                    `UPDATE stock_snapshots
-                                     SET jf_code = ?, asin = ?, product_id = ?, stock_level = ?, available = ?, allocated = ?, quarantine = ?
-                                     WHERE id = ?`,
-                                    [jfCode, asin, productId, stockLevel, available, allocated, quarantine, existing[0].id]
-                                );
-                            } else {
-                                await db.execute(
-                                    `INSERT INTO stock_snapshots
-                                        (date_ran, jf_code, asin, sku, product_id, warehouse_id, stock_level, available, allocated, quarantine)
-                                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                                    [dateRan, jfCode, asin, sku, productId, warehouseId, stockLevel, available, allocated, quarantine]
-                                );
-                            }
-                        }
-                    }
-
+                    const { jfCode, stocks } = result.value;
                     log.info(`[${jfCode}] OK`);
                     results.success.push({ jfCode, stocks });
                 } else {
-                    const { jfCode } = batch[settled.indexOf(result)];
+                    const { jfCode } = batch[idx];
                     log.error(`[${jfCode}] Failed: ${result.reason?.message}`);
                     results.failed.push({ jfCode, error: result.reason?.message });
                 }
@@ -145,6 +153,7 @@ const handler = async () => {
 };
 
 exports.handler = handler;
+exports.snapshotJfCode = snapshotJfCode;
 
 // Allow direct execution: node src/handlers/mintsoft-snapshot.js
 if (require.main === module) {

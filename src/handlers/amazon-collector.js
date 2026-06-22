@@ -10,7 +10,8 @@ const { getPool } = require('../db');
 // one for the subsequent DB writes.
 const {
     REPORT_TYPES,
-    getEndpoint, getTokenManager,
+    getEndpoint, getEndpointForCountry, getRegionForCountry,
+    getTokenManager, isPanEuPooled,
     checkReport, downloadReport, parseTsvReport,
     fetchInventorySummaries, getMarketplace,
     writeSnapshots, copyFailedFromPrevious, runBackfill,
@@ -19,7 +20,7 @@ const {
 // Collector: polls outstanding report jobs, then processes one (account, country)
 // unit per invocation. Designed to run every 2–5 minutes.
 
-const POLL_LIMIT            = 30;                  // max reports to poll per run
+const POLL_LIMIT            = 10;                  // max reports to poll per run
 const REQUEST_STALE_HOURS   = 6;                   // REQUESTED older than this → FAILED
 const CLAIM_TIMEOUT_MINUTES = 15;                  // stale claims can be stolen
 
@@ -54,8 +55,11 @@ async function pollPending(conn) {
         }
 
         try {
-            const tokenManager = getTokenManager(row.account);
-            const { status, documentId } = await checkReport(tokenManager, getEndpoint(), row.report_id);
+            // Reports are regional: poll on the same endpoint they were
+            // requested against (US → NA, everything else → EU).
+            const region = getRegionForCountry(row.country);
+            const tokenManager = getTokenManager(row.account, region);
+            const { status, documentId } = await checkReport(tokenManager, getEndpointForCountry(row.country), row.report_id, row.account);
 
             if (status === 'DONE') {
                 await conn.execute(
@@ -114,15 +118,22 @@ async function cachePanEuResults(conn) {
             const tokenManager = getTokenManager(row.account);
             const tsv = await downloadReport(tokenManager, getEndpoint(), row.document_id);
             const parsed = parseTsvReport(tsv);
-            // GET_PAN_EU_OFFER_STATUS lists every ASIN with its Pan-EU state.
-            // We filter on `Enrol = 'Y'`, which covers both `Pan-EU status =
-            // 'Enrolled'` and `'Enrolment ended'`. "Enrolment ended" ASINs
-            // are opted out going forward, but existing pooled inventory sits
-            // physically in DE/FR/ES/IT warehouses until it sells through, so
-            // Amazon's Health report keeps reporting the same fulfillable
-            // number against each marketplace — they must still be deduped.
+            // Treat an ASIN as actively Pan-EU only when enrolment is live.
+            // Amazon keeps Enrol='Y' on lapsed listings (Pan-EU status
+            // 'Enrolment ended', expiry in the past) — those are no longer
+            // pooled (the Revenue Calculator shows them as plain 'Amazon
+            // Fulfilment'), so we exclude them. This now only governs the raw
+            // Pan-EU broadcast; per-country snapshot dedup is locality-based.
+            const now = Date.now();
+            const isActivePanEu = (r) => {
+                if ((r['Enrol'] || '').trim().toUpperCase() !== 'Y') return false;
+                const status = (r['Pan-EU status'] || '').trim().toLowerCase();
+                if (status === 'enrolled' || status.includes('ending')) return true;
+                const exp = new Date((r['Date Pan-EU expires'] || '').trim());
+                return !isNaN(exp.getTime()) && exp.getTime() > now;
+            };
             const asins = [...new Set(
-                parsed.filter(r => (r['Enrol'] || '').trim().toUpperCase() === 'Y')
+                parsed.filter(isActivePanEu)
                       .map(r => (r['ASIN'] || '').trim())
                       .filter(Boolean)
             )];
@@ -257,7 +268,15 @@ async function processUnit(pool, unit) {
                 return { label, fallback: true, reason: 'pan_eu_unavailable' };
             }
 
-            if (peRows[0].status !== 'DONE' || !peRows[0].result_cache) {
+            // A DONE pan_eu is still being processed by sibling countries; a
+            // PROCESSED one was already cleaned up after the EU countries
+            // finished. Both carry a usable result_cache, so accept either —
+            // otherwise a country that runs after cleanup (e.g. US, which
+            // finishes after DE/UK/FR/ES/IT trigger cleanupPanEu) would defer
+            // forever. Only defer while the cache genuinely isn't ready yet.
+            const peReady = (peRows[0].status === 'DONE' || peRows[0].status === 'PROCESSED')
+                && peRows[0].result_cache;
+            if (!peReady) {
                 log.info(`[${label}] pan_eu not yet cached — deferring unit`);
                 await releaseClaim(conn, claimToken);
                 return { label, deferred: 'pan_eu_not_ready' };
@@ -265,7 +284,8 @@ async function processUnit(pool, unit) {
 
             // Defer FR/ES/IT until DE is processed — writeSnapshots reads
             // DE's country_snapshot rows to dedupe EFN/Pan-EU pools by FNSKU.
-            if (country !== 'DE' && country !== 'UK') {
+            // DE/UK/US are standalone and never wait.
+            if (isPanEuPooled(country)) {
                 const [deJobs] = await conn.query(
                     `SELECT status FROM amazon_report_jobs
                      WHERE batch_date = ? AND account = ? AND country = 'DE'
@@ -294,9 +314,10 @@ async function processUnit(pool, unit) {
     }
 
     // Phase B: long SP-API work with NO DB connection held, so MySQL's
-    // wait_timeout can't kill a connection we aren't using.
-    const tokenManager = getTokenManager(account);
-    const endpoint = getEndpoint();
+    // wait_timeout can't kill a connection we aren't using. US lives in the NA
+    // region (different endpoint + refresh token); everything else is EU.
+    const tokenManager = getTokenManager(account, getRegionForCountry(country));
+    const endpoint = getEndpointForCountry(country);
 
     log.info(`[${label}] Downloading Active Listings (${active_doc})...`);
     const listingTsv = await downloadReport(tokenManager, endpoint, active_doc);

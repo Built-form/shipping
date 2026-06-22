@@ -14,7 +14,15 @@ provider:
       - 'application/json'
       - '*/*'
   httpApi:
-    cors: true
+    cors:
+      allowedOrigins:
+        - '*'
+      allowedHeaders:
+        - '*'
+      allowedMethods:
+        - '*'
+      exposedResponseHeaders:
+        - X-User-Type
     authorizers:
       googleJwtAuthorizer:
         type: jwt
@@ -23,12 +31,17 @@ provider:
         audience:
           - '1085148951708-8qfkho7ilq084vvpo52jvc6fgg9ecdjt.apps.googleusercontent.com'
   environment:
-    DB_HOST: ${env:DB_HOST}
+    # Deployed Lambdas connect through the RDS Proxy (private VPC endpoint) via
+    # DB_PROXY_HOST; falls back to the direct instance (DB_HOST) if it's unset.
+    # Local runs read .env directly and never see this block, so they stay on
+    # DB_HOST = the publicly-reachable direct instance. (Same pattern as joshdex.)
+    DB_HOST: ${env:DB_PROXY_HOST, env:DB_HOST}
     DB_USER: ${env:DB_USER}
     DB_PASSWORD: ${env:DB_PASSWORD}
     DB_NAME: ${env:DB_NAME}
     DB_PORT: ${env:DB_PORT}
     MINTSOFT_API_KEY: ${env:MINTSOFT_API_KEY}
+    MINTSOFT_CLIENT_ID: ${env:MINTSOFT_CLIENT_ID}
     ASANA_PAT: ${env:ASANA_PAT}
     AMAZON_SP_CLIENT_ID: ${env:AMAZON_SP_CLIENT_ID}
     AMAZON_SP_CLIENT_SECRET: ${env:AMAZON_SP_CLIENT_SECRET}
@@ -36,7 +49,44 @@ provider:
     AMAZON_SP_CLIENT_ID_HW: ${env:AMAZON_SP_CLIENT_ID_HW}
     AMAZON_SP_CLIENT_SECRET_HW: ${env:AMAZON_SP_CLIENT_SECRET_HW}
     AMAZON_SP_REFRESH_TOKEN_HW: ${env:AMAZON_SP_REFRESH_TOKEN_HW}
+    # Hangerworld US (North America) — same HW app, NA-authorized refresh token
+    AMAZON_SP_REFRESH_TOKEN_US: ${env:AMAZON_SP_REFRESH_TOKEN_US}
     SHIPSGO_API_KEY: ${env:SHIPSGO_API_KEY}
+    MAKE_PO_SENT_WEBHOOK_URL: ${env:MAKE_PO_SENT_WEBHOOK_URL, ''}
+    PO_DOCS_BUCKET: shipping-purchase-orders-${sls:stage}
+    FRONT_API_TOKEN: ${env:FRONT_API_TOKEN, ''}
+    FRONT_CHANNEL_ID: ${env:FRONT_CHANNEL_ID, ''}
+    GEMINI_API_KEY: ${env:GEMINI_API_KEY, ''}
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - s3:PutObject
+            - s3:GetObject
+          Resource:
+            - arn:aws:s3:::shipping-purchase-orders-${sls:stage}/*
+  # ── RDS Proxy access (VPC + NAT) ─────────────────────────────────────────
+  # Every function joins the VPC so it can reach the shared RDS Proxy's private
+  # endpoint (DB_PROXY_HOST). It connects to the SAME proxy / RDS instance as
+  # joshdex, so rather than duplicate the networking we REUSE the private
+  # subnets joshdex's stack already created (CIDRs 172.31.100-102). Those
+  # subnets sit on joshdex's route table, which already sends 0.0.0.0/0 to the
+  # NAT Gateway (egress for SP-API / LWA / Mintsoft / ShipsGo / Asana / Front /
+  # Gemini) and has the S3 gateway endpoint (free PO-docs S3 access) — so
+  # shipping inherits both with zero new resources. Same security group as the
+  # proxy (MySQL from itself + all egress). Serverless auto-adds the
+  # ec2:*NetworkInterface IAM perms the VPC attachment needs.
+  #
+  # NOTE: this couples shipping to joshdex's stack for the subnets/NAT —
+  # acceptable since both stacks share the same database (explorer RDS instance).
+  vpc:
+    securityGroupIds:
+      - sg-015a76ba77bb50587
+    subnetIds:
+      - subnet-0182666b07673d609   # 172.31.100.0/24  eu-north-1a
+      - subnet-023d894c20f906c27   # 172.31.101.0/24  eu-north-1b
+      - subnet-0f684d9b9cb010dfe   # 172.31.102.0/24  eu-north-1c
 
 package:
   individually: true
@@ -44,6 +94,24 @@ package:
     - '!.env'
     - '!.git/**'
     - '!node_modules/.cache/**'
+    # npm's atomic-install staging dirs (`.<pkg>-<hash>`) left behind by an
+    # interrupted `npm install`. Each is a full package copy, so the walker
+    # crawls node_modules twice and trips EMFILE on Windows. Never runtime.
+    - '!node_modules/.*-*/**'
+    # Strip non-runtime files across all of node_modules — TS types, docs, tests,
+    # and bin shims add up to thousands of file handles during packaging and
+    # trip EMFILE "too many open files" on Windows.
+    - '!node_modules/**/*.d.ts'
+    - '!node_modules/**/*.md'
+    - '!node_modules/**/*.ts'
+    - '!node_modules/**/test/**'
+    - '!node_modules/**/tests/**'
+    - '!node_modules/**/__tests__/**'
+    - '!node_modules/**/LICENSE*'
+    - '!node_modules/**/CHANGELOG*'
+    - '!node_modules/**/README*'
+    - '!node_modules/**/.github/**'
+    - '!node_modules/**/.bin/**'
 
 functions:
   ordersApi:
@@ -86,6 +154,16 @@ functions:
           authorizer:
             name: googleJwtAuthorizer
       - httpApi:
+          path: /api/v1/containers
+          method: GET
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/containers/{proxy+}
+          method: GET
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
           path: /api/v1/containers/{proxy+}
           method: POST
           authorizer:
@@ -93,6 +171,51 @@ functions:
       - httpApi:
           path: /api/v1/containers/{proxy+}
           method: PATCH
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/air-shipments
+          method: GET
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/air-shipments/{proxy+}
+          method: GET
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/draft-containers
+          method: GET
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/draft-containers
+          method: POST
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/draft-containers/{proxy+}
+          method: GET
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/draft-containers/{proxy+}
+          method: POST
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/draft-containers/{proxy+}
+          method: PUT
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/draft-containers/{proxy+}
+          method: DELETE
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/draft-container-documents/{proxy+}
+          method: POST
           authorizer:
             name: googleJwtAuthorizer
       - httpApi:
@@ -125,6 +248,213 @@ functions:
           method: GET
           authorizer:
             name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/mintsoft/warehouses
+          method: GET
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/mintsoft/warehouses/{proxy+}
+          method: GET
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/mintsoft/carton-sizes
+          method: GET
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/purchase-orders
+          method: GET
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/purchase-orders
+          method: POST
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/purchase-orders/{proxy+}
+          method: GET
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/purchase-orders/{proxy+}
+          method: PUT
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/purchase-orders/{proxy+}
+          method: DELETE
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/purchase-orders/{proxy+}
+          method: POST
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/purchase-order-documents/{proxy+}
+          method: POST
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/purchase-order-signed-pis/{proxy+}
+          method: POST
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/purchase-order-signed-pis/{proxy+}
+          method: DELETE
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/purchase-order-invoices/{proxy+}
+          method: GET
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/purchase-order-invoices/{proxy+}
+          method: PATCH
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/purchase-order-invoices/{proxy+}
+          method: DELETE
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/purchase-order-payments/{proxy+}
+          method: PATCH
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/purchase-order-payments/{proxy+}
+          method: DELETE
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/suppliers
+          method: GET
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/suppliers/{proxy+}
+          method: GET
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/quality-assurance/{proxy+}
+          method: GET
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/quality-assurance/{proxy+}
+          method: POST
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/quality-assurance-documents/{proxy+}
+          method: POST
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/qc-reports
+          method: GET
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/qc-reports
+          method: POST
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/qc-reports/{proxy+}
+          method: GET
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/qc-reports/{proxy+}
+          method: POST
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/qc-reports/{proxy+}
+          method: DELETE
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/email-templates
+          method: GET
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/email-templates
+          method: POST
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/email-templates/{proxy+}
+          method: GET
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/email-templates/{proxy+}
+          method: PUT
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/email-templates/{proxy+}
+          method: DELETE
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/audit-log
+          method: GET
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/companies
+          method: GET
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/companies
+          method: POST
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/companies/{proxy+}
+          method: GET
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/companies/{proxy+}
+          method: PUT
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/companies/{proxy+}
+          method: DELETE
+          authorizer:
+            name: googleJwtAuthorizer
+
+  # ── Supplier "ready date" portal (PUBLIC — no authorizer) ──
+  # External suppliers (no Google login) set the estimated ready date on their
+  # own PO lines. They authenticate with just their PO number + a per-supplier
+  # access code (suppliers.portal_code) — no supplier picker. Isolated in its
+  # own handler so the public surface is just these two routes; the code is
+  # checked inside the handler, not by API Gateway. Low concurrency caps abuse.
+  supplierPortalApi:
+    handler: src/handlers/supplier-portal.handler
+    reservedConcurrency: 5
+    events:
+      - httpApi:
+          path: /api/v1/portal/po-lookup
+          method: POST
+      - httpApi:
+          path: /api/v1/portal/po-ready-date
+          method: POST
 
   stockSnapshot:
     handler: src/handlers/mintsoft-snapshot.handler
@@ -153,7 +483,7 @@ functions:
     reservedConcurrency: 2
     events:
       - schedule:
-          rate: cron(0/3 7-21 * * ? *)
+          rate: cron(0/5 7-21 * * ? *)
           enabled: true
       # Daily backfill sweep after all units should be processed
       - schedule:
@@ -166,8 +496,8 @@ functions:
     reservedConcurrency: 2
     events:
       - schedule:
-          rate: rate(5 minutes)
-          enabled: true
+          rate: rate(10 minutes)
+          enabled: false
 
   updateShipsGoEta:
     handler: src/handlers/update-shipsgo-eta.handler
@@ -184,6 +514,42 @@ functions:
           enabled: true
       - schedule:
           rate: cron(55 17 * * ? *)
+          enabled: true
+
+  mintsoftLocationsSync:
+    handler: src/handlers/mintsoft-locations-sync.handler
+    timeout: 600
+    reservedConcurrency: 1
+    events:
+      - schedule:
+          rate: cron(0 2 * * ? *)
+          enabled: true
+
+  shipsgoContainers:
+    handler: src/handlers/shipsgo-containers.handler
+    timeout: 600
+    reservedConcurrency: 1
+    events:
+      - schedule:
+          rate: rate(6 hours)
+          enabled: true
+
+  shipsgoAir:
+    handler: src/handlers/shipsgo-air.handler
+    timeout: 600
+    reservedConcurrency: 1
+    events:
+      - schedule:
+          rate: rate(6 hours)
+          enabled: true
+
+  ordersFromShipsgo:
+    handler: src/handlers/orders-from-shipsgo.handler
+    timeout: 300
+    reservedConcurrency: 1
+    events:
+      - schedule:
+          rate: rate(1 hour)
           enabled: true
 
   updateImportedDates:
@@ -203,5 +569,86 @@ functions:
           rate: cron(0 18 * * ? *)
           enabled: true
 
+  # ── QC reports: auto-import from Front ──
+  # Pulls new AQI inspection reports (attachment or jianguoyun link) out of Front
+  # and analyzes them. Idempotent (dedup on source_ref); empty runs are ~3s.
+  # 1024 MB for the jianguoyun zip download + inflate headroom; concurrency 1 so
+  # runs never overlap. Inherits the 900s provider timeout for Gemini analysis.
+  qcFrontImport:
+    handler: src/handlers/qc-front-import.handler
+    memorySize: 1024
+    reservedConcurrency: 1
+    events:
+      - schedule:
+          rate: rate(1 hour)
+          enabled: true
+
 #plugins:
 #  - serverless-offline
+
+resources:
+  # ── Per-route throttle on the PUBLIC supplier-portal routes ──
+  # The supplier portal is unauthenticated and gated only by a per-supplier
+  # access code, so throttle brute-force / abuse at the edge (API Gateway
+  # returns 429 before the Lambda or DB is touched). RouteSettings is scoped to
+  # just these two route keys — a stage-wide DefaultRouteSettings would also
+  # throttle the authed admin routes, which we must not do. NOTE: this is a
+  # GLOBAL token bucket per route (not per-IP); 5 req/s steady + burst 10 is
+  # ample for a handful of suppliers and trivially raised here if needed.
+  extensions:
+    HttpApiStage:
+      Properties:
+        RouteSettings:
+          'POST /api/v1/portal/po-lookup':
+            ThrottlingRateLimit: 5
+            ThrottlingBurstLimit: 10
+          'POST /api/v1/portal/po-ready-date':
+            ThrottlingRateLimit: 5
+            ThrottlingBurstLimit: 10
+  Resources:
+    PurchaseOrderDocsBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: shipping-purchase-orders-${sls:stage}
+        # Public read access via the bucket policy below; ACLs stay locked.
+        # Object keys carry a random UUID so URLs are unguessable in practice.
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: false
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: false
+        # CORS so the SPA can fetch() object bytes cross-origin (e.g. download a
+        # PI to sign + re-upload). Direct links/navigation never needed CORS;
+        # programmatic fetch/XHR does. Objects are already public-read, so GET/
+        # HEAD from any origin matches the existing exposure.
+        CorsConfiguration:
+          CorsRules:
+            - AllowedMethods:
+                - GET
+                - HEAD
+                - PUT
+              AllowedOrigins:
+                - '*'
+              AllowedHeaders:
+                - '*'
+              ExposedHeaders:
+                - ETag
+                - Content-Length
+                - Content-Type
+                - Content-Disposition
+              MaxAge: 3000
+        BucketEncryption:
+          ServerSideEncryptionConfiguration:
+            - ServerSideEncryptionByDefault:
+                SSEAlgorithm: AES256
+
+    PurchaseOrderDocsBucketPolicy:
+      Type: AWS::S3::BucketPolicy
+      Properties:
+        Bucket: !Ref PurchaseOrderDocsBucket
+        PolicyDocument:
+          Statement:
+            - Effect: Allow
+              Principal: '*'
+              Action: s3:GetObject
+              Resource: !Sub '${PurchaseOrderDocsBucket.Arn}/*'

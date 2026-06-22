@@ -10,7 +10,7 @@ async function fetchAsanaProject(projectId, asanaPAT) {
     return new Promise((resolve, reject) => {
         const options = {
             hostname: 'app.asana.com',
-            path: `/api/1.0/projects/${projectId}/tasks?opt_fields=name,custom_fields,created_at`,
+            path: `/api/1.0/projects/${projectId}/tasks?opt_fields=name,custom_fields,created_at,memberships.section.name`,
             method: 'GET',
             headers: {
                 'Authorization': `Bearer ${asanaPAT}`,

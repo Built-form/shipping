@@ -18,6 +18,12 @@ function transformAsanaToCSV(tasks) {
                 }
             });
         }
+
+        // Section heading is the internal container number (overrides any
+        // custom field of the same name).
+        const section = task.memberships?.[0]?.section?.name;
+        if (section) row['Section/Column'] = section.trim();
+
         return row;
     });
 }

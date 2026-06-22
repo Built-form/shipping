@@ -1,6 +1,7 @@
 {
   "permissions": {
     "allow": [
+      "Bash(curl:*)",
       "WebFetch(domain:help.daasity.com)",
       "WebFetch(domain:spapi.cyou)",
       "WebFetch(domain:www.hopted.com)",
@@ -32,7 +33,14 @@
       "Bash(grep -r \"amazon_stock_country_snapshots\\\\|amazon_oos_daily\" /c/Users/OpsLondon/shipping/*.js)",
       "Bash(curl -s \"http://localhost:3001/api/v1/stock-snapshots/oos-dates?asin=B0G1TG6XHT\")",
       "PowerShell($env:Path = \"C:\\\\Program Files\\\\nodejs;$env:Path\"; node _alter-cols.js)",
-      "PowerShell($env:Path = \"C:\\\\Program Files\\\\nodejs;$env:Path\"; node _reprocess-all.js)"
+      "PowerShell($env:Path = \"C:\\\\Program Files\\\\nodejs;$env:Path\"; node _reprocess-all.js)",
+      "Bash(\"/c/Program Files/nodejs/node.exe\" --check c:/Users/OpsLondon/shipping/src/handlers/orders.js)",
+      "Bash(\"/c/Program Files/nodejs/node.exe\" --check c:/Users/OpsLondon/shipping/src/handlers/shipsgo-containers.js)",
+      "Bash(\"/c/Program Files/nodejs/node.exe\" --check c:/Users/OpsLondon/shipping/src/services/shipsgo.js)",
+      "Bash(curl -s \"https://api.mintsoft.co.uk/swagger\" -L -o /tmp/sw.html)",
+      "Read(//tmp/**)",
+      "Bash(curl -s \"https://api.mintsoft.co.uk/swagger/ui/index\" -L)",
+      "PowerShell(*)"
     ],
     "additionalDirectories": [
       "C:\\Users\\OpsLondon\\joshdex"

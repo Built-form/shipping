@@ -19,9 +19,16 @@ function getPool() {
             // when rendered via .toISOString(). DATETIME/TIMESTAMP still come
             // back as Date objects.
             dateStrings: ['DATE'],
-        });
-        pool.on('connection', (conn) => {
-            conn.query('SET SESSION wait_timeout = 80, SESSION interactive_timeout = 80');
+            // Reap idle connections client-side (driver level) rather than with
+            // a server-side `SET SESSION wait_timeout`. The deployed path now
+            // runs through the RDS Proxy: a SET SESSION pins the connection and
+            // defeats multiplexing, whereas idleTimeout closes idle pooled
+            // connections without touching session state. Matches perp.js (the
+            // joshdex API) on the same proxy.
+            queueLimit: 0,
+            idleTimeout: 60000,
+            enableKeepAlive: true,
+            keepAliveInitialDelay: 10000,
         });
     }
     return pool;

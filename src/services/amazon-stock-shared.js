@@ -3,21 +3,10 @@
 const axios = require('axios');
 const log = require('../lib/logger');
 
-// ── Accounts ────────────────────────────────────────────────────────────────────
-const ACCOUNTS = {
-    JFA: {
-        clientId: process.env.AMAZON_SP_CLIENT_ID,
-        clientSecret: process.env.AMAZON_SP_CLIENT_SECRET,
-        refreshToken: process.env.AMAZON_SP_REFRESH_TOKEN,
-    },
-    Hangerworld: {
-        clientId: process.env.AMAZON_SP_CLIENT_ID_HW,
-        clientSecret: process.env.AMAZON_SP_CLIENT_SECRET_HW,
-        refreshToken: process.env.AMAZON_SP_REFRESH_TOKEN_HW,
-    },
-};
-
 // ── Regions ─────────────────────────────────────────────────────────────────────
+// SP-API endpoints are per-region: a report requested against the NA endpoint
+// must also be polled/downloaded against NA. Country code → region is derived
+// from these marketplace maps (see getRegionForCountry / getEndpointForCountry).
 const REGIONS = {
     EU: {
         endpoint: 'https://sellingpartnerapi-eu.amazon.com',
@@ -26,10 +15,62 @@ const REGIONS = {
             FR: 'A13V1IB3VIYZZH', ES: 'A1RKKUPIHCS9HS', IT: 'APJ6JRA9NG5V4',
         },
     },
+    NA: {
+        endpoint: 'https://sellingpartnerapi-na.amazon.com',
+        marketplaces: {
+            US: 'ATVPDKIKX0DER',
+        },
+    },
 };
+
+// ── Accounts ────────────────────────────────────────────────────────────────────
+// Credentials are per-region: an LWA refresh token is only valid for the region
+// it was authorized against. Hangerworld's NA authorization reuses the same HW
+// SP-API app (client id/secret) with a separate NA-authorized refresh token, so
+// only the refresh token differs between EU and NA. `countries` lists which
+// marketplaces each account actually sells in (JFA is EU-only; HW adds US).
+const ACCOUNTS = {
+    JFA: {
+        countries: ['DE', 'UK', 'FR', 'ES', 'IT'],
+        credentials: {
+            EU: {
+                clientId: process.env.AMAZON_SP_CLIENT_ID,
+                clientSecret: process.env.AMAZON_SP_CLIENT_SECRET,
+                refreshToken: process.env.AMAZON_SP_REFRESH_TOKEN,
+            },
+        },
+    },
+    Hangerworld: {
+        countries: ['DE', 'UK', 'FR', 'ES', 'IT', 'US'],
+        credentials: {
+            EU: {
+                clientId: process.env.AMAZON_SP_CLIENT_ID_HW,
+                clientSecret: process.env.AMAZON_SP_CLIENT_SECRET_HW,
+                refreshToken: process.env.AMAZON_SP_REFRESH_TOKEN_HW,
+            },
+            NA: {
+                clientId: process.env.AMAZON_SP_CLIENT_ID_HW,
+                clientSecret: process.env.AMAZON_SP_CLIENT_SECRET_HW,
+                refreshToken: process.env.AMAZON_SP_REFRESH_TOKEN_US,
+            },
+        },
+    },
+};
+
+// FR/ES/IT receive DE's pooled Pan-EU/EFN inventory as cross-border echoes, so
+// their snapshots must be deduped against DE. DE is the primary pool; UK and US
+// are standalone single-marketplace regions that never pool with DE.
+const PAN_EU_POOLED_COUNTRIES = new Set(['FR', 'ES', 'IT']);
+function isPanEuPooled(countryCode) {
+    return PAN_EU_POOLED_COUNTRIES.has(countryCode);
+}
 
 const COUNTRY_CODES = Object.values(REGIONS).flatMap(r => Object.keys(r.marketplaces));
 const ACCOUNT_NAMES = Object.keys(ACCOUNTS);
+
+function getAccountCountries(accountName) {
+    return ACCOUNTS[accountName]?.countries || [];
+}
 
 // Report type identifiers used in amazon_report_jobs.report_type
 const REPORT_TYPES = {
@@ -54,6 +95,23 @@ function getMarketplace(countryCode) {
     throw new Error(`Unknown country code: ${countryCode}`);
 }
 
+// Region for a country code. 'ALL' (account-scoped pan_eu) is EU-scoped.
+function getRegionForCountry(countryCode) {
+    if (countryCode === 'ALL') return 'EU';
+    for (const [regionName, region] of Object.entries(REGIONS)) {
+        if (region.marketplaces[countryCode]) return regionName;
+    }
+    throw new Error(`Unknown country code: ${countryCode}`);
+}
+
+// SP-API endpoint for a country code. 'ALL' (pan_eu) uses EU.
+function getEndpointForCountry(countryCode) {
+    if (countryCode === 'ALL') return REGIONS.EU.endpoint;
+    return getMarketplace(countryCode).endpoint;
+}
+
+// Back-compat default endpoint (EU). Prefer getEndpointForCountry for anything
+// that can target a non-EU marketplace.
 function getEndpoint() {
     return REGIONS.EU.endpoint;
 }
@@ -80,13 +138,25 @@ class SPTokenManager {
     }
 }
 
-function getTokenManager(accountName) {
+// Manager cache: a fresh instance has _token=null, so its 45-minute LWA cache
+// is per-instance. Sharing one instance per (account, region) across all callers
+// keeps us under the LWA rate limit (one refresh per ~45 min, not one per call).
+// Cached per region because EU and NA use different refresh tokens.
+// Module-level state survives across warm Lambda invocations.
+const tokenManagers = new Map();
+function getTokenManager(accountName, region = 'EU') {
+    const key = `${accountName}|${region}`;
+    if (tokenManagers.has(key)) return tokenManagers.get(key);
     const account = ACCOUNTS[accountName];
     if (!account) throw new Error(`Unknown account: ${accountName}`);
-    if (!account.clientId || !account.clientSecret || !account.refreshToken) {
-        throw new Error(`Account ${accountName} missing SP-API credentials`);
+    const creds = account.credentials?.[region];
+    if (!creds) throw new Error(`Account ${accountName} has no ${region} credentials`);
+    if (!creds.clientId || !creds.clientSecret || !creds.refreshToken) {
+        throw new Error(`Account ${accountName} missing SP-API credentials for ${region}`);
     }
-    return new SPTokenManager(account.clientId, account.clientSecret, account.refreshToken);
+    const manager = new SPTokenManager(creds.clientId, creds.clientSecret, creds.refreshToken);
+    tokenManagers.set(key, manager);
+    return manager;
 }
 
 // ── Retry & Rate Limit helpers ─────────────────────────────────────────────────
@@ -126,11 +196,17 @@ async function requestReport(tokenManager, endpoint, reportType, marketplaceIds)
 }
 
 // Returns { status, documentId } — does NOT wait. Caller decides what to do.
-async function checkReport(tokenManager, endpoint, reportId) {
+// Rate-limited + retried: pollPending fires up to 10 of these back-to-back,
+// and the Reports API getReport bucket is small (2/sec), so unrate-limited
+// bursts trip 429 quickly. Account name is used to scope the per-account
+// queue in rateLimitedRequest.
+async function checkReport(tokenManager, endpoint, reportId, accountName) {
     const token = await tokenManager.getToken();
-    const res = await axios.get(`${endpoint}/reports/2021-06-30/reports/${reportId}`, {
-        headers: { 'x-amz-access-token': token },
-    });
+    const res = await withRetry(() => rateLimitedRequest(() =>
+        axios.get(`${endpoint}/reports/2021-06-30/reports/${reportId}`, {
+            headers: { 'x-amz-access-token': token },
+        })
+    , accountName), `checkReport ${reportId}`);
     return {
         status: res.data.processingStatus,
         documentId: res.data.reportDocumentId || null,
@@ -142,8 +218,15 @@ async function downloadReport(tokenManager, endpoint, reportDocumentId) {
     const res = await axios.get(`${endpoint}/reports/2021-06-30/documents/${reportDocumentId}`, {
         headers: { 'x-amz-access-token': token },
     });
-    const doc = await axios.get(res.data.url, { responseType: 'text' });
-    return doc.data;
+    // SP-API can serve documents either plain or gzip-compressed. Always
+    // download as bytes and sniff the gzip magic (1f 8b) — don't rely on
+    // res.data.compressionAlgorithm alone, since treating gzipped bytes as
+    // text yields garbage rows with garbage keys and silently writes 0 ASINs.
+    const doc = await axios.get(res.data.url, { responseType: 'arraybuffer' });
+    const buf = Buffer.from(doc.data);
+    const isGzip = buf.length >= 2 && buf[0] === 0x1f && buf[1] === 0x8b;
+    if (isGzip) return require('zlib').gunzipSync(buf).toString('utf8');
+    return buf.toString('utf8');
 }
 
 function parseTsvReport(tsv) {
@@ -194,13 +277,19 @@ async function writeSnapshots(conn, {
     accountName, countryCode, dateRan,
     listingRows, reportRows, apiSummaries, panEuAsins,
 }) {
-    // Non-DE/UK health reports echo DE's pool (Pan-EU and EFN both do this —
-    // the same FNSKU shows up as fulfillable in every EU marketplace it can
-    // serve). Dedupe by reading DE's already-written rows for this date and
-    // skipping any ASIN whose FNSKU matches DE. Assumes DE is processed first
-    // (see claimNextUnit ordering + defer in processUnit).
+    // Per-country locality (applied in the health + API loops below): each
+    // marketplace's report echoes every other marketplace's FBA pool, so a
+    // country only counts the pools it lists as its own SKU. That attributes
+    // each physical pool — including separate per-country MCI pools, and stock
+    // left over after a Pan-EU enrolment ended — to its home marketplace.
+    //
+    // FR/ES/IT additionally drop pools sharing one of DE's own FNSKUs: those
+    // are cross-border echoes of DE's single physical pool (true Pan-EU), not
+    // local stock. DE is processed first and written locality-filtered, so its
+    // stored FNSKU list is exactly DE's own pools — read it here to spot echoes.
+    // (Assumes DE first: see claimNextUnit ordering + defer in processUnit.)
     let deFnskusByAsin = null;
-    if (countryCode !== 'DE' && countryCode !== 'UK') {
+    if (isPanEuPooled(countryCode)) {
         const [deRows] = await conn.query(
             `SELECT asin, fnsku FROM amazon_stock_country_snapshots
              WHERE date_ran = ? AND country = 'DE' AND company = ?`,
@@ -214,26 +303,43 @@ async function writeSnapshots(conn, {
     }
 
     const activeAsins = new Set();
+    const activeSkus = new Set();
+
+    // ── SKU → ASIN map for EAN-keyed listing recovery ──────────────────────
+    // Some listings (especially newer ones in FR/ES/IT) use product-id-type=4
+    // (EAN) instead of type=1 (ASIN), so the listings TSV holds an EAN in the
+    // product-id column and our ASIN extraction returns empty. The API
+    // summaries call always carries both sellerSku and asin per FNSKU pool,
+    // so we use it as a fallback resolver.
+    const skuToAsin = new Map();
+    for (const item of apiSummaries) {
+        const sku = (item.sellerSku || '').trim();
+        const asin = (item.asin || '').trim();
+        if (sku && asin && !skuToAsin.has(sku)) skuToAsin.set(sku, asin);
+    }
 
     // ── Active Listings ────────────────────────────────────────────────────
     for (const row of listingRows) {
         // FR (and possibly ES/IT) return GET_MERCHANT_LISTINGS_DATA with a
         // different schema than DE/UK: no asin1/asin2/asin3, only product-id
-        // plus product-id-type. Type '1' means product-id is an ASIN.
+        // plus product-id-type. Type '1' means product-id is an ASIN; type 2
+        // (UPC), 3 (ISBN), 4 (EAN) need resolution via the API-summary map.
         const productIdType = String(row['product-id-type'] || '').trim();
-        const asin = (
+        const sku = (row['seller-sku'] || row['sku'] || '').trim();
+        let asin = (
             row['asin1'] ||
             row['asin'] ||
             (productIdType === '1' ? row['product-id'] : '') ||
             ''
         ).trim();
+        if (!asin && sku) asin = skuToAsin.get(sku) || '';
         if (!asin) continue;
         activeAsins.add(asin);
 
-        const sku = (row['seller-sku'] || row['sku'] || '').trim();
         const fnsku = (row['fulfillment-channel-sku'] || row['fnsku'] || '').trim();
         const productName = (row['item-name'] || row['product-name'] || '').trim();
         const price = parseFloat(row['price'] || '0') || 0;
+        if (sku) activeSkus.add(sku);
 
         await conn.execute(
             `INSERT INTO amazon_active_listings
@@ -260,8 +366,17 @@ async function writeSnapshots(conn, {
         const fnsku = (row['fnsku'] || '').trim();
         const sku = row['sku'] || '';
 
-        if (panEuAsins.has(asin) && countryCode !== 'DE' && countryCode !== 'UK') continue;
-        if (deFnskusByAsin && fnsku && deFnskusByAsin.get(asin)?.has(fnsku)) continue;
+        // Locality: only count a pool this marketplace lists as its own SKU.
+        // Every other country's pool merely echoes in this report; this pins
+        // each physical pool to its home marketplace (MCI, EFN, or stock left
+        // behind after an ended Pan-EU enrolment).
+        if (!activeSkus.has(sku)) continue;
+        // FR/ES/IT: a surviving pool sharing one of DE's own FNSKUs is a
+        // cross-border echo of DE's single physical pool (true Pan-EU), not
+        // local stock — drop it so it isn't double-counted against DE.
+        if (isPanEuPooled(countryCode) && fnsku && deFnskusByAsin?.get(asin)?.has(fnsku)) {
+            continue;
+        }
 
         if (!byAsin[asin]) {
             byAsin[asin] = {
@@ -286,7 +401,23 @@ async function writeSnapshots(conn, {
             a.inbound_working   += parseInt(row['inbound-working'] || '0', 10);
             a.inbound_shipped   += parseInt(row['inbound-shipped'] || '0', 10);
             a.inbound_receiving += parseInt(row['inbound-received'] || '0', 10);
-            a.reserved          += parseInt(row['Total Reserved Quantity'] || '0', 10);
+            // Amazon's `Total Reserved Quantity` is internally inconsistent: it
+            // frequently omits the FC-transfer (transshipment) portion, dropping
+            // hundreds of in-transit units from reserved (~25-55% of SKUs with
+            // FC transfer in our reports). The same report also breaks reserved
+            // into mutually-exclusive components, so take the larger of the
+            // reported total and the component sum — never under-count FC
+            // transfer, but keep the total when it captures extra reserved
+            // buckets (e.g. Staging, which overlaps FC transfer and is excluded
+            // here) that the three components don't. If a marketplace's report
+            // lacks the component columns they read as 0, so this degrades to
+            // exactly the reported total.
+            const totalReserved = parseInt(row['Total Reserved Quantity'] || '0', 10);
+            const componentReserved =
+                parseInt(row['Reserved Customer Order'] || '0', 10) +
+                parseInt(row['Reserved FC Transfer']     || '0', 10) +
+                parseInt(row['Reserved FC Processing']   || '0', 10);
+            a.reserved          += Math.max(totalReserved, componentReserved);
         }
 
         if (fnsku && !a.seen_fnskus.has(fnsku)) {
@@ -303,16 +434,32 @@ async function writeSnapshots(conn, {
     // Sum across every FNSKU pool the API returns for the same ASIN — Amazon
     // can return 7+ FNSKUs per ASIN (re-stickered units, returns, etc.) and
     // skipping all but the first silently drops real stock. Dedup by FNSKU.
+    //
+    // SKU-scoped: /fba/inventory/v1/summaries with granularityType=Marketplace
+    // does NOT actually filter to that marketplace's physical FBA — it returns
+    // every FNSKU pool registered to the seller account, including pools
+    // physically held in other countries' FBAs (e.g. ES/IT-stickered units
+    // appear in the DE call). Counting all of them inflates the country's
+    // fulfillable. So we only count an item when its sellerSku is listed in
+    // THIS country's active_listings — that's the load-bearing locality
+    // signal.
     let recoveredCount = 0;
     for (const item of apiSummaries) {
         const asin = item.asin || '';
         if (!asin) continue;
         if (byAsin[asin] && byAsin[asin]._fromHealth) continue;
         if (!activeAsins.has(asin)) continue;
-        if (panEuAsins.has(asin) && countryCode !== 'DE' && countryCode !== 'UK') continue;
+
+        const sku = (item.sellerSku || '').trim();
+        if (!sku || !activeSkus.has(sku)) continue;
 
         const fnsku = (item.fnSku || '').trim();
-        if (deFnskusByAsin && fnsku && deFnskusByAsin.get(asin)?.has(fnsku)) continue;
+
+        // FR/ES/IT echo drop (see health-report branch); locality is already
+        // enforced above via activeSkus.has(sku).
+        if (isPanEuPooled(countryCode) && fnsku && deFnskusByAsin?.get(asin)?.has(fnsku)) {
+            continue;
+        }
 
         const details = item.inventoryDetails || {};
 
@@ -336,7 +483,6 @@ async function writeSnapshots(conn, {
             a.inbound_receiving += details.inboundReceivingQuantity   || 0;
             a.reserved          += details.reservedQuantity?.totalReservedQuantity || 0;
         }
-        const sku = (item.sellerSku || '').trim();
         if (sku && !a.seen_skus.has(sku)) {
             a.seen_skus.add(sku);
             a.sku = a.sku ? a.sku + ',' + sku : sku;
@@ -369,6 +515,7 @@ async function writeSnapshots(conn, {
     // Same FNSKU-pool dedup as above — sum each pool's fulfillable once per ASIN.
     const rawByAsin = {};
     const rawSeenQtyKeys = {};
+    const rawFromHealth = new Set();
     for (const row of reportRows) {
         const asin = row['asin'] || '';
         if (!asin || !activeAsins.has(asin)) continue;
@@ -380,11 +527,28 @@ async function writeSnapshots(conn, {
         rawSeenQtyKeys[asin].add(qtyKey);
         if (!rawByAsin[asin]) rawByAsin[asin] = 0;
         rawByAsin[asin] += parseInt(row['available'] || '0', 10);
+        rawFromHealth.add(asin);
     }
+    // API fallback: only fires for ASINs the health report didn't mention.
+    // Inside a single API fallback we still accumulate across multiple FNSKU
+    // pools for the same ASIN, with the same SKU-scoping the country-snapshot
+    // fallback uses (otherwise non-DE FBA pools leak into DE's count).
     for (const item of apiSummaries) {
         const asin = item.asin || '';
-        if (!asin || rawByAsin[asin] !== undefined || !activeAsins.has(asin)) continue;
-        rawByAsin[asin] = item.inventoryDetails?.fulfillableQuantity || 0;
+        if (!asin || !activeAsins.has(asin)) continue;
+        if (rawFromHealth.has(asin)) continue;
+
+        const sku = (item.sellerSku || '').trim();
+        if (!sku || !activeSkus.has(sku)) continue;
+
+        const fnsku = (item.fnSku || '').trim();
+        if (!rawSeenQtyKeys[asin]) rawSeenQtyKeys[asin] = new Set();
+        const qtyKey = fnsku ? `f:${fnsku}` : `s:${sku}`;
+        if (rawSeenQtyKeys[asin].has(qtyKey)) continue;
+        rawSeenQtyKeys[asin].add(qtyKey);
+
+        if (rawByAsin[asin] === undefined) rawByAsin[asin] = 0;
+        rawByAsin[asin] += item.inventoryDetails?.fulfillableQuantity || 0;
     }
 
     let rawCount = 0;
@@ -414,13 +578,13 @@ async function writeSnapshots(conn, {
                  ON al.asin = r.asin AND al.company = r.company AND al.date_ran = r.date_ran
              WHERE r.date_ran = ? AND r.country = 'DE' AND r.company = ?
                AND r.asin IN (${placeholders})
-               AND al.country NOT IN ('DE', 'UK')
+               AND al.country IN ('FR', 'ES', 'IT')
              ON DUPLICATE KEY UPDATE
                  fulfillable = VALUES(fulfillable)`,
             [dateRan, accountName, ...panEuAsinList]
         );
         panEuBroadcast = result.affectedRows;
-    } else if (panEuAsinList.length > 0 && countryCode !== 'UK') {
+    } else if (panEuAsinList.length > 0 && isPanEuPooled(countryCode)) {
         const placeholders = panEuAsinList.map(() => '?').join(',');
         const [result] = await conn.execute(
             `INSERT INTO amazon_stock_raw_snapshots (date_ran, country, asin, company, fulfillable)
@@ -509,6 +673,8 @@ async function copyFailedFromPrevious(conn, countryCode, accountName) {
 module.exports = {
     ACCOUNTS, ACCOUNT_NAMES, REGIONS, COUNTRY_CODES,
     REPORT_TYPES, SP_REPORT_TYPE,
+    getAccountCountries, isPanEuPooled,
+    getRegionForCountry, getEndpointForCountry,
     getMarketplace, getEndpoint, getTokenManager,
     SPTokenManager, withRetry, rateLimitedRequest,
     requestReport, checkReport, downloadReport,

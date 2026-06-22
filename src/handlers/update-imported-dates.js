@@ -89,8 +89,10 @@ async function main() {
 
     // Build name -> ETA map (ShipsGoETA preferred, ETA to Port fallback)
     // Build name -> Delivery Date map
+    // Build name -> Container No. map (sync to Goods on Sea as "External Container Number")
     const etaMap = {};
     const deliveryDateMap = {};
+    const containerNoMap = {};
     for (const task of seaFreightTasks) {
         const shipsGoField = task.custom_fields?.find(f =>
             f.name && f.name.toLowerCase().replace(/[\s_]/g, '') === 'shipsgoeta'
@@ -100,6 +102,9 @@ async function main() {
         );
         const deliveryField = task.custom_fields?.find(f =>
             f.name && f.name.toLowerCase() === 'delivery date'
+        );
+        const containerNoField = task.custom_fields?.find(f =>
+            f.name && f.name.toLowerCase().replace(/\./g, '').trim() === 'container no'
         );
 
         let dateVal = null;
@@ -147,14 +152,23 @@ async function main() {
             deliveryDateMap[task.name.trim()] = deliveryVal;
             console.log(`  ${task.name}: Delivery Date = ${deliveryVal}`);
         }
+
+        // Container No.
+        const containerNoVal = containerNoField?.display_value?.trim() || null;
+        if (containerNoVal) {
+            containerNoMap[task.name.trim()] = containerNoVal;
+            console.log(`  ${task.name}: Container No. = ${containerNoVal}`);
+        }
     }
 
     const matchCount = Object.keys(etaMap).length;
     const deliveryCount = Object.keys(deliveryDateMap).length;
+    const containerNoCount = Object.keys(containerNoMap).length;
     console.log(`\nBuilt ETA map with ${matchCount} entries`);
     console.log(`Built Delivery Date map with ${deliveryCount} entries`);
-    if (matchCount === 0) {
-        console.log('No ETAs found, nothing to update.');
+    console.log(`Built Container No. map with ${containerNoCount} entries`);
+    if (matchCount === 0 && deliveryCount === 0 && containerNoCount === 0) {
+        console.log('Nothing to update.');
         return;
     }
 
@@ -170,15 +184,20 @@ async function main() {
     );
     let etaFieldGid = null;
     let deliveryDateFieldGid = null;
+    let externalContainerNumberFieldGid = null;
     if (sampleResp.data && sampleResp.data.length > 0) {
         const fields = sampleResp.data[0].custom_fields || [];
         for (const f of fields) {
             console.log(`  Field: "${f.name}" (${f.gid}) type=${f.type}`);
-            if (f.name && f.name.toLowerCase() === 'eta to port') {
+            const lname = f.name ? f.name.toLowerCase() : '';
+            if (lname === 'eta to port') {
                 etaFieldGid = f.gid;
             }
-            if (f.name && f.name.toLowerCase() === 'delivery date') {
+            if (lname === 'delivery date') {
                 deliveryDateFieldGid = f.gid;
+            }
+            if (lname === 'external container number') {
+                externalContainerNumberFieldGid = f.gid;
             }
         }
     }
@@ -195,6 +214,12 @@ async function main() {
         console.log(`Using Delivery Date field GID: ${deliveryDateFieldGid}`);
     }
 
+    if (!externalContainerNumberFieldGid) {
+        console.warn('\nCould not find "External Container Number" custom field in target project! Will skip container number updates. Add a text custom field named "External Container Number" to project ' + TARGET_PROJECT + '.');
+    } else {
+        console.log(`Using External Container Number field GID: ${externalContainerNumberFieldGid}`);
+    }
+
     // 5. Match sections and update tasks
     let totalUpdated = 0;
     let totalFailed = 0;
@@ -202,10 +227,12 @@ async function main() {
         const sectionName = section.name.trim();
         const etaValue = etaMap[sectionName];
         const deliveryValue = deliveryDateMap[sectionName];
-        if (!etaValue && !deliveryValue) continue;
+        const containerNoValue = containerNoMap[sectionName];
+        if (!etaValue && !deliveryValue && !containerNoValue) continue;
 
         if (etaValue) console.log(`\nSection "${sectionName}" -> ETA to Port = ${etaValue}`);
         if (deliveryValue) console.log(`${etaValue ? '' : '\n'}Section "${sectionName}" -> Delivery Date = ${deliveryValue}`);
+        if (containerNoValue) console.log(`Section "${sectionName}" -> External Container Number = ${containerNoValue}`);
 
         const tasks = await fetchAllPages(`/sections/${section.gid}/tasks?opt_fields=name`);
         console.log(`  ${tasks.length} tasks to update`);
@@ -218,6 +245,9 @@ async function main() {
                 }
                 if (deliveryValue && deliveryDateFieldGid) {
                     customFields[deliveryDateFieldGid] = { date: deliveryValue };
+                }
+                if (containerNoValue && externalContainerNumberFieldGid) {
+                    customFields[externalContainerNumberFieldGid] = containerNoValue;
                 }
 
                 const resp = await asanaRequest('PUT', `/tasks/${task.gid}`, {
@@ -244,7 +274,7 @@ async function main() {
 exports.handler = async (event) => {
     try {
         await main();
-        return { statusCode: 200, body: JSON.stringify({ message: 'ETA to Port and Delivery Date updated' }) };
+        return { statusCode: 200, body: JSON.stringify({ message: 'ETA to Port, Delivery Date, and External Container Number updated' }) };
     } catch (err) {
         console.error('Fatal:', err.message);
         return { statusCode: 500, body: JSON.stringify({ error: err.message }) };
