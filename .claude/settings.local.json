@@ -1,5 +1,8 @@
 {
+  "skipWorkflowUsageWarning": true,
+  "skipAutoPermissionPrompt": true,
   "permissions": {
+    "defaultMode": "auto",
     "allow": [
       "Bash(curl:*)",
       "WebFetch(domain:help.daasity.com)",
@@ -40,7 +43,21 @@
       "Bash(curl -s \"https://api.mintsoft.co.uk/swagger\" -L -o /tmp/sw.html)",
       "Read(//tmp/**)",
       "Bash(curl -s \"https://api.mintsoft.co.uk/swagger/ui/index\" -L)",
-      "PowerShell(*)"
+      "PowerShell(*)",
+      "Bash(git -C c:/Users/OpsLondon/shipping diff --stat HEAD)",
+      "Bash(git -C c:/Users/OpsLondon/shipping --no-pager diff --no-color --text HEAD -- src/services/qc-report-check.js)",
+      "Bash(git -C c:/Users/OpsLondon/shipping --no-pager diff --no-color HEAD -- src/handlers/orders.js)",
+      "Bash(git -C c:/Users/OpsLondon/shipping ls-files -v -- .claude/settings.local.json)",
+      "Bash(git -C c:/Users/OpsLondon/shipping --no-pager diff --no-color HEAD -- .claude/settings.local.json)",
+      "Bash(git -C c:/Users/OpsLondon/shipping diff HEAD -- src/handlers/orders.js)",
+      "Bash(git -C c:/Users/OpsLondon/shipping show HEAD:src/handlers/orders.js)",
+      "Read",
+      "Glob",
+      "Grep",
+      "Edit(//c/Users/OpsLondon/shipping/**)",
+      "Write(//c/Users/OpsLondon/shipping/**)",
+      "Workflow",
+      "Agent"
     ],
     "additionalDirectories": [
       "C:\\Users\\OpsLondon\\joshdex"

@@ -65,8 +65,24 @@ function frontHeaders() {
     return { Authorization: `Bearer ${process.env.FRONT_API_TOKEN}`, Accept: 'application/json' };
 }
 
-async function frontGetJson(url) {
+async function frontGetJson(url, _attempt = 0) {
     const resp = await fetch(url, { headers: frontHeaders() });
+    // Front rate-limits the search route (and others) with 429s and a precise
+    // Retry-After. Without this the whole import dies mid-run; respect the hint
+    // (header seconds, or the "retry in N milliseconds" body) and retry.
+    if ((resp.status === 429 || resp.status === 503) && _attempt < 8) {
+        let waitMs = 0;
+        const ra = resp.headers.get('retry-after');
+        if (ra && Number.isFinite(Number(ra))) waitMs = Number(ra) * 1000;
+        if (!waitMs) {
+            const body = await resp.text().catch(() => '');
+            const m = body.match(/retry in (\d+)\s*milliseconds/i);
+            if (m) waitMs = Number(m[1]);
+        }
+        if (!waitMs) waitMs = Math.min(30000, 1000 * 2 ** _attempt);
+        await new Promise(r => setTimeout(r, waitMs + 300));
+        return frontGetJson(url, _attempt + 1);
+    }
     if (!resp.ok) {
         const body = await resp.text().catch(() => '');
         const e = new Error(`Front GET ${url} -> ${resp.status} ${body.slice(0, 200)}`);
@@ -553,4 +569,16 @@ module.exports = {
     fetchJianguoyunReport,
     reportSourcesFromMessage,
     looksLikeQcThread,
+    // ── Shared Front API client ──────────────────────────────────────────────
+    // Reused by src/services/front-status-import.js so the Front HTTP client,
+    // search/list pagination, and message helpers have a single home here.
+    frontGetJson,
+    searchConversations,
+    listMessages,
+    messageFromEmail,
+    emailInDomain,
+    messageText,
+    messageBodySnippet,
+    cleanSubject,
+    frontWebUrl,
 };

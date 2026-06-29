@@ -78,7 +78,39 @@
       "PowerShell(& \"C:\\\\Program Files\\\\nodejs\\\\node.exe\" tools/sql.js \"DELETE FROM amazon_stock_country_snapshots WHERE date_ran=CURDATE\\(\\)\")",
       "PowerShell(& \"C:\\\\Program Files\\\\nodejs\\\\node.exe\" tools/sql.js \"DELETE FROM amazon_stock_raw_snapshots WHERE date_ran=CURDATE\\(\\)\")",
       "PowerShell(& \"C:\\\\Program Files\\\\nodejs\\\\node.exe\" tools/sql.js \"UPDATE amazon_report_jobs SET status='DONE', processed_at=NULL, claim_token=NULL, claimed_at=NULL, result_cache=NULL WHERE batch_date=CURDATE\\(\\) AND status='PROCESSED'\")",
-      "Bash(node -e \"const g=require\\('@google/genai'\\); const ai=new g.GoogleGenAI\\({apiKey:'x'}\\); let o=ai.files, names=new Set\\(\\); while\\(o\\){Object.getOwnPropertyNames\\(o\\).forEach\\(n=>names.add\\(n\\)\\); o=Object.getPrototypeOf\\(o\\);} console.log\\([...names].filter\\(n=>/upload|get|list|delete/i.test\\(n\\)\\)\\); console.log\\('FileState', g.FileState\\);\")"
+      "Bash(node -e \"const g=require\\('@google/genai'\\); const ai=new g.GoogleGenAI\\({apiKey:'x'}\\); let o=ai.files, names=new Set\\(\\); while\\(o\\){Object.getOwnPropertyNames\\(o\\).forEach\\(n=>names.add\\(n\\)\\); o=Object.getPrototypeOf\\(o\\);} console.log\\([...names].filter\\(n=>/upload|get|list|delete/i.test\\(n\\)\\)\\); console.log\\('FileState', g.FileState\\);\")",
+      "Bash(git -C c:/Users/OpsLondon/shipping show HEAD:src/handlers/orders.js > /tmp/orders_orig.js 2>&1; wc -l /tmp/orders_orig.js)",
+      "Bash(git -C c:/Users/OpsLondon/shipping show HEAD:src/handlers/orders.js > /tmp/orders_head.js && wc -l /tmp/orders_head.js)",
+      "Bash(git -C c:/Users/OpsLondon/shipping diff HEAD -- serverless.yml)",
+      "Bash(git -C c:/Users/OpsLondon/shipping diff HEAD -- src/services/qc-report-check.js)",
+      "Bash(git -C c:/Users/OpsLondon/shipping show HEAD:src/handlers/orders.js > /tmp/orders_orig.js && wc -l /tmp/orders_orig.js)",
+      "Bash(git -C c:/Users/OpsLondon/shipping grep -n \"deepEqual\\\\|diffSnapshots\\\\|recordAudit\" -- src/handlers/orders.js)",
+      "Bash(git -C c:/Users/OpsLondon/shipping diff HEAD --numstat -- serverless.yml)",
+      "Bash(git -C c:/Users/OpsLondon/shipping grep -n \"deepEqual\\\\|diffSnapshots\\\\|recordAudit\" HEAD -- src/handlers/orders.js)",
+      "Bash(git -C c:/Users/OpsLondon/shipping status --short -- src/handlers/orders.js src/lib/audit.js)",
+      "Bash(git -C c:/Users/OpsLondon/shipping cat-file -t HEAD:src/lib/audit.js)",
+      "Bash(echo \"=== exit code: $? \\(grep returns 1 = no matches = good\\) ===\")",
+      "Bash(xxd)",
+      "Bash(git diff *)",
+      "Bash(grep -vE '^\\\\s*//' head_funcs.txt)",
+      "Bash(grep -vE '^\\\\s*$')",
+      "Bash(grep -vE '^\\\\s*//' audit_funcs.txt)",
+      "Bash(git -C c:/Users/OpsLondon/shipping grep -n \"deepEqual\\\\|diffSnapshots\" -- src/handlers/orders.js)",
+      "Bash(git -C c:/Users/OpsLondon/shipping grep -n \"require\\('../lib/audit'\\)\\\\|function deepEqual\\\\|function diffSnapshots\\\\|async function recordAudit\\\\|function recordAudit\" -- src/handlers/orders.js)",
+      "Bash(node --check src/lib/audit.js)",
+      "Bash(node --check src/lib/order-shape.js)",
+      "Bash(node --check src/services/order-receive.js)",
+      "Bash(node --check src/services/mintsoft-locations.js)",
+      "Bash(echo \"EXIT=$? \\(1=none=good\\)\")",
+      "Bash(grep -l \"app\\\\\\\\.get\\\\\\\\|app\\\\\\\\.post\\\\\\\\|app\\\\\\\\.patch\" \"c:/Users/OpsLondon/shipping/src/handlers\"/*.js)",
+      "Skill(update-config)",
+      "Skill(update-config:*)",
+      "Bash(node -e \"JSON.parse\\(require\\('fs'\\).readFileSync\\('c:/Users/OpsLondon/shipping/.claude/settings.local.json','utf8'\\)\\); console.log\\('valid JSON; defaultMode=auto set'\\)\")",
+      "Bash(python -c \"import json; json.load\\(open\\('c:/Users/OpsLondon/shipping/.claude/settings.local.json'\\)\\); print\\('valid JSON'\\)\")",
+      "Bash(xargs grep -l \"pool\\\\|mysql\")"
+    ],
+    "additionalDirectories": [
+      "\\tmp"
     ]
   }
 }

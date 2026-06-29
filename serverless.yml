@@ -57,6 +57,37 @@ provider:
     FRONT_API_TOKEN: ${env:FRONT_API_TOKEN, ''}
     FRONT_CHANNEL_ID: ${env:FRONT_CHANNEL_ID, ''}
     GEMINI_API_KEY: ${env:GEMINI_API_KEY, ''}
+    # Front -> Gemini order-status suggestion importer (frontStatusImport).
+    # STATUS_IMPORT_DOMAINS: optional comma-separated extra supplier domains
+    # and/or full addresses to scan, on top of the suppliers tables. Leave blank
+    # to scan only onboarded suppliers. CONF_MIN: min Gemini confidence (0..1) to
+    # surface a suggestion. MAX_GEMINI: per-run Gemini call cap (cost guard).
+    STATUS_IMPORT_DOMAINS: ${env:STATUS_IMPORT_DOMAINS, ''}
+    STATUS_IMPORT_CONF_MIN: ${env:STATUS_IMPORT_CONF_MIN, '0.6'}
+    STATUS_IMPORT_MAX_GEMINI: ${env:STATUS_IMPORT_MAX_GEMINI, '40'}
+    # Incremental look-back: each run scans since the last fully-drained run minus
+    # OVERLAP_HOURS, never further back than MAX_LOOKBACK_DAYS (outage cap).
+    STATUS_IMPORT_OVERLAP_HOURS: ${env:STATUS_IMPORT_OVERLAP_HOURS, '6'}
+    STATUS_IMPORT_MAX_LOOKBACK_DAYS: ${env:STATUS_IMPORT_MAX_LOOKBACK_DAYS, '7'}
+    # Front email → order indexer (frontEmailIndex). Deterministic identifier
+    # matching (PO/container/AWB/SKU/lot) over ALL recent Front mail, with a gated
+    # Gemini Flash fallback on the no-identifier residual. MAX_GEMINI: per-run Flash
+    # cap (cost guard). OVERLAP/MAX_LOOKBACK mirror the status importer's window.
+    EMAIL_INDEX_MAX_GEMINI: ${env:EMAIL_INDEX_MAX_GEMINI, '25'}
+    EMAIL_INDEX_OVERLAP_HOURS: ${env:EMAIL_INDEX_OVERLAP_HOURS, '6'}
+    EMAIL_INDEX_MAX_LOOKBACK_DAYS: ${env:EMAIL_INDEX_MAX_LOOKBACK_DAYS, '30'}
+    # Absolute hard ceiling: no run (incremental OR a manual sinceDays backfill)
+    # ever indexes email older than this. Six months.
+    EMAIL_INDEX_MAX_IMPORT_DAYS: ${env:EMAIL_INDEX_MAX_IMPORT_DAYS, '180'}
+    # Remaining tunables (so the deployed Lambda can be retuned via env, not a
+    # redeploy — most importantly the Flash model id if the preview is retired).
+    EMAIL_INDEX_GEMINI_MODEL: ${env:EMAIL_INDEX_GEMINI_MODEL, 'gemini-3-flash-preview'}
+    EMAIL_INDEX_MAX_CONVERSATIONS: ${env:EMAIL_INDEX_MAX_CONVERSATIONS, '4000'}
+    EMAIL_INDEX_MAX_PRODUCT_FANOUT: ${env:EMAIL_INDEX_MAX_PRODUCT_FANOUT, '12'}
+    EMAIL_INDEX_FUZZY_CAP: ${env:EMAIL_INDEX_FUZZY_CAP, '3'}
+    # Shared six-digit code for the PUBLIC carton-scan receiving API
+    # (cartonScanApi). Sent on the X-Quick-Auth header; checked in-handler.
+    RECEIVING_QUICK_AUTH_CODE: ${env:RECEIVING_QUICK_AUTH_CODE, ''}
   iam:
     role:
       statements:
@@ -104,6 +135,12 @@ package:
     - '!node_modules/**/*.d.ts'
     - '!node_modules/**/*.md'
     - '!node_modules/**/*.ts'
+    - '!node_modules/**/*.map'
+    # ESM mirror builds (@aws-sdk/@smithy ship dist-cjs AND dist-es). The Lambda
+    # runtime require()s the CJS build, so dist-es is ~1,300 dead files that only
+    # inflate the node_modules walk and trip EMFILE on Windows. Never runtime.
+    - '!node_modules/**/dist-es/**'
+    - '!node_modules/**/system-test/**'
     - '!node_modules/**/test/**'
     - '!node_modules/**/tests/**'
     - '!node_modules/**/__tests__/**'
@@ -438,6 +475,24 @@ functions:
           method: DELETE
           authorizer:
             name: googleJwtAuthorizer
+      # ── Daily alerts (slide-out alert window) ──
+      # GET /alerts (slider list), GET /alerts/history (past + who dismissed),
+      # PATCH /alerts/{id}/acknowledge. Populated nightly by generateDailyAlerts.
+      - httpApi:
+          path: /api/v1/alerts
+          method: GET
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/alerts/{proxy+}
+          method: GET
+          authorizer:
+            name: googleJwtAuthorizer
+      - httpApi:
+          path: /api/v1/alerts/{proxy+}
+          method: PATCH
+          authorizer:
+            name: googleJwtAuthorizer
 
   # ── Supplier "ready date" portal (PUBLIC — no authorizer) ──
   # External suppliers (no Google login) set the estimated ready date on their
@@ -455,6 +510,32 @@ functions:
       - httpApi:
           path: /api/v1/portal/po-ready-date
           method: POST
+
+  # ── Carton-scan receiving (PUBLIC — no authorizer) ──
+  # Warehouse staff receive stock from a carton scan without a Google login.
+  # Gated by a single shared six-digit code (RECEIVING_QUICK_AUTH_CODE) on the
+  # X-Quick-Auth header, checked inside the handler — not by API Gateway.
+  # Isolated in its own function so the public surface is just these routes.
+  # Low concurrency + per-route throttling (below) cap abuse.
+  cartonScanApi:
+    handler: src/handlers/carton-scan.handler
+    reservedConcurrency: 5
+    events:
+      - httpApi:
+          path: /api/v1/scan/lookup
+          method: POST
+      - httpApi:
+          path: /api/v1/scan/receive
+          method: POST
+      - httpApi:
+          path: /api/v1/scan/warehouses
+          method: GET
+      - httpApi:
+          path: /api/v1/scan/warehouses/{warehouseId}/locations
+          method: GET
+      - httpApi:
+          path: /api/v1/scan/gemini-key
+          method: GET
 
   stockSnapshot:
     handler: src/handlers/mintsoft-snapshot.handler
@@ -583,6 +664,56 @@ functions:
           rate: rate(1 hour)
           enabled: true
 
+  # ── Front -> Gemini order-status suggestions (hourly) ──
+  # Reads recent inbound supplier emails from Front, asks Gemini to infer an
+  # order status change (PO_SENT/IN_PRODUCTION/READY/READY_FOR_QC/ON_SEA/ON_AIR),
+  # matches the PO to live orders, and queues PENDING 'status_suggestion' alerts
+  # in daily_alerts for a human to approve/deny in ShipLine. AI never mutates an
+  # order — approval is the authed PATCH /api/v1/alerts/:id/approve route.
+  # Idempotent (dedup on front_status_imports.source_ref); a keyword pre-filter +
+  # per-run Gemini cap bound cost. 1024 MB + concurrency 1 mirror qcFrontImport;
+  # inherits the 900s provider timeout for the per-message Gemini calls.
+  frontStatusImport:
+    handler: src/handlers/front-status-import.handler
+    memorySize: 1024
+    reservedConcurrency: 1
+    events:
+      - schedule:
+          rate: rate(1 hour)
+          enabled: true
+
+  # ── Front email → order indexer (hourly) ──
+  # Walks recent Front conversations (ALL senders), matches known order
+  # identifiers (PO / container / AWB / SKU / lot) in the thread text, and writes
+  # link rows into order_emails so the UI can list every email about an order
+  # (GET /api/v1/orders/:id/emails). Deterministic + a gated Gemini Flash fallback
+  # on the residual. Idempotent (per-conversation dedup ledger + watermark); empty
+  # runs are ~seconds. 1024 MB + concurrency 1 mirror the other Front importers;
+  # inherits the 900s provider timeout for the per-residual Flash calls.
+  frontEmailIndex:
+    handler: src/handlers/front-email-index.handler
+    memorySize: 1024
+    reservedConcurrency: 1
+    events:
+      - schedule:
+          rate: rate(1 hour)
+          enabled: true
+
+  # ── Daily alerts generator (nightly) ──
+  # Aggregates the day's container ETAs + supplier ready dates into the
+  # daily_alerts table for the Shipsline slide-out alert window. Runs at 04:00
+  # UTC (early-morning UK, after midnight) so "today" (Europe/London) is
+  # unambiguous and the latest ETAs are in. Idempotent (INSERT IGNORE on a
+  # stable dedup_key); concurrency 1 so a manual invoke can't overlap the tick.
+  generateDailyAlerts:
+    handler: src/handlers/generate-daily-alerts.handler
+    timeout: 300
+    reservedConcurrency: 1
+    events:
+      - schedule:
+          rate: cron(0 4 * * ? *)
+          enabled: true
+
 #plugins:
 #  - serverless-offline
 
@@ -597,6 +728,23 @@ resources:
   # ample for a handful of suppliers and trivially raised here if needed.
   extensions:
     HttpApiStage:
+      # CloudFormation does NOT infer a dependency from a Stage's RouteSettings
+      # to the Route resources those keys name. Without this, CFN updates the
+      # stage (adding RouteSettings for a brand-new route) in parallel with —
+      # often BEFORE — the route itself is created, so the stage update fails
+      # with "Unable to find Route by key ..." and the whole deploy rolls back
+      # (and the rollback then jams the stack in UPDATE_ROLLBACK_FAILED). Pin an
+      # explicit DependsOn on every route key referenced in RouteSettings so the
+      # routes always exist first. Add the route's logical id here whenever you
+      # add a throttled public route below.
+      DependsOn:
+        - HttpApiRoutePostApiV1PortalPoDashlookup
+        - HttpApiRoutePostApiV1PortalPoDashreadyDashdate
+        - HttpApiRoutePostApiV1ScanLookup
+        - HttpApiRoutePostApiV1ScanReceive
+        - HttpApiRouteGetApiV1ScanWarehouses
+        - HttpApiRouteGetApiV1ScanWarehousesWarehouseidVarLocations
+        - HttpApiRouteGetApiV1ScanGeminiDashkey
       Properties:
         RouteSettings:
           'POST /api/v1/portal/po-lookup':
@@ -605,6 +753,24 @@ resources:
           'POST /api/v1/portal/po-ready-date':
             ThrottlingRateLimit: 5
             ThrottlingBurstLimit: 10
+          # PUBLIC carton-scan receiving routes — same code-only gating, so
+          # throttle brute force at the edge. gemini-key reveals a secret, so
+          # it's throttled tighter.
+          'POST /api/v1/scan/lookup':
+            ThrottlingRateLimit: 5
+            ThrottlingBurstLimit: 10
+          'POST /api/v1/scan/receive':
+            ThrottlingRateLimit: 5
+            ThrottlingBurstLimit: 10
+          'GET /api/v1/scan/warehouses':
+            ThrottlingRateLimit: 5
+            ThrottlingBurstLimit: 10
+          'GET /api/v1/scan/warehouses/{warehouseId}/locations':
+            ThrottlingRateLimit: 5
+            ThrottlingBurstLimit: 10
+          'GET /api/v1/scan/gemini-key':
+            ThrottlingRateLimit: 2
+            ThrottlingBurstLimit: 5
   Resources:
     PurchaseOrderDocsBucket:
       Type: AWS::S3::Bucket

@@ -23,11 +23,12 @@ const TABLE_LEFT = 50;
 const TABLE_WIDTH = 490;
 const ROW_H = 28;
 const COLS = [
-    { header: 'Ref',      x: 50,  w: 70,  align: 'center' },
-    { header: 'Item',     x: 120, w: 200, align: 'center' },
-    { header: 'Quantity', x: 320, w: 60,  align: 'center' },
-    { header: 'CBM',      x: 380, w: 70,  align: 'center' },
-    { header: 'Cartons',  x: 450, w: 70,  align: 'center' },
+    { header: 'Ref',      x: 50,  w: 55,  align: 'center' },
+    { header: 'Item',     x: 105, w: 160, align: 'center' },
+    { header: 'Lot',      x: 265, w: 70,  align: 'center' },
+    { header: 'Quantity', x: 335, w: 55,  align: 'center' },
+    { header: 'CBM',      x: 390, w: 70,  align: 'center' },
+    { header: 'Cartons',  x: 460, w: 75,  align: 'center' },
 ];
 
 function fmtNumber(n, dp = 2) {
@@ -107,11 +108,15 @@ function drawTableHeader(doc, y) {
 function drawRow(doc, y, line) {
     doc.lineWidth(0.5).rect(TABLE_LEFT, y, TABLE_WIDTH, ROW_H).stroke('#000');
     doc.font('Helvetica').fontSize(10).fillColor('#000');
-    doc.text(line.sku || '',                50,  y + 9, { width: 70,  align: 'center' });
-    doc.text(line.name || '',               120, y + 9, { width: 200, align: 'center' });
-    doc.text(String(line.quantity || 0),    320, y + 9, { width: 60,  align: 'center' });
-    doc.text(fmtNumber(line.cbm, 3),        380, y + 9, { width: 70,  align: 'center' });
-    doc.text(fmtInt(line.cartons),          450, y + 9, { width: 70,  align: 'center' });
+    doc.text(line.sku || '',                       50,  y + 9, { width: 55,  align: 'center' });
+    doc.text(fitText(doc, line.name || '', 160),   105, y + 9, { width: 160, align: 'center' });
+    const lotTxt = line.lot == null ? '' : String(line.lot);
+    const lotSize = fitFontSize(doc, lotTxt, 70, 10);
+    doc.fontSize(lotSize).text(lotTxt, 265, y + 9 + (10 - lotSize) / 2, { width: 70, align: 'center', lineBreak: false });
+    doc.fontSize(10);
+    doc.text(String(line.quantity || 0),           335, y + 9, { width: 55,  align: 'center' });
+    doc.text(fmtNumber(line.cbm, 3),               390, y + 9, { width: 70,  align: 'center' });
+    doc.text(fmtInt(line.cartons),                 460, y + 9, { width: 75,  align: 'center' });
     return { yNext: y + ROW_H };
 }
 
@@ -199,22 +204,23 @@ const FQ_ROW_H = 16;
 const FQ_PAGE_BOTTOM = 560; // landscape A4 height 595 − bottom margin
 
 const FQ_COLS = [
-    { key: 'sku',             header: 'SKU',                w: 104, align: 'left'  },
+    { key: 'sku',             header: 'SKU',                w: 90,  align: 'left'  },
     { key: 'jfCode',          header: 'HW/JF Code',         w: 50,  align: 'left'  },
+    { key: 'lot',             header: 'LOT',                w: 64,  align: 'left'  },
     { key: 'orderedUnits',    header: 'Ordered Units',      w: 46,  align: 'right', fmt: fmtInt },
     { key: 'cartonWeight',    header: 'Carton Weight (kg)', w: 46,  align: 'right', fmt: v => fmtNumber(v, 2) },
     { key: 'unitsPerCarton',  header: 'Units per Carton',   w: 42,  align: 'right', fmt: fmtInt },
     { key: 'cartonH',         header: 'Carton H (cm)',      w: 36,  align: 'right', fmt: v => fmtNumber(v, 1) },
     { key: 'cartonL',         header: 'Carton L (cm)',      w: 36,  align: 'right', fmt: v => fmtNumber(v, 1) },
     { key: 'cartonW',         header: 'Carton W (cm)',      w: 36,  align: 'right', fmt: v => fmtNumber(v, 1) },
-    { key: 'cartonCbm',       header: 'Carton CBM',         w: 52,  align: 'right', fmt: v => fmtNumber(v, 4) },
+    { key: 'cartonCbm',       header: 'Carton CBM',         w: 48,  align: 'right', fmt: v => fmtNumber(v, 4) },
     { key: 'noOfCartons',     header: 'No. of Cartons',     w: 40,  align: 'right', fmt: fmtInt },
-    { key: 'totalCbm',        header: 'Total CBM',          w: 52,  align: 'right', fmt: v => fmtNumber(v, 4) },
-    { key: 'totalWeight',     header: 'Total Weight (kg)',  w: 48,  align: 'right', fmt: v => fmtNumber(v, 2),
+    { key: 'totalCbm',        header: 'Total CBM',          w: 48,  align: 'right', fmt: v => fmtNumber(v, 4) },
+    { key: 'totalWeight',     header: 'Total Weight (kg)',  w: 44,  align: 'right', fmt: v => fmtNumber(v, 2),
       compute: l => Number(l.cartonWeight || 0) * Number(l.noOfCartons || 0) },
-    { key: 'supplier',        header: 'Supplier',           w: 88,  align: 'left'  },
-    { key: 'port',            header: 'Port',               w: 56,  align: 'left'  },
-    { key: 'poNumber',        header: 'PO Number',          w: 60,  align: 'left'  },
+    { key: 'supplier',        header: 'Supplier',           w: 70,  align: 'left'  },
+    { key: 'port',            header: 'Port',               w: 50,  align: 'left'  },
+    { key: 'poNumber',        header: 'PO Number',          w: 46,  align: 'left'  },
 ];
 const FQ_TABLE_WIDTH = FQ_COLS.reduce((s, c) => s + c.w, 0);
 
@@ -262,6 +268,21 @@ function fitText(doc, txt, maxWidth) {
     return s + '…';
 }
 
+// Choose the largest font size <= baseSize at which `txt` fits maxWidth on one
+// line, down to minSize. Used for the Lot column so a long lot number renders
+// smaller rather than being truncated or wrapped. Caller restores the font.
+function fitFontSize(doc, txt, maxWidth, baseSize, minSize = 3) {
+    txt = txt == null ? '' : String(txt);
+    let size = baseSize;
+    doc.fontSize(size);
+    if (!txt) return size;
+    while (size > minSize && doc.widthOfString(txt) > maxWidth) {
+        size = Math.max(minSize, size - 0.5);
+        doc.fontSize(size);
+    }
+    return size;
+}
+
 function drawFqRow(doc, cols, y, line) {
     doc.lineWidth(0.5);
     for (const c of cols) doc.rect(c.x, y, c.w, FQ_ROW_H).stroke('#000');
@@ -269,11 +290,20 @@ function drawFqRow(doc, cols, y, line) {
     for (const c of cols) {
         const raw = c.compute ? c.compute(line) : line[c.key];
         const txt = c.fmt ? c.fmt(raw) : (raw == null ? '' : String(raw));
-        doc.text(fitText(doc, txt, c.w - 4), c.x + 2, y + 4, {
-            width: c.w - 4,
-            align: c.align === 'right' ? 'right' : 'left',
-            lineBreak: false,
-        });
+        if (c.key === 'lot') {
+            // Lot numbers are never truncated — shrink the font to fit instead.
+            const size = fitFontSize(doc, txt, c.w - 4, 7);
+            doc.fontSize(size).text(txt, c.x + 2, y + 4 + (7 - size) / 2, {
+                width: c.w - 4, align: 'left', lineBreak: false,
+            });
+            doc.fontSize(7);
+        } else {
+            doc.text(fitText(doc, txt, c.w - 4), c.x + 2, y + 4, {
+                width: c.w - 4,
+                align: c.align === 'right' ? 'right' : 'left',
+                lineBreak: false,
+            });
+        }
     }
     return y + FQ_ROW_H;
 }
@@ -356,22 +386,23 @@ const SQ_ROW_H = 16;
 const SQ_PAGE_BOTTOM = 560; // landscape A4 height 595 − bottom margin
 
 const SQ_COLS = [
-    { key: 'sku',             header: 'SKU',                w: 104, align: 'left'  },
+    { key: 'sku',             header: 'SKU',                w: 90,  align: 'left'  },
     { key: 'jfCode',          header: 'HW/JF Code',         w: 50,  align: 'left'  },
+    { key: 'lot',             header: 'LOT',                w: 64,  align: 'left'  },
     { key: 'orderedUnits',    header: 'Ordered Units',      w: 46,  align: 'right', fmt: fmtInt },
     { key: 'cartonWeight',    header: 'Carton Weight (kg)', w: 46,  align: 'right', fmt: v => fmtNumber(v, 2) },
     { key: 'unitsPerCarton',  header: 'Units per Carton',   w: 42,  align: 'right', fmt: fmtInt },
     { key: 'cartonH',         header: 'Carton H (cm)',      w: 36,  align: 'right', fmt: v => fmtNumber(v, 1) },
     { key: 'cartonL',         header: 'Carton L (cm)',      w: 36,  align: 'right', fmt: v => fmtNumber(v, 1) },
     { key: 'cartonW',         header: 'Carton W (cm)',      w: 36,  align: 'right', fmt: v => fmtNumber(v, 1) },
-    { key: 'cartonCbm',       header: 'Carton CBM',         w: 52,  align: 'right', fmt: v => fmtNumber(v, 4) },
+    { key: 'cartonCbm',       header: 'Carton CBM',         w: 48,  align: 'right', fmt: v => fmtNumber(v, 4) },
     { key: 'noOfCartons',     header: 'No. of Cartons',     w: 40,  align: 'right', fmt: fmtInt },
-    { key: 'totalCbm',        header: 'Total CBM',          w: 52,  align: 'right', fmt: v => fmtNumber(v, 4) },
-    { key: 'totalWeight',     header: 'Total Weight (kg)',  w: 48,  align: 'right', fmt: v => fmtNumber(v, 2),
+    { key: 'totalCbm',        header: 'Total CBM',          w: 48,  align: 'right', fmt: v => fmtNumber(v, 4) },
+    { key: 'totalWeight',     header: 'Total Weight (kg)',  w: 44,  align: 'right', fmt: v => fmtNumber(v, 2),
       compute: l => Number(l.cartonWeight || 0) * Number(l.noOfCartons || 0) },
-    { key: 'supplier',        header: 'Supplier',           w: 88,  align: 'left'  },
-    { key: 'port',            header: 'Port',               w: 56,  align: 'left'  },
-    { key: 'poNumber',        header: 'PO Number',          w: 60,  align: 'left'  },
+    { key: 'supplier',        header: 'Supplier',           w: 70,  align: 'left'  },
+    { key: 'port',            header: 'Port',               w: 50,  align: 'left'  },
+    { key: 'poNumber',        header: 'PO Number',          w: 46,  align: 'left'  },
 ];
 const SQ_TABLE_WIDTH = SQ_COLS.reduce((s, c) => s + c.w, 0);
 
@@ -412,11 +443,20 @@ function drawSqRow(doc, cols, y, line) {
     for (const c of cols) {
         const raw = c.compute ? c.compute(line) : line[c.key];
         const txt = c.fmt ? c.fmt(raw) : (raw == null ? '' : String(raw));
-        doc.text(fitText(doc, txt, c.w - 4), c.x + 2, y + 4, {
-            width: c.w - 4,
-            align: c.align === 'right' ? 'right' : 'left',
-            lineBreak: false,
-        });
+        if (c.key === 'lot') {
+            // Lot numbers are never truncated — shrink the font to fit instead.
+            const size = fitFontSize(doc, txt, c.w - 4, 7);
+            doc.fontSize(size).text(txt, c.x + 2, y + 4 + (7 - size) / 2, {
+                width: c.w - 4, align: 'left', lineBreak: false,
+            });
+            doc.fontSize(7);
+        } else {
+            doc.text(fitText(doc, txt, c.w - 4), c.x + 2, y + 4, {
+                width: c.w - 4,
+                align: c.align === 'right' ? 'right' : 'left',
+                lineBreak: false,
+            });
+        }
     }
     return y + SQ_ROW_H;
 }
@@ -502,7 +542,7 @@ const QA_COLS = [
     { key: 'sku',             header: 'SKU',                w: 84, align: 'left'  },
     { key: 'jfCode',          header: 'HW/JF Code',         w: 42, align: 'left'  },
     { key: 'orderedUnits',    header: 'Ordered Units',      w: 40, align: 'right', fmt: fmtInt },
-    { key: 'lot',             header: 'LOT',                w: 50, align: 'left'  },
+    { key: 'lot',             header: 'LOT',                w: 64, align: 'left'  },
     { key: 'cartonWeight',    header: 'Carton Weight (kg)', w: 40, align: 'right', fmt: v => fmtNumber(v, 2) },
     { key: 'unitsPerCarton',  header: 'Units per Carton',   w: 38, align: 'right', fmt: fmtInt },
     { key: 'cartonH',         header: 'Carton H (cm)',      w: 30, align: 'right', fmt: v => fmtNumber(v, 1) },
@@ -511,11 +551,11 @@ const QA_COLS = [
     { key: 'cartonCbm',       header: 'Carton CBM',         w: 44, align: 'right', fmt: v => fmtNumber(v, 4) },
     { key: 'noOfCartons',     header: 'No. of Cartons',     w: 38, align: 'right', fmt: fmtInt },
     { key: 'totalCbm',        header: 'Total CBM',          w: 44, align: 'right', fmt: v => fmtNumber(v, 4) },
-    { key: 'supplier',        header: 'Supplier',           w: 70, align: 'left'  },
+    { key: 'supplier',        header: 'Supplier',           w: 62, align: 'left'  },
     { key: 'supplierCountry', header: 'Supplier Country',   w: 46, align: 'left'  },
     { key: 'port',            header: 'Port',               w: 48, align: 'left'  },
     { key: 'terms',           header: 'Terms',              w: 34, align: 'left'  },
-    { key: 'poNumber',        header: 'PO Number',          w: 50, align: 'left'  },
+    { key: 'poNumber',        header: 'PO Number',          w: 44, align: 'left'  },
     { key: 'qcUnits',         header: 'QC Units',           w: 34, align: 'right', fmt: fmtInt },
 ];
 const QA_TABLE_WIDTH = QA_COLS.reduce((s, c) => s + c.w, 0);
@@ -551,11 +591,20 @@ function drawQaRow(doc, cols, y, line) {
     for (const c of cols) {
         const raw = c.compute ? c.compute(line) : line[c.key];
         const txt = c.fmt ? c.fmt(raw) : (raw == null ? '' : String(raw));
-        doc.text(fitText(doc, txt, c.w - 4), c.x + 2, y + 4, {
-            width: c.w - 4,
-            align: c.align === 'right' ? 'right' : 'left',
-            lineBreak: false,
-        });
+        if (c.key === 'lot') {
+            // Lot numbers are never truncated — shrink the font to fit instead.
+            const size = fitFontSize(doc, txt, c.w - 4, 7);
+            doc.fontSize(size).text(txt, c.x + 2, y + 4 + (7 - size) / 2, {
+                width: c.w - 4, align: 'left', lineBreak: false,
+            });
+            doc.fontSize(7);
+        } else {
+            doc.text(fitText(doc, txt, c.w - 4), c.x + 2, y + 4, {
+                width: c.w - 4,
+                align: c.align === 'right' ? 'right' : 'left',
+                lineBreak: false,
+            });
+        }
     }
     return y + QA_ROW_H;
 }
@@ -626,4 +675,60 @@ async function buildQualityAssurancePdf(meta, lines) {
     return done;
 }
 
-module.exports = { buildDraftContainerPdf, buildForwarderQuotePdf, buildSupplierQuotePdf, buildQualityAssurancePdf };
+// ── CSV companions ───────────────────────────────────────────────────────
+// Each PDF above is emailed with a CSV sibling so recipients (forwarders,
+// suppliers, QC inspectors) can parse the figures without re-keying the PDF.
+// The CSVs reuse the very same column definitions + formatters as the PDFs,
+// so the two stay in lockstep: change a column here and both formats follow.
+// No totals row — one header row + one row per line keeps it cleanly parseable.
+
+// Columns for the simple "Delivery Quote Request" (buildDraftContainerPdf),
+// which draws from inline `line.*` fields rather than a COLS array.
+const QUOTE_CSV_COLS = [
+    { key: 'sku',      header: 'Ref' },
+    { key: 'name',     header: 'Item' },
+    { key: 'lot',      header: 'Lot' },
+    { key: 'quantity', header: 'Quantity', fmt: fmtInt },
+    { key: 'cbm',      header: 'CBM',      fmt: v => fmtNumber(v, 3) },
+    { key: 'cartons',  header: 'Cartons',  fmt: fmtInt },
+];
+
+// Quote a single CSV field per RFC 4180: wrap in double quotes (and double any
+// embedded quotes) when it contains a comma, quote, CR or LF.
+function csvEscape(value) {
+    const s = value == null ? '' : String(value);
+    return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+// Resolve one column's cell for a line, applying the same compute/fmt the PDF
+// uses. The PDF's '-' placeholder for missing numbers becomes an empty cell so
+// the CSV parses as a true blank rather than a literal dash.
+function csvCell(col, line) {
+    const raw = col.compute ? col.compute(line) : line[col.key];
+    let txt = col.fmt ? col.fmt(raw) : (raw == null ? '' : String(raw));
+    if (txt === '-') txt = '';
+    return txt;
+}
+
+// U+FEFF byte-order mark, prepended so Excel opens the CSV as UTF-8.
+const CSV_BOM = String.fromCharCode(0xFEFF);
+
+// Build a CSV string from a COLS array + lines. Prepends the UTF-8 BOM and uses
+// CRLF line endings (Excel-friendly, RFC 4180).
+function colsToCsv(cols, lines) {
+    const header = cols.map(c => csvEscape(c.header)).join(',');
+    const body = (lines || []).map(line => cols.map(c => csvEscape(csvCell(c, line))).join(','));
+    return Buffer.from(CSV_BOM + [header, ...body].join('\r\n') + '\r\n', 'utf8');
+}
+
+// Same (draft/meta, lines) signatures as the PDF builders, but synchronous —
+// a CSV is just string assembly, no PDFKit stream to await.
+function buildDraftContainerCsv(draft, lines) { return colsToCsv(QUOTE_CSV_COLS, lines); }
+function buildForwarderQuoteCsv(draft, lines) { return colsToCsv(FQ_COLS, lines); }
+function buildSupplierQuoteCsv(draft, lines) { return colsToCsv(SQ_COLS, lines); }
+function buildQualityAssuranceCsv(meta, lines) { return colsToCsv(QA_COLS, lines); }
+
+module.exports = {
+    buildDraftContainerPdf, buildForwarderQuotePdf, buildSupplierQuotePdf, buildQualityAssurancePdf,
+    buildDraftContainerCsv, buildForwarderQuoteCsv, buildSupplierQuoteCsv, buildQualityAssuranceCsv,
+};

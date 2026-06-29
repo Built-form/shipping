@@ -318,6 +318,23 @@ async function writeSnapshots(conn, {
         if (sku && asin && !skuToAsin.has(sku)) skuToAsin.set(sku, asin);
     }
 
+    // ── FNSKU → live reserved (real-time, matches Seller Central) ──────────
+    // The health report's reserved columns are a once-daily snapshot that
+    // badly under-reports pending-customer-order reserved on fast-movers
+    // (observed 14 vs 115 and 11 vs 61 on single UK pools — the dashboard's
+    // "Amazon Total" then reads low vs Seller Central). The
+    // /fba/inventory/v1/summaries call we already make for the fallback is
+    // real-time and marketplace-scoped, so its totalReservedQuantity is the
+    // authoritative reserved for each physical pool. Key by FNSKU (the pool);
+    // multiple SKUs can map to one FNSKU with identical quantities, first wins.
+    const apiReservedByFnsku = new Map();
+    for (const item of apiSummaries) {
+        const fnsku = (item.fnSku || '').trim();
+        if (!fnsku || apiReservedByFnsku.has(fnsku)) continue;
+        const r = item.inventoryDetails?.reservedQuantity?.totalReservedQuantity;
+        if (typeof r === 'number') apiReservedByFnsku.set(fnsku, r);
+    }
+
     // ── Active Listings ────────────────────────────────────────────────────
     for (const row of listingRows) {
         // FR (and possibly ES/IT) return GET_MERCHANT_LISTINGS_DATA with a
@@ -417,7 +434,13 @@ async function writeSnapshots(conn, {
                 parseInt(row['Reserved Customer Order'] || '0', 10) +
                 parseInt(row['Reserved FC Transfer']     || '0', 10) +
                 parseInt(row['Reserved FC Processing']   || '0', 10);
-            a.reserved          += Math.max(totalReserved, componentReserved);
+            // The live inventory API is real-time and matches Seller Central,
+            // whereas the health report's reserved is a stale daily snapshot
+            // that under-reports it; fold in the live per-pool value so we
+            // never under-count. Take the largest of all three — max (not sum)
+            // keeps this safe against the same pool being seen twice.
+            const liveReserved = fnsku ? apiReservedByFnsku.get(fnsku) : undefined;
+            a.reserved          += Math.max(totalReserved, componentReserved, liveReserved || 0);
         }
 
         if (fnsku && !a.seen_fnskus.has(fnsku)) {

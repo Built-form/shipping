@@ -9,7 +9,21 @@ const log = require('../lib/logger');
 const { ensureSupplierPortalCodes } = require('../lib/portal-code');
 const { getProductsByJfCode, createAsn, receiveAsnItems } = require('../services/mintsoft');
 const { snapshotJfCode } = require('./mintsoft-snapshot');
-const { buildDraftContainerPdf, buildForwarderQuotePdf, buildSupplierQuotePdf, buildQualityAssurancePdf } = require('../services/draft-container-pdf');
+const {
+    buildDraftContainerPdf, buildForwarderQuotePdf, buildSupplierQuotePdf, buildQualityAssurancePdf,
+    buildDraftContainerCsv, buildForwarderQuoteCsv, buildSupplierQuoteCsv, buildQualityAssuranceCsv,
+} = require('../services/draft-container-pdf');
+// Order-shaping helpers, audit, and the receive transaction live in shared
+// modules so the public carton-scan Lambda reuses the exact same projection +
+// Mintsoft receiving path (see src/services/order-receive.js).
+const { ORDER_SELECT, parseDates, formatDate, formatDateTime, normalizeExpiry, receiptToJson, rowToOrder } = require('../lib/order-shape');
+const { recordAudit } = require('../lib/audit');
+const { receiveOrderStock, ReceiveError } = require('../services/order-receive');
+const { listWarehousesWithLocations, listLocationsForWarehouse } = require('../services/mintsoft-locations');
+// Daily alerts (slide-out alert window). Generation logic lives in the service
+// so the nightly Lambda reuses it; here we only expose the read/ack routes.
+const { ensureDailyAlertsSchema, listAlerts, listHistory, actOnAlert, getSuggestionForUpdate, actOnSuggestion, londonToday } = require('../services/daily-alerts');
+const T = require('../lib/order-transitions');
 
 const app = express();
 
@@ -47,6 +61,11 @@ const orderReceiptsSchemaReady = (async () => {
         conn.release();
     }
 })().catch(err => log.error('[orders] order_receipts schema migration failed', err));
+
+// Lazy-create the daily_alerts table (shared with the nightly generator). Each
+// alert route awaits this before touching the table.
+const dailyAlertsSchemaReady = ensureDailyAlertsSchema(pool)
+    .catch(err => log.error('[orders] daily_alerts schema migration failed', err));
 
 // Lazy-create the audit_log table. Captures before/after JSON for every
 // mutation on orders and purchase_orders performed through this API. The
@@ -157,6 +176,36 @@ const draftContainerAllocationsSchemaReady = (async () => {
         } catch (e) {
             if (!String(e.message || '').includes('Duplicate column')) throw e;
         }
+        // batch_id groups the documents produced by a single generate call (a
+        // forwarder-quote plus its per-supplier supplier-quotes), so emailing the
+        // forwarder-quote can attach the whole set. NULL for standalone docs.
+        try {
+            await conn.query(
+                `ALTER TABLE draft_container_documents ADD COLUMN batch_id VARCHAR(64) NULL`
+            );
+        } catch (e) {
+            if (!String(e.message || '').includes('Duplicate column')) throw e;
+        }
+        try {
+            await conn.query(
+                `ALTER TABLE draft_container_documents ADD KEY idx_batch_id (batch_id)`
+            );
+        } catch (e) {
+            if (!String(e.message || '').includes('Duplicate key')) throw e;
+        }
+        // CSV companion of the PDF — generated, stored in S3 and served at its own
+        // public URL exactly like the PDF. NULL on documents generated before this
+        // was added (their email send rebuilds the CSV on the fly as a fallback).
+        const draftDocCsvMigrations = [
+            `ALTER TABLE draft_container_documents ADD COLUMN csv_s3_key VARCHAR(500) NULL`,
+            `ALTER TABLE draft_container_documents ADD COLUMN csv_public_url VARCHAR(1000) NULL`,
+            `ALTER TABLE draft_container_documents ADD COLUMN csv_file_size INT NULL`,
+        ];
+        for (const sql of draftDocCsvMigrations) {
+            try { await conn.query(sql); } catch (e) {
+                if (!String(e.message || '').includes('Duplicate column')) throw e;
+            }
+        }
     } finally {
         conn.release();
     }
@@ -211,6 +260,11 @@ const qualityAssuranceSchemaReady = (async () => {
         const migrations = [
             `ALTER TABLE quality_assurance_documents ADD COLUMN draft_container_name VARCHAR(100) NULL`,
             `ALTER TABLE quality_assurance_documents ADD KEY idx_draft_container_name (draft_container_name)`,
+            // CSV companion of the PDF — stored in S3 and served at its own public
+            // URL exactly like the PDF. NULL on documents predating this column.
+            `ALTER TABLE quality_assurance_documents ADD COLUMN csv_s3_key VARCHAR(500) NULL`,
+            `ALTER TABLE quality_assurance_documents ADD COLUMN csv_public_url VARCHAR(1000) NULL`,
+            `ALTER TABLE quality_assurance_documents ADD COLUMN csv_file_size INT NULL`,
         ];
         for (const sql of migrations) {
             try { await conn.query(sql); } catch (e) {
@@ -223,60 +277,8 @@ const qualityAssuranceSchemaReady = (async () => {
     }
 })().catch(err => log.error('[orders] quality_assurance schema migration failed', err));
 
-function deepEqual(a, b) {
-    if (a === b) return true;
-    if (a === null || b === null || a === undefined || b === undefined) return a === b;
-    if (typeof a !== 'object' || typeof b !== 'object') return false;
-    if (Array.isArray(a) !== Array.isArray(b)) return false;
-    const ak = Object.keys(a);
-    const bk = Object.keys(b);
-    if (ak.length !== bk.length) return false;
-    for (const k of ak) {
-        if (!deepEqual(a[k], b[k])) return false;
-    }
-    return true;
-}
-
-// For an update, store only the keys whose value changed. For create/delete,
-// keep the full snapshot since "everything is new" / "everything is gone"
-// is itself the diff.
-function diffSnapshots(before, after) {
-    if (!before || !after) return { before, after };
-    const beforeOut = {};
-    const afterOut = {};
-    const keys = new Set([...Object.keys(before), ...Object.keys(after)]);
-    for (const k of keys) {
-        if (!deepEqual(before[k], after[k])) {
-            beforeOut[k] = before[k];
-            afterOut[k] = after[k];
-        }
-    }
-    return { before: beforeOut, after: afterOut };
-}
-
-async function recordAudit(conn, { entityType, entityId, action, before, after, userEmail }) {
-    try {
-        const diffed = diffSnapshots(before, after);
-        // Skip no-op updates (e.g. PUT with identical values).
-        if (action === 'update' && diffed.before && Object.keys(diffed.before).length === 0) {
-            return;
-        }
-        await conn.query(
-            `INSERT INTO audit_log (entity_type, entity_id, action, before_json, after_json, user_email)
-             VALUES (?, ?, ?, ?, ?, ?)`,
-            [
-                entityType,
-                entityId,
-                action,
-                diffed.before ? JSON.stringify(diffed.before) : null,
-                diffed.after ? JSON.stringify(diffed.after) : null,
-                userEmail || null,
-            ]
-        );
-    } catch (err) {
-        log.warn('[audit] insert failed', { entityType, entityId, action, error: err.message });
-    }
-}
+// deepEqual / diffSnapshots / recordAudit moved to src/lib/audit.js (imported
+// above) so the receive service can write identical before/after audit rows.
 
 // Mirror an order's PO assignment change as PO-level audit events so the
 // PO's audit trail shows when lines come and go. The order's own row in
@@ -905,6 +907,10 @@ const UPDATABLE_FIELDS = {
     vesselName: 'vessel_name', eta: 'eta', cbmPerUnit: 'cbm_per_unit', orderCbm: 'order_cbm',
     cartonCbm: 'carton_cbm',
     unitsPerCarton: 'units_per_carton',
+    cartonWeight: 'carton_weight',
+    cartonHeight: 'carton_height',
+    cartonWidth: 'carton_width',
+    cartonDepth: 'carton_depth',
     packSize: 'pack_size',
     scheduledDate: 'scheduled_date',
     poDate: 'po_date',
@@ -940,146 +946,17 @@ const ORDER_INSERT_COLS_LIST = [...REQUIRED_INSERT_COLS, ...Object.values(UPDATA
 const ORDER_INSERT_COLS = `(${ORDER_INSERT_COLS_LIST.join(', ')})`;
 const ORDER_INSERT_PLACEHOLDERS = `(${ORDER_INSERT_COLS_LIST.map(() => '?').join(', ')})`;
 
-// Always project live `received_quantity` (physically checked-in stock
-// pushed to Mintsoft) and `not_received_quantity` (recorded shortfalls,
-// no Mintsoft side effect) from order_receipts. Outstanding = qty -
-// (received + not_received). Soft-deleted rows are filtered out — every
-// caller must append further conditions with AND.
-const ORDER_SELECT = `
-    SELECT orders.*,
-           COALESCE((SELECT SUM(quantity) FROM order_receipts WHERE order_id = orders.id AND type = 'received'), 0) AS received_quantity,
-           COALESCE((SELECT SUM(quantity) FROM order_receipts WHERE order_id = orders.id AND type = 'not_received'), 0) AS not_received_quantity,
-           (SELECT JSON_ARRAYAGG(draft_container_name)
-              FROM draft_container_allocations
-             WHERE order_id = orders.id) AS draft_container_names
-    FROM orders
-    WHERE orders.deleted_at IS NULL
-`;
+// ORDER_SELECT + the order/receipt mappers (parseDates, formatDate,
+// formatDateTime, normalizeExpiry, receiptToJson, rowToOrder) moved to
+// src/lib/order-shape.js (imported above) so the receive/lookup service shapes
+// orders identically. setDateKey stays here — it's only used by this handler.
 
 // ── Helpers ──────────────────────────────────────────────────────────────
-
-function parseDates(raw) {
-    if (typeof raw === 'string') return JSON.parse(raw) || {};
-    return raw || {};
-}
 
 function setDateKey(dates, status) {
     const key = STATUS_DATE_KEY[status];
     if (key) dates[key] = new Date().toISOString();
     return dates;
-}
-
-function formatDate(val) {
-    if (!val) return null;
-    return val.toISOString?.().slice(0, 10) ?? val;
-}
-
-// Like formatDate but preserves the time component — for DATETIME columns
-// (e.g. delivery_date) where the client needs the wall-clock time, not just
-// the calendar day. Returns a full ISO string for Date inputs, passes strings
-// through untouched.
-function formatDateTime(val) {
-    if (!val) return null;
-    return val.toISOString?.() ?? val;
-}
-
-// Normalize an expiry value (string, Date, or null) to YYYY-MM-DD or null.
-// Mintsoft sometimes ships a far-future sentinel (e.g. 9999-12-31) when no
-// expiry is set — treat anything past year 9000 as "no expiry".
-// Returns the sentinel `false` for input that looks like a date but cannot be
-// parsed, so callers can distinguish "missing" from "invalid".
-function normalizeExpiry(val) {
-    if (val === null || val === undefined || val === '') return null;
-    if (typeof val === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(val)) {
-        const year = Number(val.slice(0, 4));
-        if (year >= 9000) return null;
-        return val;
-    }
-    const d = val instanceof Date ? val : new Date(val);
-    if (isNaN(d.getTime())) return false;
-    if (d.getFullYear() >= 9000) return null;
-    return d.toISOString().slice(0, 10);
-}
-
-function receiptToJson(row) {
-    return {
-        id: row.id,
-        orderId: row.order_id,
-        type: row.type || 'received',
-        jfCode: row.jf_code || null,
-        quantity: Number(row.quantity),
-        locationId: row.location_id,
-        warehouseId: row.warehouse_id,
-        asnId: row.asn_id,
-        asnItemId: row.asn_item_id,
-        idempotencyKey: row.idempotency_key || null,
-        batchNo: row.batch_no || null,
-        expiryDate: formatDate(row.expiry_date),
-        receivedAt: row.received_at?.toISOString?.() ?? row.received_at,
-    };
-}
-
-function rowToOrder(row) {
-    const quantity = Number(row.quantity || 0);
-    const receivedQuantity = Number(row.received_quantity || 0);
-    const notReceivedQuantity = Number(row.not_received_quantity || 0);
-    // JSON_ARRAYAGG returns either a JSON string, an already-parsed array
-    // (mysql2 unwraps JSON columns automatically), or NULL when the order
-    // has no allocations.
-    let partDraftContainer = [];
-    if (row.draft_container_names) {
-        partDraftContainer = typeof row.draft_container_names === 'string'
-            ? JSON.parse(row.draft_container_names)
-            : row.draft_container_names;
-    }
-    return {
-        id: row.id,
-        jfCode: row.jf_code || null,
-        asin: row.asin || null,
-        productName: row.product_name || null,
-        quantity,
-        receivedQuantity,
-        notReceivedQuantity,
-        outstandingQuantity: Math.max(quantity - receivedQuantity - notReceivedQuantity, 0),
-        partDraftContainer,
-        status: row.status,
-        poNumber: row.po_number || null,
-        supplier: row.supplier || null,
-        containerNumber: row.container_number || null,
-        vesselName: row.vessel_name || null,
-        eta: formatDate(row.eta),
-        cbmPerUnit: row.cbm_per_unit != null ? Number(row.cbm_per_unit) : null,
-        orderCbm: row.order_cbm != null ? Number(row.order_cbm) : null,
-        notes: row.notes || null,
-        port: row.port || null,
-        cartonCbm: row.carton_cbm != null ? Number(row.carton_cbm) : null,
-        unitsPerCarton: row.units_per_carton != null ? Number(row.units_per_carton) : null,
-        packSize: row.pack_size || null,
-        scheduledDate: formatDate(row.scheduled_date),
-        poDate: formatDate(row.po_date),
-        qcStatus: row.qc_status || null,
-        qcDate: formatDate(row.qc_date),
-        qcInvoiceNumber: row.qc_invoice_number || null,
-        dates: parseDates(row.dates),
-        deliveryDate: formatDateTime(row.delivery_date),
-        lotNumber: row.lot_number || null,
-        mfgDate: formatDate(row.mfg_date),
-        expDate: formatDate(row.exp_date),
-        deliveryTime: row.delivery_time || null,
-        containerStatus: row.container_status || null,
-        bookingStatus: row.booking_status || null,
-        arrivedDate: formatDate(row.arrived_date),
-        externalContainerNumber: row.external_container_number || null,
-        awbNumber: row.awb_number || null,
-        purchaseOrderId: row.purchase_order_id ?? null,
-        unitPrice: row.unit_price != null ? Number(row.unit_price) : null,
-        actualReadyDate: formatDate(row.actual_ready_date),
-        estimatedDepartureDate: formatDate(row.estimated_departure_date),
-        shippedDate: formatDate(row.shipped_date),
-        orderedDate: formatDate(row.ordered_date),
-        estimatedReadyDate: formatDate(row.estimated_ready_date),
-        artworkConfirmedDate: formatDate(row.artwork_confirmed_date),
-    };
 }
 
 // Builds INSERT values from a DB row (snake_case keys), copying every
@@ -1108,6 +985,77 @@ function orderInsertValuesFromBody(body, status, dates) {
         }
     }
     return values;
+}
+
+// Carton spec frozen onto each order row at create time so historical quote
+// PDFs (forwarder/supplier/QA) stay reproducible even as jfpro.products later
+// changes. camelCase body key -> product_carton_sizes (view) column.
+const CARTON_SNAPSHOT_FIELDS = {
+    cartonWeight: 'carton_weight',
+    cartonHeight: 'carton_height',
+    cartonWidth: 'carton_width',
+    cartonDepth: 'carton_depth',
+    cartonCbm: 'carton_cbm',
+    unitsPerCarton: 'carton_qty',   // the view exposes units-per-carton as carton_qty
+};
+
+// A carton field counts as client-supplied only when it carries a real positive
+// number. null / undefined / '' / 0 / non-numeric are treated as "not given" so
+// a left-blank create form falls back to the catalogue rather than saving 0.
+function cartonValueProvided(val) {
+    if (val == null || val === '') return false;
+    const n = Number(val);
+    return Number.isFinite(n) && n > 0;
+}
+
+// Resolves the carton spec for a new order on `body`. Per field, a client-
+// supplied value (the create form) wins; otherwise weight/dims/units freeze from
+// the catalogue (product_carton_sizes, matched by jf_code) so historical quote
+// PDFs stay reproducible. CBM is DERIVED from the resolved H×W×D — so it always
+// agrees with the dimensions on the row and with what the quote PDFs recompute —
+// unless the client sent an explicit CBM. Mutates + returns `body`.
+async function applyCartonSnapshot(conn, body) {
+    // 1. Normalise client input: keep provided positive numbers, null the rest
+    //    (so '' never coerces to 0 on INSERT).
+    const provided = {};
+    for (const key of Object.keys(CARTON_SNAPSHOT_FIELDS)) {
+        provided[key] = cartonValueProvided(body[key]);
+        body[key] = provided[key] ? Number(body[key]) : null;
+    }
+
+    // 2. Pull the catalogue row once if anything still needs filling.
+    const jfCode = typeof body.jfCode === 'string' ? body.jfCode.trim() : '';
+    let v = null;
+    if (jfCode && Object.keys(CARTON_SNAPSHOT_FIELDS).some(k => body[k] == null)) {
+        const [rows] = await conn.query(
+            `SELECT carton_weight, carton_height, carton_width, carton_depth, carton_cbm, carton_qty
+               FROM product_carton_sizes WHERE jf_code = ? LIMIT 1`,
+            [jfCode]
+        );
+        v = rows[0] || null;
+    }
+    const snap = (col) => {
+        if (!v) return null;
+        const n = Number(v[col]);
+        return Number.isFinite(n) && n > 0 ? n : null;
+    };
+
+    // 3. Fill weight / dims / units from the catalogue where the client omitted them.
+    for (const key of ['cartonWeight', 'cartonHeight', 'cartonWidth', 'cartonDepth', 'unitsPerCarton']) {
+        if (body[key] == null) body[key] = snap(CARTON_SNAPSHOT_FIELDS[key]);
+    }
+
+    // 4. CBM precedence: an explicit client-supplied CBM wins and is kept as-is
+    //    (the quote PDFs now prefer the stored carton_cbm, so it actually flows
+    //    through). Otherwise derive it from the resolved dimensions; failing
+    //    that (dims incomplete), fall back to the catalogue's stored CBM.
+    if (!provided.cartonCbm) {
+        const h = body.cartonHeight, w = body.cartonWidth, d = body.cartonDepth;
+        body.cartonCbm = (h > 0 && w > 0 && d > 0)
+            ? Number((h * w * d / 1_000_000).toFixed(6))
+            : snap('carton_cbm');
+    }
+    return body;
 }
 
 async function withConnection(fn) {
@@ -1279,6 +1227,10 @@ app.post('/api/v1/orders', async (req, res) => {
 
         const order = await withConnection(async (conn) => {
             const dates = setDateKey(b.dates && typeof b.dates === 'object' ? { ...b.dates } : {}, status);
+
+            // Freeze the carton spec from the catalogue onto this order so its
+            // future quote PDFs don't drift when jfpro.products changes.
+            await applyCartonSnapshot(conn, b);
 
             const [insertResult] = await conn.query(
                 `INSERT INTO orders ${ORDER_INSERT_COLS} VALUES ${ORDER_INSERT_PLACEHOLDERS}`,
@@ -1521,298 +1473,41 @@ app.post('/api/v1/orders/:id/receive', async (req, res) => {
         await auditLogSchemaReady;
 
         const { locationId, warehouseId, quantity, goodsInType, idempotencyKey, lotNumber, expiryDate } = req.body || {};
-        if (!locationId) return res.status(400).json({ error: 'locationId is required.' });
-        if (!warehouseId) return res.status(400).json({ error: 'warehouseId is required.' });
-        if (!quantity || Number(quantity) <= 0) {
-            return res.status(400).json({ error: 'quantity must be a positive number.' });
-        }
-        const qty = Number(quantity);
 
-        // Optional client-supplied batch + expiry. If sent, they overwrite the
-        // order row and are forwarded to Mintsoft; otherwise the existing
-        // values on the order are used.
-        let suppliedLot = null;
-        if (lotNumber !== undefined && lotNumber !== null && String(lotNumber).trim() !== '') {
-            suppliedLot = String(lotNumber).trim();
-        }
-        let suppliedExpiry = null;
-        if (expiryDate !== undefined && expiryDate !== null && expiryDate !== '') {
-            const normalized = normalizeExpiry(expiryDate);
-            if (normalized === false) {
-                return res.status(400).json({ error: 'expiryDate is not a valid date.' });
-            }
-            suppliedExpiry = normalized;
-        }
-
-        // GoodsInType: 0=TwentyFtContainer, 1=FortyFtContainer, 2=Pallet, 3=Carton,
-        // 4=FortyFtContainerHC, 5=FortyFiveFtContainer, 6=FortyFiveFtContainerHC
-        let goodsInTypeId = 3;
-        if (goodsInType !== undefined && goodsInType !== null && goodsInType !== '') {
-            goodsInTypeId = Number(goodsInType);
-            if (!Number.isInteger(goodsInTypeId) || goodsInTypeId < 0 || goodsInTypeId > 6) {
-                return res.status(400).json({ error: 'goodsInType must be an integer between 0 and 6.' });
-            }
-        }
-
-        let idemKey = null;
-        if (idempotencyKey !== undefined && idempotencyKey !== null && idempotencyKey !== '') {
-            if (typeof idempotencyKey !== 'string' || idempotencyKey.length > 64) {
-                return res.status(400).json({ error: 'idempotencyKey must be a string of ≤64 characters.' });
-            }
-            idemKey = idempotencyKey;
-        }
-
-        const { id } = req.params;
-
+        // The whole receive transaction (validation, idempotency, FOR UPDATE
+        // lock, capacity check, Mintsoft ASN create/confirm/receive, receipt
+        // persistence, lot/expiry override, status + audit) lives in the shared
+        // service so the public carton-scan Lambda runs the exact same path.
         const conn = await pool.getConnection();
-        let committed = false;
-        let asn = null;
-        let jfCode = null;
-        let orderRow = null;
+        let result;
         try {
-            await conn.beginTransaction();
-
-            // Idempotent replay: if we've already processed this (order, key),
-            // return the prior state without a second Mintsoft call.
-            if (idemKey) {
-                const [dup] = await conn.query(
-                    `SELECT * FROM order_receipts WHERE order_id = ? AND idempotency_key = ? LIMIT 1`,
-                    [id, idemKey]
-                );
-                if (dup.length) {
-                    const [orderRows] = await conn.query(`${ORDER_SELECT} AND orders.id = ?`, [id]);
-                    const [allReceipts] = await conn.query(
-                        'SELECT * FROM order_receipts WHERE order_id = ? ORDER BY received_at DESC',
-                        [id]
-                    );
-                    await conn.commit();
-                    committed = true;
-                    return res.json({
-                        order: rowToOrder(orderRows[0]),
-                        asnId: dup[0].asn_id,
-                        receipts: allReceipts.map(receiptToJson),
-                        idempotent: true,
-                    });
-                }
-            }
-
-            // Lock the order row so concurrent receives serialize.
-            const [lockRows] = await conn.query(
-                `SELECT * FROM orders WHERE id = ? AND deleted_at IS NULL FOR UPDATE`,
-                [id]
-            );
-            if (!lockRows.length) {
-                await conn.rollback();
-                committed = true;
-                return res.status(404).json({ error: `Order ${id} not found.` });
-            }
-            orderRow = lockRows[0];
-
-            // Live sums under the same lock — never trust a cached counter.
-            // `received` = physically checked-in (Mintsoft); `settled` adds in
-            // not_received shortfalls so remaining capacity is bounded by the
-            // total reconciled qty, not just received.
-            const [sumRows] = await conn.query(
-                `SELECT
-                    COALESCE(SUM(CASE WHEN type = 'received' THEN quantity END), 0) AS received,
-                    COALESCE(SUM(CASE WHEN type = 'not_received' THEN quantity END), 0) AS not_received,
-                    COALESCE(SUM(quantity), 0) AS settled
-                 FROM order_receipts WHERE order_id = ?`,
-                [id]
-            );
-            const receivedQty = Number(sumRows[0].received);
-            const notReceivedQty = Number(sumRows[0].not_received);
-            const settledQty = Number(sumRows[0].settled);
-            const orderQty = Number(orderRow.quantity);
-            const remaining = orderQty - settledQty;
-            const beforeOrder = rowToOrder({
-                ...orderRow,
-                received_quantity: receivedQty,
-                not_received_quantity: notReceivedQty,
+            result = await receiveOrderStock(conn, {
+                orderId: req.params.id,
+                quantity, locationId, warehouseId, goodsInType,
+                lotNumber, expiryDate, idempotencyKey,
+                actorEmail: req.userEmail,
             });
-
-            if (remaining <= 0) {
-                await conn.rollback();
-                committed = true;
-                const [orderRows] = await conn.query(`${ORDER_SELECT} AND orders.id = ?`, [id]);
-                return res.status(409).json({ error: 'Order is already fully received.', order: rowToOrder(orderRows[0]) });
-            }
-            if (qty > remaining) {
-                await conn.rollback();
-                committed = true;
-                return res.status(400).json({ error: `quantity (${qty}) exceeds remaining (${remaining}).` });
-            }
-            if (!orderRow.jf_code) {
-                await conn.rollback();
-                committed = true;
-                return res.status(400).json({ error: 'Order has no jf_code; cannot resolve Mintsoft product.' });
-            }
-            jfCode = orderRow.jf_code;
-
-            // BatchNo + ExpiryDate sent to Mintsoft. Client-supplied values
-            // win and are also written back to the order; otherwise fall back
-            // to whatever's already on the order row. Refuse if neither
-            // source has a value so stock never lands without batch/expiry.
-            const existingLot = (orderRow.lot_number ?? '').toString().trim();
-            const existingExpiry = normalizeExpiry(orderRow.exp_date) || null;
-            const orderLot = suppliedLot ?? existingLot;
-            const orderExpiry = suppliedExpiry ?? existingExpiry;
-            const missingFields = [];
-            if (!orderLot) missingFields.push('lot_number');
-            if (!orderExpiry) missingFields.push('exp_date');
-            if (missingFields.length) {
-                await conn.rollback();
-                committed = true;
-                return res.status(400).json({
-                    error: `Order is missing ${missingFields.join(' and ')}; set these on the order before receiving into Mintsoft.`,
-                    missing: missingFields,
-                });
-            }
-            const lotChanged = suppliedLot !== null && suppliedLot !== existingLot;
-            const expiryChanged = suppliedExpiry !== null && suppliedExpiry !== existingExpiry;
-
-            // Resolve Mintsoft product — exact SKU match only.
-            // /Product/Search is a substring match so 'HW1122' returns both
-            // 'HW1122' and any variant ('HW1122_QC', 'HW1122_READY', ...).
-            // Receive must target the base SKU; otherwise stock lands on the
-            // wrong product (observed: HW1122 receipts allocated to HW1122_QC).
-            const products = await getProductsByJfCode(jfCode);
-            const exact = products.find(p => p.sku === jfCode);
-            if (!exact) {
-                await conn.rollback();
-                committed = true;
-                return res.status(404).json({
-                    error: `No Mintsoft product with exact SKU "${jfCode}" found.`,
-                    candidates: products.map(p => p.sku),
-                });
-            }
-            const { productId, sku } = exact;
-
-            // Mintsoft side effects (still under lock so a concurrent retry waits)
-            let asnItemId;
-            try {
-                const today = new Date().toISOString().slice(0, 10);
-                const poRefParts = [orderRow.po_number, orderRow.asin, jfCode, today, `r${Date.now()}`].filter(Boolean);
-                const poReference = poRefParts.join('-');
-
-                asn = await createAsn({
-                    warehouseId,
-                    poReference,
-                    supplier: orderRow.supplier || '',
-                    quantity: qty,
-                    items: [{ productId, sku, quantity: qty }],
-                    goodsInType: goodsInTypeId,
-                });
-
-                const asnItem = (asn.Items || [])[0];
-                if (!asn.ID || !asnItem?.ID) {
-                    throw new Error('Mintsoft ASN response missing ID or Items[0].ID');
-                }
-                asnItemId = asnItem.ID;
-
-                await receiveAsnItems(asn.ID, [{
-                    asnItemId,
-                    productId,
-                    quantity: qty,
-                    locationId,
-                    batchNo: orderLot,
-                    expiryDate: orderExpiry,
-                }]);
-            } catch (err) {
-                await conn.rollback();
-                committed = true;
-                log.error('[POST /orders/:id/receive] Mintsoft call failed', err?.response?.data || err);
-                return res.status(502).json({
-                    error: 'Mintsoft request failed; please retry.',
-                    details: err?.response?.data || err.message,
-                });
-            }
-
-            // Persist receipt + (maybe) flip status
-            await conn.query(
-                `INSERT INTO order_receipts
-                    (order_id, jf_code, quantity, location_id, warehouse_id,
-                     asn_id, asn_item_id, idempotency_key, batch_no, expiry_date, type)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'received')`,
-                [
-                    id, jfCode, qty, locationId, warehouseId,
-                    asn.ID, asnItemId, idemKey,
-                    orderLot,
-                    orderExpiry,
-                ]
-            );
-
-            const newSettled = settledQty + qty;
-            const dates = parseDates(orderRow.dates);
-            if (!dates.received_by_warehouse) {
-                dates.received_by_warehouse = new Date().toISOString();
-            }
-
-            // Flip status when the order is fully reconciled (received +
-            // not_received = quantity). Partial receipts must NOT clobber the
-            // existing status (e.g. IN_WAREHOUSE set by the Sea import) —
-            // that's what was hiding partials from the warehouse view.
-            // Outstanding=0 + any not_received → PARTIALLY_RECEIVED (this is a
-            // /receive call, so the not_received total is unchanged).
-            let nextStatus = orderRow.status;
-            if (newSettled >= orderQty) {
-                nextStatus = notReceivedQty > 0 ? 'PARTIALLY_RECEIVED' : 'RECEIVED';
-                dates.received = new Date().toISOString();
-            }
-
-            const updateCols = ['status = ?', 'dates = ?'];
-            const updateVals = [nextStatus, JSON.stringify(dates)];
-            if (lotChanged) {
-                updateCols.push('lot_number = ?');
-                updateVals.push(orderLot);
-            }
-            if (expiryChanged) {
-                updateCols.push('exp_date = ?');
-                updateVals.push(orderExpiry);
-            }
-            updateVals.push(id);
-            await conn.query(
-                `UPDATE orders SET ${updateCols.join(', ')} WHERE id = ?`,
-                updateVals
-            );
-
-            const [finalRows] = await conn.query(`${ORDER_SELECT} AND orders.id = ?`, [id]);
-            const updatedOrder = rowToOrder(finalRows[0]);
-            await recordAudit(conn, {
-                entityType: 'order', entityId: updatedOrder.id, action: 'update',
-                before: beforeOrder, after: updatedOrder, userEmail: req.userEmail,
-            });
-
-            await conn.commit();
-            committed = true;
-
-            const [receipts] = await conn.query(
-                'SELECT * FROM order_receipts WHERE order_id = ? ORDER BY received_at DESC',
-                [id]
-            );
-
-            res.json({
-                order: updatedOrder,
-                asnId: asn.ID,
-                receipts: receipts.map(receiptToJson),
-            });
-        } catch (err) {
-            if (!committed) {
-                try { await conn.rollback(); } catch (_) { /* ignore */ }
-            }
-            throw err;
         } finally {
             conn.release();
         }
 
+        res.json({
+            order: result.order,
+            asnId: result.asnId,
+            receipts: result.receipts,
+            ...(result.idempotent ? { idempotent: true } : {}),
+        });
+
         // Refresh stock_snapshots for this JF code so UIs reflect the receive.
         // Fire-and-forget with a delay so Mintsoft's stock aggregates have time
-        // to settle after /Items/Receive — failure here must not affect the response.
-        if (jfCode) {
+        // to settle after /Items/Receive — failure here must not affect the
+        // response. Skipped on an idempotent replay (result.jfCode is null).
+        if (result.jfCode) {
+            const { jfCode, asin } = result;
             setTimeout(async () => {
                 const c = await pool.getConnection();
                 try {
-                    await snapshotJfCode(c, jfCode, orderRow?.asin || '');
+                    await snapshotJfCode(c, jfCode, asin || '');
                 } catch (err) {
                     log.warn('[POST /orders/:id/receive] post-receive snapshot failed', { jfCode, error: err.message });
                 } finally {
@@ -1821,6 +1516,9 @@ app.post('/api/v1/orders/:id/receive', async (req, res) => {
             }, 10000);
         }
     } catch (error) {
+        if (error instanceof ReceiveError) {
+            return res.status(error.status).json({ error: error.message, ...(error.payload || {}) });
+        }
         log.error('[POST /orders/:id/receive]', error);
         if (!res.headersSent) {
             res.status(500).json({ error: 'An internal error occurred.' });
@@ -2011,37 +1709,7 @@ app.get('/api/v1/orders/:id/receipts', async (req, res) => {
 // Returns every warehouse with its locations nested.
 app.get('/api/v1/mintsoft/warehouses', async (req, res) => {
     try {
-        const data = await withConnection(async (conn) => {
-            const [rows] = await conn.query(
-                `SELECT warehouse_id, warehouse_name, warehouse_code, warehouse_active,
-                        location_id, name, location_name, pick_sequence, location_type_id, last_synced
-                 FROM mintsoft_locations
-                 ORDER BY warehouse_name, warehouse_id, pick_sequence, name`
-            );
-            const byWh = new Map();
-            for (const r of rows) {
-                let wh = byWh.get(r.warehouse_id);
-                if (!wh) {
-                    wh = {
-                        warehouseId: r.warehouse_id,
-                        name: r.warehouse_name || '',
-                        code: r.warehouse_code || '',
-                        active: !!r.warehouse_active,
-                        lastSynced: r.last_synced?.toISOString?.() ?? r.last_synced,
-                        locations: [],
-                    };
-                    byWh.set(r.warehouse_id, wh);
-                }
-                wh.locations.push({
-                    locationId: r.location_id,
-                    name: r.name || '',
-                    locationName: r.location_name || r.name || '',
-                    pickSequence: r.pick_sequence,
-                    locationTypeId: r.location_type_id,
-                });
-            }
-            return Array.from(byWh.values());
-        });
+        const data = await withConnection((conn) => listWarehousesWithLocations(conn));
         res.json({ data });
     } catch (error) {
         log.error('[GET /mintsoft/warehouses]', error);
@@ -2050,9 +1718,12 @@ app.get('/api/v1/mintsoft/warehouses', async (req, res) => {
 });
 
 // ── 4g. GET /api/v1/mintsoft/carton-sizes ────────────────────────────────
-// Lists every row in mintsoft_carton_sizes with both unit and carton
-// dimensions, plus computed CBMs. Source dimensions are in cm; CBM is
-// in m³ (cm³ → m³ via /1,000,000).
+// Lists every row in product_carton_sizes (a jfa view over jfpro.products,
+// keyed by jf_code) with both unit and carton dimensions, plus computed CBMs.
+// Source dimensions are in cm; CBM is in m³ (cm³ → m³ via /1,000,000).
+// NOTE: unit-level weight/height/width/depth and product_id have no source in
+// jfpro.products and come back as 0/null; carton weight is the real
+// grossCartonWeightKg (falls back to netCartonWeightKg).
 //
 // Optional filters:
 //   ?asin=B0...      (exact)
@@ -2071,7 +1742,7 @@ app.get('/api/v1/mintsoft/carton-sizes', async (req, res) => {
                         weight, height, width, depth,
                         carton_weight, carton_height, carton_width, carton_depth,
                         carton_qty, created_at, updated_at
-                   FROM mintsoft_carton_sizes
+                   FROM product_carton_sizes
                    ${whereSql}
                   ORDER BY jf_code ASC, sku ASC`,
                 params
@@ -2188,25 +1859,7 @@ app.get('/api/v1/mintsoft/warehouses/:warehouseId/locations', async (req, res) =
     try {
         const warehouseId = Number(req.params.warehouseId);
         if (!warehouseId) return res.status(400).json({ error: 'warehouseId must be a number.' });
-        const data = await withConnection(async (conn) => {
-            const [rows] = await conn.query(
-                `SELECT location_id, warehouse_id, name, location_name,
-                        pick_sequence, location_type_id, last_synced
-                 FROM mintsoft_locations
-                 WHERE warehouse_id = ?
-                 ORDER BY pick_sequence, name`,
-                [warehouseId]
-            );
-            return rows.map(r => ({
-                locationId: r.location_id,
-                warehouseId: r.warehouse_id,
-                name: r.name || '',
-                locationName: r.location_name || r.name || '',
-                pickSequence: r.pick_sequence,
-                locationTypeId: r.location_type_id,
-                lastSynced: r.last_synced?.toISOString?.() ?? r.last_synced,
-            }));
-        });
+        const data = await withConnection((conn) => listLocationsForWarehouse(conn, warehouseId));
         res.json({ data });
     } catch (error) {
         log.error('[GET /mintsoft/warehouses/:warehouseId/locations]', error);
@@ -2868,7 +2521,7 @@ async function loadDraftForPdf(conn, draftName) {
     const [rows] = await conn.query(
         `SELECT dca.allocated, dca.draft_container_name,
                 o.id AS order_id, o.jf_code, o.asin, o.product_name, o.quantity,
-                o.cbm_per_unit, o.order_cbm, o.units_per_carton, o.port
+                o.cbm_per_unit, o.order_cbm, o.units_per_carton, o.port, o.lot_number
            FROM draft_container_allocations dca
            INNER JOIN orders o ON o.id = dca.order_id AND o.deleted_at IS NULL
           WHERE dca.draft_container_name = ?
@@ -2895,6 +2548,7 @@ async function loadDraftForPdf(conn, draftName) {
             quantity: allocated,
             cbm,
             cartons,
+            lot: r.lot_number || '',
         };
     });
 
@@ -2902,14 +2556,16 @@ async function loadDraftForPdf(conn, draftName) {
 }
 
 // Richer loader for the 'forwarder-quote' PDF. One row per allocation, enriched
-// with carton weight/dimensions from mintsoft_carton_sizes (joined by jf_code).
-// Carton weight falls back to unit weight × units-per-carton when the stored
-// carton_weight is empty — same rule as the /mintsoft/carton-sizes endpoint.
+// with carton weight/dimensions. Source precedence: the spec frozen on the
+// order row at create time (so a regenerated quote reproduces the original
+// numbers even after jfpro.products changes), then the live product_carton_sizes
+// view (joined by jf_code), then unit-weight × units-per-carton.
 async function loadForwarderQuoteForPdf(conn, draftName, supplierName = null) {
     const [allRows] = await conn.query(
         `SELECT dca.allocated,
                 o.jf_code, o.asin, o.product_name, o.supplier, o.port, o.po_number,
-                o.units_per_carton
+                o.units_per_carton, o.lot_number,
+                o.carton_weight, o.carton_height, o.carton_width, o.carton_depth, o.carton_cbm
            FROM draft_container_allocations dca
            INNER JOIN orders o ON o.id = dca.order_id AND o.deleted_at IS NULL
           WHERE dca.draft_container_name = ?
@@ -2932,7 +2588,7 @@ async function loadForwarderQuoteForPdf(conn, draftName, supplierName = null) {
         const [crows] = await conn.query(
             `SELECT jf_code, weight, carton_weight, carton_qty,
                     carton_height, carton_width, carton_depth
-               FROM mintsoft_carton_sizes
+               FROM product_carton_sizes
               WHERE jf_code IN (${jfCodes.map(() => '?').join(',')})`,
             jfCodes
         );
@@ -2945,19 +2601,23 @@ async function loadForwarderQuoteForPdf(conn, draftName, supplierName = null) {
     const lines = rows.map(r => {
         const c = cartonByJf.get(r.jf_code) || {};
         const orderedUnits = num(r.allocated);
-        // Derived carton weight when empty: unit weight × units-per-carton.
-        const cartonWeight = num(c.carton_weight) || num(c.weight) * num(c.carton_qty);
-        const unitsPerCarton = num(c.carton_qty) || num(r.units_per_carton);
-        const cartonH = num(c.carton_height);
-        const cartonL = num(c.carton_depth);
-        const cartonW = num(c.carton_width);
+        // Prefer the carton spec frozen on the order row (snapshot at create);
+        // fall back to the live catalogue view, then unit-weight × units-per-carton.
+        const cartonWeight = num(r.carton_weight) || num(c.carton_weight) || num(c.weight) * num(c.carton_qty);
+        const unitsPerCarton = num(r.units_per_carton) || num(c.carton_qty);
+        const cartonH = num(r.carton_height) || num(c.carton_height);
+        const cartonL = num(r.carton_depth) || num(c.carton_depth);
+        const cartonW = num(r.carton_width) || num(c.carton_width);
         const cartonVol = cartonH * cartonW * cartonL;
-        const cartonCbm = cartonVol > 0 ? cartonVol / 1_000_000 : 0;
+        // Prefer the CBM frozen on the order row (honours a user-supplied value);
+        // otherwise recompute from the resolved dimensions.
+        const cartonCbm = num(r.carton_cbm) || (cartonVol > 0 ? cartonVol / 1_000_000 : 0);
         const noOfCartons = unitsPerCarton > 0 ? Math.ceil(orderedUnits / unitsPerCarton) : 0;
         const totalCbm = cartonCbm * noOfCartons;
         return {
             sku: r.product_name || r.jf_code || r.asin || '',
             jfCode: r.jf_code || '',
+            lot: r.lot_number || '',
             orderedUnits,
             cartonWeight,
             unitsPerCarton,
@@ -2974,6 +2634,139 @@ async function loadForwarderQuoteForPdf(conn, draftName, supplierName = null) {
     });
 
     return { lines, originPorts };
+}
+
+// Build the CSV companion for a draft-container document, drawing from the same
+// loaders the matching PDF was rendered from so the two formats carry identical
+// figures. `doc` is a row carrying { type, supplier, draft_container_name }.
+// Returns a Buffer, or null when the (filtered) draft has no lines.
+async function buildDraftDocumentCsv(conn, doc) {
+    const draftName = doc.draft_container_name;
+    if (doc.type === 'quote') {
+        const { lines } = await loadDraftForPdf(conn, draftName);
+        return lines.length ? buildDraftContainerCsv({ name: draftName }, lines) : null;
+    }
+    // forwarder-quote (supplier null = combined) and supplier-quote both use the
+    // forwarder loader, filtered by the doc's supplier (null = all suppliers).
+    const { lines } = await loadForwarderQuoteForPdf(conn, draftName, doc.supplier);
+    if (!lines.length) return null;
+    return doc.type === 'supplier-quote'
+        ? buildSupplierQuoteCsv({ name: draftName, supplier: doc.supplier }, lines)
+        : buildForwarderQuoteCsv({ name: draftName }, lines);
+}
+
+// Distinct supplier names allocated to a draft container (free-text on orders),
+// trimmed and de-duplicated case-insensitively so we don't emit two near-identical
+// per-supplier PDFs for "Acme" vs "acme". Blank suppliers are skipped — a file
+// can't be named after a nameless supplier; those lines still appear in the main
+// forwarder PDF.
+async function loadDraftSuppliers(conn, draftName) {
+    const [rows] = await conn.query(
+        `SELECT DISTINCT TRIM(o.supplier) AS supplier
+           FROM draft_container_allocations dca
+           INNER JOIN orders o ON o.id = dca.order_id AND o.deleted_at IS NULL
+          WHERE dca.draft_container_name = ?
+            AND o.supplier IS NOT NULL AND TRIM(o.supplier) <> ''
+          ORDER BY supplier ASC`,
+        [draftName]
+    );
+    const seen = new Set();
+    const out = [];
+    for (const r of rows) {
+        const s = String(r.supplier || '').trim();
+        if (!s) continue;
+        const key = s.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(s);
+    }
+    return out;
+}
+
+// Build + store ONE draft-container document (quote / forwarder-quote /
+// supplier-quote), returning its DB record. Extracted from the generate route so
+// the route can produce a main forwarder PDF plus one per-supplier PDF in a single
+// request. Returns { noLines: true } when the (filtered) draft has no lines.
+async function generateDraftDocument(conn, { name, docType, supplierName, comments, generatedByEmail, batchId = null }) {
+    const { lines, originPorts } = docType === 'quote'
+        ? await loadDraftForPdf(conn, name)
+        : await loadForwarderQuoteForPdf(conn, name, supplierName);
+    if (!lines.length) return { noLines: true };
+
+    const draftMeta = { name, date: new Date(), originPorts, comments: comments || '', supplier: supplierName };
+    let pdfBuffer, csvBuffer;
+    if (docType === 'supplier-quote') {
+        pdfBuffer = await buildSupplierQuotePdf(draftMeta, lines);
+        csvBuffer = buildSupplierQuoteCsv(draftMeta, lines);
+    } else if (docType === 'forwarder-quote') {
+        pdfBuffer = await buildForwarderQuotePdf(draftMeta, lines);
+        csvBuffer = buildForwarderQuoteCsv(draftMeta, lines);
+    } else {
+        pdfBuffer = await buildDraftContainerPdf(draftMeta, lines);
+        csvBuffer = buildDraftContainerCsv(draftMeta, lines);
+    }
+
+    // Versions are sequenced per (draft, type, supplier) so each flavour — and
+    // each supplier within supplier-quote — has its own v1, v2, …
+    const [versionRows] = await conn.query(
+        `SELECT COALESCE(MAX(version), 0) AS max_version
+           FROM draft_container_documents
+          WHERE draft_container_name = ? AND type = ?
+            AND ((supplier IS NULL AND ? IS NULL) OR supplier = ?)
+            AND deleted_at IS NULL`,
+        [name, docType, supplierName, supplierName]
+    );
+    const version = Number(versionRows[0].max_version) + 1;
+    const safeName = name.replace(/[^A-Za-z0-9._-]/g, '_');
+    const token = uuidv4();
+    // Any per-supplier doc (supplier-quote, or a per-supplier forwarder-quote
+    // copy) carries the supplier name stripped to a–z so it doesn't collide with
+    // the combined PDF or the other suppliers' copies.
+    const supplierSlug = supplierName ? (supplierName.replace(/[^A-Za-z]/g, '') || 'supplier') : null;
+    const fileBase = supplierSlug
+        ? `${docType}-${supplierSlug}-${safeName}-v${version}`
+        : `${docType}-${safeName}-v${version}`;
+    const s3Key = `draft-containers/${token}/${fileBase}.pdf`;
+    const publicUrl = publicS3Url(s3Key);
+    // CSV sibling, same key prefix so it lives next to the PDF in S3.
+    const csvS3Key = `draft-containers/${token}/${fileBase}.csv`;
+    const csvPublicUrl = publicS3Url(csvS3Key);
+
+    await s3.send(new PutObjectCommand({
+        Bucket: PO_BUCKET,
+        Key: s3Key,
+        Body: pdfBuffer,
+        ContentType: 'application/pdf',
+        ContentDisposition: `inline; filename="${fileBase}.pdf"`,
+    }));
+    await s3.send(new PutObjectCommand({
+        Bucket: PO_BUCKET,
+        Key: csvS3Key,
+        Body: csvBuffer,
+        ContentType: 'text/csv; charset=utf-8',
+        // attachment (not inline) so a click downloads the .csv with its filename
+        // rather than rendering raw text in a browser tab; PDFs stay inline.
+        ContentDisposition: `attachment; filename="${fileBase}.csv"`,
+    }));
+
+    const [insertResult] = await conn.query(
+        `INSERT INTO draft_container_documents
+            (draft_container_name, version, type, supplier, s3_key, public_url, file_size,
+             csv_s3_key, csv_public_url, csv_file_size, generated_by_email, batch_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [name, version, docType, supplierName, s3Key, publicUrl, pdfBuffer.length,
+         csvS3Key, csvPublicUrl, csvBuffer.length, generatedByEmail || null, batchId]
+    );
+    return {
+        documentId: insertResult.insertId,
+        draftContainerName: name,
+        type: docType,
+        supplier: supplierName,
+        version,
+        fileSize: pdfBuffer.length,
+        url: publicUrl,
+        csvUrl: csvPublicUrl,
+    };
 }
 
 app.post('/api/v1/draft-containers/:name/generate', async (req, res) => {
@@ -2999,59 +2792,45 @@ app.post('/api/v1/draft-containers/:name/generate', async (req, res) => {
             return res.status(400).json({ error: "supplier is required for type 'supplier-quote'." });
         }
 
+        // Per-supplier split: emit one forwarder-quote PDF per distinct supplier in
+        // the draft (forwarder layout, filtered to that supplier) alongside the main
+        // combined forwarder PDF. Defaults ON for forwarder quotes (they go out as
+        // forwarder emails as a collection — the combined quote plus each supplier's
+        // copy); pass splitBySupplier:false to suppress. Never applies to a plain
+        // 'quote' or an already-single-supplier 'supplier-quote'.
+        const splitFlag = req.body ? req.body.splitBySupplier : undefined;
+        const wantSplit = docType === 'forwarder-quote' && splitFlag !== false;
+
+        // Shared batch id ties the main forwarder PDF to its per-supplier PDFs so
+        // the forwarder email can attach the whole set.
+        const batchId = wantSplit ? uuidv4() : null;
+
         const result = await withConnection(async (conn) => {
-            const { lines, originPorts } = docType === 'quote'
-                ? await loadDraftForPdf(conn, name)
-                : await loadForwarderQuoteForPdf(conn, name, supplierName);
-            if (!lines.length) return { noLines: true };
+            const main = await generateDraftDocument(conn, {
+                name, docType, supplierName, comments, generatedByEmail: req.userEmail, batchId,
+            });
+            if (main.noLines) return { noLines: true };
+            if (!wantSplit) return { main };
 
-            const draftMeta = { name, date: new Date(), originPorts, comments: comments || '', supplier: supplierName };
-            let pdfBuffer;
-            if (docType === 'supplier-quote') pdfBuffer = await buildSupplierQuotePdf(draftMeta, lines);
-            else if (docType === 'forwarder-quote') pdfBuffer = await buildForwarderQuotePdf(draftMeta, lines);
-            else pdfBuffer = await buildDraftContainerPdf(draftMeta, lines);
-
-            // Versions are sequenced per (draft, type, supplier) so each flavour
-            // — and each supplier within supplier-quote — has its own v1, v2, …
-            const [versionRows] = await conn.query(
-                `SELECT COALESCE(MAX(version), 0) AS max_version
-                   FROM draft_container_documents
-                  WHERE draft_container_name = ? AND type = ?
-                    AND ((supplier IS NULL AND ? IS NULL) OR supplier = ?)
-                    AND deleted_at IS NULL`,
-                [name, docType, supplierName, supplierName]
-            );
-            const version = Number(versionRows[0].max_version) + 1;
-            const safeName = name.replace(/[^A-Za-z0-9._-]/g, '_');
-            const token = uuidv4();
-            // supplier-quote filenames carry the supplier name stripped to a–z.
-            const supplierSlug = supplierName ? (supplierName.replace(/[^A-Za-z]/g, '') || 'supplier') : null;
-            const fileBase = docType === 'supplier-quote'
-                ? `supplier-quote-${supplierSlug}-${safeName}-v${version}`
-                : `${docType}-${safeName}-v${version}`;
-            const s3Key = `draft-containers/${token}/${fileBase}.pdf`;
-            const publicUrl = publicS3Url(s3Key);
-
-            await s3.send(new PutObjectCommand({
-                Bucket: PO_BUCKET,
-                Key: s3Key,
-                Body: pdfBuffer,
-                ContentType: 'application/pdf',
-                ContentDisposition: `inline; filename="${fileBase}.pdf"`,
-            }));
-
-            const [insertResult] = await conn.query(
-                `INSERT INTO draft_container_documents
-                    (draft_container_name, version, type, supplier, s3_key, public_url, file_size, generated_by_email)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-                [name, version, docType, supplierName, s3Key, publicUrl, pdfBuffer.length, req.userEmail || null]
-            );
-            return {
-                documentId: insertResult.insertId,
-                version,
-                publicUrl,
-                fileSize: pdfBuffer.length,
-            };
+            // One PDF per supplier, best-effort: a single supplier failing (or
+            // having no lines after filtering) must not lose the main PDF or the
+            // other suppliers. Collect outcomes for the response.
+            const suppliers = await loadDraftSuppliers(conn, name);
+            const supplierDocuments = [];
+            const failedSuppliers = [];
+            for (const s of suppliers) {
+                try {
+                    const doc = await generateDraftDocument(conn, {
+                        name, docType: 'forwarder-quote', supplierName: s,
+                        comments, generatedByEmail: req.userEmail, batchId,
+                    });
+                    if (!doc.noLines) supplierDocuments.push(doc);
+                } catch (err) {
+                    log.error(`[generate] supplier-quote failed for "${s}"`, err);
+                    failedSuppliers.push(s);
+                }
+            }
+            return { main, supplierDocuments, failedSuppliers };
         });
 
         if (result.noLines) {
@@ -3060,15 +2839,31 @@ app.post('/api/v1/draft-containers/:name/generate', async (req, res) => {
                 : `Draft container "${name}" has no allocations.`;
             return res.status(400).json({ error: msg });
         }
-        res.status(201).json({
-            documentId: result.documentId,
+        const { main } = result;
+        const payload = {
+            documentId: main.documentId,
             draftContainerName: name,
             type: docType,
             supplier: supplierName,
-            version: result.version,
-            fileSize: result.fileSize,
-            url: result.publicUrl,
-        });
+            version: main.version,
+            fileSize: main.fileSize,
+            url: main.url,
+            csvUrl: main.csvUrl,
+        };
+        if (wantSplit) {
+            payload.batchId = batchId;
+            payload.supplierDocuments = result.supplierDocuments.map(d => ({
+                documentId: d.documentId,
+                type: d.type,
+                supplier: d.supplier,
+                version: d.version,
+                fileSize: d.fileSize,
+                url: d.url,
+                csvUrl: d.csvUrl,
+            }));
+            if (result.failedSuppliers.length) payload.failedSuppliers = result.failedSuppliers;
+        }
+        res.status(201).json(payload);
     } catch (error) {
         log.error('[POST /draft-containers/:name/generate]', error);
         res.status(500).json({ error: 'An internal error occurred.' });
@@ -3084,7 +2879,8 @@ app.get('/api/v1/draft-containers/:name/documents', async (req, res) => {
         const { docs, sendsByDoc } = await withConnection(async (conn) => {
             const [r] = await conn.query(
                 `SELECT id, draft_container_name, version, type, supplier, s3_key, public_url, file_size,
-                        generated_by_email, generated_at
+                        csv_s3_key, csv_public_url, csv_file_size,
+                        batch_id, generated_by_email, generated_at
                    FROM draft_container_documents
                   WHERE draft_container_name = ? AND deleted_at IS NULL
                   ORDER BY type ASC, version DESC`,
@@ -3116,8 +2912,14 @@ app.get('/api/v1/draft-containers/:name/documents', async (req, res) => {
                 version: r.version,
                 type: r.type || 'quote',
                 supplier: r.supplier || null,
+                // Ties together the PDFs produced by one split-generate run. Group
+                // by this in the UI to show the exact set a forwarder email sends
+                // (combined + per-supplier copies); null for non-split documents.
+                batchId: r.batch_id || null,
                 fileSize: r.file_size,
                 url: r.public_url || publicS3Url(r.s3_key),
+                csvUrl: r.csv_public_url || (r.csv_s3_key ? publicS3Url(r.csv_s3_key) : null),
+                csvFileSize: r.csv_file_size ?? null,
                 generatedByEmail: r.generated_by_email || null,
                 generatedAt: r.generated_at?.toISOString?.() ?? r.generated_at,
                 sends: (sendsByDoc.get(r.id) || []).map(s => ({
@@ -3166,7 +2968,7 @@ app.post('/api/v1/draft-container-documents/:id/email', async (req, res) => {
 
         const result = await withConnection(async (conn) => {
             const [docRows] = await conn.query(
-                `SELECT id, draft_container_name, version, s3_key, public_url, file_size
+                `SELECT id, draft_container_name, version, s3_key, public_url, file_size, csv_s3_key, type, supplier, batch_id
                    FROM draft_container_documents
                   WHERE id = ? AND deleted_at IS NULL`,
                 [id]
@@ -3174,11 +2976,56 @@ app.post('/api/v1/draft-container-documents/:id/email', async (req, res) => {
             if (!docRows.length) return { notFound: true };
             const doc = docRows[0];
 
-            const obj = await s3.send(new GetObjectCommand({ Bucket: PO_BUCKET, Key: doc.s3_key }));
-            const pdfBytes = Buffer.from(await obj.Body.transformToByteArray());
+            // Emailing a split forwarder-quote attaches the whole collection of
+            // forwarder quotes — the main combined PDF (supplier NULL) first, then
+            // one per-supplier forwarder copy A–Z. Restricting to the same `type`
+            // guarantees we only ever group forwarder quotes: any other document
+            // type that happened to share the batch is never mixed in. Any other
+            // document emails just itself.
+            let docsToSend = [doc];
+            if (doc.type === 'forwarder-quote' && doc.batch_id) {
+                const [batchRows] = await conn.query(
+                    `SELECT id, draft_container_name, version, s3_key, csv_s3_key, type, supplier
+                       FROM draft_container_documents
+                      WHERE batch_id = ? AND type = ? AND deleted_at IS NULL
+                      ORDER BY (supplier IS NULL) DESC, supplier ASC, id ASC`,
+                    [doc.batch_id, doc.type]
+                );
+                if (batchRows.length) docsToSend = batchRows;
+            }
 
+            // Download each PDF + its stored CSV companion. Filenames = the S3
+            // objects' basenames, which already encode the supplier (e.g.
+            // supplier-quote-Acme-<draft>-v1.pdf / .csv) so the pair reads as a set.
             const safeName = String(doc.draft_container_name).replace(/[^A-Za-z0-9._-]/g, '_');
-            const filename = `draft-${safeName}-v${doc.version}.pdf`;
+            const attachments = [];
+            for (const d of docsToSend) {
+                const obj = await s3.send(new GetObjectCommand({ Bucket: PO_BUCKET, Key: d.s3_key }));
+                const bytes = Buffer.from(await obj.Body.transformToByteArray());
+                const filename = d.s3_key.split('/').pop() || `draft-${safeName}-v${d.version}.pdf`;
+                const item = { doc: d, pdf: { bytes, filename }, csv: null };
+                // Attach the CSV stored next to the PDF. For documents generated
+                // before CSVs were stored (no csv_s3_key), rebuild it on the fly so
+                // the email still carries one. Best-effort: never lose the PDF send.
+                try {
+                    let csvBytes = null;
+                    if (d.csv_s3_key) {
+                        const csvObj = await s3.send(new GetObjectCommand({ Bucket: PO_BUCKET, Key: d.csv_s3_key }));
+                        csvBytes = Buffer.from(await csvObj.Body.transformToByteArray());
+                    } else {
+                        csvBytes = await buildDraftDocumentCsv(conn, d);
+                    }
+                    if (csvBytes && csvBytes.length) {
+                        const csvName = d.csv_s3_key
+                            ? (d.csv_s3_key.split('/').pop() || filename.replace(/\.pdf$/i, '') + '.csv')
+                            : filename.replace(/\.pdf$/i, '') + '.csv';
+                        item.csv = { bytes: csvBytes, filename: csvName };
+                    }
+                } catch (err) {
+                    log.error('[draft-container-documents/email] CSV attach failed', { documentId: d.id, err });
+                }
+                attachments.push(item);
+            }
 
             const tpl = await getEmailTemplate(conn, 'draft_container_quote');
             const vars = { draftContainerName: doc.draft_container_name };
@@ -3195,7 +3042,12 @@ app.post('/api/v1/draft-container-documents/:id/email', async (req, res) => {
             form.append('body', htmlBody);
             form.append('body_format', 'html');
             form.append('options[archive]', 'false');
-            form.append('attachments[]', new Blob([pdfBytes], { type: 'application/pdf' }), filename);
+            for (const a of attachments) {
+                form.append('attachments[]', new Blob([a.pdf.bytes], { type: 'application/pdf' }), a.pdf.filename);
+                if (a.csv) {
+                    form.append('attachments[]', new Blob([a.csv.bytes], { type: 'text/csv' }), a.csv.filename);
+                }
+            }
 
             const frontUrl = `https://api2.frontapp.com/channels/${encodeURIComponent(process.env.FRONT_CHANNEL_ID)}/messages`;
             const resp = await fetch(frontUrl, {
@@ -3220,28 +3072,34 @@ app.post('/api/v1/draft-container-documents/:id/email', async (req, res) => {
             const frontConversationId = conversationUrl ? conversationUrl.split('/').pop() : null;
             const frontMessageUid = parsed?.message_uid || parsed?.id || null;
 
-            const [sendInsert] = await conn.query(
-                `INSERT INTO draft_container_document_sends
-                    (draft_container_document_id, sent_to, subject, front_message_uid, front_conversation_id, sent_by_email)
-                 VALUES (?, ?, ?, ?, ?, ?)`,
-                [
-                    doc.id,
-                    JSON.stringify(toAddresses),
-                    finalSubject,
-                    frontMessageUid,
-                    frontConversationId,
-                    req.userEmail || null,
-                ]
-            );
+            // One send row per attached document (all share the Front message), so
+            // each PDF shows this email in its own sends history.
+            let primarySendId = null;
+            for (const a of attachments) {
+                const [ins] = await conn.query(
+                    `INSERT INTO draft_container_document_sends
+                        (draft_container_document_id, sent_to, subject, front_message_uid, front_conversation_id, sent_by_email)
+                     VALUES (?, ?, ?, ?, ?, ?)`,
+                    [
+                        a.doc.id,
+                        JSON.stringify(toAddresses),
+                        finalSubject,
+                        frontMessageUid,
+                        frontConversationId,
+                        req.userEmail || null,
+                    ]
+                );
+                if (a.doc.id === doc.id) primarySendId = ins.insertId;
+            }
             const [sentRow] = await conn.query(
                 `SELECT sent_at FROM draft_container_document_sends WHERE id = ?`,
-                [sendInsert.insertId]
+                [primarySendId]
             );
             const sentAt = sentRow[0]?.sent_at?.toISOString?.() ?? sentRow[0]?.sent_at ?? null;
 
             return {
                 ok: true,
-                sendId: sendInsert.insertId,
+                sendId: primarySendId,
                 documentId: doc.id,
                 draftContainerName: doc.draft_container_name,
                 version: doc.version,
@@ -3250,6 +3108,14 @@ app.post('/api/v1/draft-container-documents/:id/email', async (req, res) => {
                 sentAt,
                 frontMessageUid,
                 frontConversationId,
+                attachments: attachments.map(a => ({
+                    documentId: a.doc.id,
+                    type: a.doc.type,
+                    supplier: a.doc.supplier,
+                    version: a.doc.version,
+                    filename: a.pdf.filename,
+                    csvFilename: a.csv ? a.csv.filename : null,
+                })),
             };
         });
 
@@ -3279,7 +3145,8 @@ async function loadQualityAssuranceForPdf(conn, orderIds, qcUnitsByOrderId) {
     const ph = orderIds.map(() => '?').join(',');
     const [orderRows] = await conn.query(
         `SELECT id, jf_code, asin, product_name, quantity, supplier, port, po_number,
-                units_per_carton, lot_number
+                units_per_carton, lot_number,
+                carton_weight, carton_height, carton_width, carton_depth, carton_cbm
            FROM orders
           WHERE id IN (${ph}) AND deleted_at IS NULL`,
         orderIds
@@ -3295,7 +3162,7 @@ async function loadQualityAssuranceForPdf(conn, orderIds, qcUnitsByOrderId) {
         const [crows] = await conn.query(
             `SELECT jf_code, weight, carton_weight, carton_qty,
                     carton_height, carton_width, carton_depth
-               FROM mintsoft_carton_sizes
+               FROM product_carton_sizes
               WHERE jf_code IN (${jfCodes.map(() => '?').join(',')})`,
             jfCodes
         );
@@ -3322,13 +3189,17 @@ async function loadQualityAssuranceForPdf(conn, orderIds, qcUnitsByOrderId) {
         const c = cartonByJf.get(r.jf_code) || {};
         const sup = supByName.get(norm(r.supplier)) || {};
         const orderedUnits = num(r.quantity);
-        const cartonWeight = num(c.carton_weight) || num(c.weight) * num(c.carton_qty);
-        const unitsPerCarton = num(c.carton_qty) || num(r.units_per_carton);
-        const cartonH = num(c.carton_height);
-        const cartonL = num(c.carton_depth);
-        const cartonW = num(c.carton_width);
+        // Prefer the carton spec frozen on the order row; fall back to the live
+        // catalogue view, then unit-weight × units-per-carton.
+        const cartonWeight = num(r.carton_weight) || num(c.carton_weight) || num(c.weight) * num(c.carton_qty);
+        const unitsPerCarton = num(r.units_per_carton) || num(c.carton_qty);
+        const cartonH = num(r.carton_height) || num(c.carton_height);
+        const cartonL = num(r.carton_depth) || num(c.carton_depth);
+        const cartonW = num(r.carton_width) || num(c.carton_width);
         const cartonVol = cartonH * cartonW * cartonL;
-        const cartonCbm = cartonVol > 0 ? cartonVol / 1_000_000 : 0;
+        // Prefer the CBM frozen on the order row (honours a user-supplied value);
+        // otherwise recompute from the resolved dimensions.
+        const cartonCbm = num(r.carton_cbm) || (cartonVol > 0 ? cartonVol / 1_000_000 : 0);
         const noOfCartons = unitsPerCarton > 0 ? Math.ceil(orderedUnits / unitsPerCarton) : 0;
         const totalCbm = cartonCbm * noOfCartons;
         const qcRaw = qcUnitsByOrderId[oid] ?? qcUnitsByOrderId[String(oid)];
@@ -3408,9 +3279,13 @@ app.post('/api/v1/quality-assurance/generate', async (req, res) => {
 
                 const meta = { name: ref, date: new Date(), comments: comments || '' };
                 const pdfBuffer = await buildQualityAssurancePdf(meta, lines);
+                const csvBuffer = buildQualityAssuranceCsv(meta, lines);
 
                 const s3Key = `quality-assurance/${token}/${ref}-v${version}.pdf`;
                 const publicUrl = publicS3Url(s3Key);
+                // CSV sibling, same key prefix so it lives next to the PDF in S3.
+                const csvS3Key = `quality-assurance/${token}/${ref}-v${version}.csv`;
+                const csvPublicUrl = publicS3Url(csvS3Key);
                 await s3.send(new PutObjectCommand({
                     Bucket: PO_BUCKET,
                     Key: s3Key,
@@ -3418,15 +3293,25 @@ app.post('/api/v1/quality-assurance/generate', async (req, res) => {
                     ContentType: 'application/pdf',
                     ContentDisposition: `inline; filename="${ref}-v${version}.pdf"`,
                 }));
+                await s3.send(new PutObjectCommand({
+                    Bucket: PO_BUCKET,
+                    Key: csvS3Key,
+                    Body: csvBuffer,
+                    ContentType: 'text/csv; charset=utf-8',
+                    // attachment (not inline) so a click downloads the .csv with its
+                    // filename rather than rendering raw text in a tab; PDF stays inline.
+                    ContentDisposition: `attachment; filename="${ref}-v${version}.csv"`,
+                }));
 
                 await conn.query(
                     `UPDATE quality_assurance_documents
-                        SET ref = ?, s3_key = ?, public_url = ?, file_size = ?
+                        SET ref = ?, s3_key = ?, public_url = ?, file_size = ?,
+                            csv_s3_key = ?, csv_public_url = ?, csv_file_size = ?
                       WHERE id = ?`,
-                    [ref, s3Key, publicUrl, pdfBuffer.length, newId]
+                    [ref, s3Key, publicUrl, pdfBuffer.length, csvS3Key, csvPublicUrl, csvBuffer.length, newId]
                 );
                 await conn.commit();
-                return { documentId: newId, ref, version, draftContainerName: draftName, publicUrl, fileSize: pdfBuffer.length, rowCount: lines.length };
+                return { documentId: newId, ref, version, draftContainerName: draftName, publicUrl, csvPublicUrl, fileSize: pdfBuffer.length, csvFileSize: csvBuffer.length, rowCount: lines.length };
             } catch (err) {
                 await conn.rollback();
                 throw err;
@@ -3444,6 +3329,8 @@ app.post('/api/v1/quality-assurance/generate', async (req, res) => {
             rowCount: result.rowCount,
             fileSize: result.fileSize,
             url: result.publicUrl,
+            csvUrl: result.csvPublicUrl,
+            csvFileSize: result.csvFileSize,
         });
     } catch (error) {
         log.error('[POST /quality-assurance/generate]', error);
@@ -3467,7 +3354,8 @@ app.get('/api/v1/quality-assurance/documents', async (req, res) => {
             const filterParams = draftContainerName ? [draftContainerName] : [];
             const [r] = await conn.query(
                 `SELECT id, ref, version, draft_container_name, order_ids, qc_units, s3_key,
-                        public_url, file_size, comments, generated_by_email, generated_at
+                        public_url, file_size, csv_s3_key, csv_public_url, csv_file_size,
+                        comments, generated_by_email, generated_at
                    FROM quality_assurance_documents
                   WHERE deleted_at IS NULL${filterSql}
                   ORDER BY generated_at DESC, id DESC`,
@@ -3507,6 +3395,8 @@ app.get('/api/v1/quality-assurance/documents', async (req, res) => {
                     comments: r.comments || null,
                     fileSize: r.file_size,
                     url: r.public_url || publicS3Url(r.s3_key),
+                    csvUrl: r.csv_public_url || (r.csv_s3_key ? publicS3Url(r.csv_s3_key) : null),
+                    csvFileSize: r.csv_file_size ?? null,
                     generatedByEmail: r.generated_by_email || null,
                     generatedAt: r.generated_at?.toISOString?.() ?? r.generated_at,
                     sends: (sendsByDoc.get(r.id) || []).map(s => ({
@@ -3553,7 +3443,7 @@ app.post('/api/v1/quality-assurance-documents/:id/email', async (req, res) => {
 
         const result = await withConnection(async (conn) => {
             const [docRows] = await conn.query(
-                `SELECT id, ref, version, s3_key FROM quality_assurance_documents
+                `SELECT id, ref, version, s3_key, csv_s3_key, order_ids, qc_units FROM quality_assurance_documents
                   WHERE id = ? AND deleted_at IS NULL`,
                 [id]
             );
@@ -3565,6 +3455,33 @@ app.post('/api/v1/quality-assurance-documents/:id/email', async (req, res) => {
             const pdfBytes = Buffer.from(await obj.Body.transformToByteArray());
             const safeRef = String(refLabel).replace(/[^A-Za-z0-9._-]/g, '_');
             const filename = `${safeRef}-v${doc.version}.pdf`;
+
+            // Attach the CSV stored next to the PDF. For documents generated before
+            // CSVs were stored (no csv_s3_key), rebuild it from the doc's order ids
+            // + QC units via the same loader the PDF used. Best-effort: a CSV
+            // failure must not block the PDF send.
+            let csvAttachment = null;
+            try {
+                let csvBytes = null;
+                if (doc.csv_s3_key) {
+                    const csvObj = await s3.send(new GetObjectCommand({ Bucket: PO_BUCKET, Key: doc.csv_s3_key }));
+                    csvBytes = Buffer.from(await csvObj.Body.transformToByteArray());
+                } else {
+                    const orderIds = ((typeof doc.order_ids === 'string' ? JSON.parse(doc.order_ids) : doc.order_ids) || [])
+                        .map(Number).filter(n => Number.isInteger(n) && n > 0);
+                    const qcUnits = (typeof doc.qc_units === 'string' ? JSON.parse(doc.qc_units) : doc.qc_units) || {};
+                    const { lines } = await loadQualityAssuranceForPdf(conn, orderIds, qcUnits);
+                    if (lines.length) csvBytes = buildQualityAssuranceCsv({ name: refLabel }, lines);
+                }
+                if (csvBytes && csvBytes.length) {
+                    const csvName = doc.csv_s3_key
+                        ? (doc.csv_s3_key.split('/').pop() || `${safeRef}-v${doc.version}.csv`)
+                        : `${safeRef}-v${doc.version}.csv`;
+                    csvAttachment = { bytes: csvBytes, filename: csvName };
+                }
+            } catch (err) {
+                log.error('[quality-assurance-documents/email] CSV attach failed', { documentId: doc.id, err });
+            }
 
             const tpl = await getEmailTemplate(conn, 'quality_assurance');
             const vars = { ref: refLabel };
@@ -3582,6 +3499,9 @@ app.post('/api/v1/quality-assurance-documents/:id/email', async (req, res) => {
             form.append('body_format', 'html');
             form.append('options[archive]', 'false');
             form.append('attachments[]', new Blob([pdfBytes], { type: 'application/pdf' }), filename);
+            if (csvAttachment) {
+                form.append('attachments[]', new Blob([csvAttachment.bytes], { type: 'text/csv' }), csvAttachment.filename);
+            }
 
             const frontUrl = `https://api2.frontapp.com/channels/${encodeURIComponent(process.env.FRONT_CHANNEL_ID)}/messages`;
             const resp = await fetch(frontUrl, {
@@ -3629,6 +3549,8 @@ app.post('/api/v1/quality-assurance-documents/:id/email', async (req, res) => {
                 sentAt,
                 frontMessageUid,
                 frontConversationId,
+                filename,
+                csvFilename: csvAttachment ? csvAttachment.filename : null,
             };
         });
 
@@ -3798,7 +3720,7 @@ app.get('/api/v1/stock-snapshots/sum', async (req, res) => {
                 pool.query(
                     `SELECT carton_qty AS units_per_ctn,
                             (carton_height * carton_width * carton_depth) / 1000000 AS carton_cbm
-                     FROM mintsoft_carton_sizes
+                     FROM product_carton_sizes
                      WHERE asin = ?
                      LIMIT 1`,
                     [cleanAsin]
@@ -3962,7 +3884,7 @@ app.get('/api/v1/stock-snapshots/sum/all-asins', async (req, res) => {
                     SELECT asin,
                            carton_qty AS units_per_ctn,
                            (carton_height * carton_width * carton_depth) / 1000000 AS carton_cbm
-                    FROM mintsoft_carton_sizes
+                    FROM product_carton_sizes
                     WHERE asin IS NOT NULL AND asin != ''
                 `),
             ]),
@@ -7808,6 +7730,302 @@ app.delete('/api/v1/qc-reports/:id/orders/:orderId', async (req, res) => {
         res.json(qcReportDetailJson(out.report, out.links));
     } catch (error) {
         log.error('[DELETE /qc-reports/:id/orders/:orderId]', error);
+        res.status(500).json({ error: 'An internal error occurred.' });
+    }
+});
+
+// ── Daily alerts (slide-out alert window) ──────────────────────────────────
+// Populated overnight by the generateDailyAlerts Lambda. Each alert can be
+// snoozed (re-nags in N days if still unresolved), dismissed ("never remind"),
+// or restored; actions are attributed and `/alerts/history` lists past alerts
+// with who actioned them. `/alerts/history` is a fixed sub-path and the only
+// `/alerts/:id` routes are PATCH actions, so no GET route can shadow it.
+app.get('/api/v1/alerts', async (req, res) => {
+    try {
+        await dailyAlertsSchemaReady;
+        const { status, type, limit } = req.query;
+        const data = await withConnection(conn => listAlerts(conn, { status, type, limit }));
+        const pending = data.filter(a => a.status === 'pending').length;
+        res.json({ data, counts: { returned: data.length, pending } });
+    } catch (error) {
+        log.error('[GET /alerts]', error);
+        res.status(500).json({ error: 'An internal error occurred.' });
+    }
+});
+
+app.get('/api/v1/alerts/history', async (req, res) => {
+    try {
+        await dailyAlertsSchemaReady;
+        const { limit, days } = req.query;
+        const data = await withConnection(conn => listHistory(conn, { limit, days }));
+        res.json({ data });
+    } catch (error) {
+        log.error('[GET /alerts/history]', error);
+        res.status(500).json({ error: 'An internal error occurred.' });
+    }
+});
+
+// One action endpoint per verb (all PATCH, all covered by the
+// PATCH /api/v1/alerts/{proxy+} route in serverless.yml):
+//   POST-less by design — these mutate an existing alert's lifecycle state.
+//   • /snooze   body { days } (default 2) — hide until now+days, re-nags if still live
+//   • /dismiss  — permanent "never remind"
+//   • /restore  — undo snooze/dismiss, back to pending
+const ALERT_ACTION_PATHS = { snooze: 'snooze', dismiss: 'dismiss', restore: 'restore' };
+for (const action of Object.values(ALERT_ACTION_PATHS)) {
+    app.patch(`/api/v1/alerts/:id/${action}`, async (req, res) => {
+        try {
+            await dailyAlertsSchemaReady;
+            const id = Number(req.params.id);
+            if (!Number.isInteger(id) || id <= 0) {
+                return res.status(400).json({ error: 'A valid alert id is required.' });
+            }
+            const days = action === 'snooze' ? req.body?.days : undefined;
+            const result = await withConnection(conn =>
+                actOnAlert(conn, { id, userEmail: req.userEmail, action, days }));
+            if (result.notFound) {
+                return res.status(404).json({ error: `Alert ${id} not found.` });
+            }
+            res.json(result.alert);
+        } catch (error) {
+            log.error(`[PATCH /alerts/:id/${action}]`, error);
+            res.status(500).json({ error: 'An internal error occurred.' });
+        }
+    });
+}
+
+// ── AI status suggestions: approve / deny ──────────────────────────────────
+// The Front importer (frontStatusImport) queues type='status_suggestion' alerts
+// proposing an order status change inferred from a supplier email. A human
+// either APPROVES it — which applies the change to orders.status exactly like
+// PATCH /orders/:id/status (audited, PO-sent webhook fired) and resolves the
+// alert — or DENIES it, which dismisses it permanently. Both are covered by the
+// existing PATCH /api/v1/alerts/{proxy+} route, so serverless.yml needs no change.
+//
+// No transition validation: per the product decision, the human approver is the
+// control. The card shows current -> suggested; an operator may pass an explicit
+// { status } in the body to correct the AI's guess before applying. The one
+// hard guard is that we refuse to apply a (now-stale) suggestion to an order
+// that has since reached a received/warehouse state — those are never live
+// candidates for a supplier-email status change.
+//
+// Runs in a TRANSACTION with a row lock on the suggestion (getSuggestionForUpdate
+// = SELECT ... FOR UPDATE) so two concurrent approvals can't both mutate the
+// order: the second blocks on the lock, then sees the suggestion resolved and
+// aborts. The PO-sent webhook (an external HTTP call) is fired AFTER commit so it
+// never holds the lock.
+// Already-received/terminal: a stale suggestion must not regress one of these
+// (live DB vocabulary — see order-transitions.CANDIDATE_EXCLUDED_STATUSES).
+const RECEIVED_TERMINAL_STATUSES = [...T.CANDIDATE_EXCLUDED_STATUSES];
+// Statuses an approve may set. The legacy ALL_STATUSES enum predates the live
+// pipeline (it has IN_WAREHOUSE/MINTSOFT — 0 rows — and lacks ARRIVED_AT_WAREHOUSE
+// / DESTROYED, both of which the rules engine can legitimately target), so union
+// it with the real pipeline statuses from order-transitions.
+const APPROVE_VALID_STATUSES = new Set([...ALL_STATUSES, ...Object.keys(T.STATUS_LEVEL), 'PARTIALLY_RECEIVED']);
+app.patch('/api/v1/alerts/:id/approve', async (req, res) => {
+    try {
+        await dailyAlertsSchemaReady;
+        await auditLogSchemaReady;
+        await poSentWebhooksSchemaReady;
+        const id = Number(req.params.id);
+        if (!Number.isInteger(id) || id <= 0) {
+            return res.status(400).json({ error: 'A valid alert id is required.' });
+        }
+
+        const result = await withConnection(async (conn) => {
+            await conn.beginTransaction();
+            try {
+                const alert = await getSuggestionForUpdate(conn, id);
+                if (!alert) { await conn.rollback(); return { notFound: true }; }
+                if (alert.status === 'dismissed' || alert.status === 'resolved') {
+                    await conn.rollback();
+                    return { alreadyActioned: true, alert };
+                }
+                const meta = alert.meta || {};
+                const orderId = Number(meta.orderId);
+                if (!Number.isInteger(orderId) || orderId <= 0) { await conn.rollback(); return { badMeta: 'orderId' }; }
+                const status = (req.body && req.body.status) || meta.suggestedStatus;
+                if (!APPROVE_VALID_STATUSES.has(status)) { await conn.rollback(); return { badStatus: status }; }
+
+                const [existing] = await conn.query(`${ORDER_SELECT} AND orders.id = ?`, [orderId]);
+                if (!existing.length) { await conn.rollback(); return { orderNotFound: orderId }; }
+                const beforeOrder = rowToOrder(existing[0]);
+                if (RECEIVED_TERMINAL_STATUSES.includes(beforeOrder.status)) {
+                    await conn.rollback();
+                    return { staleTerminal: beforeOrder.status, alert };
+                }
+
+                // Also apply the field values the email provided for this move
+                // (meta.fieldUpdates), or an explicit body.fields override. These
+                // are re-validated HERE against the current order (the world may
+                // have changed since the suggestion): non-admin rules — mfg/exp
+                // snap to the 1st, expiry can't be in the past, and a JF+lot can't
+                // take a second expiry (§5). Rejected fields are skipped (the
+                // status move still applies) and reported back.
+                const proposed = {};
+                if (req.body && req.body.fields && typeof req.body.fields === 'object') {
+                    Object.assign(proposed, req.body.fields);
+                } else if (Array.isArray(meta.fieldUpdates)) {
+                    for (const u of meta.fieldUpdates) if (u && u.field) proposed[u.field] = u.to;
+                }
+                // Scope: only fields pertinent to THIS move/stage may be applied via
+                // approve (gate + milestone + stage-data fields). A backward QC-failed
+                // rework and a no-move data_update carry only data fields. Anything
+                // else (e.g. editing supplier while moving to CONSOLIDATED) belongs on
+                // the normal order-edit path, not approve.
+                const fromStatus = beforeOrder.status;
+                const isMove = status !== fromStatus;
+                const isBackwardRework = fromStatus === 'READY_FOR_QC' && status === 'IN_PRODUCTION';
+                const gateScope = (isMove && !isBackwardRework) ? T.applicableFieldsFor(status) : [];
+                const allowedFields = new Set([...gateScope, ...T.applicableDataFields(status)]);
+
+                const today = londonToday();
+                const fieldsToSet = {};
+                const appliedFields = [];
+                const skippedFields = [];
+                let pendingExp = null;
+                for (const [field, rawVal] of Object.entries(proposed)) {
+                    const col = UPDATABLE_FIELDS[field];
+                    if (!col) { skippedFields.push({ field, reason: 'not_updatable' }); continue; }
+                    if (!allowedFields.has(field)) { skippedFields.push({ field, reason: 'not_applicable_here' }); continue; }
+                    if (rawVal == null || rawVal === '') continue;
+                    let val = rawVal;
+                    if (field === 'mfgDate' || field === 'expDate') val = T.snapMonthStart(val);
+                    if (field === 'expDate') {
+                        if (String(val).slice(0, 10) < today) { skippedFields.push({ field, reason: 'expiry_in_past' }); continue; }
+                        pendingExp = String(val).slice(0, 10);
+                    }
+                    fieldsToSet[col] = val;
+                    appliedFields.push({ field, value: val });
+                }
+                // Lot↔expiry uniqueness (§5): re-check when EITHER the lot OR the
+                // expiry would change (a lot change can collide an unchanged expiry).
+                const lotChanged = fieldsToSet.lot_number !== undefined;
+                if (pendingExp != null || lotChanged) {
+                    const lot = lotChanged ? fieldsToSet.lot_number : existing[0].lot_number;
+                    const exp = pendingExp != null ? pendingExp
+                        : (existing[0].exp_date ? String(existing[0].exp_date).slice(0, 10) : null);
+                    if (lot && exp) {
+                        const [conf] = await conn.query(
+                            `SELECT 1 FROM orders WHERE deleted_at IS NULL AND id <> ?
+                                AND UPPER(TRIM(jf_code)) = UPPER(TRIM(?)) AND UPPER(TRIM(lot_number)) = UPPER(TRIM(?))
+                                AND exp_date IS NOT NULL AND DATE_FORMAT(exp_date, '%Y-%m-%d') <> ? LIMIT 1`,
+                            [orderId, existing[0].jf_code, lot, exp]
+                        );
+                        if (conf.length) {
+                            const dropField = pendingExp != null ? 'expDate' : 'lotNumber';
+                            const dropCol = pendingExp != null ? 'exp_date' : 'lot_number';
+                            delete fieldsToSet[dropCol];
+                            const i = appliedFields.findIndex(a => a.field === dropField);
+                            if (i >= 0) appliedFields.splice(i, 1);
+                            skippedFields.push({ field: dropField, reason: 'lot_expiry_conflict' });
+                        }
+                    }
+                }
+                // QC-report HARD gate (§3a): a forward move to READY needs an attached
+                // inspection report — un-fillable by a form field, and skipping it
+                // leaves a genuinely invalid order. Re-checked here in case the report
+                // was removed since the suggestion. Soft field gates stay "human
+                // decides" (consistent with the permissive PATCH /orders/:id/status).
+                if (isMove && status === 'READY') {
+                    const [[qr]] = await conn.query(`SELECT EXISTS(SELECT 1 FROM order_qc_reports WHERE order_id = ?) AS h`, [orderId]);
+                    if (!qr || !qr.h) {
+                        await conn.rollback();
+                        return { gateBlocked: ['qcReport(attachment)'], alert };
+                    }
+                }
+
+                // Same status-update transaction as PATCH /orders/:id/status, plus
+                // any validated field columns. A data_update suggestion sets status
+                // to the CURRENT status (no move) — don't re-stamp its date key.
+                const dates = parseDates(existing[0].dates);
+                if (status !== beforeOrder.status) setDateKey(dates, status);
+                const extraCols = Object.keys(fieldsToSet);
+                const setClause = ['status = ?', 'dates = ?', ...extraCols.map(c => `${c} = ?`)].join(', ');
+                await conn.query(
+                    `UPDATE orders SET ${setClause} WHERE id = ?`,
+                    [status, JSON.stringify(dates), ...extraCols.map(c => fieldsToSet[c]), orderId]
+                );
+                const [rows] = await conn.query(`${ORDER_SELECT} AND orders.id = ?`, [orderId]);
+                const updated = rowToOrder(rows[0]);
+                await recordAudit(conn, {
+                    entityType: 'order', entityId: updated.id, action: 'update',
+                    before: beforeOrder, after: updated, userEmail: req.userEmail,
+                });
+                // Resolve the suggestion + audit who approved it (row already locked above).
+                const acted = await actOnSuggestion(conn, {
+                    id, userEmail: req.userEmail, action: 'approve', note: req.body && req.body.note,
+                });
+                await conn.commit();
+                return { order: updated, alert: acted.alert, appliedStatus: status, appliedFields, skippedFields };
+            } catch (e) {
+                await conn.rollback();
+                throw e;
+            }
+        });
+
+        if (result.notFound) return res.status(404).json({ error: `Status suggestion ${id} not found.` });
+        if (result.alreadyActioned) return res.status(409).json({ error: 'Suggestion already actioned.', alert: result.alert });
+        if (result.badMeta) return res.status(422).json({ error: `Suggestion is missing ${result.badMeta}.` });
+        if (result.badStatus) return res.status(400).json({ error: `Invalid status '${result.badStatus}'.` });
+        if (result.orderNotFound) return res.status(404).json({ error: `Order ${result.orderNotFound} not found.` });
+        if (result.staleTerminal) {
+            return res.status(409).json({ error: `Order already ${result.staleTerminal}; suggestion is stale.`, alert: result.alert });
+        }
+        if (result.gateBlocked) {
+            return res.status(422).json({ error: 'Cannot move to READY: a QC inspection report must be attached first.', missing: result.gateBlocked, alert: result.alert });
+        }
+
+        // Webhook fires outside the lock window, only if the approve committed.
+        await withConnection(conn => firePoSentWebhookIfNeeded(conn, result.order));
+        res.json({
+            order: result.order, alert: result.alert, appliedStatus: result.appliedStatus,
+            appliedFields: result.appliedFields || [], skippedFields: result.skippedFields || [],
+        });
+    } catch (error) {
+        log.error('[PATCH /alerts/:id/approve]', error);
+        res.status(500).json({ error: 'An internal error occurred.' });
+    }
+});
+
+app.patch('/api/v1/alerts/:id/deny', async (req, res) => {
+    try {
+        await dailyAlertsSchemaReady;
+        await auditLogSchemaReady;
+        const id = Number(req.params.id);
+        if (!Number.isInteger(id) || id <= 0) {
+            return res.status(400).json({ error: 'A valid alert id is required.' });
+        }
+        const note = req.body && req.body.note;
+        const result = await withConnection(conn => actOnSuggestion(conn, { id, userEmail: req.userEmail, action: 'deny', note }));
+        if (result.notFound) return res.status(404).json({ error: `Status suggestion ${id} not found.` });
+        if (result.alreadyActioned) return res.status(409).json({ error: 'Suggestion already actioned.', alert: result.alert });
+        res.json(result.alert);
+    } catch (error) {
+        log.error('[PATCH /alerts/:id/deny]', error);
+        res.status(500).json({ error: 'An internal error occurred.' });
+    }
+});
+
+// Acknowledge: the operator has SEEN the suggestion and handled it their own way
+// (e.g. updated the order manually, or it's already actioned elsewhere) — so it
+// leaves the queue WITHOUT applying the AI's status change. The { note } records
+// what they did instead and is shown in /alerts/history alongside who did it.
+app.patch('/api/v1/alerts/:id/acknowledge', async (req, res) => {
+    try {
+        await dailyAlertsSchemaReady;
+        await auditLogSchemaReady;
+        const id = Number(req.params.id);
+        if (!Number.isInteger(id) || id <= 0) {
+            return res.status(400).json({ error: 'A valid alert id is required.' });
+        }
+        const note = req.body && req.body.note;
+        const result = await withConnection(conn => actOnSuggestion(conn, { id, userEmail: req.userEmail, action: 'acknowledge', note }));
+        if (result.notFound) return res.status(404).json({ error: `Status suggestion ${id} not found.` });
+        if (result.alreadyActioned) return res.status(409).json({ error: 'Suggestion already actioned.', alert: result.alert });
+        res.json(result.alert);
+    } catch (error) {
+        log.error('[PATCH /alerts/:id/acknowledge]', error);
         res.status(500).json({ error: 'An internal error occurred.' });
     }
 });
