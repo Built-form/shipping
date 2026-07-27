@@ -9,9 +9,12 @@
 // Kept out of the 7000-line orders.js handler so the nightly job reuses the
 // exact same generation + dedup logic without pulling in the Express app.
 //
-// Event types:
-//   • container_eta        — an order's ETA (orders.eta), grouped by container
-//   • supplier_ready_date  — an order/PO line's ready date (actual ?? estimated)
+// Event types (generated nightly):
+//   • container_eta      — an order's ETA (orders.eta), grouped by container
+//   • missing_data       — an in-transit order missing LOT / MFG / EXP
+//   • arrived_unreceived — arrived at warehouse, units not booked into Mintsoft
+//   • shipment_late      — delivery slot passed or carrier ETA slipped ≥ 2 days
+// Retired (kept only so old rows auto-resolve): supplier_ready_date, qc_pending.
 //
 // LIFECYCLE (the important part). Each logical condition maps to ONE alert via
 // a stable, DATE-FREE dedup_key. The nightly job upserts every condition that
@@ -47,24 +50,32 @@ const DEFAULT_SNOOZE_DAYS = 2;
 // "arriving").
 const ETA_EXCLUDED_STATUSES = ['ARRIVED_AT_WAREHOUSE', 'RECEIVED', 'DESTROYED', 'IN_WAREHOUSE', 'MINTSOFT', 'PARTIALLY_RECEIVED'];
 
-// Supplier ready-date condition is "live" only in the factory stages. Once the
-// order consolidates / ships / is received, or the ready date is pushed past
-// today, it drops out of the live set and the alert auto-resolves.
-const READY_STATUSES = ['SCHEDULED', 'PO_SENT', 'IN_PRODUCTION', 'READY_FOR_QC', 'READY'];
-
 // In-transit stages used by the missing-data and shipment-late builders.
 const IN_TRANSIT_STATUSES = ['CONSOLIDATED', 'ON_SEA', 'ON_AIR'];
 
-// Alert types OWNED by the nightly generator — recomputed from the DB each run,
-// so the global auto-resolve sweep ("not seen this run -> resolve") applies to
-// them. Event-driven types written by OTHER producers (e.g. 'status_suggestion'
-// from the Front status importer, src/services/front-status-import.js) are NOT
-// recomputed nightly and MUST be excluded from that sweep, or they'd be wiped
-// every night. Keep this list in sync with the builders in generateDailyAlerts.
-const MANAGED_TYPES = [
-    'container_eta', 'supplier_ready_date', 'missing_data',
-    'arrived_unreceived', 'qc_pending', 'shipment_late',
+// Alert types the nightly generator ACTIVELY produces this run — recomputed from
+// the DB each run, so the global auto-resolve sweep ("not seen this run ->
+// resolve") applies to them. Keep this list in sync with the builders in
+// generateDailyAlerts.
+const GENERATED_TYPES = [
+    'container_eta', 'missing_data', 'arrived_unreceived', 'shipment_late',
 ];
+
+// Retired types: no longer generated, but STILL owned by the auto-resolve sweep
+// so any existing pending rows resolve (disappear) on the next nightly run.
+//   • supplier_ready_date — an order sat at its ready date while still in a
+//     factory stage
+//   • qc_pending          — an order sat in READY_FOR_QC awaiting a QC pass
+// Removed 2026-07-14 as low-value nags: an order legitimately sits at "ready" /
+// "ready for QC" for a long time, so the alert kept re-surfacing after every
+// snooze and was never useful to action.
+const RETIRED_TYPES = ['supplier_ready_date', 'qc_pending'];
+
+// Every type the nightly auto-resolve sweep owns (generated + retired). Types
+// written by OTHER producers (e.g. 'status_suggestion' from the Front status
+// importer, src/services/front-status-import.js) are NOT recomputed nightly and
+// MUST be excluded from that sweep, or they'd be wiped every night.
+const MANAGED_TYPES = [...GENERATED_TYPES, ...RETIRED_TYPES];
 
 // Outstanding (un-received) qty for an order, as a SQL fragment.
 const OUTSTANDING_SQL = `(orders.quantity - COALESCE((SELECT SUM(r.quantity) FROM order_receipts r WHERE r.order_id = orders.id AND r.type IN ('received','not_received')), 0))`;
@@ -279,67 +290,6 @@ async function buildContainerEtaAlerts(conn, today) {
     return alerts;
 }
 
-async function buildReadyDateAlerts(conn, today) {
-    const placeholders = READY_STATUSES.map(() => '?').join(', ');
-    const [rows] = await conn.query(
-        `SELECT id, jf_code, product_name, supplier, status, quantity, po_number,
-                purchase_order_id, estimated_ready_date, actual_ready_date
-           FROM orders
-          WHERE deleted_at IS NULL
-            AND status IN (${placeholders})
-            AND (
-                  (actual_ready_date IS NOT NULL AND actual_ready_date <= ?)
-               OR (actual_ready_date IS NULL AND estimated_ready_date IS NOT NULL AND estimated_ready_date <= ?)
-            )
-          ORDER BY id ASC`,
-        [...READY_STATUSES, today, today]
-    );
-
-    const onOrBefore = (d) => !!d && d <= today;
-    const alerts = [];
-    for (const r of rows) {
-        const actual = toDateStr(r.actual_ready_date);
-        const estimated = toDateStr(r.estimated_ready_date);
-        const kind = onOrBefore(actual) ? 'actual' : 'estimated';
-        const date = kind === 'actual' ? actual : estimated;
-        if (!onOrBefore(date)) continue;
-        const severity = date === today ? 'today' : 'overdue';
-        const sku = r.jf_code || r.product_name || `order ${r.id}`;
-        const label = kind === 'actual' ? 'ready' : 'due ready';
-        const bodyParts = [];
-        if (r.po_number) bodyParts.push(`PO ${r.po_number}`);
-        if (r.product_name) bodyParts.push(r.product_name);
-        if (r.quantity) bodyParts.push(`${Number(r.quantity)} units`);
-        bodyParts.push(`(${kind} ready ${date})`);
-        alerts.push({
-            // Date-free, kind-free: one live ready-date alert per order. The
-            // estimated→actual transition refreshes this same alert in place.
-            dedupKey: `supplier_ready:o:${r.id}`,
-            type: 'supplier_ready_date',
-            severity,
-            eventDate: date,
-            title: `${r.supplier || 'Supplier'} ${label}: ${sku}`,
-            body: bodyParts.join(' · '),
-            entityType: 'order',
-            entityId: String(r.id),
-            meta: {
-                orderId: r.id,
-                jfCode: r.jf_code || null,
-                productName: r.product_name || null,
-                supplier: r.supplier || null,
-                poNumber: r.po_number || null,
-                purchaseOrderId: r.purchase_order_id ?? null,
-                status: r.status,
-                readyKind: kind,
-                estimatedReadyDate: estimated,
-                actualReadyDate: actual,
-                quantity: Number(r.quantity || 0),
-            },
-        });
-    }
-    return alerts;
-}
-
 // ── Missing receiving data (LOT / MFG / EXP) ────────────────────────────────
 // In-transit orders missing the lot / mfg / expiry that Mintsoft receiving
 // needs — fix it before the goods land. Resolves when the data is filled in or
@@ -426,46 +376,6 @@ async function buildArrivedUnreceivedAlerts(conn, today) {
                 supplier: r.supplier || null, poNumber: r.po_number || null,
                 quantity: Number(r.quantity || 0), outstanding,
                 containerNumber: container || null, arrivedDate: arrived,
-            },
-        });
-    }
-    return alerts;
-}
-
-// ── QC pending / overdue ────────────────────────────────────────────────────
-// Orders sat in READY_FOR_QC without a QC pass. event_date is when they entered
-// QC (dates.ready_for_qc), so long-waiting ones read as overdue. Resolves when
-// QC is approved or the order moves on.
-async function buildQcPendingAlerts(conn, today) {
-    const [rows] = await conn.query(
-        `SELECT id, jf_code, product_name, supplier, po_number, qc_status, quantity,
-                -- when it entered QC; fall back to last_updated so age/overdue
-                -- reflects how long it has actually waited, not the run date.
-                COALESCE(DATE(JSON_UNQUOTE(JSON_EXTRACT(dates, '$.ready_for_qc'))), DATE(last_updated)) AS rfq
-           FROM orders
-          WHERE deleted_at IS NULL
-            AND status = 'READY_FOR_QC'
-            AND COALESCE(qc_status, '') NOT IN ('APPROVED', 'PASS', 'PASSED')
-          ORDER BY rfq ASC, id ASC`
-    );
-    const alerts = [];
-    for (const r of rows) {
-        const rfq = toDateStr(r.rfq);
-        const date = rfq || today;
-        const sku = r.jf_code || r.product_name || `order ${r.id}`;
-        alerts.push({
-            dedupKey: `qc_pending:o:${r.id}`,
-            type: 'qc_pending',
-            severity: severityFor(date, today),
-            eventDate: date,
-            title: `QC pending: ${sku}`,
-            body: [r.supplier, r.po_number ? `PO ${r.po_number}` : null, rfq ? `in QC since ${rfq}` : 'awaiting QC'].filter(Boolean).join(' · '),
-            entityType: 'order',
-            entityId: String(r.id),
-            meta: {
-                orderId: r.id, jfCode: r.jf_code || null, productName: r.product_name || null,
-                supplier: r.supplier || null, poNumber: r.po_number || null,
-                qcStatus: r.qc_status || null, readyForQcDate: rfq, quantity: Number(r.quantity || 0),
             },
         });
     }
@@ -568,14 +478,12 @@ async function generateDailyAlerts(pool, { today = londonToday() } = {}) {
         );
 
         const containerAlerts = await buildContainerEtaAlerts(conn, today);
-        const readyAlerts = await buildReadyDateAlerts(conn, today);
         const missingAlerts = await buildMissingDataAlerts(conn, today);
         const arrivedAlerts = await buildArrivedUnreceivedAlerts(conn, today);
-        const qcAlerts = await buildQcPendingAlerts(conn, today);
         const lateAlerts = await buildShipmentLateAlerts(conn, today);
         const all = [
-            ...containerAlerts, ...readyAlerts, ...missingAlerts,
-            ...arrivedAlerts, ...qcAlerts, ...lateAlerts,
+            ...containerAlerts, ...missingAlerts,
+            ...arrivedAlerts, ...lateAlerts,
         ];
         const { created, refreshed } = await upsertAlerts(conn, all, runTs);
 
@@ -585,10 +493,8 @@ async function generateDailyAlerts(pool, { today = londonToday() } = {}) {
         // candidates this run, so a silent mass-resolve is at least visible.
         const candidatesByType = {
             container_eta: containerAlerts.length,
-            supplier_ready_date: readyAlerts.length,
             missing_data: missingAlerts.length,
             arrived_unreceived: arrivedAlerts.length,
-            qc_pending: qcAlerts.length,
             shipment_late: lateAlerts.length,
         };
         const managedPh = MANAGED_TYPES.map(() => '?').join(', ');
@@ -601,6 +507,9 @@ async function generateDailyAlerts(pool, { today = londonToday() } = {}) {
             MANAGED_TYPES
         );
         for (const row of pendingByType) {
+            // Retired types are EXPECTED to produce 0 candidates and mass-resolve
+            // their remaining rows — that's the point, not a builder regression.
+            if (RETIRED_TYPES.includes(row.type)) continue;
             if ((candidatesByType[row.type] || 0) === 0 && row.n > 0) {
                 log.warn(`[daily-alerts] type '${row.type}' produced 0 candidates but has ${row.n} pending — they will auto-resolve this run (possible builder regression)`);
             }
@@ -624,10 +533,8 @@ async function generateDailyAlerts(pool, { today = londonToday() } = {}) {
             today,
             candidates: {
                 containerEta: containerAlerts.length,
-                supplierReadyDate: readyAlerts.length,
                 missingData: missingAlerts.length,
                 arrivedUnreceived: arrivedAlerts.length,
-                qcPending: qcAlerts.length,
                 shipmentLate: lateAlerts.length,
             },
             created,

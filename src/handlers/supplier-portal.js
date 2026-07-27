@@ -115,9 +115,13 @@ async function authenticate(conn, { poNumber, accessCode }) {
             'SELECT id, name, portal_code FROM suppliers WHERE name = ? AND deleted_at IS NULL',
             [po.supplier]
         );
-        const supplier = supRows[0];
-        if (supplier && supplier.portal_code && safeCompareCode(code, normalizeCode(supplier.portal_code))) {
-            return { supplier, po };
+        // suppliers is now a view over jfpro.suppliers, whose `name` is not
+        // unique-constrained, so one name can resolve to several rows. Accept the
+        // first whose code verifies rather than blindly trusting supRows[0].
+        for (const supplier of supRows) {
+            if (supplier.portal_code && safeCompareCode(code, normalizeCode(supplier.portal_code))) {
+                return { supplier, po };
+            }
         }
     }
     return null;

@@ -9,6 +9,15 @@ const { getPool, closePool } = require('../src/db');
 
 const supplierIdArg = process.argv[2] ? Number(process.argv[2]) : null;
 
+// DEPRECATED after the supplier unification (2026-06-30): jfa.supplier_emails is
+// now a VIEW over jfpro.supplier_contacts and the lazy contact_email backfill was
+// removed. This script CREATE TABLE / INSERTs into the old table and is retired.
+// (Use --force-legacy only against a pre-cutover backup.)
+if (!process.argv.includes('--force-legacy')) {
+    console.error('tools/test-supplier-emails.js: DEPRECATED — supplier_emails is now a view over jfpro.supplier_contacts. Refusing to run.');
+    process.exit(1);
+}
+
 (async () => {
     const pool = getPool();
     const conn = await pool.getConnection();

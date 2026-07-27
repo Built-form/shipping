@@ -294,6 +294,59 @@ async function matchOrdersByContainer(conn, raw) {
     return rows;
 }
 
+// Suppliers frequently reference an order by its PRODUCT code ("JF0230") instead
+// of the PO. A JF code lives in orders.jf_code and — unlike a PO — is a SKU
+// shared across many order rows (one per batch/PO), so a match can be ambiguous.
+// This returns ALL live (non-terminal) orders for the code; the caller only
+// TRUSTS a single-order result and treats a wider match as ambiguous. Match is
+// alphanumeric-normalised + exact (so "JF0230" != the FQC variant "JF5011_FQC").
+async function matchOrdersByJfCode(conn, raw) {
+    const norm = normalizePo(raw);
+    if (norm.length < 4) return []; // avoid spurious short matches
+    const placeholders = TERMINAL_STATUSES.map(() => '?').join(', ');
+    const [rows] = await conn.query(
+        `${ORDER_MATCH_SELECT}
+          WHERE o.deleted_at IS NULL
+            AND o.jf_code IS NOT NULL AND o.jf_code <> ''
+            AND o.status NOT IN (${placeholders})
+            AND UPPER(REGEXP_REPLACE(o.jf_code, '[^A-Za-z0-9]', '')) = ?
+          ORDER BY o.id ASC`,
+        [...TERMINAL_STATUSES, norm]
+    );
+    return rows;
+}
+
+// A single PO can span MULTIPLE live order rows when it was /split (see
+// POST /orders/:id/split): same po_number + jf_code, but only PART of the
+// quantity went into a given container — the split clone carries that
+// container_number (status CONSOLIDATED) while the remainder keeps producing.
+// Anything an email says about a SPECIFIC container therefore applies ONLY to
+// the row(s) physically in THAT container — never the sibling still in the
+// factory. That covers both a container/transit MILESTONE (consolidated /
+// sailed / arrived) AND a pure DATA update that carries container data (a
+// forwarder pushing ETA/vessel onto its shipment). This narrows a multi-row PO
+// match to the order(s) whose recorded container matches the email's container.
+// It is a no-op unless ALL of these hold, so a normal (unsplit) PO and any
+// FACTORY-stage milestone (which advances the whole PO) are untouched:
+//   • more than one row matched, AND
+//   • the milestone is NOT a factory stage (transit milestone, or none at all
+//     for a data-only forwarder update), AND
+//   • the email cited a usable container, AND
+//   • at least one matched row already carries that container.
+// When no matched row carries the container yet (e.g. a first-ever mention that
+// predates the split) we can't disambiguate deterministically, so keep them all
+// and let Pass 2 + the human reviewer decide.
+const FACTORY_MILESTONES = new Set(['PO_SENT', 'IN_PRODUCTION', 'READY_FOR_QC', 'READY']);
+function narrowSplitByContainer(matched, containerRef, milestone) {
+    if (matched.length <= 1 || FACTORY_MILESTONES.has(milestone)) return matched;
+    const norm = normalizePo(containerRef);
+    if (norm.length < 6) return matched; // no usable container ref to split on
+    const inContainer = matched.filter(o =>
+        normalizePo(o.container_number) === norm ||
+        normalizePo(o.external_container_number) === norm);
+    return inContainer.length ? inContainer : matched;
+}
+
 function confidencePct(c) {
     return `${Math.round((Number(c) || 0) * 100)}%`;
 }
@@ -537,7 +590,7 @@ async function importStatusUpdatesFromFront(conn, {
         scanned: 0, geminiCalls: 0, capped: false,
         alerted: 0, alertsCreated: 0,
         refine, maxRefine, refineCalls: 0, refineSkipped: 0,
-        skipped: { chatter: 0, nopo: 0, nomatch: 0, nochange: 0, lowconf: 0, fqc: 0 },
+        skipped: { chatter: 0, nopo: 0, nomatch: 0, nochange: 0, lowconf: 0, fqc: 0, ambiguousJf: 0 },
         failed: 0,
         suggestions: [],
     };
@@ -706,13 +759,49 @@ async function importStatusUpdatesFromFront(conn, {
                     continue;
                 }
 
-                // Match by PO first, then fall back to the container/booking number.
+                // Match by PO first, then the container/booking number, then the
+                // product (JF) code — suppliers often reference an order by its
+                // SKU ("JF0230") rather than the PO (the extractor puts such a code
+                // in poNumber, and poInText has confirmed it's really in the email).
+                // A JF code can span many order rows, so matchOrdersByJfCode is only
+                // TRUSTED when it resolves to exactly ONE live order; a wider match
+                // is recorded as ambiguous rather than guessed across order lines.
                 let matched = poInText ? await matchOrdersByPo(conn, extract.poNumber) : [];
                 if (!matched.length && containerRef) matched = await matchOrdersByContainer(conn, containerRef);
+                if (!matched.length && poInText && /^[A-Z]{2,4}\d{2,}/.test(normalizePo(extract.poNumber))) {
+                    const byJf = await matchOrdersByJfCode(conn, extract.poNumber);
+                    if (byJf.length === 1) {
+                        matched = byJf;
+                        if (verbose) log.info('[front-status-import] matched by JF code', { jf: extract.poNumber, order: byJf[0].id });
+                    } else if (byJf.length > 1) {
+                        summary.skipped.ambiguousJf += 1;
+                        log.info('[front-status-import] ambiguous JF — skipped', { jf: extract.poNumber, liveOrders: byJf.length, from });
+                        if (!dryRun) await recordImport(conn, {
+                            ...enrich, outcome: 'skipped_ambiguous_jf',
+                            matchedOrderCount: 0, orderIds: byJf.map(o => o.id),
+                        });
+                        continue;
+                    }
+                }
                 if (!matched.length) {
                     summary.skipped.nomatch += 1;
                     if (!dryRun) await recordImport(conn, { ...enrich, outcome: 'skipped_nomatch' });
                     continue;
+                }
+
+                // Split PO: when an email cites a container (a transit milestone
+                // OR a data-only forwarder update), keep only the part physically
+                // in it — don't touch the sibling half still in the factory (see
+                // narrowSplitByContainer).
+                if (matched.length > 1 && containerRef) {
+                    const narrowed = narrowSplitByContainer(matched, containerRef, extract.milestone);
+                    if (narrowed.length < matched.length) {
+                        log.info('[front-status-import] split PO narrowed to container', {
+                            po: extract.poNumber || null, container: containerRef,
+                            milestone: extract.milestone, from: matched.length, to: narrowed.length,
+                        });
+                        matched = narrowed;
+                    }
                 }
 
                 const ctx = {
@@ -857,6 +946,8 @@ module.exports = {
     ensureSchema,
     matchOrdersByPo,
     matchOrdersByContainer,
+    matchOrdersByJfCode,
+    narrowSplitByContainer,
     loadOrderForSuggestion,
     buildSuggestionAlert,
     normalizePo,

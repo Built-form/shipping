@@ -42,7 +42,7 @@ const codeArg = process.argv[3];
             );
             for (const r of rows) {
                 const code = generatePortalCode();
-                await conn.query('UPDATE suppliers SET portal_code = ? WHERE id = ?', [code, r.id]);
+                await conn.query('UPDATE jfpro.suppliers SET portal_code = ? WHERE id = ?', [code, r.id]);
                 console.log(`  [${String(r.id).padStart(4)}] ${code}  ${r.name}`);
             }
             console.log(`Regenerated portal codes for ${rows.length} suppliers.`);
@@ -68,7 +68,7 @@ const codeArg = process.argv[3];
             console.error('Explicit code is empty after normalisation (letters/digits only).');
             process.exit(1);
         }
-        await conn.query('UPDATE suppliers SET portal_code = ? WHERE id = ?', [newCode, id]);
+        await conn.query('UPDATE jfpro.suppliers SET portal_code = ? WHERE id = ?', [newCode, id]);
         console.log(`Supplier [${id}] ${supRows[0].name}`);
         console.log(`New portal code: ${newCode}`);
     } finally {

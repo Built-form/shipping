@@ -4,14 +4,35 @@ const { getPool } = require('../db');
 const { getProductsByJfCode, getProductStock } = require('../services/mintsoft');
 // Note: Database table creation should ideally be handled by a migration script
 // and not within the Lambda handler for production environments.
-// ── JF codes + ASINs loaded from landed_costs table ──────────────────────────
+// ── JF codes + ASINs: the full snapshot universe ─────────────────────────────
+// Union of three sources so a live product can't silently fall out of the daily
+// rotation:
+//   1. landed_costs         — historical seed list (carries ASINs)
+//   2. product_carton_sizes — live jfpro.products catalogue (authoritative)
+//   3. stock_snapshots      — anything we've ever snapshotted (e.g. received-only
+//                             items that never made it into landed_costs)
+// Previously the list came from landed_costs alone, so codes missing there (e.g.
+// HW0207) only ever refreshed on order receipt and went stale on the schedule.
+// One row per jf_code; prefer a non-empty ASIN; least-recently-snapshotted first
+// (never-snapshotted codes sort first via NULL last_updated).
 async function loadJfCodes(conn) {
     const [rows] = await conn.execute(
-        `SELECT lc.jf_code, lc.asin, MAX(ss.created_at) as last_updated
-         FROM landed_costs lc
-         LEFT JOIN stock_snapshots ss ON ss.jf_code = lc.jf_code
-         WHERE lc.jf_code IS NOT NULL AND lc.jf_code != '' AND lc.jf_code != 'NULL'
-         GROUP BY lc.jf_code, lc.asin
+        `SELECT c.jf_code, c.asin, MAX(ss.created_at) AS last_updated
+         FROM (
+             SELECT jf_code, MAX(asin) AS asin FROM (
+                 SELECT jf_code, COALESCE(asin, '') AS asin FROM landed_costs
+                   WHERE jf_code IS NOT NULL AND jf_code <> '' AND jf_code <> 'NULL'
+                 UNION ALL
+                 SELECT jf_code, COALESCE(asin, '') AS asin FROM product_carton_sizes
+                   WHERE jf_code IS NOT NULL AND jf_code <> '' AND jf_code <> 'NULL'
+                 UNION ALL
+                 SELECT jf_code, COALESCE(asin, '') AS asin FROM stock_snapshots
+                   WHERE jf_code IS NOT NULL AND jf_code <> '' AND jf_code <> 'NULL'
+             ) u
+             GROUP BY jf_code
+         ) c
+         LEFT JOIN stock_snapshots ss ON ss.jf_code = c.jf_code
+         GROUP BY c.jf_code, c.asin
          ORDER BY last_updated ASC, RAND()`
     );
     return rows.map(r => ({ jfCode: r.jf_code.trim(), asin: (r.asin || '').trim() }));
@@ -25,6 +46,9 @@ async function ensureTable(conn) {
         `ALTER TABLE stock_snapshots ADD COLUMN warehouse_id INT NOT NULL DEFAULT 0 AFTER product_id`,
         `ALTER TABLE stock_snapshots ADD COLUMN allocated INT NOT NULL DEFAULT 0 AFTER available`,
         `ALTER TABLE stock_snapshots ADD COLUMN quarantine INT NOT NULL DEFAULT 0 AFTER allocated`,
+        // "Last refreshed" timestamp — bumped on every upsert so the stock-sum
+        // views can tell whether an order receipt is already reflected here.
+        `ALTER TABLE stock_snapshots ADD COLUMN updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP`,
     ];
     for (const sql of migrations) {
         try { await conn.execute(sql); } catch (e) {

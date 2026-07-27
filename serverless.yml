@@ -57,12 +57,27 @@ provider:
     FRONT_API_TOKEN: ${env:FRONT_API_TOKEN, ''}
     FRONT_CHANNEL_ID: ${env:FRONT_CHANNEL_ID, ''}
     GEMINI_API_KEY: ${env:GEMINI_API_KEY, ''}
+    # Email receipt confirmation: optional static page (e.g. an S3-hosted
+    # confirmation page) that the "Confirm receipt" click 302-redirects to after
+    # recording it. Leave blank to render the built-in thank-you page from the
+    # emailReceiptApi Lambda instead.
+    EMAIL_RECEIPT_REDIRECT_URL: ${env:EMAIL_RECEIPT_REDIRECT_URL, ''}
+    # Absolute base URL (scheme + host) of this API. The interactive confirm
+    # endpoint derives it from the inbound request, but the auto-reminder sweep
+    # (sendReceiptReminders) has no request — it needs this to build absolute
+    # confirm links. Unset → the sweep skips (logs a warning), sending nothing.
+    PUBLIC_API_BASE_URL: ${env:PUBLIC_API_BASE_URL, ''}
+    # Email-receipt auto-reminders: hours between reminders per email, and the
+    # cap on how many to ever send. Set MAX to 0 to disable auto-reminders.
+    RECEIPT_REMINDER_INTERVAL_HOURS: ${env:RECEIPT_REMINDER_INTERVAL_HOURS, '48'}
+    RECEIPT_REMINDER_MAX: ${env:RECEIPT_REMINDER_MAX, '5'}
     # Front -> Gemini order-status suggestion importer (frontStatusImport).
-    # STATUS_IMPORT_DOMAINS: optional comma-separated extra supplier domains
-    # and/or full addresses to scan, on top of the suppliers tables. Leave blank
-    # to scan only onboarded suppliers. CONF_MIN: min Gemini confidence (0..1) to
-    # surface a suggestion. MAX_GEMINI: per-run Gemini call cap (cost guard).
-    STATUS_IMPORT_DOMAINS: ${env:STATUS_IMPORT_DOMAINS, ''}
+    # STATUS_IMPORT_DOMAINS: comma-separated extra supplier/forwarder domains
+    # and/or full addresses to scan, on top of the suppliers tables. Hardcoded
+    # 2026-06-29 from tools/never-processed-domains.js (active supplier domains
+    # whose order-linked emails the importer wasn't reaching). CONF_MIN: min
+    # Gemini confidence (0..1) to surface a suggestion. MAX_GEMINI: per-run cap.
+    STATUS_IMPORT_DOMAINS: 'szsunmed.com,roosin.com,kingphar.cn,yohohangers.com,likesgreen.com,joghninsole.com,dcglogistics.com,owentek.net,owentek.com,fabricfun.cn,china-fk.com,haodymedical.com.cn,tapeningbo.com,ullwin.com,aliyun.com,chinalongbow.com,dynamic-medical.com,intco.com,iso-medical.com.cn,yerconlab.com,youcareyk.com.cn,gxflight.com,medoffice.com.tr,packrich.com,realmould.com,rennington.com.cn,savinodelbene.com,tamhangers.com,aojmedical.com,eurofarm-spa.com,europa-worldwide.com,hangersfactorychina.com,qualityfreight.co.uk,yunhan.ltd,zhende.com,arisen-ltd.com,brightnonwoven.com,china-a2u.cn,healthandbeyond.cn,jiangheyicai.onaliyun.com,mkbmedical.com,mypocdoc.com,nbpassion.com.cn,pengfeihanger.com'
     STATUS_IMPORT_CONF_MIN: ${env:STATUS_IMPORT_CONF_MIN, '0.6'}
     STATUS_IMPORT_MAX_GEMINI: ${env:STATUS_IMPORT_MAX_GEMINI, '40'}
     # Incremental look-back: each run scans since the last fully-drained run minus
@@ -155,344 +170,26 @@ functions:
     handler: src/handlers/orders.handler
     reservedConcurrency: 20
     events:
-      - httpApi:
-          path: /api/v1/orders
-          method: GET
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/orders
-          method: POST
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/orders/{proxy+}
-          method: GET
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/orders/{proxy+}
-          method: PUT
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/orders/{proxy+}
-          method: PATCH
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/orders/{proxy+}
-          method: POST
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/orders/{proxy+}
-          method: DELETE
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/containers
-          method: GET
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/containers/{proxy+}
-          method: GET
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/containers/{proxy+}
-          method: POST
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/containers/{proxy+}
-          method: PATCH
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/air-shipments
-          method: GET
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/air-shipments/{proxy+}
-          method: GET
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/draft-containers
-          method: GET
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/draft-containers
-          method: POST
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/draft-containers/{proxy+}
-          method: GET
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/draft-containers/{proxy+}
-          method: POST
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/draft-containers/{proxy+}
-          method: PUT
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/draft-containers/{proxy+}
-          method: DELETE
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/draft-container-documents/{proxy+}
-          method: POST
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/stock-snapshots/sum
-          method: GET
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/stock-snapshots/sum/all-asins
-          method: GET
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/stock-snapshots/fnskus
-          method: GET
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/stock-snapshots/asana-tasks
-          method: GET
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/stock-snapshots/oos-dates
-          method: GET
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/stock-snapshots/active-listings
-          method: GET
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/mintsoft/warehouses
-          method: GET
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/mintsoft/warehouses/{proxy+}
-          method: GET
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/mintsoft/carton-sizes
-          method: GET
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/purchase-orders
-          method: GET
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/purchase-orders
-          method: POST
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/purchase-orders/{proxy+}
-          method: GET
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/purchase-orders/{proxy+}
-          method: PUT
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/purchase-orders/{proxy+}
-          method: DELETE
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/purchase-orders/{proxy+}
-          method: POST
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/purchase-order-documents/{proxy+}
-          method: POST
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/purchase-order-signed-pis/{proxy+}
-          method: POST
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/purchase-order-signed-pis/{proxy+}
-          method: DELETE
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/purchase-order-invoices/{proxy+}
-          method: GET
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/purchase-order-invoices/{proxy+}
-          method: PATCH
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/purchase-order-invoices/{proxy+}
-          method: DELETE
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/purchase-order-payments/{proxy+}
-          method: PATCH
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/purchase-order-payments/{proxy+}
-          method: DELETE
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/suppliers
-          method: GET
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/suppliers/{proxy+}
-          method: GET
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/quality-assurance/{proxy+}
-          method: GET
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/quality-assurance/{proxy+}
-          method: POST
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/quality-assurance-documents/{proxy+}
-          method: POST
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/qc-reports
-          method: GET
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/qc-reports
-          method: POST
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/qc-reports/{proxy+}
-          method: GET
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/qc-reports/{proxy+}
-          method: POST
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/qc-reports/{proxy+}
-          method: DELETE
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/email-templates
-          method: GET
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/email-templates
-          method: POST
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/email-templates/{proxy+}
-          method: GET
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/email-templates/{proxy+}
-          method: PUT
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/email-templates/{proxy+}
-          method: DELETE
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/audit-log
-          method: GET
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/companies
-          method: GET
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/companies
-          method: POST
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/companies/{proxy+}
-          method: GET
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/companies/{proxy+}
-          method: PUT
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/companies/{proxy+}
-          method: DELETE
-          authorizer:
-            name: googleJwtAuthorizer
-      # ── Daily alerts (slide-out alert window) ──
-      # GET /alerts (slider list), GET /alerts/history (past + who dismissed),
-      # PATCH /alerts/{id}/acknowledge. Populated nightly by generateDailyAlerts.
-      - httpApi:
-          path: /api/v1/alerts
-          method: GET
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/alerts/{proxy+}
-          method: GET
-          authorizer:
-            name: googleJwtAuthorizer
-      - httpApi:
-          path: /api/v1/alerts/{proxy+}
-          method: PATCH
-          authorizer:
-            name: googleJwtAuthorizer
+      # Single greedy catch-all. serverless-http + Express do the real
+      # routing inside the Lambda, so every /api/v1/* path and method is
+      # handled here — adding an authed endpoint needs only an Express route,
+      # no change to this file. The public Lambdas own more-specific prefixes
+      # (/confirm-receipt, /portal, /scan) which win by route specificity, so
+      # they stay unauthenticated despite this authed catch-all.
+      - httpApi:
+          path: /api/v1/{proxy+}
+          method: '*'
+          authorizer:
+            name: googleJwtAuthorizer
+      # CORS preflight. The '*' (ANY) route above also matches OPTIONS, so
+      # preflight would otherwise hit the JWT authorizer and 401 (preflight
+      # carries no Authorization header). This more-specific OPTIONS route wins
+      # and has NO authorizer, so the browser's preflight succeeds. Express's
+      # cors() middleware answers it (API Gateway's own CORS config adds the
+      # headers regardless).
+      - httpApi:
+          path: /api/v1/{proxy+}
+          method: OPTIONS
 
   # ── Supplier "ready date" portal (PUBLIC — no authorizer) ──
   # External suppliers (no Google login) set the estimated ready date on their
@@ -536,6 +233,25 @@ functions:
       - httpApi:
           path: /api/v1/scan/gemini-key
           method: GET
+
+  # ── Email receipt confirmation (PUBLIC — no authorizer) ──
+  # Serves the "Confirm receipt" link embedded in every outbound supplier/
+  # forwarder email. The token in the path IS the capability (no login, no
+  # access code). Two-step: GET (the emailed link) records a weak "open" and
+  # shows a Confirm button; POST (the button press) records the strong
+  # "confirmed" — link-scanners fetch the GET but won't submit the form.
+  # Isolated so the public surface is just these two routes. Low concurrency +
+  # per-route throttling (below) cap abuse.
+  emailReceiptApi:
+    handler: src/handlers/email-receipt.handler
+    reservedConcurrency: 5
+    events:
+      - httpApi:
+          path: /api/v1/confirm-receipt/{token}
+          method: GET
+      - httpApi:
+          path: /api/v1/confirm-receipt/{token}
+          method: POST
 
   stockSnapshot:
     handler: src/handlers/mintsoft-snapshot.handler
@@ -612,7 +328,9 @@ functions:
     reservedConcurrency: 1
     events:
       - schedule:
-          rate: rate(6 hours)
+          # Hourly: registration is the billed event, data pulls are free, so
+          # tighter polling surfaces ETA slips / milestones sooner at ~zero cost.
+          rate: rate(1 hour)
           enabled: true
 
   shipsgoAir:
@@ -621,7 +339,7 @@ functions:
     reservedConcurrency: 1
     events:
       - schedule:
-          rate: rate(6 hours)
+          rate: rate(1 hour)
           enabled: true
 
   ordersFromShipsgo:
@@ -714,6 +432,22 @@ functions:
           rate: cron(0 4 * * ? *)
           enabled: true
 
+  # ── Email-receipt auto-reminders ──
+  # Chases suppliers who haven't confirmed receipt of an email. The per-email
+  # 48h cadence + max-reminder cap live in SQL (services/receipt-reminders.js),
+  # so this ticks every 6h and just re-selects whatever is now due — no
+  # over-sending. Reuses each email's original confirm token; the reminder shows
+  # its number. concurrency 1 so a manual invoke can't overlap the tick. Needs
+  # PUBLIC_API_BASE_URL for absolute confirm links (no request to derive host).
+  sendReceiptReminders:
+    handler: src/handlers/send-receipt-reminders.handler
+    timeout: 300
+    reservedConcurrency: 1
+    events:
+      - schedule:
+          rate: rate(6 hours)
+          enabled: true
+
 #plugins:
 #  - serverless-offline
 
@@ -740,6 +474,8 @@ resources:
       DependsOn:
         - HttpApiRoutePostApiV1PortalPoDashlookup
         - HttpApiRoutePostApiV1PortalPoDashreadyDashdate
+        - HttpApiRouteGetApiV1ConfirmDashreceiptTokenVar
+        - HttpApiRoutePostApiV1ConfirmDashreceiptTokenVar
         - HttpApiRoutePostApiV1ScanLookup
         - HttpApiRoutePostApiV1ScanReceive
         - HttpApiRouteGetApiV1ScanWarehouses
@@ -751,6 +487,15 @@ resources:
             ThrottlingRateLimit: 5
             ThrottlingBurstLimit: 10
           'POST /api/v1/portal/po-ready-date':
+            ThrottlingRateLimit: 5
+            ThrottlingBurstLimit: 10
+          # Public confirm-receipt open (GET) + confirm (POST). Token is
+          # unguessable, but throttle the edge anyway to blunt brute-force
+          # enumeration.
+          'GET /api/v1/confirm-receipt/{token}':
+            ThrottlingRateLimit: 5
+            ThrottlingBurstLimit: 10
+          'POST /api/v1/confirm-receipt/{token}':
             ThrottlingRateLimit: 5
             ThrottlingBurstLimit: 10
           # PUBLIC carton-scan receiving routes — same code-only gating, so

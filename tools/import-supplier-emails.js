@@ -14,6 +14,15 @@ const fs = require('fs');
 const path = require('path');
 const { getPool, closePool } = require('../src/db');
 
+// DEPRECATED after the supplier unification (2026-06-30): contacts now live in
+// the single store jfpro.supplier_contacts, and jfa.supplier_emails is a VIEW
+// over it (not insertable). This importer wrote into the old jfa.supplier_emails
+// table and is retired. (Use --force-legacy only against a pre-cutover backup.)
+if (!process.argv.includes('--force-legacy')) {
+    console.error('tools/import-supplier-emails.js: DEPRECATED — supplier_emails is now a view over jfpro.supplier_contacts. Refusing to run.');
+    process.exit(1);
+}
+
 // Minimal RFC4180 parser: handles quoted fields, escaped quotes, embedded commas
 function parseCsv(text) {
     const rows = [];

@@ -18,6 +18,12 @@ const {
 // Mintsoft receiving path (see src/services/order-receive.js).
 const { ORDER_SELECT, parseDates, formatDate, formatDateTime, normalizeExpiry, receiptToJson, rowToOrder } = require('../lib/order-shape');
 const { recordAudit } = require('../lib/audit');
+const {
+    ensureEmailReceiptsSchema, apiBaseUrlFromReq, createEmailReceipt,
+    linkReceiptToSend, appendReceiptLink,
+    getReceiptForResend, recordReminderSend, listReminders,
+} = require('../lib/email-receipt');
+const { sendReminderForReceipt } = require('../services/receipt-reminders');
 const { receiveOrderStock, ReceiveError } = require('../services/order-receive');
 const { listWarehousesWithLocations, listLocationsForWarehouse } = require('../services/mintsoft-locations');
 // Daily alerts (slide-out alert window). Generation logic lives in the service
@@ -61,6 +67,22 @@ const orderReceiptsSchemaReady = (async () => {
         conn.release();
     }
 })().catch(err => log.error('[orders] order_receipts schema migration failed', err));
+
+// Give stock_snapshots a real "last refreshed" timestamp (bumped on every
+// upsert) so the stock-sum views can gate order receipts against the cached
+// Mintsoft number — netting a receipt only once the snapshot reflects it.
+const stockSnapshotsSchemaReady = (async () => {
+    const conn = await pool.getConnection();
+    try {
+        await conn.query(
+            `ALTER TABLE stock_snapshots ADD COLUMN updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP`
+        );
+    } catch (e) {
+        if (!(e.message || '').includes('Duplicate column')) throw e;
+    } finally {
+        conn.release();
+    }
+})().catch(err => log.error('[orders] stock_snapshots schema migration failed', err));
 
 // Lazy-create the daily_alerts table (shared with the nightly generator). Each
 // alert route awaits this before touching the table.
@@ -393,37 +415,21 @@ async function firePoSentWebhookIfNeeded(conn, order) {
     }
 }
 
-// Lazy-create the supplier_emails table. Suppliers can have multiple contact
-// addresses (purchasing, logistics, finance, etc.); the legacy single
-// `suppliers.contact_email` column is kept as the canonical primary and is
-// backfilled into this table on first read per supplier.
+// suppliers and supplier_emails are now VIEWs over the unified JFPro tables
+// (jfpro.suppliers / jfpro.supplier_contacts) — see 2026-06-30_suppliers_views.sql.
+// There is nothing to create here. We only ensure every live JFPro supplier has a
+// portal access code (the helper writes to jfpro.suppliers; it no longer ALTERs
+// anything). Idempotent — the portal Lambda runs the same helper on its own cold
+// start. The promise name is kept so existing `await supplierEmailsSchemaReady`
+// gates are unchanged.
 const supplierEmailsSchemaReady = (async () => {
     const conn = await pool.getConnection();
     try {
-        await conn.query(`
-            CREATE TABLE IF NOT EXISTS supplier_emails (
-                id INT NOT NULL AUTO_INCREMENT,
-                supplier_id INT NOT NULL,
-                email VARCHAR(255) NOT NULL,
-                label VARCHAR(64) NULL,
-                is_primary TINYINT(1) NOT NULL DEFAULT 0,
-                created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                deleted_at DATETIME NULL,
-                PRIMARY KEY (id),
-                UNIQUE KEY uk_supplier_email (supplier_id, email),
-                KEY idx_supplier_id (supplier_id)
-            )
-        `);
-        // Per-supplier access code for the public supplier "ready date" portal
-        // (src/handlers/supplier-portal.js). Adds the column if missing and
-        // gives every code-less supplier a fresh code. Idempotent — the portal
-        // Lambda runs the same helper on its own cold start.
         await ensureSupplierPortalCodes(conn);
     } finally {
         conn.release();
     }
-})().catch(err => log.error('[orders] supplier_emails schema migration failed', err));
+})().catch(err => log.error('[orders] supplier portal-code setup failed', err));
 
 // ── Email templates ──────────────────────────────────────────────────────
 // Subject/body HTML used when emailing documents to suppliers/forwarders via
@@ -436,6 +442,7 @@ const DEFAULT_EMAIL_TEMPLATES = [
     {
         key: 'purchase_order',
         name: 'Purchase Order',
+        category: 'Purchasing',
         description: 'Emailed to a supplier with a PO PDF attached. Tokens: {poNumber}.',
         subject: '{poNumber}',
         bodyHtml: [
@@ -450,6 +457,7 @@ const DEFAULT_EMAIL_TEMPLATES = [
     {
         key: 'draft_container_quote',
         name: 'Delivery Quote Request',
+        category: 'Logistics',
         description: 'Emailed to a freight forwarder with a draft container PDF attached. Tokens: {draftContainerName}.',
         subject: 'Delivery Quote Request – {draftContainerName}',
         bodyHtml: [
@@ -464,6 +472,7 @@ const DEFAULT_EMAIL_TEMPLATES = [
     {
         key: 'purchase_order_signed_pi',
         name: 'Signed Proforma Invoice',
+        category: 'Purchasing',
         description: 'Emailed with a signed proforma invoice (PI_signed) attached. Tokens: {poNumber}.',
         subject: 'Signed PI – {poNumber}',
         bodyHtml: [
@@ -478,6 +487,7 @@ const DEFAULT_EMAIL_TEMPLATES = [
     {
         key: 'quality_assurance',
         name: 'Quality Assurance',
+        category: 'Quality',
         description: 'Emailed to a QC inspector/supplier with a quality assurance sheet attached. Tokens: {ref}.',
         subject: 'Quality Assurance – {ref}',
         bodyHtml: [
@@ -500,6 +510,7 @@ const emailTemplatesSchemaReady = (async () => {
                 id INT NOT NULL AUTO_INCREMENT,
                 template_key VARCHAR(64) NOT NULL,
                 name VARCHAR(255) NOT NULL,
+                category VARCHAR(64) NULL,
                 description TEXT NULL,
                 subject VARCHAR(500) NULL,
                 body_html MEDIUMTEXT NOT NULL,
@@ -510,19 +521,34 @@ const emailTemplatesSchemaReady = (async () => {
                 UNIQUE KEY uk_template_key (template_key)
             )
         `);
+        // Additive migration for tables that predate the category column.
+        try { await conn.query(`ALTER TABLE email_templates ADD COLUMN category VARCHAR(64) NULL AFTER name`); }
+        catch (e) { if (!e || e.errno !== 1060) throw e; } // 1060 = duplicate column, already migrated
         // Seed the built-in templates. INSERT IGNORE so an ops edit is never
         // clobbered on redeploy — only missing keys get (re)created.
         for (const t of DEFAULT_EMAIL_TEMPLATES) {
             await conn.query(
-                `INSERT IGNORE INTO email_templates (template_key, name, description, subject, body_html)
-                 VALUES (?, ?, ?, ?, ?)`,
-                [t.key, t.name, t.description || null, t.subject || null, t.bodyHtml]
+                `INSERT IGNORE INTO email_templates (template_key, name, category, description, subject, body_html)
+                 VALUES (?, ?, ?, ?, ?, ?)`,
+                [t.key, t.name, t.category || null, t.description || null, t.subject || null, t.bodyHtml]
             );
         }
     } finally {
         conn.release();
     }
 })().catch(err => log.error('[orders] email_templates schema migration failed', err));
+
+// Lazy-create the email_receipts table (shared with the public supplier-portal
+// Lambda, which serves the confirm-receipt click endpoint). Each send handler
+// awaits this before minting a receipt token.
+const emailReceiptsSchemaReady = (async () => {
+    const conn = await pool.getConnection();
+    try {
+        await ensureEmailReceiptsSchema(conn);
+    } finally {
+        conn.release();
+    }
+})().catch(err => log.error('[orders] email_receipts schema migration failed', err));
 
 // Resolve an email template by key, falling back to the in-code default if
 // the row was deleted or the table isn't ready yet. Never throws — a missing
@@ -1195,6 +1221,25 @@ function buildOrderStatusMap(rows) {
     return orders;
 }
 
+// Like buildOrderStatusMap but from RAW per-order rows ({ id, asin, status,
+// quantity }). ONLY the ARRIVED_AT_WAREHOUSE bucket is netted: that's the
+// column that double-counts against mintsoft_stock_level, because a partial
+// receive moves units into Mintsoft but leaves the order sitting in
+// ARRIVED_AT_WAREHOUSE at its full ordered qty. Every other status reports its
+// raw ordered total. Used by /all-asins, where the snapshot-freshness threshold
+// differs per ASIN and so can't be gated in a single grouped SQL sum.
+function buildNettedStatusMap(rows, reflectedSettledFor) {
+    const orders = Object.fromEntries(ALL_STATUSES.map(s => [s, 0]));
+    for (const row of rows) {
+        const ordered = Number(row.quantity || 0);
+        const qty = row.status === 'ARRIVED_AT_WAREHOUSE'
+            ? Math.max(ordered - reflectedSettledFor(row), 0)
+            : ordered;
+        orders[row.status] = (orders[row.status] || 0) + qty;
+    }
+    return orders;
+}
+
 // ── 1. GET /api/v1/orders ────────────────────────────────────────────────
 app.get('/api/v1/orders', async (req, res) => {
     try {
@@ -1796,8 +1841,7 @@ app.get('/api/v1/suppliers', async (req, res) => {
         const { rows, emailsBySupplierId } = await withConnection(async (conn) => {
             const [supRows] = await conn.query(`
                 SELECT id, name, code, portal_code, country, default_currency, default_incoterms,
-                       default_payment_terms, contact_name, contact_email, contact_phone,
-                       address, notes, active, created_at, updated_at
+                       default_payment_terms, contact_name, contact_email, created_at, updated_at
                   FROM suppliers
                  WHERE deleted_at IS NULL
                  ORDER BY name ASC
@@ -1832,10 +1876,6 @@ app.get('/api/v1/suppliers', async (req, res) => {
                 defaultPaymentTerms: r.default_payment_terms || null,
                 contactName: r.contact_name || null,
                 contactEmail: r.contact_email || null,
-                contactPhone: r.contact_phone || null,
-                address: r.address || null,
-                notes: r.notes || null,
-                active: r.active === 1,
                 createdAt: r.created_at?.toISOString?.() ?? r.created_at,
                 updatedAt: r.updated_at?.toISOString?.() ?? r.updated_at,
                 emails: (emailsBySupplierId.get(r.id) || []).map(e => ({
@@ -2769,11 +2809,25 @@ async function generateDraftDocument(conn, { name, docType, supplierName, commen
     };
 }
 
-app.post('/api/v1/draft-containers/:name/generate', async (req, res) => {
+// A draft-container name can contain "/" (e.g. "… - HW/JFA Ningbo Container 2")
+// and spaces. Behind API Gateway (httpApi), an encoded "%2F" in the path is
+// decoded to a REAL "/" before Express routes, which splits the name across
+// segments and makes a single-token `:name` param fail to match (→ Express 404,
+// "Cannot GET …"). So the name-in-path routes below match the name with a
+// greedy regex capture (req.params[0]) instead of `:name`, and this helper
+// decodes whatever encoding survives to that point (Express decodes the capture,
+// but a stray "%20" left by the gateway is handled defensively).
+function draftNameFromPath(raw) {
+    let s = String(raw || '');
+    if (s.includes('%')) { try { s = decodeURIComponent(s); } catch { /* keep as-is */ } }
+    return s.trim();
+}
+
+app.post(/^\/api\/v1\/draft-containers\/(.+)\/generate\/?$/, async (req, res) => {
     try {
         await draftContainerAllocationsSchemaReady;
         if (!PO_BUCKET) return res.status(500).json({ error: 'PO_DOCS_BUCKET env var not configured.' });
-        const name = String(req.params.name || '').trim();
+        const name = draftNameFromPath(req.params[0]);
         if (!name) return res.status(400).json({ error: 'draft container name required in path.' });
         const { comments, type, supplier } = req.body || {};
 
@@ -2870,10 +2924,10 @@ app.post('/api/v1/draft-containers/:name/generate', async (req, res) => {
     }
 });
 
-app.get('/api/v1/draft-containers/:name/documents', async (req, res) => {
+app.get(/^\/api\/v1\/draft-containers\/(.+)\/documents\/?$/, async (req, res) => {
     try {
         await draftContainerAllocationsSchemaReady;
-        const name = String(req.params.name || '').trim();
+        const name = draftNameFromPath(req.params[0]);
         if (!name) return res.status(400).json({ error: 'draft container name required in path.' });
 
         const { docs, sendsByDoc } = await withConnection(async (conn) => {
@@ -2944,6 +2998,7 @@ app.post('/api/v1/draft-container-documents/:id/email', async (req, res) => {
         await draftContainerAllocationsSchemaReady;
         await auditLogSchemaReady;
         await emailTemplatesSchemaReady;
+        await emailReceiptsSchemaReady;
 
         const { id } = req.params;
         // `subject`/`body` are optional per-send overrides. When the caller
@@ -3036,10 +3091,15 @@ app.post('/api/v1/draft-container-documents/:id/email', async (req, res) => {
                 ? body
                 : renderTemplate(tpl.bodyHtml, vars);
 
+            const receiptToken = await createEmailReceipt(conn, {
+                emailType: 'draft_container_quote', sentTo: toAddresses, subject: finalSubject,
+            });
+            const bodyWithReceipt = appendReceiptLink(htmlBody, receiptToken, apiBaseUrlFromReq(req));
+
             const form = new FormData();
             for (const addr of toAddresses) form.append('to[]', addr);
             form.append('subject', finalSubject);
-            form.append('body', htmlBody);
+            form.append('body', bodyWithReceipt);
             form.append('body_format', 'html');
             form.append('options[archive]', 'false');
             for (const a of attachments) {
@@ -3096,6 +3156,7 @@ app.post('/api/v1/draft-container-documents/:id/email', async (req, res) => {
                 [primarySendId]
             );
             const sentAt = sentRow[0]?.sent_at?.toISOString?.() ?? sentRow[0]?.sent_at ?? null;
+            await linkReceiptToSend(conn, receiptToken, 'draft_container_document_sends', primarySendId);
 
             return {
                 ok: true,
@@ -3424,6 +3485,7 @@ app.post('/api/v1/quality-assurance-documents/:id/email', async (req, res) => {
     try {
         await qualityAssuranceSchemaReady;
         await emailTemplatesSchemaReady;
+        await emailReceiptsSchemaReady;
 
         const { id } = req.params;
         const { to, subject, body } = req.body || {};
@@ -3492,10 +3554,15 @@ app.post('/api/v1/quality-assurance-documents/:id/email', async (req, res) => {
                 ? body
                 : renderTemplate(tpl.bodyHtml, vars);
 
+            const receiptToken = await createEmailReceipt(conn, {
+                emailType: 'quality_assurance', sentTo: toAddresses, subject: finalSubject,
+            });
+            const bodyWithReceipt = appendReceiptLink(htmlBody, receiptToken, apiBaseUrlFromReq(req));
+
             const form = new FormData();
             for (const addr of toAddresses) form.append('to[]', addr);
             form.append('subject', finalSubject);
-            form.append('body', htmlBody);
+            form.append('body', bodyWithReceipt);
             form.append('body_format', 'html');
             form.append('options[archive]', 'false');
             form.append('attachments[]', new Blob([pdfBytes], { type: 'application/pdf' }), filename);
@@ -3537,6 +3604,7 @@ app.post('/api/v1/quality-assurance-documents/:id/email', async (req, res) => {
                 [sendInsert.insertId]
             );
             const sentAt = sentRow[0]?.sent_at?.toISOString?.() ?? sentRow[0]?.sent_at ?? null;
+            await linkReceiptToSend(conn, receiptToken, 'quality_assurance_document_sends', sendInsert.insertId);
 
             return {
                 ok: true,
@@ -3572,39 +3640,78 @@ app.post('/api/v1/quality-assurance-documents/:id/email', async (req, res) => {
 // ── 8. GET /api/v1/stock-snapshots/sum ───────────────────────────────────
 app.get('/api/v1/stock-snapshots/sum', async (req, res) => {
     try {
+        await stockSnapshotsSchemaReady;
         const cleanAsin = parseAsin(req.query.asin);
-        if (!cleanAsin) {
-            return res.status(400).json({ error: 'A valid 10-character alphanumeric ASIN is required.' });
+        const jfCodeParam = (req.query.jfCode || '').trim();
+        if (!cleanAsin && !jfCodeParam) {
+            return res.status(400).json({ error: 'Provide either a valid 10-character asin or a jfCode query parameter.' });
         }
+        // company is optional: when supplied it narrows the Amazon snapshots to
+        // one seller account; when omitted we sum across every company for the
+        // resolved ASIN(s).
         const company = (req.query.company || '').trim();
-        if (!company) {
-            return res.status(400).json({ error: 'company query parameter is required.' });
+
+        // A product is identified by an asin OR a jf_code; the two are mapped in
+        // landed_costs. We resolve BOTH sets here because the sources are keyed
+        // differently: stock_snapshots / orders / product_carton_sizes by
+        // jf_code, amazon_stock_country_snapshots by asin. One jf_code can map
+        // to several ASINs (e.g. HW0152 → B01MXXEO0D + B00CCGEKCY) that all
+        // share a single stock_snapshots row, so looking up by jf_code is what
+        // reliably finds it; looking up by asin alone misses it half the time.
+        let jfCodes, asins;
+        if (cleanAsin) {
+            const [rows] = await pool.query(
+                `SELECT DISTINCT jf_code FROM landed_costs WHERE asin = ? AND jf_code IS NOT NULL AND jf_code <> ''`,
+                [cleanAsin]
+            );
+            jfCodes = rows.map(r => r.jf_code);
+            asins = [cleanAsin];
+        } else {
+            jfCodes = [jfCodeParam];
+            const [rows] = await pool.query(
+                `SELECT DISTINCT asin FROM landed_costs WHERE jf_code = ? AND asin IS NOT NULL AND asin <> ''`,
+                [jfCodeParam]
+            );
+            asins = rows.map(r => r.asin);
         }
 
-        // Resolve every JF code mapped to this ASIN. stock_snapshots is keyed
-        // by sku/warehouse, not by asin — multiple ASINs sharing one JF code
-        // (e.g. HW0152 → both B01MXXEO0D and B00CCGEKCY) end up sharing one
-        // stock_snapshots row, which gets stamped with whichever asin was
-        // last passed to snapshotJfCode. Looking up by asin alone misses the
-        // row half the time. Looking up by jf_code(s) always finds it.
-        const [jfCodeRows] = await pool.query(
-            `SELECT DISTINCT jf_code FROM landed_costs WHERE asin = ? AND jf_code IS NOT NULL AND jf_code <> ''`,
-            [cleanAsin]
-        );
-        const jfCodes = jfCodeRows.map(r => r.jf_code);
         const stockClause = jfCodes.length
             ? `jf_code IN (${jfCodes.map(() => '?').join(',')})`
             : `asin = ?`;
         const stockParams = jfCodes.length ? jfCodes : [cleanAsin];
+
+        // Match orders / product_carton_sizes by the SAME identifier the caller
+        // searched on: an asin search keeps its exact previous behaviour
+        // (orders.asin = ?), a jfCode search keys off the jf_code(s).
+        let idParams, idWhere;
+        if (cleanAsin) {
+            idParams = [cleanAsin];
+            idWhere = (prefix) => `${prefix ? `${prefix}.` : ''}asin = ?`;
+        } else {
+            idParams = jfCodes;
+            idWhere = (prefix) => `${prefix ? `${prefix}.` : ''}jf_code IN (${jfCodes.map(() => '?').join(',')})`;
+        }
+
+        // Amazon snapshots are keyed by asin only. With no mapped ASIN there is
+        // nothing to look up, so amzWhere collapses to a never-match clause.
+        const hasAmazon = asins.length > 0;
+        const amzParams = hasAmazon ? [...asins, ...(company ? [company] : [])] : [];
+        const amzWhere = (prefix) => {
+            if (!hasAmazon) return '1=0';
+            const p = prefix ? `${prefix}.` : '';
+            let w = `${p}asin IN (${asins.map(() => '?').join(',')})`;
+            if (company) w += ` AND ${p}company = ?`;
+            return w;
+        };
 
         const [
             [msTodayRows], [amzTodayRows], [msFallbackRows], [amzFallbackRows],
         ] = await withTimeout(
             Promise.all([
                 pool.query(`SELECT MAX(date_ran) as latest FROM stock_snapshots WHERE ${stockClause} AND date_ran = CURDATE()`, stockParams),
-                pool.query(`SELECT MAX(date_ran) as latest FROM amazon_stock_country_snapshots WHERE asin = ? AND company = ? AND date_ran = CURDATE()`, [cleanAsin, company]),
+                pool.query(`SELECT MAX(date_ran) as latest FROM amazon_stock_country_snapshots WHERE ${amzWhere('')} AND date_ran = CURDATE()`, amzParams),
                 pool.query(`SELECT MAX(date_ran) as latest FROM stock_snapshots WHERE ${stockClause}`, stockParams),
-                pool.query(`SELECT MAX(date_ran) as latest FROM amazon_stock_country_snapshots WHERE asin = ? AND company = ?`, [cleanAsin, company]),
+                pool.query(`SELECT MAX(date_ran) as latest FROM amazon_stock_country_snapshots WHERE ${amzWhere('')}`, amzParams),
             ]),
             QUERY_TIMEOUT_MS, 'Date lookup'
         );
@@ -3612,6 +3719,37 @@ app.get('/api/v1/stock-snapshots/sum', async (req, res) => {
         const msDate = msTodayRows[0]?.latest ?? msFallbackRows[0]?.latest ?? null;
         const amzDate = amzTodayRows[0]?.latest ?? amzFallbackRows[0]?.latest ?? null;
         const days = parseInt(req.query.days, 10) || 30;
+
+        // How fresh is the Mintsoft number we're about to show? = the newest
+        // last-refresh time among the snapshot rows that feed mintsoft_stock_level.
+        // A received receipt is only netted out of the order figures once it's
+        // reflected here (received_at <= this). NULL (no snapshot yet) → nothing
+        // received is netted, so we never undercount.
+        let snapshotFreshness = null;
+        if (msDate) {
+            const [freshRows] = await pool.query(
+                `SELECT MAX(updated_at) AS fresh FROM stock_snapshots WHERE date_ran = ? AND ${stockClause}`,
+                [msDate, ...stockParams]
+            );
+            snapshotFreshness = freshRows[0]?.fresh ?? null;
+        }
+
+        // Per-order rollup of receipt units the cached Mintsoft snapshot ALREADY
+        // reflects — netted out of the ARRIVED_AT_WAREHOUSE total below so it
+        // doesn't double-count what's now in mintsoft_stock_level. = not_received
+        // shortfalls (always reconciled) + received units whose received_at is
+        // <= the snapshot's last refresh. The leading `?` binds snapshotFreshness,
+        // so it must precede idParams.
+        const receiptsJoin = `
+                     LEFT JOIN (
+                         SELECT order_id,
+                             COALESCE(SUM(CASE
+                                 WHEN type <> 'received' THEN quantity
+                                 WHEN received_at <= ? THEN quantity
+                                 ELSE 0 END), 0) AS reflected_settled
+                         FROM order_receipts GROUP BY order_id
+                     ) rcpt ON rcpt.order_id = orders.id`;
+        const orderParams = [snapshotFreshness, ...idParams];
 
         const [msRows, amzRows, orderRows, onSeaRows, onAirRows, ordersBreakdownRows, msHistoryRows, amzHistoryRows, tagRows] = await withTimeout(
             Promise.all([
@@ -3643,19 +3781,29 @@ app.get('/api/v1/stock-snapshots/sum', async (req, res) => {
                          JOIN (
                              SELECT country, MAX(date_ran) AS latest
                              FROM amazon_stock_country_snapshots
-                             WHERE asin = ? AND company = ?
+                             WHERE ${amzWhere('')}
                              GROUP BY country
                          ) ld ON ld.country = a.country AND a.date_ran = ld.latest
-                         WHERE a.asin = ? AND a.company = ?
+                         WHERE ${amzWhere('a')}
                          GROUP BY a.country`,
-                        [cleanAsin, company, cleanAsin, company]
+                        [...amzParams, ...amzParams]
                     ).then(([rows]) => rows)
                     : Promise.resolve([]),
 
                 pool.query(
-                    `SELECT status, CAST(COALESCE(SUM(quantity), 0) AS UNSIGNED) as total_quantity
-                     FROM orders WHERE asin = ? AND deleted_at IS NULL GROUP BY status`,
-                    [cleanAsin]
+                    // Only ARRIVED_AT_WAREHOUSE is netted — that's the bucket that
+                    // double-counts against mintsoft_stock_level (a partial receive
+                    // moves units into Mintsoft but leaves the order here at full
+                    // qty). Every other status keeps its raw ordered total.
+                    `SELECT orders.status,
+                            CAST(COALESCE(SUM(
+                                CASE WHEN orders.status = 'ARRIVED_AT_WAREHOUSE'
+                                     THEN GREATEST(orders.quantity - COALESCE(rcpt.reflected_settled, 0), 0)
+                                     ELSE orders.quantity END
+                            ), 0) AS UNSIGNED) as total_quantity
+                     FROM orders${receiptsJoin}
+                     WHERE ${idWhere('orders')} AND orders.deleted_at IS NULL GROUP BY orders.status`,
+                    orderParams
                 ).then(([rows]) => rows),
 
                 pool.query(
@@ -3666,8 +3814,8 @@ app.get('/api/v1/stock-snapshots/sum', async (req, res) => {
                             orders.actual_ready_date, orders.estimated_departure_date,
                             po.created_at AS po_created_at
                      FROM orders LEFT JOIN purchase_orders po ON po.id = orders.purchase_order_id
-                     WHERE orders.asin = ? AND orders.status = 'ON_SEA' AND orders.deleted_at IS NULL ORDER BY orders.eta ASC`,
-                    [cleanAsin]
+                     WHERE ${idWhere('orders')} AND orders.status = 'ON_SEA' AND orders.deleted_at IS NULL ORDER BY orders.eta ASC`,
+                    idParams
                 ).then(([rows]) => rows),
 
                 pool.query(
@@ -3677,8 +3825,8 @@ app.get('/api/v1/stock-snapshots/sum', async (req, res) => {
                             orders.actual_ready_date, orders.estimated_departure_date,
                             po.created_at AS po_created_at
                      FROM orders LEFT JOIN purchase_orders po ON po.id = orders.purchase_order_id
-                     WHERE orders.asin = ? AND orders.status = 'ON_AIR' AND orders.deleted_at IS NULL ORDER BY orders.eta ASC`,
-                    [cleanAsin]
+                     WHERE ${idWhere('orders')} AND orders.status = 'ON_AIR' AND orders.deleted_at IS NULL ORDER BY orders.eta ASC`,
+                    idParams
                 ).then(([rows]) => rows),
 
                 pool.query(
@@ -3688,8 +3836,8 @@ app.get('/api/v1/stock-snapshots/sum', async (req, res) => {
                             orders.shipped_date, orders.estimated_departure_date,
                             po.created_at AS po_created_at
                      FROM orders LEFT JOIN purchase_orders po ON po.id = orders.purchase_order_id
-                     WHERE orders.asin = ? AND orders.status NOT IN ('ON_SEA', 'ON_AIR', 'RECEIVED') AND orders.deleted_at IS NULL ORDER BY orders.created_at DESC`,
-                    [cleanAsin]
+                     WHERE ${idWhere('orders')} AND orders.status NOT IN ('ON_SEA', 'ON_AIR', 'RECEIVED') AND orders.deleted_at IS NULL ORDER BY orders.created_at DESC`,
+                    idParams
                 ).then(([rows]) => rows),
 
                 pool.query(
@@ -3712,18 +3860,18 @@ app.get('/api/v1/stock-snapshots/sum', async (req, res) => {
                         CAST(COALESCE(SUM(inbound_receiving), 0) AS UNSIGNED) as inbound_receiving,
                         CAST(COALESCE(SUM(reserved), 0) AS UNSIGNED)          as reserved
                      FROM amazon_stock_country_snapshots
-                     WHERE asin = ? AND company = ? AND date_ran >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
+                     WHERE ${amzWhere('')} AND date_ran >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
                      GROUP BY date_ran ORDER BY date_ran`,
-                    [cleanAsin, company, days]
+                    [...amzParams, days]
                 ).then(([rows]) => rows),
 
                 pool.query(
                     `SELECT carton_qty AS units_per_ctn,
                             (carton_height * carton_width * carton_depth) / 1000000 AS carton_cbm
                      FROM product_carton_sizes
-                     WHERE asin = ?
+                     WHERE ${idWhere('')}
                      LIMIT 1`,
-                    [cleanAsin]
+                    idParams
                 ).then(([rows]) => rows),
             ]),
             QUERY_TIMEOUT_MS, 'Data fetch'
@@ -3778,6 +3926,7 @@ app.get('/api/v1/stock-snapshots/sum', async (req, res) => {
 // ── 9. GET /api/v1/stock-snapshots/sum/all-asins ─────────────────────────
 app.get('/api/v1/stock-snapshots/sum/all-asins', async (req, res) => {
     try {
+        await stockSnapshotsSchemaReady;
         const company = (req.query.company || '').trim();
         if (!company) {
             return res.status(400).json({ error: 'company query parameter is required.' });
@@ -3801,7 +3950,7 @@ app.get('/api/v1/stock-snapshots/sum/all-asins', async (req, res) => {
         ]);
 
         const [
-            [msDates], [amzDates], [orderStats], [onSeaOrders], [onAirOrders], [allOrdersRows], [msLatestRows], [amzLatestRows], [tagRows],
+            [msDates], [amzDates], [allStatusOrders], [onSeaOrders], [onAirOrders], [allOrdersRows], [msLatestRows], [amzLatestRows], [tagRows], [receiptRollup],
         ] = await withTimeout(
             Promise.all([
                 pool.query(`
@@ -3814,11 +3963,12 @@ app.get('/api/v1/stock-snapshots/sum/all-asins', async (req, res) => {
                     FROM amazon_stock_country_snapshots WHERE asin IS NOT NULL AND asin != '' AND company = ?
                     GROUP BY asin ORDER BY asin
                 `, [company]),
+                // Raw per-order rows (not pre-aggregated) so the status map can
+                // net each order's reflected receipts using its ASIN's snapshot
+                // freshness — see buildNettedStatusMap.
                 pool.query(`
-                    SELECT asin, status,
-                           CAST(COALESCE(SUM(quantity), 0) AS UNSIGNED) as total_quantity
+                    SELECT id, asin, status, quantity
                     FROM orders WHERE asin IS NOT NULL AND deleted_at IS NULL
-                    GROUP BY asin, status
                 `),
                 pool.query(`
                     SELECT orders.asin, orders.id, orders.product_name, orders.quantity, orders.eta, orders.container_number, orders.port, orders.supplier, orders.po_number,
@@ -3858,7 +4008,8 @@ app.get('/api/v1/stock-snapshots/sum/all-asins', async (req, res) => {
                            CAST(COALESCE(SUM(s.stock_level), 0) AS UNSIGNED) as total_stock_level,
                            CAST(COALESCE(SUM(s.available), 0) AS UNSIGNED) as total_available,
                            CAST(COALESCE(SUM(s.allocated), 0) AS UNSIGNED) as total_allocated,
-                           CAST(COALESCE(SUM(s.quarantine), 0) AS UNSIGNED) as total_quarantine
+                           CAST(COALESCE(SUM(s.quarantine), 0) AS UNSIGNED) as total_quarantine,
+                           MAX(s.updated_at) AS fresh
                     FROM stock_snapshots s
                     JOIN LatestDates ld ON s.asin = ld.asin AND s.date_ran = ld.latest
                     GROUP BY s.asin, s.date_ran
@@ -3887,6 +4038,14 @@ app.get('/api/v1/stock-snapshots/sum/all-asins', async (req, res) => {
                     FROM product_carton_sizes
                     WHERE asin IS NOT NULL AND asin != ''
                 `),
+                // Per-order receipt rollup for the reflected-ledger netting.
+                pool.query(`
+                    SELECT order_id,
+                           COALESCE(SUM(CASE WHEN type = 'received' THEN quantity END), 0) AS received_qty,
+                           COALESCE(SUM(CASE WHEN type <> 'received' THEN quantity END), 0) AS not_received_qty,
+                           MAX(CASE WHEN type = 'received' THEN received_at END) AS last_received_at
+                    FROM order_receipts GROUP BY order_id
+                `),
             ]),
             QUERY_TIMEOUT_MS, 'Batch data fetch'
         );
@@ -3895,6 +4054,24 @@ app.get('/api/v1/stock-snapshots/sum/all-asins', async (req, res) => {
         const amzDatesMap = Object.fromEntries(amzDates.map(r => [r.asin, r.latest]));
         const tagMap = Object.fromEntries(tagRows.map(r => [r.asin, r]));
 
+        // For the ARRIVED_AT_WAREHOUSE netting in buildNettedStatusMap: snapshot
+        // freshness per ASIN + the receipt rollup keyed by order. A received
+        // receipt is only netted once its ASIN's snapshot reflects it. Coarser
+        // than /sum (which gates each receipt individually): here we net an
+        // order's received units only if its MOST RECENT received receipt is
+        // reflected — biasing to a brief double-count over an undercount.
+        const freshnessMap = Object.fromEntries(msLatestRows.map(r => [r.asin, r.fresh]));
+        const receiptsByOrder = new Map(receiptRollup.map(r => [r.order_id, r]));
+        const reflectedSettledFor = (r) => {
+            const rr = receiptsByOrder.get(r.id);
+            if (!rr) return 0;
+            const fresh = freshnessMap[r.asin] || null;
+            const lastRecv = rr.last_received_at || null;
+            const receivedReflected = (lastRecv && fresh && +new Date(lastRecv) <= +new Date(fresh))
+                ? Number(rr.received_qty || 0) : 0;
+            return Number(rr.not_received_qty || 0) + receivedReflected;
+        };
+
         const results = {};
 
         for (const asin of allAsins) {
@@ -3902,7 +4079,7 @@ app.get('/api/v1/stock-snapshots/sum/all-asins', async (req, res) => {
 
             const msStats = msLatestRows.find(r => r.asin === asin) || {};
             const amzByCountry = amzLatestRows.filter(r => r.asin === asin);
-            const ordersByStatus = orderStats.filter(r => r.asin === asin);
+            const ordersByStatus = allStatusOrders.filter(r => r.asin === asin);
             const seaOrders = onSeaOrders.filter(r => r.asin === asin);
             const airOrders = onAirOrders.filter(r => r.asin === asin);
             const ordersBreakdown = allOrdersRows.filter(r => r.asin === asin);
@@ -3922,7 +4099,7 @@ app.get('/api/v1/stock-snapshots/sum/all-asins', async (req, res) => {
                 mintsoft_quarantine: Number(msStats.total_quarantine || 0),
                 ...totals,
                 amazon_stock_by_country,
-                orders: buildOrderStatusMap(ordersByStatus),
+                orders: buildNettedStatusMap(ordersByStatus, reflectedSettledFor),
                 goods_on_sea: seaOrders.map(mapGoodsOnSeaRow),
                 goods_on_air: airOrders.map(mapGoodsOnAirRow),
                 orders_breakdown: ordersBreakdown.map(mapOrderBreakdownRow),
@@ -5256,19 +5433,10 @@ app.get('/api/v1/suppliers/:id/emails', async (req, res) => {
                 return rows;
             };
 
-            let rows = await fetchEmails();
-
-            // Backfill: if no rows exist yet and Mintsoft has a primary
-            // contact_email on file, insert it as the primary. INSERT IGNORE
-            // tolerates a concurrent backfill from another request.
-            if (rows.length === 0 && sup.contact_email) {
-                await conn.query(
-                    `INSERT IGNORE INTO supplier_emails (supplier_id, email, label, is_primary)
-                     VALUES (?, ?, 'Primary', 1)`,
-                    [supplierId, sup.contact_email.trim()]
-                );
-                rows = await fetchEmails();
-            }
+            const rows = await fetchEmails();
+            // Contacts are owned by JFPro now (jfpro.supplier_contacts, surfaced
+            // through the supplier_emails view), so the legacy contact_email
+            // backfill is retired — a view is not insertable.
             return { supplier: sup, rows };
         });
 
@@ -5307,6 +5475,7 @@ app.post('/api/v1/purchase-order-documents/:id/email', async (req, res) => {
         await auditLogSchemaReady;
         await purchaseOrdersSchemaReady;
         await emailTemplatesSchemaReady;
+        await emailReceiptsSchemaReady;
 
         const { id } = req.params;
         // `subject`/`body` are optional per-send overrides. When the caller
@@ -5359,6 +5528,13 @@ app.post('/api/v1/purchase-order-documents/:id/email', async (req, res) => {
                 ? body
                 : renderTemplate(tpl.bodyHtml, vars);
 
+            // Mint a receipt token and embed a "Confirm receipt" link so the
+            // recipient can one-click confirm they got this email.
+            const receiptToken = await createEmailReceipt(conn, {
+                emailType: 'purchase_order', sentTo: toAddresses, subject: finalSubject,
+            });
+            const bodyWithReceipt = appendReceiptLink(htmlBody, receiptToken, apiBaseUrlFromReq(req));
+
             // Front /channels/{id}/messages — multipart so we can attach the
             // PDF. `to[]` notation makes Front treat the field as an array;
             // we append once per recipient. body_format=html so our HTML
@@ -5366,7 +5542,7 @@ app.post('/api/v1/purchase-order-documents/:id/email', async (req, res) => {
             const form = new FormData();
             for (const addr of toAddresses) form.append('to[]', addr);
             form.append('subject', finalSubject);
-            form.append('body', htmlBody);
+            form.append('body', bodyWithReceipt);
             form.append('body_format', 'html');
             form.append('options[archive]', 'false');
             form.append('attachments[]', new Blob([pdfBytes], { type: 'application/pdf' }), filename);
@@ -5416,6 +5592,7 @@ app.post('/api/v1/purchase-order-documents/:id/email', async (req, res) => {
                 [sendInsert.insertId]
             );
             const sentAt = sentRow[0]?.sent_at?.toISOString?.() ?? sentRow[0]?.sent_at ?? null;
+            await linkReceiptToSend(conn, receiptToken, 'purchase_order_document_sends', sendInsert.insertId);
 
             await recordAudit(conn, {
                 entityType: 'purchase_order',
@@ -5943,6 +6120,7 @@ app.post('/api/v1/purchase-order-signed-pis/:id/email', async (req, res) => {
         await auditLogSchemaReady;
         await purchaseOrdersSchemaReady;
         await emailTemplatesSchemaReady;
+        await emailReceiptsSchemaReady;
 
         const { id } = req.params;
         const { to, subject, body } = req.body || {};
@@ -5986,10 +6164,15 @@ app.post('/api/v1/purchase-order-signed-pis/:id/email', async (req, res) => {
                 ? body
                 : renderTemplate(tpl.bodyHtml, vars);
 
+            const receiptToken = await createEmailReceipt(conn, {
+                emailType: 'purchase_order_signed_pi', sentTo: toAddresses, subject: finalSubject,
+            });
+            const bodyWithReceipt = appendReceiptLink(htmlBody, receiptToken, apiBaseUrlFromReq(req));
+
             const form = new FormData();
             for (const addr of toAddresses) form.append('to[]', addr);
             form.append('subject', finalSubject);
-            form.append('body', htmlBody);
+            form.append('body', bodyWithReceipt);
             form.append('body_format', 'html');
             form.append('options[archive]', 'false');
             form.append('attachments[]', new Blob([fileBytes], { type: ct }), safeFilename);
@@ -6028,6 +6211,7 @@ app.post('/api/v1/purchase-order-signed-pis/:id/email', async (req, res) => {
                 [sendInsert.insertId]
             );
             const sentAt = sentRow[0]?.sent_at?.toISOString?.() ?? sentRow[0]?.sent_at ?? null;
+            await linkReceiptToSend(conn, receiptToken, 'purchase_order_signed_pi_sends', sendInsert.insertId);
 
             await recordAudit(conn, {
                 entityType: 'purchase_order',
@@ -6803,6 +6987,187 @@ app.delete('/api/v1/purchase-order-payments/:id', async (req, res) => {
     }
 });
 
+// ── Email receipt status (read) ──────────────────────────────────────────
+// Per-email confirmation status for the "Confirm receipt" links embedded in
+// outbound supplier/forwarder emails (see src/lib/email-receipt.js). One row
+// per sent email, with a three-state lifecycle:
+//   'sent'      → link never fetched
+//   'opened'    → landing page fetched (WEAK: link-scanners fetch it too)
+//   'confirmed' → recipient pressed the Confirm button (STRONG: a form POST)
+// Filter by a specific send (sendTable+sendId, as recorded on the *_sends row),
+// by email_type, or by status ('sent'|'opened'|'confirmed'). Newest first.
+//   email_type ∈ purchase_order | purchase_order_signed_pi |
+//                draft_container_quote | quality_assurance
+// The token is intentionally NOT returned — it is a click capability, not data.
+function rowToEmailReceipt(r) {
+    let sentTo = null;
+    if (r.sent_to) {
+        try { sentTo = JSON.parse(r.sent_to); } catch { sentTo = r.sent_to; }
+    }
+    const status = r.confirmed_at ? 'confirmed' : (r.opened_at ? 'opened' : 'sent');
+    return {
+        id: r.id,
+        emailType: r.email_type,
+        sendTable: r.send_table || null,
+        sendId: r.send_id || null,
+        sentTo,
+        subject: r.subject || null,
+        status,
+        createdAt: r.created_at?.toISOString?.() ?? r.created_at,
+        openedAt: r.opened_at?.toISOString?.() ?? r.opened_at,
+        openCount: Number(r.open_count || 0),
+        confirmedAt: r.confirmed_at?.toISOString?.() ?? r.confirmed_at,
+        confirmedIp: r.confirmed_ip || null,
+        confirmedUserAgent: r.confirmed_user_agent || null,
+        reminderCount: Number(r.reminder_count || 0),
+        lastReminderAt: r.last_reminder_at?.toISOString?.() ?? r.last_reminder_at ?? null,
+    };
+}
+
+app.get('/api/v1/email-receipts', async (req, res) => {
+    try {
+        await emailReceiptsSchemaReady;
+        const { sendTable, emailType, status } = req.query;
+        // Clamp paging to sane bounds; both are sanitized ints, safe to inline.
+        const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 100, 1), 500);
+        const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+
+        const where = [];
+        const params = [];
+        if (sendTable) { where.push('send_table = ?'); params.push(String(sendTable)); }
+        if (req.query.sendId !== undefined && Number.isFinite(Number(req.query.sendId))) {
+            where.push('send_id = ?'); params.push(Number(req.query.sendId));
+        }
+        if (emailType) { where.push('email_type = ?'); params.push(String(emailType)); }
+        if (status === 'confirmed') where.push('confirmed_at IS NOT NULL');
+        else if (status === 'opened') where.push('opened_at IS NOT NULL AND confirmed_at IS NULL');
+        else if (status === 'sent' || status === 'pending') where.push('opened_at IS NULL AND confirmed_at IS NULL');
+        const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+
+        const rows = await withConnection(async (conn) => {
+            const [r] = await conn.query(
+                `SELECT id, email_type, send_table, send_id, sent_to, subject,
+                        created_at, opened_at, open_count, confirmed_at, confirmed_ip, confirmed_user_agent,
+                        reminder_count, last_reminder_at
+                   FROM email_receipts
+                   ${whereSql}
+                  ORDER BY created_at DESC, id DESC
+                  LIMIT ${limit} OFFSET ${offset}`,
+                params
+            );
+            return r;
+        });
+        res.json({ data: rows.map(rowToEmailReceipt) });
+    } catch (error) {
+        log.error('[GET /email-receipts]', error);
+        res.status(500).json({ error: 'An internal error occurred.' });
+    }
+});
+
+// ── POST /api/v1/email-receipts/:id/resend ───────────────────────────────
+// Resend a reminder for a receipt that hasn't been confirmed yet. Sends a
+// short standalone email (no attachment) to the ORIGINAL recipients via Front,
+// reusing the original confirm token so a click updates the same row. No-op
+// (200, resent:false) if the receipt is already confirmed. Bumps
+// reminder_count / last_reminder_at.
+app.post('/api/v1/email-receipts/:id/resend', async (req, res) => {
+    try {
+        await emailReceiptsSchemaReady;
+        const id = Number(req.params.id);
+        if (!Number.isFinite(id)) return res.status(400).json({ error: 'Invalid id.' });
+
+        const receipt = await withConnection((conn) => getReceiptForResend(conn, id));
+        if (!receipt) return res.status(404).json({ error: 'Email receipt not found.' });
+        if (receipt.confirmed_at) {
+            return res.json({ resent: false, reason: 'already_confirmed' });
+        }
+
+        // Same send path the auto-reminder sweep uses (reuses the original
+        // token, shows the reminder count).
+        const result = await sendReminderForReceipt(receipt, apiBaseUrlFromReq(req));
+        if (!result.ok) {
+            if (result.reason === 'no_recipients') {
+                return res.status(422).json({ error: 'No recipients recorded for this email; cannot resend.' });
+            }
+            if (result.reason === 'front_not_configured') {
+                return res.status(503).json({ error: 'Front is not configured.' });
+            }
+            log.error('[email-receipts/resend] Front API error', {
+                status: result.status, body: result.detail,
+            });
+            return res.status(502).json({ error: 'Failed to send reminder via Front.' });
+        }
+
+        const updated = await withConnection(async (conn) => {
+            await recordReminderSend(conn, id, {
+                reminderNumber: result.reminderNumber,
+                sentTo: result.recipients,
+                subject: result.subject,
+                frontMessageUid: result.frontMessageUid,
+                frontConversationId: result.frontConversationId,
+                sentByEmail: req.userEmail || null,
+            });
+            const [rows] = await conn.query(
+                `SELECT id, email_type, send_table, send_id, sent_to, subject,
+                        created_at, opened_at, open_count, confirmed_at, confirmed_ip, confirmed_user_agent,
+                        reminder_count, last_reminder_at
+                   FROM email_receipts WHERE id = ?`,
+                [id]
+            );
+            await recordAudit(conn, {
+                entityType: 'email_receipt',
+                entityId: id,
+                action: 'reminder_sent',
+                before: null,
+                after: { to: result.recipients, subject: result.subject, reminderNumber: result.reminderNumber },
+                userEmail: req.userEmail,
+            });
+            return rows[0];
+        });
+
+        res.json({ resent: true, data: updated ? rowToEmailReceipt(updated) : null });
+    } catch (error) {
+        log.error('[POST /email-receipts/:id/resend]', error);
+        res.status(500).json({ error: 'An internal error occurred.' });
+    }
+});
+
+// ── GET /api/v1/email-receipts/:id/reminders ─────────────────────────────
+// The list of follow-up (reminder) emails sent for a receipt, oldest first.
+// Each row is one send — automated sweep (sentBy null) or a manual resend
+// (sentBy = operator). The parent receipt's reminderCount/lastReminderAt is the
+// summary; this is the detail.
+app.get('/api/v1/email-receipts/:id/reminders', async (req, res) => {
+    try {
+        await emailReceiptsSchemaReady;
+        const id = Number(req.params.id);
+        if (!Number.isFinite(id)) return res.status(400).json({ error: 'Invalid id.' });
+        const rows = await withConnection((conn) => listReminders(conn, id));
+        res.json({
+            data: rows.map((r) => {
+                let sentTo = null;
+                if (r.sent_to) {
+                    try { sentTo = JSON.parse(r.sent_to); } catch { sentTo = r.sent_to; }
+                }
+                return {
+                    id: r.id,
+                    emailReceiptId: r.email_receipt_id,
+                    reminderNumber: Number(r.reminder_number || 0),
+                    sentTo,
+                    subject: r.subject || null,
+                    frontMessageUid: r.front_message_uid || null,
+                    frontConversationId: r.front_conversation_id || null,
+                    sentBy: r.sent_by_email || null,
+                    sentAt: r.created_at?.toISOString?.() ?? r.created_at,
+                };
+            }),
+        });
+    } catch (error) {
+        log.error('[GET /email-receipts/:id/reminders]', error);
+        res.status(500).json({ error: 'An internal error occurred.' });
+    }
+});
+
 // ── Email templates CRUD ─────────────────────────────────────────────────
 // The subject/body HTML used when emailing documents via Front. The send
 // handlers read by template_key; this CRUD lets ops view and edit the copy.
@@ -6813,6 +7178,7 @@ function rowToEmailTemplate(r) {
         id: r.id,
         key: r.template_key,
         name: r.name,
+        category: r.category || null,
         description: r.description || null,
         subject: r.subject || null,
         body: r.body_html,
@@ -6821,7 +7187,7 @@ function rowToEmailTemplate(r) {
     };
 }
 
-const EMAIL_TEMPLATE_COLS = `id, template_key, name, description, subject, body_html,
+const EMAIL_TEMPLATE_COLS = `id, template_key, name, category, description, subject, body_html,
                              created_at, updated_at`;
 
 app.get('/api/v1/email-templates', async (req, res) => {
@@ -6867,7 +7233,7 @@ app.get('/api/v1/email-templates/:idOrKey', async (req, res) => {
 app.post('/api/v1/email-templates', async (req, res) => {
     try {
         await emailTemplatesSchemaReady;
-        const { key, name, description, subject, body } = req.body || {};
+        const { key, name, category, description, subject, body } = req.body || {};
         if (!key || typeof key !== 'string' || !/^[a-z0-9_]+$/.test(key.trim())) {
             return res.status(400).json({ error: 'key is required (lowercase letters, digits and underscores only).' });
         }
@@ -6880,9 +7246,9 @@ app.post('/api/v1/email-templates', async (req, res) => {
         const result = await withConnection(async (conn) => {
             try {
                 const [ins] = await conn.query(
-                    `INSERT INTO email_templates (template_key, name, description, subject, body_html)
-                     VALUES (?, ?, ?, ?, ?)`,
-                    [key.trim(), name.trim(), description || null, subject || null, body]
+                    `INSERT INTO email_templates (template_key, name, category, description, subject, body_html)
+                     VALUES (?, ?, ?, ?, ?, ?)`,
+                    [key.trim(), name.trim(), category == null ? null : (String(category).trim() || null), description || null, subject || null, body]
                 );
                 const [rows] = await conn.query(
                     `SELECT ${EMAIL_TEMPLATE_COLS} FROM email_templates WHERE id = ?`,
@@ -6907,14 +7273,15 @@ app.put('/api/v1/email-templates/:id', async (req, res) => {
         await emailTemplatesSchemaReady;
         const { id } = req.params;
         // template_key is the stable handle the send handlers rely on, so it's
-        // immutable here — name/description/subject/body are editable.
-        const { name, description, subject, body } = req.body || {};
+        // immutable here — name/category/description/subject/body are editable.
+        const { name, category, description, subject, body } = req.body || {};
         const fields = [];
         const values = [];
         if (name !== undefined) {
             if (!name || !String(name).trim()) return res.status(400).json({ error: 'name cannot be empty.' });
             fields.push('name = ?'); values.push(String(name).trim());
         }
+        if (category !== undefined) { fields.push('category = ?'); values.push(category == null ? null : (String(category).trim() || null)); }
         if (description !== undefined) { fields.push('description = ?'); values.push(description || null); }
         if (subject !== undefined) { fields.push('subject = ?'); values.push(subject || null); }
         if (body !== undefined) {
@@ -7844,8 +8211,6 @@ app.patch('/api/v1/alerts/:id/approve', async (req, res) => {
                 const meta = alert.meta || {};
                 const orderId = Number(meta.orderId);
                 if (!Number.isInteger(orderId) || orderId <= 0) { await conn.rollback(); return { badMeta: 'orderId' }; }
-                const status = (req.body && req.body.status) || meta.suggestedStatus;
-                if (!APPROVE_VALID_STATUSES.has(status)) { await conn.rollback(); return { badStatus: status }; }
 
                 const [existing] = await conn.query(`${ORDER_SELECT} AND orders.id = ?`, [orderId]);
                 if (!existing.length) { await conn.rollback(); return { orderNotFound: orderId }; }
@@ -7854,6 +8219,19 @@ app.patch('/api/v1/alerts/:id/approve', async (req, res) => {
                     await conn.rollback();
                     return { staleTerminal: beforeOrder.status, alert };
                 }
+
+                // Resolve the status this approve will set. A 'data_update' suggestion
+                // carries NO status move: meta.suggestedStatus is just the order's status
+                // frozen at email-processing time (front-status-import sets target =
+                // order.status for a no-move). Applying it verbatim would silently
+                // re-stamp an order whose status was changed by hand in the interim —
+                // e.g. order 930 approved a field-only estimatedReadyDate update and
+                // jumped IN_PRODUCTION -> READY_FOR_QC. Pin to the LIVE status; only move
+                // for a genuine move suggestion or an explicit body.status override.
+                const isDataUpdate = meta.category === 'data_update';
+                const status = (req.body && req.body.status)
+                    || (isDataUpdate ? beforeOrder.status : meta.suggestedStatus);
+                if (!APPROVE_VALID_STATUSES.has(status)) { await conn.rollback(); return { badStatus: status }; }
 
                 // Also apply the field values the email provided for this move
                 // (meta.fieldUpdates), or an explicit body.fields override. These

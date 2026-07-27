@@ -13,15 +13,18 @@ nothing extra for attribution.
 | `type` | fires when | resolves when |
 |---|---|---|
 | `container_eta` | a container/order ETA is today or overdue and still in transit | received / arrived |
-| `supplier_ready_date` | an order's ready date (actual ?? estimated) is today/overdue while still in a factory stage | leaves factory stage / ready date pushed forward |
 | `missing_data` | an in-transit order is missing LOT / MFG / EXP (blocks Mintsoft receiving) | the missing fields are filled, or it ships past |
 | `arrived_unreceived` | stock is `ARRIVED_AT_WAREHOUSE` with units still not booked into Mintsoft | fully received |
-| `qc_pending` | an order sits in `READY_FOR_QC` without a QC pass | QC approved / order moves on |
 | `shipment_late` | an in-transit order's delivery slot has passed, or its carrier ETA slipped ≥ 2 days | arrives / received |
 
-All six share the lifecycle, shape, and endpoints below. `meta` is type-specific
+> **Retired 2026-07-14:** `supplier_ready_date` (order sat at its ready date) and
+> `qc_pending` (order sat in `READY_FOR_QC`) are no longer generated — they nagged
+> on states orders legitimately sit in for a long time and kept re-surfacing after
+> a snooze. Existing rows auto-resolve on the next nightly run.
+
+All four share the lifecycle, shape, and endpoints below. `meta` is type-specific
 (it always carries `orderId`/`jfCode`/`supplier` plus fields relevant to the type —
-e.g. `missing: ["LOT","EXP"]`, `outstanding`, `readyForQcDate`, `etaSlipDays`).
+e.g. `missing: ["LOT","EXP"]`, `outstanding`, `etaSlipDays`).
 
 ## Lifecycle (important)
 
@@ -49,7 +52,7 @@ stuck order keeps re-surfacing until its state actually changes.
 ```jsonc
 {
   "id": 1234,
-  "type": "container_eta",            // one of the 6 types in the table above
+  "type": "container_eta",            // one of the 4 types in the table above
   "severity": "overdue",              // "today" | "overdue"
   "status": "pending",                // "pending" | "snoozed" | "dismissed" | "resolved"
   "eventDate": "2026-06-12",          // the ETA / ready date that triggered it
@@ -71,16 +74,12 @@ stuck order keeps re-surfacing until its state actually changes.
 `meta` for `container_eta`: `{ containerNumber, eta, suppliers[], poNumbers[], totalQuantity, orders[] }`
 where each order is `{ id, jfCode, productName, supplier, quantity, status }`.
 
-`meta` for `supplier_ready_date`: `{ orderId, jfCode, productName, supplier, poNumber,
-purchaseOrderId, status, readyKind ("estimated"|"actual"), estimatedReadyDate,
-actualReadyDate, quantity }`.
-
 ## Endpoints
 
 ### `GET /api/v1/alerts` — the slider list
 Query params (all optional):
 - `status` — `pending` (default), `snoozed`, `dismissed`, `resolved`, or `all`
-- `type` — one of `container_eta` · `supplier_ready_date` · `missing_data` · `arrived_unreceived` · `qc_pending` · `shipment_late`
+- `type` — one of `container_eta` · `missing_data` · `arrived_unreceived` · `shipment_late`
 - `limit` — 1–1000 (default 200)
 
 Response (200): `{ "data": [ /* Alert[] */ ], "counts": { "returned": 12, "pending": 12 } }`.

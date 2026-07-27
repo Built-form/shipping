@@ -38,20 +38,20 @@ function safeCompareCode(a, b) {
 }
 
 // Idempotent feature setup, safe to call on every cold start from any handler:
-// add the suppliers.portal_code column if it is missing, then give every
-// supplier that still lacks a code a freshly generated one. Returns the number
-// of suppliers that were assigned a new code.
+// give every live supplier that still lacks a code a freshly generated one.
+//
+// portal_code now lives on jfpro.suppliers — the unified single source of truth.
+// jfa.suppliers is a VIEW over it (see 2026-06-30_suppliers_views.sql), so we
+// read/write jfpro.suppliers directly: you cannot ALTER or UPDATE through the
+// view, and the column already exists (added by 2026-06-30_jfpro_suppliers_add_columns.sql).
+// Returns the number of suppliers that were assigned a new code (0 in steady state).
 async function ensureSupplierPortalCodes(conn) {
-    try {
-        await conn.query('ALTER TABLE suppliers ADD COLUMN portal_code VARCHAR(32) NULL');
-    } catch (e) {
-        if (!String(e.message || '').includes('Duplicate column')) throw e;
-    }
     const [rows] = await conn.query(
-        `SELECT id FROM suppliers WHERE deleted_at IS NULL AND (portal_code IS NULL OR portal_code = '')`
+        `SELECT id FROM jfpro.suppliers
+          WHERE COALESCE(is_deleted, 0) = 0 AND (portal_code IS NULL OR portal_code = '')`
     );
     for (const r of rows) {
-        await conn.query('UPDATE suppliers SET portal_code = ? WHERE id = ?', [generatePortalCode(), r.id]);
+        await conn.query('UPDATE jfpro.suppliers SET portal_code = ? WHERE id = ?', [generatePortalCode(), r.id]);
     }
     return rows.length;
 }

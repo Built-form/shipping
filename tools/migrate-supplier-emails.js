@@ -11,6 +11,15 @@
 require('dotenv').config();
 const { getPool, closePool } = require('../src/db');
 
+// DEPRECATED after the supplier unification (2026-06-30): jfa.supplier_emails is
+// now a VIEW over jfpro.supplier_contacts (not insertable) and contacts were
+// migrated by tools/merge-suppliers-into-jfpro.js. This backfill is retired.
+// (Use --force-legacy only against a pre-cutover backup.)
+if (!process.argv.includes('--force-legacy')) {
+    console.error('tools/migrate-supplier-emails.js: DEPRECATED — supplier_emails is now a view over jfpro.supplier_contacts. Refusing to run.');
+    process.exit(1);
+}
+
 (async () => {
     const pool = getPool();
     const conn = await pool.getConnection();

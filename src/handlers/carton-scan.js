@@ -30,6 +30,7 @@ const { getPool } = require('../db');
 const log = require('../lib/logger');
 const { safeCompareCode, normalizeCode } = require('../lib/portal-code');
 const { receiveOrderStock, findReceivableOrders, ReceiveError } = require('../services/order-receive');
+const { snapshotJfCode } = require('./mintsoft-snapshot');
 const { listWarehousesWithLocations, listLocationsForWarehouse } = require('../services/mintsoft-locations');
 
 const app = express();
@@ -188,6 +189,25 @@ app.post('/api/v1/scan/receive', async (req, res) => {
             receipts: result.receipts,
             ...(result.idempotent ? { idempotent: true } : {}),
         });
+
+        // Refresh stock_snapshots for this JF code so the stock-sum views reflect
+        // the receive quickly (and can net it out) instead of waiting up to an
+        // hour for the scheduled snapshot. Mirrors POST /orders/:id/receive:
+        // fire-and-forget after a short delay for Mintsoft's aggregates to settle;
+        // skipped on an idempotent replay (result.jfCode is null).
+        if (result.jfCode) {
+            const { jfCode, asin } = result;
+            setTimeout(async () => {
+                const c = await pool.getConnection();
+                try {
+                    await snapshotJfCode(c, jfCode, asin || '');
+                } catch (err) {
+                    log.warn('[POST /scan/receive] post-receive snapshot failed', { jfCode, error: err.message });
+                } finally {
+                    c.release();
+                }
+            }, 10000);
+        }
     } catch (error) {
         if (error instanceof ReceiveError) {
             return res.status(error.status).json({ error: error.message, ...(error.payload || {}) });
