@@ -5,7 +5,49 @@ const API_KEY = process.env.SHIPSGO_API_KEY;
 const BASE_HOST = 'api.shipsgo.com';
 const BASE_PATH = '/v2';
 
-function shipsgoRequest(method, path, body) {
+// ShipsGo rate-limits per account across ALL endpoints (~100 req/min; the reply
+// is a bare 429 "Too Many Attempts"). The container/air sync loops fire 3 calls
+// per shipment back-to-back, so an unthrottled run of 40 shipments burned the
+// budget partway through and every remaining shipment 429'd — always the same
+// tail of the list, which therefore never got a `containers` row at all.
+// So: serialise requests behind a minimum gap, and retry a 429 after a wait.
+const MIN_REQUEST_GAP_MS = 700;
+const MAX_429_RETRIES = 3;
+const RETRY_429_WAIT_MS = 20000;
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+let requestChain = Promise.resolve();
+let lastRequestAt = 0;
+
+// Queues onto a single chain so concurrent callers can't bypass the gap.
+function throttle() {
+    const next = requestChain.then(async () => {
+        const wait = MIN_REQUEST_GAP_MS - (Date.now() - lastRequestAt);
+        if (wait > 0) await sleep(wait);
+        lastRequestAt = Date.now();
+    });
+    requestChain = next.catch(() => {});
+    return next;
+}
+
+async function shipsgoRequest(method, path, body, attempt = 0) {
+    await throttle();
+    const resp = await rawShipsgoRequest(method, path, body);
+
+    if (resp.status === 429 && attempt < MAX_429_RETRIES) {
+        const retryAfter = Number(resp.headers?.['retry-after']);
+        const wait = Number.isFinite(retryAfter) && retryAfter > 0
+            ? retryAfter * 1000
+            : RETRY_429_WAIT_MS * (attempt + 1);
+        console.log(`  429 — backing off ${Math.round(wait / 1000)}s (attempt ${attempt + 1}/${MAX_429_RETRIES})`);
+        await sleep(wait);
+        return shipsgoRequest(method, path, body, attempt + 1);
+    }
+    return resp;
+}
+
+function rawShipsgoRequest(method, path, body) {
     return new Promise((resolve, reject) => {
         const bodyStr = body ? JSON.stringify(body) : null;
         const options = {
@@ -26,9 +68,9 @@ function shipsgoRequest(method, path, body) {
             res.on('end', () => {
                 console.log(`  HTTP ${res.statusCode}`);
                 try {
-                    resolve({ status: res.statusCode, body: JSON.parse(data) });
+                    resolve({ status: res.statusCode, headers: res.headers, body: JSON.parse(data) });
                 } catch {
-                    resolve({ status: res.statusCode, body: data });
+                    resolve({ status: res.statusCode, headers: res.headers, body: data });
                 }
             });
         });
@@ -115,9 +157,12 @@ async function getShipmentByContainer(containerNumber, { mapPoint = true, geojso
     const cn = encodeURIComponent(containerNumber);
     const listResp = await shipsgoRequest('GET', `/ocean/shipments?filters[container_number]=eq:${cn}`);
 
+    // v2 wraps results under `shipments` ("data" was never present). Reading the
+    // wrong key made every lookup look untracked, so we POSTed a registration for
+    // every container on every run and ShipsGo 429'd the tail of the list.
     let shipmentId = null;
     if (listResp.status === 200) {
-        const list = listResp.body.data || listResp.body;
+        const list = listResp.body.shipments || listResp.body.data || listResp.body;
         if (Array.isArray(list) && list.length > 0) shipmentId = list[0].id;
     }
 
@@ -369,9 +414,10 @@ async function getShipmentByAwb(awbNumber, { geojson = true } = {}) {
     const awb = encodeURIComponent(awbNumber);
     const listResp = await shipsgoRequest('GET', `/air/shipments?filters[awb_number]=eq:${awb}`);
 
+    // Same wrapper as ocean: results live under `shipments`.
     let shipmentId = null;
     if (listResp.status === 200) {
-        const list = listResp.body.data || listResp.body;
+        const list = listResp.body.shipments || listResp.body.data || listResp.body;
         if (Array.isArray(list) && list.length > 0) shipmentId = list[0].id;
     }
 

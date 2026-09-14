@@ -54,6 +54,9 @@ const schemaReady = (async () => {
             `ALTER TABLE order_receipts ADD COLUMN idempotency_key VARCHAR(64) NULL AFTER asn_item_id`,
             `ALTER TABLE order_receipts ADD UNIQUE KEY uk_order_idempotency (order_id, idempotency_key)`,
             `ALTER TABLE order_receipts ADD COLUMN type VARCHAR(16) NOT NULL DEFAULT 'received'`,
+            // Mirrors ordersApi — the shared receive path writes this column, so
+            // this Lambda must be able to create it if it warms up first.
+            `ALTER TABLE order_receipts ADD COLUMN quarantined TINYINT(1) NOT NULL DEFAULT 0`,
         ];
         for (const sql of migrations) {
             try { await conn.query(sql); } catch (e) {
@@ -73,6 +76,24 @@ const schemaReady = (async () => {
                 created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (id),
                 KEY idx_entity (entity_type, entity_id, created_at)
+            )
+        `);
+        // ORDER_SELECT (src/lib/order-shape.js) aggregates planned-container
+        // names as a subquery, so every order read from this Lambda touches
+        // this table. ordersApi owns it, but create it here too so a cold
+        // carton-scan that warms first doesn't 500 on a missing table.
+        await conn.query(`
+            CREATE TABLE IF NOT EXISTS planned_container_allocations (
+                id INT NOT NULL AUTO_INCREMENT,
+                order_id INT NOT NULL,
+                planned_container_name VARCHAR(100) NOT NULL,
+                allocated INT NOT NULL DEFAULT 0,
+                created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                PRIMARY KEY (id),
+                UNIQUE KEY uk_order_planned (order_id, planned_container_name),
+                KEY idx_planned_name (planned_container_name),
+                KEY idx_order_id (order_id)
             )
         `);
     } finally {

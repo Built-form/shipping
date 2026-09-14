@@ -17,6 +17,9 @@
 // Routes (all unauthenticated — no JWT authorizer in serverless.yml):
 //   POST /api/v1/portal/po-lookup       → { poNumber, accessCode }
 //   POST /api/v1/portal/po-ready-date   → + { updates: [{ orderId, estimatedReadyDate }] }
+//
+// The one exception to "dates only" is the opt-in markReadyForQc flag on an
+// update, which moves a line IN_PRODUCTION → READY_FOR_QC (and nothing else).
 const serverless = require('serverless-http');
 require('dotenv').config();
 const express = require('express');
@@ -135,6 +138,32 @@ async function authenticate(conn, { poNumber, accessCode }) {
 // some editable lines and some locked.
 const EDITABLE_STATUSES = new Set(['PO_SENT', 'IN_PRODUCTION', 'READY_FOR_QC', 'READY']);
 
+// ── The one status move a supplier may make ─────────────────────────────────
+// "goods finished, come and inspect": IN_PRODUCTION (doc name UNDER_PRODUCTION)
+// → READY_FOR_QC, opted into per line with `markReadyForQc: true`. It is the
+// only write here that touches orders.status, it is one step forward on the
+// ShipLine pipeline (src/lib/order-transitions.js), and it is refused from any
+// other status — a supplier can never advance a line past QC, move it
+// backwards, or skip a stage.
+//
+// Same gate as the authed app (gateFieldsFor('READY_FOR_QC') === ['actualReadyDate']):
+// the line must have an actual ready date — either already stored or supplied
+// in the same request, which is the normal case (the supplier fills the date
+// and ticks "ready for QC" together).
+const READY_FOR_QC_FROM = 'IN_PRODUCTION';
+const READY_FOR_QC_STATUS = 'READY_FOR_QC';
+// Mirrors STATUS_DATE_KEY in orders.js — the milestone timestamp key stamped
+// into orders.dates so this move looks identical to one made in ShipLine.
+const READY_FOR_QC_DATE_KEY = 'ready_for_qc';
+
+function parseDates(raw) {
+    if (!raw) return {};
+    if (typeof raw === 'string') {
+        try { return JSON.parse(raw) || {}; } catch { return {}; }
+    }
+    return raw;
+}
+
 async function fetchLineItems(conn, poId) {
     const [rows] = await conn.query(
         `SELECT id, jf_code, product_name, quantity, status,
@@ -153,6 +182,11 @@ async function fetchLineItems(conn, poId) {
         // Frontend should disable the date input when false; the write path
         // enforces the same rule server-side.
         editable: EDITABLE_STATUSES.has(r.status),
+        // Whether `markReadyForQc` would be accepted for this line right now.
+        // The actual-ready-date part can also be satisfied by the same request,
+        // so the frontend should offer the tick-box whenever the status is
+        // right and just require the date alongside it.
+        canMarkReadyForQc: r.status === READY_FOR_QC_FROM,
         estimatedReadyDate: formatDate(r.estimated_ready_date),
         actualReadyDate: formatDate(r.actual_ready_date),
     }));
@@ -214,12 +248,16 @@ app.post('/api/v1/portal/po-lookup', async (req, res) => {
 });
 
 // ── POST /api/v1/portal/po-ready-date ───────────────────────────────────────
-// { poNumber, accessCode, updates: [{ orderId, estimatedReadyDate?, actualReadyDate? }] }
+// { poNumber, accessCode, updates: [{ orderId, estimatedReadyDate?, actualReadyDate?, markReadyForQc? }] }
 // Re-validates the code + PO on every write (stateless — the client re-sends
 // the code it holds). Writes only estimated_ready_date / actual_ready_date
 // (whichever keys are present), only on lines that belong to this PO AND are
 // still in an editable status (EDITABLE_STATUSES), and audits every change. A
 // locked line (status moved past the factory) → 409.
+//
+// `markReadyForQc: true` additionally moves that line IN_PRODUCTION →
+// READY_FOR_QC (see READY_FOR_QC_FROM above): 409 from any other status, 422
+// without an actual ready date (stored or set in the same update).
 app.post('/api/v1/portal/po-ready-date', async (req, res) => {
     try {
         await schemaReady;
@@ -239,7 +277,7 @@ app.post('/api/v1/portal/po-ready-date', async (req, res) => {
             // plus status (for the editable gate) and the before-state for
             // auditing.
             const [ownRows] = await conn.query(
-                `SELECT id, status, estimated_ready_date, actual_ready_date FROM orders
+                `SELECT id, status, estimated_ready_date, actual_ready_date, dates FROM orders
                   WHERE purchase_order_id = ? AND deleted_at IS NULL`,
                 [auth.po.id]
             );
@@ -251,8 +289,9 @@ app.post('/api/v1/portal/po-ready-date', async (req, res) => {
             for (const u of updates) {
                 const oid = Number(u?.orderId);
                 if (!Number.isInteger(oid) || !byId.has(oid)) return { error: 'order' };
+                const row = byId.get(oid);
                 // Locked once the line moves past the factory stages.
-                if (!EDITABLE_STATUSES.has(byId.get(oid).status)) return { error: 'status' };
+                if (!EDITABLE_STATUSES.has(row.status)) return { error: 'status' };
 
                 const cols = {};
                 for (const [field, col] of Object.entries(WRITABLE_DATE_FIELDS)) {
@@ -261,10 +300,32 @@ app.post('/api/v1/portal/po-ready-date', async (req, res) => {
                     if (!norm.ok) return { error: 'date' };
                     cols[col] = norm.value;
                 }
-                if (Object.keys(cols).length) planned.push({ oid, cols });
+
+                // Opt-in status move. Only IN_PRODUCTION → READY_FOR_QC, only
+                // with an actual ready date (stored, or set by this same update).
+                const markReadyForQc = u?.markReadyForQc === true;
+                if (u && 'markReadyForQc' in u && typeof u.markReadyForQc !== 'boolean') {
+                    return { error: 'qcFlag' };
+                }
+                if (markReadyForQc) {
+                    // Already there (a double-submit / a re-send of the whole
+                    // form) is a no-op success, not an error — only a genuinely
+                    // wrong starting status is refused.
+                    if (row.status !== READY_FOR_QC_FROM && row.status !== READY_FOR_QC_STATUS) {
+                        return { error: 'qcFrom' };
+                    }
+                    if (row.status === READY_FOR_QC_FROM) {
+                        const ard = ('actual_ready_date' in cols)
+                            ? cols.actual_ready_date
+                            : formatDate(row.actual_ready_date);
+                        if (!ard) return { error: 'qcNoDate' };
+                    }
+                }
+
+                if (Object.keys(cols).length || markReadyForQc) planned.push({ oid, cols, markReadyForQc });
             }
 
-            for (const { oid, cols } of planned) {
+            for (const { oid, cols, markReadyForQc } of planned) {
                 const row = byId.get(oid);
                 const sets = [];
                 const vals = [];
@@ -278,6 +339,18 @@ app.post('/api/v1/portal/po-ready-date', async (req, res) => {
                     vals.push(cols[col]);
                     before[field] = prev;
                     after[field] = cols[col];
+                }
+                // The status move rides along on the same UPDATE, stamping the
+                // milestone into orders.dates exactly as ShipLine's own status
+                // patch does. Guarded on the live status so a duplicate submit
+                // is a no-op rather than a second write.
+                if (markReadyForQc && row.status === READY_FOR_QC_FROM) {
+                    const dates = parseDates(row.dates);
+                    dates[READY_FOR_QC_DATE_KEY] = new Date().toISOString();
+                    sets.push('status = ?', 'dates = ?');
+                    vals.push(READY_FOR_QC_STATUS, JSON.stringify(dates));
+                    before.status = row.status;
+                    after.status = READY_FOR_QC_STATUS;
                 }
                 if (!sets.length) continue; // all no-ops for this line
                 vals.push(oid);
@@ -303,6 +376,15 @@ app.post('/api/v1/portal/po-ready-date', async (req, res) => {
         }
         if (outcome.error === 'date') {
             return res.status(400).json({ error: 'Invalid ready date — use YYYY-MM-DD (or empty to clear).' });
+        }
+        if (outcome.error === 'qcFlag') {
+            return res.status(400).json({ error: 'markReadyForQc must be true or false.' });
+        }
+        if (outcome.error === 'qcFrom') {
+            return res.status(409).json({ error: 'This item can only be marked ready for QC while it is under production.' });
+        }
+        if (outcome.error === 'qcNoDate') {
+            return res.status(422).json({ error: 'An actual ready date is required before an item can be marked ready for QC.' });
         }
         res.json({ data: { items: outcome.items } });
     } catch (error) {

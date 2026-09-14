@@ -29,6 +29,9 @@ const { listWarehousesWithLocations, listLocationsForWarehouse } = require('../s
 // Daily alerts (slide-out alert window). Generation logic lives in the service
 // so the nightly Lambda reuses it; here we only expose the read/ack routes.
 const { ensureDailyAlertsSchema, listAlerts, listHistory, actOnAlert, getSuggestionForUpdate, actOnSuggestion, londonToday } = require('../services/daily-alerts');
+// This app's own user allowlist: the table the auth middleware below checks,
+// plus the /api/v1/users CRUD that manages it.
+const { ensureAllowedEmailsSchema, lookupUserType, registerUserRoutes } = require('../lib/allowed-emails');
 const T = require('../lib/order-transitions');
 
 const app = express();
@@ -56,6 +59,9 @@ const orderReceiptsSchemaReady = (async () => {
             `ALTER TABLE order_receipts ADD COLUMN idempotency_key VARCHAR(64) NULL AFTER asn_item_id`,
             `ALTER TABLE order_receipts ADD UNIQUE KEY uk_order_idempotency (order_id, idempotency_key)`,
             `ALTER TABLE order_receipts ADD COLUMN type VARCHAR(16) NOT NULL DEFAULT 'received'`,
+            // Did these units go into Mintsoft quarantine rather than normal
+            // sellable stock? Reflects what Mintsoft actually did.
+            `ALTER TABLE order_receipts ADD COLUMN quarantined TINYINT(1) NOT NULL DEFAULT 0`,
         ];
         for (const sql of migrations) {
             try { await conn.query(sql); } catch (e) {
@@ -83,6 +89,39 @@ const stockSnapshotsSchemaReady = (async () => {
         conn.release();
     }
 })().catch(err => log.error('[orders] stock_snapshots schema migration failed', err));
+
+// Manually adjusted sales figures — an ops override of the sales number used
+// for an ASIN in a given marketplace, held at the same (asin, country) grain as
+// amazon_stock_country_snapshots. Purely a store: nothing in this API consumes
+// the figure, it's read back through the /adjusted-sales routes.
+//
+// One live row per (asin, country); country 'ALL' is the reserved cross-market
+// entry. The unique key covers soft-deleted rows too, so re-creating a deleted
+// key revives that row rather than inserting a second one (see POST below).
+const adjustedSalesSchemaReady = (async () => {
+    const conn = await pool.getConnection();
+    try {
+        await conn.query(`
+            CREATE TABLE IF NOT EXISTS adjusted_sales (
+                id INT NOT NULL AUTO_INCREMENT,
+                asin VARCHAR(20) NOT NULL,
+                country VARCHAR(8) NOT NULL,
+                adjusted_sales DECIMAL(12,2) NOT NULL,
+                note VARCHAR(500) NULL,
+                created_by_email VARCHAR(255) NULL,
+                updated_by_email VARCHAR(255) NULL,
+                created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                deleted_at DATETIME NULL,
+                PRIMARY KEY (id),
+                UNIQUE KEY uk_asin_country (asin, country),
+                KEY idx_asin (asin)
+            )
+        `);
+    } finally {
+        conn.release();
+    }
+})().catch(err => log.error('[orders] adjusted_sales schema migration failed', err));
 
 // Lazy-create the daily_alerts table (shared with the nightly generator). Each
 // alert route awaits this before touching the table.
@@ -232,6 +271,35 @@ const draftContainerAllocationsSchemaReady = (async () => {
         conn.release();
     }
 })().catch(err => log.error('[orders] draft_container_allocations schema migration failed', err));
+
+// Join table linking orders to user-named "planned containers" — the same
+// planning shape as draft containers (see above) but a separate, independent
+// stream, so an order can be planned and drafted at the same time without the
+// two lists interfering. Allocations only: planned containers have no document
+// or email side, by design. One order can sit in many planned containers with
+// different allocated quantities; (order_id, planned_container_name) is unique
+// so the same order can't appear twice in the same planned container.
+const plannedContainerAllocationsSchemaReady = (async () => {
+    const conn = await pool.getConnection();
+    try {
+        await conn.query(`
+            CREATE TABLE IF NOT EXISTS planned_container_allocations (
+                id INT NOT NULL AUTO_INCREMENT,
+                order_id INT NOT NULL,
+                planned_container_name VARCHAR(100) NOT NULL,
+                allocated INT NOT NULL DEFAULT 0,
+                created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                PRIMARY KEY (id),
+                UNIQUE KEY uk_order_planned (order_id, planned_container_name),
+                KEY idx_planned_name (planned_container_name),
+                KEY idx_order_id (order_id)
+            )
+        `);
+    } finally {
+        conn.release();
+    }
+})().catch(err => log.error('[orders] planned_container_allocations schema migration failed', err));
 
 // Quality Assurance documents — a QC inspection sheet built from an explicit
 // set of order ids (not tied to a draft container). Mirrors the draft/PO
@@ -828,7 +896,9 @@ const purchaseOrdersSchemaReady = (async () => {
             `ALTER TABLE purchase_orders ADD KEY idx_company_id (company_id)`,
             `ALTER TABLE purchase_orders ADD COLUMN deleted_at DATETIME NULL`,
             `ALTER TABLE purchase_order_documents ADD COLUMN public_url VARCHAR(1000) NULL`,
-            `ALTER TABLE allowed_emails ADD COLUMN type VARCHAR(32) NOT NULL DEFAULT 'standard'`,
+            // NOTE: `allowed_emails` (joshdex's shared table) is deliberately no
+            // longer migrated from here — this app owns shipping_allowed_emails
+            // instead. See src/lib/allowed-emails.js.
             // Widen the check status enum to include 'pending' — a row is
             // inserted at upload time and updated in the background once
             // Gemini settles. MODIFY is idempotent across cold starts.
@@ -849,13 +919,24 @@ const purchaseOrdersSchemaReady = (async () => {
 })().catch(err => log.error('[orders] purchase_orders schema migration failed', err));
 
 // ── Email whitelist middleware ────────────────────────────────────────────
+// Checks `shipping_allowed_emails` — THIS app's own table, managed through
+// /api/v1/users. It used to read `allowed_emails`, which joshdex's API creates
+// and manages in the same schema; that list is no longer consulted here beyond
+// the one-time seed in src/lib/allowed-emails.js.
 const IS_LOCAL = process.env.IS_OFFLINE || process.env.NODE_ENV === 'development';
+
+// Create + seed the table eagerly rather than on the first request, so a cold
+// start doesn't pay for it inside an auth check.
+const allowedEmailsSchemaReady = ensureAllowedEmailsSchema(pool)
+    .catch(err => log.error('[orders] shipping_allowed_emails schema migration failed', err));
 
 app.use(async (req, res, next) => {
     if (IS_LOCAL) {
         req.userEmail = 'local@dev';
-        req.userType = 'standard';
-        res.set('X-User-Type', 'standard');
+        // Local-only escape hatch so dev can exercise the admin-gated routes.
+        // Defaults to 'standard'; this branch never runs in production.
+        req.userType = process.env.LOCAL_USER_TYPE || 'standard';
+        res.set('X-User-Type', req.userType);
         return next();
     }
 
@@ -865,19 +946,10 @@ app.use(async (req, res, next) => {
             return res.status(401).json({ error: 'Unauthorized: no email in token.' });
         }
 
-        const connection = await pool.getConnection();
-        let userType;
-        try {
-            const [rows] = await connection.query(
-                'SELECT type FROM allowed_emails WHERE email = ?',
-                [email.toLowerCase()]
-            );
-            if (rows.length === 0) {
-                return res.status(401).json({ error: 'Unauthorized: email not in allowlist.' });
-            }
-            userType = rows[0].type || 'standard';
-        } finally {
-            connection.release();
+        await allowedEmailsSchemaReady;
+        const userType = await lookupUserType(pool, email);
+        if (userType === null) {
+            return res.status(401).json({ error: 'Unauthorized: email not in allowlist.' });
         }
 
         req.userEmail = email.toLowerCase();
@@ -899,6 +971,12 @@ app.use((req, res, next) => {
     res.set('Cache-Control', 'no-store');
     next();
 });
+
+// ── User allowlist CRUD (/api/v1/users) ──────────────────────────────────
+// Manages shipping_allowed_emails — the same table the middleware above just
+// checked, so a grant or revoke lands on the affected user's next request.
+// Admin-only apart from GET /api/v1/users/me. See src/lib/allowed-emails.js.
+registerUserRoutes(app, pool);
 
 // ── Constants ────────────────────────────────────────────────────────────
 
@@ -1133,6 +1211,91 @@ function aggregateAmazonStock(rows) {
     totals.amazon_total = totals.amazon_fulfillable + totals.amazon_inbound_working
         + totals.amazon_inbound_shipped + totals.amazon_inbound_receiving + totals.amazon_reserved;
     return { byCountry, totals };
+}
+
+// Amazon history from (date_ran, country) rows, ordered by date. Returns
+//   total:     [ {date, fulfillable, …}, … ]            — one row per day, all
+//              countries summed (the pre-existing history.amazon shape)
+//   byCountry: { UK: [ {date, …}, … ], US: [ … ] }      — one series per country
+// The total is summed in code from the same rows rather than fetched by a
+// second GROUP BY date_ran query, so the two can never disagree. Rows with no
+// country (shouldn't happen — the collector always stamps one) still count
+// towards the total but get no per-country series.
+const AMAZON_HISTORY_FIELDS = ['fulfillable', 'inbound_working', 'inbound_shipped', 'inbound_receiving', 'reserved'];
+function buildAmazonHistory(rows) {
+    const totalByDate = new Map();
+    const byCountry = {};
+    for (const row of rows) {
+        const date = row.date_ran;
+        const entry = { date };
+        for (const f of AMAZON_HISTORY_FIELDS) entry[f] = Number(row[f] || 0);
+
+        let total = totalByDate.get(date);
+        if (!total) {
+            total = { date };
+            for (const f of AMAZON_HISTORY_FIELDS) total[f] = 0;
+            totalByDate.set(date, total);
+        }
+        for (const f of AMAZON_HISTORY_FIELDS) total[f] += entry[f];
+
+        const country = row.country?.trim().toUpperCase();
+        if (!country) continue;
+        (byCountry[country] ||= []).push(entry);
+    }
+    return { total: [...totalByDate.values()], byCountry };
+}
+
+// Splits the aggregate mintsoft_* figures back out per child SKU. A JF code's
+// stock is the SUM of its whitelisted children (bare code + _TR trade, _QC,
+// _IFU, _LABELLED, … — see SKU_SUFFIXES in services/mintsoft.js), so the
+// aggregate alone can't answer "where are those units?": 4,000 units reads very
+// differently when 3,500 of them sit in _TR.
+//
+// Rows arrive at (sku, warehouse) grain — the stock_snapshots grain. Each entry
+// sums its warehouses and keeps the per-warehouse split nested, so callers that
+// only care about the SKU label ignore `warehouses` and callers splitting by
+// warehouse don't need a second query. Bare SKU first, then suffix A-Z.
+function buildMintsoftSkuBreakdown(rows) {
+    const bySku = new Map();
+    for (const row of rows) {
+        const sku = (row.sku || '').trim();
+        if (!sku) continue;
+        const jfCode = (row.jf_code || '').trim();
+        // The suffix is whatever the SKU carries beyond its JF code ('' for the
+        // bare code). Rows whose sku doesn't start with the jf_code (legacy /
+        // hand-entered) report a null suffix rather than a bogus slice.
+        const startsWithCode = jfCode && sku.toUpperCase().startsWith(jfCode.toUpperCase());
+        const suffix = startsWithCode ? sku.slice(jfCode.length) : null;
+
+        if (!bySku.has(sku)) {
+            bySku.set(sku, {
+                sku,
+                jf_code: jfCode || null,
+                suffix: suffix || null,          // null for the bare SKU
+                is_base: startsWithCode ? suffix === '' : null,
+                product_id: row.product_id ?? null,
+                stock_level: 0, available: 0, allocated: 0, quarantine: 0,
+                warehouses: [],
+            });
+        }
+
+        const entry = bySku.get(sku);
+        const figures = {
+            stock_level: Number(row.stock_level || 0),
+            available: Number(row.available || 0),
+            allocated: Number(row.allocated || 0),
+            quarantine: Number(row.quarantine || 0),
+        };
+        entry.stock_level += figures.stock_level;
+        entry.available   += figures.available;
+        entry.allocated   += figures.allocated;
+        entry.quarantine  += figures.quarantine;
+        entry.warehouses.push({ warehouse_id: Number(row.warehouse_id || 0), ...figures });
+    }
+
+    return [...bySku.values()].sort((a, b) =>
+        Number(Boolean(a.suffix)) - Number(Boolean(b.suffix)) || a.sku.localeCompare(b.sku)
+    );
 }
 
 function mapGoodsOnSeaRow(r) {
@@ -1517,7 +1680,9 @@ app.post('/api/v1/orders/:id/receive', async (req, res) => {
         await orderReceiptsSchemaReady;
         await auditLogSchemaReady;
 
-        const { locationId, warehouseId, quantity, goodsInType, idempotencyKey, lotNumber, expiryDate } = req.body || {};
+        // `quarantine: true` books the units into Mintsoft quarantine instead of
+        // normal sellable stock (omit or false = normal receive, unchanged).
+        const { locationId, warehouseId, quantity, goodsInType, idempotencyKey, lotNumber, expiryDate, quarantine } = req.body || {};
 
         // The whole receive transaction (validation, idempotency, FOR UPDATE
         // lock, capacity check, Mintsoft ASN create/confirm/receive, receipt
@@ -1529,7 +1694,7 @@ app.post('/api/v1/orders/:id/receive', async (req, res) => {
             result = await receiveOrderStock(conn, {
                 orderId: req.params.id,
                 quantity, locationId, warehouseId, goodsInType,
-                lotNumber, expiryDate, idempotencyKey,
+                lotNumber, expiryDate, idempotencyKey, quarantine,
                 actorEmail: req.userEmail,
             });
         } finally {
@@ -1540,6 +1705,10 @@ app.post('/api/v1/orders/:id/receive', async (req, res) => {
             order: result.order,
             asnId: result.asnId,
             receipts: result.receipts,
+            // Present whenever quarantine was asked for. `applied: false` means
+            // the stock IS booked in but as normal stock — the caller must not
+            // read a 200 as "quarantined".
+            ...(result.quarantine?.requested ? { quarantine: result.quarantine } : {}),
             ...(result.idempotent ? { idempotent: true } : {}),
         });
 
@@ -2541,6 +2710,188 @@ app.delete('/api/v1/draft-containers/:id', async (req, res) => {
         res.json({ ok: true, id: Number(id) });
     } catch (error) {
         log.error('[DELETE /draft-containers/:id]', error);
+        res.status(500).json({ error: 'An internal error occurred.' });
+    }
+});
+
+// ── Planned container allocations ─────────────────────────────────────────
+// Independent twin of the draft-container planning layer above: one order can
+// sit in many user-named "planned containers" with different allocated
+// quantities. Deliberately allocations-only — no PDF/CSV generation and no
+// forwarder email, so the routes stop at CRUD.
+const PLANNED_ALLOC_SELECT = `
+    SELECT pca.id, pca.order_id, pca.planned_container_name, pca.allocated,
+           pca.created_at, pca.updated_at,
+           orders.jf_code, orders.asin, orders.product_name, orders.quantity AS order_quantity,
+           orders.status AS order_status, orders.supplier, orders.po_number,
+           orders.purchase_order_id, orders.container_number, orders.eta
+    FROM planned_container_allocations pca
+    INNER JOIN orders ON orders.id = pca.order_id AND orders.deleted_at IS NULL
+`;
+
+function rowToPlannedAllocation(row) {
+    return {
+        id: row.id,
+        orderId: row.order_id,
+        plannedContainerName: row.planned_container_name,
+        allocated: Number(row.allocated),
+        createdAt: row.created_at?.toISOString?.() ?? row.created_at,
+        updatedAt: row.updated_at?.toISOString?.() ?? row.updated_at,
+        order: {
+            id: row.order_id,
+            jfCode: row.jf_code || null,
+            asin: row.asin || null,
+            productName: row.product_name || null,
+            quantity: row.order_quantity != null ? Number(row.order_quantity) : null,
+            status: row.order_status || null,
+            supplier: row.supplier || null,
+            poNumber: row.po_number || null,
+            purchaseOrderId: row.purchase_order_id ?? null,
+            containerNumber: row.container_number || null,
+            eta: formatDate(row.eta),
+        },
+    };
+}
+
+// List allocations, optionally filtered by planned_container_name or order_id.
+// GET /api/v1/planned-containers                → every row
+// GET /api/v1/planned-containers?name=PLANNED1  → one planned container's lines
+// GET /api/v1/planned-containers?orderId=42     → every planned container an order sits in
+app.get('/api/v1/planned-containers', async (req, res) => {
+    try {
+        await plannedContainerAllocationsSchemaReady;
+        const { name, orderId } = req.query;
+        const where = [];
+        const params = [];
+        if (name) { where.push('pca.planned_container_name = ?'); params.push(String(name)); }
+        if (orderId) { where.push('pca.order_id = ?'); params.push(Number(orderId)); }
+        const sql = `${PLANNED_ALLOC_SELECT}${where.length ? ' WHERE ' + where.join(' AND ') : ''} ORDER BY pca.planned_container_name ASC, pca.id ASC`;
+
+        const rows = await withConnection(async (conn) => {
+            const [rs] = await conn.query(sql, params);
+            return rs;
+        });
+        res.json({ data: rows.map(rowToPlannedAllocation) });
+    } catch (error) {
+        log.error('[GET /planned-containers]', error);
+        res.status(500).json({ error: 'An internal error occurred.' });
+    }
+});
+
+// Fetch a single allocation row by its primary key.
+app.get('/api/v1/planned-containers/:id', async (req, res) => {
+    try {
+        await plannedContainerAllocationsSchemaReady;
+        const { id } = req.params;
+        const row = await withConnection(async (conn) => {
+            const [rs] = await conn.query(`${PLANNED_ALLOC_SELECT} WHERE pca.id = ?`, [id]);
+            return rs[0] || null;
+        });
+        if (!row) return res.status(404).json({ error: `Allocation ${id} not found.` });
+        res.json(rowToPlannedAllocation(row));
+    } catch (error) {
+        log.error('[GET /planned-containers/:id]', error);
+        res.status(500).json({ error: 'An internal error occurred.' });
+    }
+});
+
+// Create an allocation. Body: { orderId, plannedContainerName, allocated }.
+// 409 if (orderId, plannedContainerName) already exists — callers should PUT
+// to change the allocated quantity instead.
+app.post('/api/v1/planned-containers', async (req, res) => {
+    try {
+        await plannedContainerAllocationsSchemaReady;
+        const { orderId, plannedContainerName, allocated } = req.body || {};
+        const oid = Number(orderId);
+        const name = typeof plannedContainerName === 'string' ? plannedContainerName.trim() : '';
+        const qty = Number(allocated);
+        if (!Number.isInteger(oid) || oid <= 0) return res.status(400).json({ error: 'orderId must be a positive integer.' });
+        if (!name) return res.status(400).json({ error: 'plannedContainerName is required.' });
+        if (!Number.isFinite(qty) || qty < 0) return res.status(400).json({ error: 'allocated must be a non-negative number.' });
+
+        const result = await withConnection(async (conn) => {
+            const [orderRows] = await conn.query('SELECT id FROM orders WHERE id = ? AND deleted_at IS NULL', [oid]);
+            if (!orderRows.length) return { orderNotFound: true };
+            try {
+                const [ins] = await conn.query(
+                    `INSERT INTO planned_container_allocations (order_id, planned_container_name, allocated) VALUES (?, ?, ?)`,
+                    [oid, name, qty]
+                );
+                const [rs] = await conn.query(`${PLANNED_ALLOC_SELECT} WHERE pca.id = ?`, [ins.insertId]);
+                return { row: rs[0] };
+            } catch (e) {
+                if (e.code === 'ER_DUP_ENTRY') return { duplicate: true };
+                throw e;
+            }
+        });
+        if (result.orderNotFound) return res.status(404).json({ error: `Order ${oid} not found.` });
+        if (result.duplicate) return res.status(409).json({ error: `Order ${oid} is already in planned container ${name}.` });
+        res.status(201).json(rowToPlannedAllocation(result.row));
+    } catch (error) {
+        log.error('[POST /planned-containers]', error);
+        res.status(500).json({ error: 'An internal error occurred.' });
+    }
+});
+
+// Update an allocation. Any of { plannedContainerName, allocated } can be sent;
+// orderId is intentionally immutable — to move a line to a different order
+// the caller should DELETE + POST.
+app.put('/api/v1/planned-containers/:id', async (req, res) => {
+    try {
+        await plannedContainerAllocationsSchemaReady;
+        const { id } = req.params;
+        const { plannedContainerName, allocated } = req.body || {};
+        const fields = [];
+        const values = [];
+        if (plannedContainerName !== undefined) {
+            const name = String(plannedContainerName).trim();
+            if (!name) return res.status(400).json({ error: 'plannedContainerName cannot be empty.' });
+            fields.push('planned_container_name = ?');
+            values.push(name);
+        }
+        if (allocated !== undefined) {
+            const qty = Number(allocated);
+            if (!Number.isFinite(qty) || qty < 0) return res.status(400).json({ error: 'allocated must be a non-negative number.' });
+            fields.push('allocated = ?');
+            values.push(qty);
+        }
+        if (!fields.length) return res.status(400).json({ error: 'No fields to update.' });
+
+        const result = await withConnection(async (conn) => {
+            const [existing] = await conn.query('SELECT id FROM planned_container_allocations WHERE id = ?', [id]);
+            if (!existing.length) return { notFound: true };
+            try {
+                values.push(id);
+                await conn.query(`UPDATE planned_container_allocations SET ${fields.join(', ')} WHERE id = ?`, values);
+                const [rs] = await conn.query(`${PLANNED_ALLOC_SELECT} WHERE pca.id = ?`, [id]);
+                return { row: rs[0] };
+            } catch (e) {
+                if (e.code === 'ER_DUP_ENTRY') return { duplicate: true };
+                throw e;
+            }
+        });
+        if (result.notFound) return res.status(404).json({ error: `Allocation ${id} not found.` });
+        if (result.duplicate) return res.status(409).json({ error: 'This order is already in the target planned container.' });
+        res.json(rowToPlannedAllocation(result.row));
+    } catch (error) {
+        log.error('[PUT /planned-containers/:id]', error);
+        res.status(500).json({ error: 'An internal error occurred.' });
+    }
+});
+
+// Hard delete — these rows are pure planning state, no audit history to keep.
+app.delete('/api/v1/planned-containers/:id', async (req, res) => {
+    try {
+        await plannedContainerAllocationsSchemaReady;
+        const { id } = req.params;
+        const deleted = await withConnection(async (conn) => {
+            const [r] = await conn.query('DELETE FROM planned_container_allocations WHERE id = ?', [id]);
+            return r.affectedRows > 0;
+        });
+        if (!deleted) return res.status(404).json({ error: `Allocation ${id} not found.` });
+        res.json({ ok: true, id: Number(id) });
+    } catch (error) {
+        log.error('[DELETE /planned-containers/:id]', error);
         res.status(500).json({ error: 'An internal error occurred.' });
     }
 });
@@ -3751,7 +4102,7 @@ app.get('/api/v1/stock-snapshots/sum', async (req, res) => {
                      ) rcpt ON rcpt.order_id = orders.id`;
         const orderParams = [snapshotFreshness, ...idParams];
 
-        const [msRows, amzRows, orderRows, onSeaRows, onAirRows, ordersBreakdownRows, msHistoryRows, amzHistoryRows, tagRows] = await withTimeout(
+        const [msRows, amzRows, orderRows, onSeaRows, onAirRows, ordersBreakdownRows, msHistoryRows, amzHistoryRows, tagRows, msSkuRows] = await withTimeout(
             Promise.all([
                 msDate
                     ? pool.query(
@@ -3852,8 +4203,12 @@ app.get('/api/v1/stock-snapshots/sum', async (req, res) => {
                     [...stockParams, days]
                 ).then(([rows]) => rows),
 
+                // One row per (day, country). buildAmazonHistory derives BOTH
+                // the per-day total series (history.amazon, shape unchanged)
+                // and the per-country series (history.amazon_by_country) from
+                // these rows, so one query serves both.
                 pool.query(
-                    `SELECT date_ran,
+                    `SELECT date_ran, country,
                         CAST(COALESCE(SUM(fulfillable), 0) AS UNSIGNED)       as fulfillable,
                         CAST(COALESCE(SUM(inbound_working), 0) AS UNSIGNED)   as inbound_working,
                         CAST(COALESCE(SUM(inbound_shipped), 0) AS UNSIGNED)   as inbound_shipped,
@@ -3861,7 +4216,7 @@ app.get('/api/v1/stock-snapshots/sum', async (req, res) => {
                         CAST(COALESCE(SUM(reserved), 0) AS UNSIGNED)          as reserved
                      FROM amazon_stock_country_snapshots
                      WHERE ${amzWhere('')} AND date_ran >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
-                     GROUP BY date_ran ORDER BY date_ran`,
+                     GROUP BY date_ran, country ORDER BY date_ran, country`,
                     [...amzParams, days]
                 ).then(([rows]) => rows),
 
@@ -3873,11 +4228,30 @@ app.get('/api/v1/stock-snapshots/sum', async (req, res) => {
                      LIMIT 1`,
                     idParams
                 ).then(([rows]) => rows),
+
+                // Same rows, same date as the aggregate above — just kept at
+                // (sku, warehouse) grain instead of collapsed, so the response
+                // can show which child SKU (_TR, _QC, …) holds the units.
+                msDate
+                    ? pool.query(
+                        `SELECT jf_code, sku, product_id, warehouse_id,
+                            CAST(COALESCE(SUM(stock_level), 0) AS UNSIGNED)  as stock_level,
+                            CAST(COALESCE(SUM(available), 0) AS UNSIGNED)    as available,
+                            CAST(COALESCE(SUM(allocated), 0) AS UNSIGNED)    as allocated,
+                            CAST(COALESCE(SUM(quarantine), 0) AS UNSIGNED)   as quarantine
+                         FROM stock_snapshots
+                         WHERE date_ran = ? AND ${stockClause}
+                         GROUP BY jf_code, sku, product_id, warehouse_id
+                         ORDER BY sku, warehouse_id`,
+                        [msDate, ...stockParams]
+                    ).then(([rows]) => rows)
+                    : Promise.resolve([]),
             ]),
             QUERY_TIMEOUT_MS, 'Data fetch'
         );
 
         const { byCountry: amazon_stock_by_country, totals } = aggregateAmazonStock(amzRows);
+        const amazonHistory = buildAmazonHistory(amzHistoryRows);
         const msStats = msRows[0] || {};
         const tagData = tagRows[0] || {};
 
@@ -3891,6 +4265,9 @@ app.get('/api/v1/stock-snapshots/sum', async (req, res) => {
                 mintsoft_available: Number(msStats.total_available || 0),
                 mintsoft_allocated: Number(msStats.total_allocated || 0),
                 mintsoft_quarantine: Number(msStats.total_quarantine || 0),
+                // Per-child-SKU split of the four mintsoft_* figures above; the
+                // entries sum to them exactly.
+                mintsoft_by_sku: buildMintsoftSkuBreakdown(msSkuRows),
                 ...totals,
                 amazon_stock_by_country,
                 orders: buildOrderStatusMap(orderRows),
@@ -3905,14 +4282,13 @@ app.get('/api/v1/stock-snapshots/sum', async (req, res) => {
                         allocated: Number(r.allocated || 0),
                         quarantine: Number(r.quarantine || 0),
                     })),
-                    amazon: amzHistoryRows.map(r => ({
-                        date: r.date_ran,
-                        fulfillable: Number(r.fulfillable || 0),
-                        inbound_working: Number(r.inbound_working || 0),
-                        inbound_shipped: Number(r.inbound_shipped || 0),
-                        inbound_receiving: Number(r.inbound_receiving || 0),
-                        reserved: Number(r.reserved || 0),
-                    })),
+                    amazon: amazonHistory.total,
+                    // { UK: [ {date, fulfillable, …}, … ], US: [ … ] } — same
+                    // row shape as `amazon`, one series per country. Countries
+                    // start on different days (US collection began after UK),
+                    // so a day missing from one series means "no snapshot",
+                    // not zero.
+                    amazon_by_country: amazonHistory.byCountry,
                 },
             },
         });
@@ -3950,7 +4326,7 @@ app.get('/api/v1/stock-snapshots/sum/all-asins', async (req, res) => {
         ]);
 
         const [
-            [msDates], [amzDates], [allStatusOrders], [onSeaOrders], [onAirOrders], [allOrdersRows], [msLatestRows], [amzLatestRows], [tagRows], [receiptRollup],
+            [msDates], [amzDates], [allStatusOrders], [onSeaOrders], [onAirOrders], [allOrdersRows], [msLatestRows], [amzLatestRows], [tagRows], [receiptRollup], [msSkuRows],
         ] = await withTimeout(
             Promise.all([
                 pool.query(`
@@ -4046,6 +4422,23 @@ app.get('/api/v1/stock-snapshots/sum/all-asins', async (req, res) => {
                            MAX(CASE WHEN type = 'received' THEN received_at END) AS last_received_at
                     FROM order_receipts GROUP BY order_id
                 `),
+                // The same latest-date rows as msLatestRows, left at (sku,
+                // warehouse) grain to feed each ASIN's mintsoft_by_sku split.
+                pool.query(`
+                    WITH LatestDates AS (
+                        SELECT asin, MAX(date_ran) as latest FROM stock_snapshots
+                        WHERE asin IS NOT NULL AND asin != '' GROUP BY asin
+                    )
+                    SELECT s.asin, s.jf_code, s.sku, s.product_id, s.warehouse_id,
+                           CAST(COALESCE(SUM(s.stock_level), 0) AS UNSIGNED) as stock_level,
+                           CAST(COALESCE(SUM(s.available), 0) AS UNSIGNED) as available,
+                           CAST(COALESCE(SUM(s.allocated), 0) AS UNSIGNED) as allocated,
+                           CAST(COALESCE(SUM(s.quarantine), 0) AS UNSIGNED) as quarantine
+                    FROM stock_snapshots s
+                    JOIN LatestDates ld ON s.asin = ld.asin AND s.date_ran = ld.latest
+                    GROUP BY s.asin, s.jf_code, s.sku, s.product_id, s.warehouse_id
+                    ORDER BY s.sku, s.warehouse_id
+                `),
             ]),
             QUERY_TIMEOUT_MS, 'Batch data fetch'
         );
@@ -4053,6 +4446,14 @@ app.get('/api/v1/stock-snapshots/sum/all-asins', async (req, res) => {
         const msDatesMap = Object.fromEntries(msDates.map(r => [r.asin, r.latest]));
         const amzDatesMap = Object.fromEntries(amzDates.map(r => [r.asin, r.latest]));
         const tagMap = Object.fromEntries(tagRows.map(r => [r.asin, r]));
+
+        // Bucketed once up front rather than filtered per ASIN — this is the one
+        // list here with several rows per ASIN (a child SKU per warehouse).
+        const msSkuByAsin = new Map();
+        for (const row of msSkuRows) {
+            if (!msSkuByAsin.has(row.asin)) msSkuByAsin.set(row.asin, []);
+            msSkuByAsin.get(row.asin).push(row);
+        }
 
         // For the ARRIVED_AT_WAREHOUSE netting in buildNettedStatusMap: snapshot
         // freshness per ASIN + the receipt rollup keyed by order. A received
@@ -4097,6 +4498,7 @@ app.get('/api/v1/stock-snapshots/sum/all-asins', async (req, res) => {
                 mintsoft_available: Number(msStats.total_available || 0),
                 mintsoft_allocated: Number(msStats.total_allocated || 0),
                 mintsoft_quarantine: Number(msStats.total_quarantine || 0),
+                mintsoft_by_sku: buildMintsoftSkuBreakdown(msSkuByAsin.get(asin) || []),
                 ...totals,
                 amazon_stock_by_country,
                 orders: buildNettedStatusMap(ordersByStatus, reflectedSettledFor),
@@ -4448,6 +4850,685 @@ app.get('/api/v1/stock-snapshots/active-listings', async (req, res) => {
         log.error('[GET /stock-snapshots/active-listings]', error);
         const status = error.message?.includes('timed out') ? 504 : 500;
         res.status(status).json({ error: 'An internal error occurred.' });
+    }
+});
+
+// ── 14. POST /api/v1/stock-snapshots/refresh ─────────────────────────────
+// On-demand Mintsoft refresh for ONE jf_code instead of waiting for the hourly
+// stockSnapshot sweep (which walks ~900 codes and takes 2-11 minutes). Hits
+// Mintsoft live and upserts today's stock_snapshots rows for the bare SKU AND
+// its whitelisted children (_TR trade units, _QC, _IFU, …) — the same SKU set
+// the hourly sweep resolves, so refreshing a code never moves its total on its
+// own; it only makes the existing number fresher.
+const JF_CODE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/;
+const REFRESH_TIMEOUT_MS = 25_000; // under API Gateway's 30s integration cap
+
+app.post('/api/v1/stock-snapshots/refresh', async (req, res) => {
+    const jfCode = String(req.body?.jfCode ?? req.query.jfCode ?? '').trim();
+    try {
+        await stockSnapshotsSchemaReady;
+        if (!JF_CODE_PATTERN.test(jfCode)) {
+            return res.status(400).json({ error: 'Provide a valid jfCode (letters, digits, . _ -).' });
+        }
+
+        // Populate the row's asin column the same way the batch job does, so a
+        // refreshed row is indistinguishable from a swept one. landed_costs is
+        // the mapping table; an existing snapshot row is the fallback for codes
+        // that never made it into it.
+        const [asinRows] = await pool.query(
+            `SELECT asin FROM landed_costs WHERE jf_code = ? AND asin IS NOT NULL AND asin <> ''
+             UNION
+             SELECT asin FROM stock_snapshots WHERE jf_code = ? AND asin IS NOT NULL AND asin <> ''
+             LIMIT 1`,
+            [jfCode, jfCode]
+        );
+        const asin = asinRows[0]?.asin || '';
+
+        const conn = await pool.getConnection();
+        let stocks;
+        try {
+            stocks = await withTimeout(
+                snapshotJfCode(conn, jfCode, asin),
+                REFRESH_TIMEOUT_MS, 'Mintsoft refresh'
+            );
+        } finally {
+            conn.release();
+        }
+
+        if (!stocks.length) {
+            return res.status(404).json({ error: `No Mintsoft product found for jfCode "${jfCode}".`, jfCode });
+        }
+
+        // One entry per SKU/warehouse pair — the same grain as stock_snapshots.
+        const skus = stocks.flatMap(({ sku, productId, warehouseStocks }) =>
+            warehouseStocks.map(w => ({
+                sku, productId, warehouseId: w.warehouseId,
+                stockLevel: w.stockLevel, available: w.available,
+                allocated: w.allocated, quarantine: w.quarantine,
+            }))
+        );
+        const sum = (key) => skus.reduce((t, s) => t + (s[key] || 0), 0);
+
+        log.info(`[POST /stock-snapshots/refresh] ${jfCode} — ${skus.length} rows (${stocks.map(s => s.sku).join(', ')})`);
+        res.json({
+            jfCode,
+            asin: asin || null,
+            refreshedAt: new Date().toISOString(),
+            skus,
+            // Same numbers as `skus`, grouped into the mintsoft_by_sku shape the
+            // /stock-snapshots/sum endpoints return, so a caller renders the
+            // breakdown the same way whichever endpoint it read.
+            mintsoft_by_sku: buildMintsoftSkuBreakdown(skus.map(s => ({
+                jf_code: jfCode, sku: s.sku, product_id: s.productId,
+                warehouse_id: s.warehouseId, stock_level: s.stockLevel,
+                available: s.available, allocated: s.allocated, quarantine: s.quarantine,
+            }))),
+            totals: {
+                stockLevel: sum('stockLevel'), available: sum('available'),
+                allocated: sum('allocated'), quarantine: sum('quarantine'),
+            },
+        });
+    } catch (error) {
+        log.error('[POST /stock-snapshots/refresh]', { jfCode, error: error.message });
+        const status = error.message?.includes('timed out') ? 504 : 500;
+        res.status(status).json({
+            error: status === 504
+                ? 'Mintsoft did not respond in time — try again.'
+                : 'An internal error occurred.',
+        });
+    }
+});
+
+// ── Adjusted sales CRUD ──────────────────────────────────────────────────
+// An ops-entered override of the sales figure for an ASIN in one marketplace.
+// Grain is (asin, country) — the same grain as amazon_stock_country_snapshots —
+// with 'ALL' reserved for a single cross-market figure. One live row per key:
+// the figure is a current value, not a series, and every change is written to
+// audit_log (entity_type 'adjusted_sales') so the history is recoverable via
+// GET /audit-log?entityType=adjusted_sales&entityId=<id>.
+//
+// Rows are addressable two ways, because both are natural for a UI: by numeric
+// id, and by the (asin, country) pair — the latter upserts, so a grid can PUT a
+// cell without first knowing whether a row exists.
+// The six marketplaces amazon_stock_country_snapshots actually carries, plus
+// EU (used by the replenishment regions) and the reserved cross-market 'ALL'.
+// Spelled out rather than reusing ASANA_REPLENISHMENT_REGIONS, which is
+// declared further down this file and so isn't initialised yet at this point.
+const ADJUSTED_SALES_COUNTRIES = new Set(['UK', 'DE', 'FR', 'IT', 'ES', 'US', 'EU', 'ALL']);
+
+function rowToAdjustedSales(r) {
+    return {
+        id: r.id,
+        asin: r.asin,
+        country: r.country,
+        // DECIMAL comes back from mysql2 as a string — Number() so callers get
+        // a JSON number rather than "1234.00".
+        adjustedSales: Number(r.adjusted_sales),
+        note: r.note || null,
+        createdBy: r.created_by_email || null,
+        updatedBy: r.updated_by_email || null,
+        createdAt: r.created_at?.toISOString?.() ?? r.created_at,
+        updatedAt: r.updated_at?.toISOString?.() ?? r.updated_at,
+    };
+}
+
+const ADJUSTED_SALES_COLS = `id, asin, country, adjusted_sales, note,
+                             created_by_email, updated_by_email, created_at, updated_at`;
+
+// Shared validation. Returns { error } or the cleaned values.
+function parseAdjustedSalesKey(asinRaw, countryRaw) {
+    const asin = parseAsin(asinRaw);
+    if (!asin) return { error: 'asin must be a valid 10-character ASIN.' };
+    const country = String(countryRaw ?? '').trim().toUpperCase();
+    if (!country) return { error: 'country is required.' };
+    if (!ADJUSTED_SALES_COUNTRIES.has(country)) {
+        return { error: `country must be one of: ${[...ADJUSTED_SALES_COUNTRIES].join(', ')}.` };
+    }
+    return { asin, country };
+}
+
+// A fetch() with no headers sends text/plain, which express.json() ignores —
+// the body would then arrive empty and produce a baffling "adjustedSales is
+// required". Capture non-JSON bodies as raw text instead; adjustedSalesInput()
+// JSON-parses the string. The matcher deliberately skips application/json so
+// this can never clobber express.json's already-parsed object with ''.
+const adjustedSalesTextBody = express.text({
+    type: (req) => !/application\/json/i.test(req.headers['content-type'] || ''),
+    limit: '256kb',
+});
+
+// Pull the request payload tolerantly. The stock endpoints in this file return
+// snake_case while these routes speak camelCase, so callers legitimately send
+// either — accept both rather than 400 on a naming coin-flip. Query params are
+// a fallback for the same reason POST /stock-snapshots/refresh accepts them.
+// A body that arrived as a JSON *string* (wrong Content-Type, double-encoded
+// client) is parsed here too instead of silently reading as empty.
+function adjustedSalesInput(req) {
+    let body = req.body;
+    if (typeof body === 'string') {
+        try { body = JSON.parse(body); } catch { body = {}; }
+    }
+    if (!body || typeof body !== 'object') body = {};
+    const src = { ...req.query, ...body };
+    const pick = (...names) => {
+        for (const n of names) if (src[n] !== undefined) return src[n];
+        return undefined;
+    };
+    return {
+        asin: pick('asin', 'ASIN'),
+        country: pick('country', 'countryCode', 'country_code'),
+        adjustedSales: pick('adjustedSales', 'adjusted_sales'),
+        note: pick('note'),
+        // Was a note key present at all? Drives keep-vs-clear on PUT.
+        noteProvided: 'note' in src,
+        receivedKeys: Object.keys(src),
+    };
+}
+
+// The figure itself. Negative is rejected (a negative sales figure is always a
+// mistake); 0 is legitimate — it means "assume this ASIN doesn't sell here".
+// The "required" error echoes what actually arrived: this failing on a body
+// that looked fine to the caller is otherwise near-impossible to diagnose.
+function parseAdjustedSalesValue(raw, receivedKeys) {
+    if (raw === undefined || raw === null || raw === '') {
+        const got = receivedKeys?.length ? receivedKeys.join(', ') : '(no body received)';
+        return {
+            error: `adjustedSales is required (accepted as "adjustedSales" or "adjusted_sales", `
+                 + `in a JSON body with Content-Type: application/json, or as a query param). Received: ${got}.`,
+        };
+    }
+    const value = Number(raw);
+    if (!Number.isFinite(value)) return { error: 'adjustedSales must be a number.' };
+    if (value < 0) return { error: 'adjustedSales cannot be negative.' };
+    if (value > 99_999_999.99) return { error: 'adjustedSales is out of range.' };
+    return { value };
+}
+
+function parseAdjustedSalesNote(raw) {
+    if (raw === undefined || raw === null) return { note: null };
+    const note = String(raw).trim();
+    if (!note) return { note: null };
+    if (note.length > 500) return { error: 'note cannot exceed 500 characters.' };
+    return { note };
+}
+
+// GET /api/v1/adjusted-sales?asin=&country= — list, both filters optional.
+app.get('/api/v1/adjusted-sales', async (req, res) => {
+    try {
+        await adjustedSalesSchemaReady;
+        const where = ['deleted_at IS NULL'];
+        const params = [];
+
+        if (req.query.asin) {
+            const asin = parseAsin(req.query.asin);
+            if (!asin) return res.status(400).json({ error: 'asin must be a valid 10-character ASIN.' });
+            where.push('asin = ?'); params.push(asin);
+        }
+        if (req.query.country) {
+            const country = String(req.query.country).trim().toUpperCase();
+            if (!ADJUSTED_SALES_COUNTRIES.has(country)) {
+                return res.status(400).json({ error: `country must be one of: ${[...ADJUSTED_SALES_COUNTRIES].join(', ')}.` });
+            }
+            where.push('country = ?'); params.push(country);
+        }
+
+        const rows = await withConnection(async (conn) => {
+            const [r] = await conn.query(
+                `SELECT ${ADJUSTED_SALES_COLS} FROM adjusted_sales
+                  WHERE ${where.join(' AND ')} ORDER BY asin ASC, country ASC`,
+                params
+            );
+            return r;
+        });
+        res.json({ data: rows.map(rowToAdjustedSales) });
+    } catch (error) {
+        log.error('[GET /adjusted-sales]', error);
+        res.status(500).json({ error: 'An internal error occurred.' });
+    }
+});
+
+// GET /api/v1/adjusted-sales/:asin — every country's figure for one ASIN.
+// `byCountry` is the same rows keyed for direct lookup, so a per-country UI
+// doesn't have to scan the array.
+app.get('/api/v1/adjusted-sales/:asin', async (req, res) => {
+    try {
+        await adjustedSalesSchemaReady;
+        const asin = parseAsin(req.params.asin);
+        if (!asin) return res.status(400).json({ error: 'asin must be a valid 10-character ASIN.' });
+
+        const rows = await withConnection(async (conn) => {
+            const [r] = await conn.query(
+                `SELECT ${ADJUSTED_SALES_COLS} FROM adjusted_sales
+                  WHERE asin = ? AND deleted_at IS NULL ORDER BY country ASC`,
+                [asin]
+            );
+            return r;
+        });
+        const data = rows.map(rowToAdjustedSales);
+        res.json({
+            asin,
+            data,
+            byCountry: Object.fromEntries(data.map(d => [d.country, d])),
+        });
+    } catch (error) {
+        log.error('[GET /adjusted-sales/:asin]', error);
+        res.status(500).json({ error: 'An internal error occurred.' });
+    }
+});
+
+// POST /api/v1/adjusted-sales — create. 409 if a live row already holds the
+// key (use PUT to change it). A soft-deleted row for the same key is revived
+// and overwritten: the unique index spans deleted rows, so inserting alongside
+// it isn't possible, and silently failing would be worse.
+app.post('/api/v1/adjusted-sales', adjustedSalesTextBody, async (req, res) => {
+    try {
+        await adjustedSalesSchemaReady;
+        await auditLogSchemaReady;
+        const input = adjustedSalesInput(req);
+
+        const key = parseAdjustedSalesKey(input.asin, input.country);
+        if (key.error) return res.status(400).json({ error: key.error });
+        const val = parseAdjustedSalesValue(input.adjustedSales, input.receivedKeys);
+        if (val.error) return res.status(400).json({ error: val.error });
+        const noteParsed = parseAdjustedSalesNote(input.note);
+        if (noteParsed.error) return res.status(400).json({ error: noteParsed.error });
+
+        const result = await withConnection(async (conn) => {
+            const [existing] = await conn.query(
+                `SELECT ${ADJUSTED_SALES_COLS}, deleted_at FROM adjusted_sales
+                  WHERE asin = ? AND country = ?`,
+                [key.asin, key.country]
+            );
+
+            if (existing.length && !existing[0].deleted_at) {
+                return { duplicate: true };
+            }
+
+            let id;
+            let before = null;
+            if (existing.length) {
+                id = existing[0].id;
+                before = { ...rowToAdjustedSales(existing[0]), deleted: true };
+                await conn.query(
+                    `UPDATE adjusted_sales
+                        SET adjusted_sales = ?, note = ?, updated_by_email = ?, deleted_at = NULL
+                      WHERE id = ?`,
+                    [val.value, noteParsed.note, req.userEmail || null, id]
+                );
+            } else {
+                const [ins] = await conn.query(
+                    `INSERT INTO adjusted_sales
+                        (asin, country, adjusted_sales, note, created_by_email, updated_by_email)
+                     VALUES (?, ?, ?, ?, ?, ?)`,
+                    [key.asin, key.country, val.value, noteParsed.note, req.userEmail || null, req.userEmail || null]
+                );
+                id = ins.insertId;
+            }
+
+            const [rows] = await conn.query(
+                `SELECT ${ADJUSTED_SALES_COLS} FROM adjusted_sales WHERE id = ?`, [id]
+            );
+            await recordAudit(conn, {
+                entityType: 'adjusted_sales',
+                entityId: id,
+                action: 'create',
+                before,
+                after: rowToAdjustedSales(rows[0]),
+                userEmail: req.userEmail,
+            });
+            return { row: rows[0] };
+        });
+
+        if (result.duplicate) {
+            return res.status(409).json({
+                error: `An adjusted sales figure already exists for ${key.asin} / ${key.country}. Use PUT to update it.`,
+            });
+        }
+        res.status(201).json(rowToAdjustedSales(result.row));
+    } catch (error) {
+        log.error('[POST /adjusted-sales]', error);
+        res.status(500).json({ error: 'An internal error occurred.' });
+    }
+});
+
+// Shared by both PUT forms. `create` allows the upsert route to insert.
+async function updateAdjustedSales(conn, { id, asin, country, value, note, noteProvided, userEmail, allowCreate }) {
+    const [existing] = await conn.query(
+        id != null
+            ? `SELECT ${ADJUSTED_SALES_COLS}, deleted_at FROM adjusted_sales WHERE id = ?`
+            : `SELECT ${ADJUSTED_SALES_COLS}, deleted_at FROM adjusted_sales WHERE asin = ? AND country = ?`,
+        id != null ? [id] : [asin, country]
+    );
+    const live = existing.length && !existing[0].deleted_at ? existing[0] : null;
+
+    if (!live && !allowCreate) return { notFound: true };
+
+    if (!live) {
+        // Upsert path: insert, or revive the soft-deleted row holding the key.
+        if (existing.length) {
+            await conn.query(
+                `UPDATE adjusted_sales
+                    SET adjusted_sales = ?, note = ?, updated_by_email = ?, deleted_at = NULL
+                  WHERE id = ?`,
+                [value, note, userEmail || null, existing[0].id]
+            );
+            const [rows] = await conn.query(`SELECT ${ADJUSTED_SALES_COLS} FROM adjusted_sales WHERE id = ?`, [existing[0].id]);
+            await recordAudit(conn, {
+                entityType: 'adjusted_sales', entityId: existing[0].id, action: 'create',
+                before: { ...rowToAdjustedSales(existing[0]), deleted: true },
+                after: rowToAdjustedSales(rows[0]), userEmail,
+            });
+            return { row: rows[0], created: true };
+        }
+        const [ins] = await conn.query(
+            `INSERT INTO adjusted_sales (asin, country, adjusted_sales, note, created_by_email, updated_by_email)
+             VALUES (?, ?, ?, ?, ?, ?)`,
+            [asin, country, value, note, userEmail || null, userEmail || null]
+        );
+        const [rows] = await conn.query(`SELECT ${ADJUSTED_SALES_COLS} FROM adjusted_sales WHERE id = ?`, [ins.insertId]);
+        await recordAudit(conn, {
+            entityType: 'adjusted_sales', entityId: ins.insertId, action: 'create',
+            before: null, after: rowToAdjustedSales(rows[0]), userEmail,
+        });
+        return { row: rows[0], created: true };
+    }
+
+    const fields = ['adjusted_sales = ?', 'updated_by_email = ?'];
+    const values = [value, userEmail || null];
+    // Omitting `note` leaves the existing one; sending null/'' clears it.
+    if (noteProvided) { fields.push('note = ?'); values.push(note); }
+    values.push(live.id);
+
+    await conn.query(`UPDATE adjusted_sales SET ${fields.join(', ')} WHERE id = ?`, values);
+    const [rows] = await conn.query(`SELECT ${ADJUSTED_SALES_COLS} FROM adjusted_sales WHERE id = ?`, [live.id]);
+    await recordAudit(conn, {
+        entityType: 'adjusted_sales', entityId: live.id, action: 'update',
+        before: rowToAdjustedSales(live), after: rowToAdjustedSales(rows[0]), userEmail,
+    });
+    return { row: rows[0] };
+}
+
+// PUT /api/v1/adjusted-sales/:id — update an existing row by numeric id.
+// A non-numeric param is an ASIN: fall through to the bulk route below.
+app.put('/api/v1/adjusted-sales/:id', adjustedSalesTextBody, async (req, res, next) => {
+    try {
+        await adjustedSalesSchemaReady;
+        await auditLogSchemaReady;
+        const { id } = req.params;
+        if (!/^\d+$/.test(id)) return next();
+        const input = adjustedSalesInput(req);
+        const val = parseAdjustedSalesValue(input.adjustedSales, input.receivedKeys);
+        if (val.error) return res.status(400).json({ error: val.error });
+        const noteParsed = parseAdjustedSalesNote(input.note);
+        if (noteParsed.error) return res.status(400).json({ error: noteParsed.error });
+
+        const result = await withConnection((conn) => updateAdjustedSales(conn, {
+            id, value: val.value, note: noteParsed.note,
+            noteProvided: input.noteProvided,
+            userEmail: req.userEmail, allowCreate: false,
+        }));
+        if (result.notFound) return res.status(404).json({ error: `Adjusted sales figure ${id} not found.` });
+        res.json(rowToAdjustedSales(result.row));
+    } catch (error) {
+        log.error('[PUT /adjusted-sales/:id]', error);
+        res.status(500).json({ error: 'An internal error occurred.' });
+    }
+});
+
+// PUT /api/v1/adjusted-sales/:asin — set every country in one request.
+//
+// Three body forms, all upserts:
+// A DIFFERENT figure per country (any of these — the wrapper is optional and
+// the value key may be either casing):
+//   { "countries": { "UK": 920, "DE": { "adjustedSales": 300, "note": "..." } } }
+//   { "UK": 920, "DE": 300, "FR": 150 }
+//   [ { "country": "UK", "adjustedSales": 920 }, { "country": "DE", "adjusted_sales": 300 } ]
+//   { "countries": [ { "country": "UK", "adjustedSales": 920 } ] }
+// The SAME figure across countries:
+//   { "countries": ["UK", "DE"], "adjustedSales": 920 }
+//   { "adjustedSales": 920 }                        → every marketplace (as "*")
+//
+// "*" means the six real marketplaces (UK/DE/FR/IT/ES/US) — NOT the EU or ALL
+// pseudo-countries, which have to be named explicitly so a blanket update can't
+// silently write a cross-market figure nobody asked for.
+//
+// Runs in one transaction: either every country lands or none does, so a
+// half-applied bulk edit can't leave the ASIN in a state nobody intended.
+const ADJUSTED_SALES_MARKETPLACES = ['UK', 'DE', 'FR', 'IT', 'ES', 'US'];
+
+app.put('/api/v1/adjusted-sales/:asin', adjustedSalesTextBody, async (req, res) => {
+    try {
+        await adjustedSalesSchemaReady;
+        await auditLogSchemaReady;
+
+        const asin = parseAsin(req.params.asin);
+        if (!asin) return res.status(400).json({ error: 'asin must be a valid 10-character ASIN.' });
+
+        const input = adjustedSalesInput(req);
+        let body = req.body;
+        if (typeof body === 'string') { try { body = JSON.parse(body); } catch { body = {}; } }
+        if (!body || typeof body !== 'object') body = {};
+        let countriesRaw = body.countries !== undefined ? body.countries : req.query.countries;
+
+        // Unwrapped forms: a bare top-level array of per-country objects, or a
+        // bare country→figure map. Recognised only when the body carries no
+        // shared-value key, so { "adjustedSales": 920 } keeps meaning "one
+        // figure everywhere" and can't be misread as a country map.
+        const hasSharedValue = body.adjustedSales !== undefined || body.adjusted_sales !== undefined;
+        if (countriesRaw === undefined) {
+            if (Array.isArray(body)) {
+                countriesRaw = body;
+            } else {
+                const countryKeys = Object.keys(body)
+                    .filter(k => ADJUSTED_SALES_COUNTRIES.has(String(k).trim().toUpperCase()));
+                if (countryKeys.length && hasSharedValue) {
+                    return res.status(400).json({
+                        error: 'Send either per-country figures or a single adjustedSales, not both.',
+                    });
+                }
+                if (countryKeys.length) {
+                    countriesRaw = Object.fromEntries(countryKeys.map(k => [k, body[k]]));
+                }
+            }
+        }
+
+        // Normalise every form into one list of { country, value, note,
+        // noteProvided }, validating everything BEFORE touching the database —
+        // a bad country in the map must not leave earlier ones applied.
+        const items = [];
+        const addItem = (countryRaw, valueRaw, noteRaw, noteProvided) => {
+            const key = parseAdjustedSalesKey(asin, countryRaw);
+            if (key.error) return key.error;
+            if (items.some(i => i.country === key.country)) {
+                return `country ${key.country} appears more than once.`;
+            }
+            const val = parseAdjustedSalesValue(valueRaw, input.receivedKeys);
+            if (val.error) return `${key.country}: ${val.error}`;
+            const noteParsed = parseAdjustedSalesNote(noteRaw);
+            if (noteParsed.error) return `${key.country}: ${noteParsed.error}`;
+            items.push({ country: key.country, value: val.value, note: noteParsed.note, noteProvided });
+            return null;
+        };
+
+        // One entry of a per-country list: either a bare country code (which
+        // takes the shared top-level figure) or an object carrying its own.
+        const addEntry = (entry, countryFromKey) => {
+            const isObj = entry && typeof entry === 'object' && !Array.isArray(entry);
+            if (!isObj) {
+                // In a map the key is the country and the value is the figure;
+                // in a list a bare element IS the country code.
+                return countryFromKey !== undefined
+                    ? addItem(countryFromKey, entry, input.note, input.noteProvided)
+                    : addItem(entry, input.adjustedSales, input.note, input.noteProvided);
+            }
+            const country = countryFromKey !== undefined
+                ? countryFromKey
+                : (entry.country ?? entry.countryCode ?? entry.country_code);
+            const value = entry.adjustedSales !== undefined ? entry.adjustedSales
+                : (entry.adjusted_sales !== undefined ? entry.adjusted_sales : input.adjustedSales);
+            const noteProvided = 'note' in entry;
+            return addItem(country, value, noteProvided ? entry.note : input.note,
+                noteProvided || input.noteProvided);
+        };
+
+        let err = null;
+        if (countriesRaw && typeof countriesRaw === 'object' && !Array.isArray(countriesRaw)) {
+            // Per-country map: value is either a bare number or an object.
+            for (const [countryRaw, entry] of Object.entries(countriesRaw)) {
+                err = addEntry(entry, countryRaw);
+                if (err) break;
+            }
+        } else if (Array.isArray(countriesRaw) && countriesRaw.some(e => e && typeof e === 'object')) {
+            // List of per-country objects (possibly mixed with bare codes).
+            if (!countriesRaw.length) {
+                return res.status(400).json({ error: 'countries resolved to an empty list.' });
+            }
+            for (const entry of countriesRaw) {
+                err = addEntry(entry);
+                if (err) break;
+            }
+        } else {
+            // Shared value across a list of countries (or every marketplace).
+            const list = Array.isArray(countriesRaw)
+                ? countriesRaw
+                : (countriesRaw === undefined || countriesRaw === '*' || String(countriesRaw).trim() === '*'
+                    ? ADJUSTED_SALES_MARKETPLACES
+                    : String(countriesRaw).split(',').map(s => s.trim()).filter(Boolean));
+            if (!list.length) {
+                return res.status(400).json({ error: 'countries resolved to an empty list.' });
+            }
+            const val = parseAdjustedSalesValue(input.adjustedSales, input.receivedKeys);
+            if (val.error) return res.status(400).json({ error: val.error });
+            for (const countryRaw of list) {
+                err = addItem(countryRaw, input.adjustedSales, input.note, input.noteProvided);
+                if (err) break;
+            }
+        }
+        if (err) return res.status(400).json({ error: err });
+        if (!items.length) return res.status(400).json({ error: 'No countries to update.' });
+
+        const results = await withConnection(async (conn) => {
+            await conn.beginTransaction();
+            try {
+                const out = [];
+                for (const item of items) {
+                    const r = await updateAdjustedSales(conn, {
+                        asin, country: item.country, value: item.value,
+                        note: item.note, noteProvided: item.noteProvided,
+                        userEmail: req.userEmail, allowCreate: true,
+                    });
+                    out.push({ ...rowToAdjustedSales(r.row), action: r.created ? 'created' : 'updated' });
+                }
+                // Final state for the whole ASIN, so a grid can refresh from
+                // this one response without a follow-up GET.
+                const [rows] = await conn.query(
+                    `SELECT ${ADJUSTED_SALES_COLS} FROM adjusted_sales
+                      WHERE asin = ? AND deleted_at IS NULL ORDER BY country ASC`,
+                    [asin]
+                );
+                await conn.commit();
+                return { applied: out, all: rows.map(rowToAdjustedSales) };
+            } catch (e) {
+                await conn.rollback();
+                throw e;
+            }
+        });
+
+        res.json({
+            asin,
+            created: results.applied.filter(r => r.action === 'created').length,
+            updated: results.applied.filter(r => r.action === 'updated').length,
+            results: results.applied,
+            data: results.all,
+            byCountry: Object.fromEntries(results.all.map(d => [d.country, d])),
+        });
+    } catch (error) {
+        log.error('[PUT /adjusted-sales/:asin]', error);
+        res.status(500).json({ error: 'An internal error occurred.' });
+    }
+});
+
+// PUT /api/v1/adjusted-sales/:asin/:country — upsert by natural key. 201 when
+// it created the row, 200 when it updated one, so a UI can tell them apart.
+app.put('/api/v1/adjusted-sales/:asin/:country', adjustedSalesTextBody, async (req, res) => {
+    try {
+        await adjustedSalesSchemaReady;
+        await auditLogSchemaReady;
+        const key = parseAdjustedSalesKey(req.params.asin, req.params.country);
+        if (key.error) return res.status(400).json({ error: key.error });
+        const input = adjustedSalesInput(req);
+        const val = parseAdjustedSalesValue(input.adjustedSales, input.receivedKeys);
+        if (val.error) return res.status(400).json({ error: val.error });
+        const noteParsed = parseAdjustedSalesNote(input.note);
+        if (noteParsed.error) return res.status(400).json({ error: noteParsed.error });
+
+        const result = await withConnection((conn) => updateAdjustedSales(conn, {
+            asin: key.asin, country: key.country, value: val.value, note: noteParsed.note,
+            noteProvided: input.noteProvided,
+            userEmail: req.userEmail, allowCreate: true,
+        }));
+        res.status(result.created ? 201 : 200).json(rowToAdjustedSales(result.row));
+    } catch (error) {
+        log.error('[PUT /adjusted-sales/:asin/:country]', error);
+        res.status(500).json({ error: 'An internal error occurred.' });
+    }
+});
+
+// Soft-delete, matching the rest of the schema. The row keeps its id and its
+// audit trail; POSTing the same key again revives it.
+async function deleteAdjustedSales(conn, { id, asin, country, userEmail }) {
+    const [existing] = await conn.query(
+        id != null
+            ? `SELECT ${ADJUSTED_SALES_COLS} FROM adjusted_sales WHERE id = ? AND deleted_at IS NULL`
+            : `SELECT ${ADJUSTED_SALES_COLS} FROM adjusted_sales WHERE asin = ? AND country = ? AND deleted_at IS NULL`,
+        id != null ? [id] : [asin, country]
+    );
+    if (!existing.length) return { notFound: true };
+
+    await conn.query('UPDATE adjusted_sales SET deleted_at = NOW(), updated_by_email = ? WHERE id = ?',
+        [userEmail || null, existing[0].id]);
+    await recordAudit(conn, {
+        entityType: 'adjusted_sales', entityId: existing[0].id, action: 'delete',
+        before: rowToAdjustedSales(existing[0]), after: null, userEmail,
+    });
+    return { deleted: true };
+}
+
+app.delete('/api/v1/adjusted-sales/:id', async (req, res) => {
+    try {
+        await adjustedSalesSchemaReady;
+        await auditLogSchemaReady;
+        const { id } = req.params;
+        if (!/^\d+$/.test(id)) {
+            return res.status(400).json({
+                error: 'Expected a numeric id. To address a row by ASIN, use DELETE /adjusted-sales/:asin/:country.',
+            });
+        }
+        const result = await withConnection((conn) => deleteAdjustedSales(conn, { id, userEmail: req.userEmail }));
+        if (result.notFound) return res.status(404).json({ error: `Adjusted sales figure ${id} not found.` });
+        res.status(204).end();
+    } catch (error) {
+        log.error('[DELETE /adjusted-sales/:id]', error);
+        res.status(500).json({ error: 'An internal error occurred.' });
+    }
+});
+
+app.delete('/api/v1/adjusted-sales/:asin/:country', async (req, res) => {
+    try {
+        await adjustedSalesSchemaReady;
+        await auditLogSchemaReady;
+        const key = parseAdjustedSalesKey(req.params.asin, req.params.country);
+        if (key.error) return res.status(400).json({ error: key.error });
+        const result = await withConnection((conn) => deleteAdjustedSales(conn, {
+            asin: key.asin, country: key.country, userEmail: req.userEmail,
+        }));
+        if (result.notFound) {
+            return res.status(404).json({ error: `No adjusted sales figure for ${key.asin} / ${key.country}.` });
+        }
+        res.status(204).end();
+    } catch (error) {
+        log.error('[DELETE /adjusted-sales/:asin/:country]', error);
+        res.status(500).json({ error: 'An internal error occurred.' });
     }
 });
 
@@ -8312,6 +9393,19 @@ app.patch('/api/v1/alerts/:id/approve', async (req, res) => {
                         return { gateBlocked: ['qcReport(attachment)'], alert };
                     }
                 }
+                // Ready-date HARD gate: an order can't move into READY_FOR_QC while its
+                // estimated ready date is still in the future — the goods aren't finished,
+                // so there's nothing to inspect yet. Use the value being applied by this
+                // approve (fieldsToSet) if present, else the order's current one.
+                if (isMove && status === 'READY_FOR_QC') {
+                    const erd = ('estimated_ready_date' in fieldsToSet)
+                        ? String(fieldsToSet.estimated_ready_date).slice(0, 10)
+                        : beforeOrder.estimatedReadyDate;
+                    if (erd && erd > today) {
+                        await conn.rollback();
+                        return { readyDateFuture: erd, alert };
+                    }
+                }
 
                 // Same status-update transaction as PATCH /orders/:id/status, plus
                 // any validated field columns. A data_update suggestion sets status
@@ -8352,6 +9446,9 @@ app.patch('/api/v1/alerts/:id/approve', async (req, res) => {
         }
         if (result.gateBlocked) {
             return res.status(422).json({ error: 'Cannot move to READY: a QC inspection report must be attached first.', missing: result.gateBlocked, alert: result.alert });
+        }
+        if (result.readyDateFuture) {
+            return res.status(422).json({ error: `Cannot move to READY_FOR_QC: estimated ready date (${result.readyDateFuture}) is in the future.`, alert: result.alert });
         }
 
         // Webhook fires outside the lock window, only if the approve committed.
@@ -8422,6 +9519,10 @@ const serverlessApp = serverless(app, {
         req.lambdaContext = context;
     },
 });
+
+// The bare Express app, so local test scripts (tools/test-*.js) can drive the
+// routes in-process instead of through a Lambda event.
+module.exports.app = app;
 
 module.exports.handler = async (event, context) => {
     // Default: freeze the container as soon as the HTTP response is built.

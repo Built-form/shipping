@@ -34,7 +34,7 @@ flowchart LR
         L6[updateImportedDates<br/>4× daily]
     end
 
-    DB[("MySQL · RDS<br/>orders · stock_snapshots<br/>amazon_stock_*<br/>amazon_report_jobs<br/>landed_costs · allowed_emails")]
+    DB[("MySQL · RDS<br/>orders · stock_snapshots<br/>amazon_stock_*<br/>amazon_report_jobs<br/>landed_costs · shipping_allowed_emails")]
 
     subgraph api["API Layer"]
         direction TB
@@ -245,17 +245,94 @@ All endpoints require a Google JWT `Authorization` header (bypassed in local dev
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/api/v1/stock-snapshots/sum?asin=...&company=...&days=30` | Aggregated stock summary for a single ASIN (Mintsoft + Amazon + orders + history) |
-| `GET` | `/api/v1/stock-snapshots/sum/all-asins?company=...` | Full summary for every known ASIN |
+| `GET` | `/api/v1/stock-snapshots/sum?asin=...&company=...&days=30` | Aggregated stock summary for a single ASIN (Mintsoft + Amazon + orders + history), plus `mintsoft_by_sku`. `history.amazon` is the per-day total across countries; `history.amazon_by_country` is the same daily series split per country (`{ UK: [...], US: [...] }`) — series start on different days, a missing day means no snapshot, not zero |
+| `GET` | `/api/v1/stock-snapshots/sum/all-asins?company=...` | Full summary for every known ASIN, plus `mintsoft_by_sku` per ASIN |
 | `GET` | `/api/v1/stock-snapshots/fnskus?asin=...&company=...` | SKU/FNSKU pairs per country |
 | `GET` | `/api/v1/stock-snapshots/asana-tasks?asin=...` | Replenishment Asana tasks for an ASIN |
 | `GET` | `/api/v1/stock-snapshots/oos-dates?asin=...&company=...` | Historical dates where `fulfillable = 0` per country |
 | `GET` | `/api/v1/stock-snapshots/active-listings?asin=...&company=...` | Current listings + history |
+| `POST` | `/api/v1/stock-snapshots/refresh` (body/query `jfCode`) | Live Mintsoft refresh of ONE jf_code — bare SKU plus its whitelisted children (`_TR`, `_QC`, `_IFU`, …) — instead of waiting for the hourly sweep |
+
+#### `mintsoft_by_sku` — per-child-SKU breakdown
+
+The `mintsoft_stock_level` / `_available` / `_allocated` / `_quarantine` figures are the **sum across a JF code's whitelisted child SKUs** (bare code + `_TR` trade, `_QC`, `_READY`, `_IFU`, `_LABELLED`, … — see `SKU_SUFFIXES` in [src/services/mintsoft.js](src/services/mintsoft.js)). `mintsoft_by_sku` splits that total back out so it's clear which child holds the units — 4,000 units reads very differently when 3,500 of them sit in `_TR`.
+
+Entries sum exactly to the four aggregate figures. Bare SKU first, then suffixes A–Z. Each entry also carries its per-warehouse split (today everything lives in warehouse 7, but the grain is preserved):
+
+```json
+"mintsoft_by_sku": [
+  { "sku": "HW0168", "jf_code": "HW0168", "suffix": null, "is_base": true,
+    "product_id": 9277, "stock_level": 4702, "available": 4702, "allocated": 0, "quarantine": 0,
+    "warehouses": [{ "warehouse_id": 7, "stock_level": 4702, "available": 4702, "allocated": 0, "quarantine": 0 }] },
+  { "sku": "HW0168_TR", "jf_code": "HW0168", "suffix": "_TR", "is_base": false,
+    "product_id": 10309, "stock_level": 4, "available": 4, "allocated": 0, "quarantine": 0,
+    "warehouses": [{ "warehouse_id": 7, "stock_level": 4, "available": 4, "allocated": 0, "quarantine": 0 }] }
+]
+```
+
+`POST /stock-snapshots/refresh` returns the same `mintsoft_by_sku` shape alongside its flat `skus` array, so the breakdown renders identically whichever endpoint the caller read.
 
 #### Per-country latest-date semantics
 
 > [!NOTE]
 > Because the Amazon snapshot is written to the database one country at a time over a ~30-minute window each morning, the stock-snapshot endpoints resolve the **latest snapshot date per `(asin, country)`** rather than a single date per ASIN. A country that already wrote today's data shows today; a country still waiting in the collector queue continues showing yesterday. This prevents the partial-refresh "disappearing countries" artefact.
+
+### Adjusted Sales
+
+Ops-entered override of the sales figure for an ASIN in one marketplace, stored at the same `(asin, country)` grain as `amazon_stock_country_snapshots`. Country is one of `UK`, `DE`, `FR`, `IT`, `ES`, `US`, `EU`, or `ALL` (reserved for a single cross-market figure).
+
+One **live row per `(asin, country)`** holding a current value — not a time series. Every change is written to `audit_log` under `entity_type = 'adjusted_sales'`, so history is recoverable via `GET /api/v1/audit-log?entityType=adjusted_sales&entityId=<id>`. Deletes are soft; re-creating a deleted key revives the same row (and its id).
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/v1/adjusted-sales?asin=...&country=...` | List; both filters optional |
+| `GET` | `/api/v1/adjusted-sales/:asin` | Every country's figure for one ASIN — `data` array plus a `byCountry` map |
+| `POST` | `/api/v1/adjusted-sales` | Create. `409` if a live row already holds the key |
+| `PUT` | `/api/v1/adjusted-sales/:id` | Update by numeric id |
+| `PUT` | `/api/v1/adjusted-sales/:asin` | **Bulk** — set several/all countries in one request |
+| `PUT` | `/api/v1/adjusted-sales/:asin/:country` | Upsert by natural key — `201` when created, `200` when updated |
+| `DELETE` | `/api/v1/adjusted-sales/:id` | Soft-delete by id |
+| `DELETE` | `/api/v1/adjusted-sales/:asin/:country` | Soft-delete by natural key |
+
+Body for POST/PUT: `{ "asin": "B0...", "country": "UK", "adjustedSales": 1250.5, "note": "seasonal uplift" }` — `asin`/`country` are path- or body-supplied depending on the route, `note` is optional (omit on PUT to keep the existing note, send `null` to clear it). `adjustedSales` must be `>= 0`; `0` is valid and means "assume this ASIN doesn't sell here".
+
+The figure is accepted as either **`adjustedSales` or `adjusted_sales`** (these routes speak camelCase but the stock endpoints return snake_case, so both are honoured), from a JSON body or a query param, and a body sent without `Content-Type: application/json` is parsed rather than silently read as empty.
+
+#### Bulk update — `PUT /api/v1/adjusted-sales/:asin`
+
+All forms are upserts. **A different figure per country**, in one request — the `countries` wrapper is optional and either key casing works:
+
+```jsonc
+{ "countries": { "UK": 920, "DE": 300, "FR": 150 } }                    // map
+{ "UK": 920, "DE": 300, "FR": 150 }                                     // bare map
+[ { "country": "UK", "adjustedSales": 920 },
+  { "country": "DE", "adjusted_sales": 300 } ]                          // array
+{ "countries": [ { "country": "UK", "adjustedSales": 920, "note": "..." } ] }
+{ "countries": { "UK": { "adjustedSales": 920, "note": "per-country note" } } }
+```
+
+**The same figure across countries:**
+
+```jsonc
+{ "countries": ["UK", "DE"], "adjustedSales": 920 }   // named countries
+{ "adjustedSales": 920 }                              // every marketplace
+```
+
+`countries` also accepts a CSV string (`"IT,ES"`) or `"*"`. Omitting it — or passing `"*"` — targets the six real marketplaces `UK, DE, FR, IT, ES, US`; the `EU` and `ALL` pseudo-countries must be named explicitly, so a blanket update can't silently write a cross-market figure.
+
+A per-country map combined with a top-level `adjustedSales` is rejected as ambiguous rather than guessed at. A top-level `note` applies to every country that doesn't carry its own.
+
+Runs in a **single transaction** and validates the whole batch up front: one bad country or negative value rejects the request with `400` and writes nothing. The response carries both what changed and the ASIN's resulting full state, so a grid can refresh without a follow-up GET:
+
+```json
+{ "asin": "B0...", "created": 3, "updated": 3,
+  "results": [{ "country": "UK", "adjustedSales": 920, "action": "updated", "id": 10, "...": "" }],
+  "data": [ "...every live row for this ASIN..." ],
+  "byCountry": { "UK": { "...": "" } } }
+```
+
+> [!NOTE]
+> Nothing else in the API consumes this figure yet — the stock-snapshot endpoints are unchanged. It is written and read back through these routes only.
 
 ---
 
@@ -301,6 +378,18 @@ Hourly Mintsoft warehouse stock levels, keyed by SKU + warehouse + date.
 | `allocated` | INT | Reserved/allocated |
 | `quarantine` | INT | In quarantine |
 
+### `adjusted_sales`
+Manually adjusted sales figures, one live row per `(asin, country)`. See [Adjusted Sales](#adjusted-sales) above; canonical DDL in [src/db/migrations/2026-08-03_adjusted_sales.sql](src/db/migrations/2026-08-03_adjusted_sales.sql).
+
+| Column | Type | Notes |
+|---|---|---|
+| `asin` | VARCHAR(20) | Amazon ASIN |
+| `country` | VARCHAR(8) | `UK`/`DE`/`FR`/`IT`/`ES`/`US`/`EU`, or `ALL` for cross-market |
+| `adjusted_sales` | DECIMAL(12,2) | The override figure; `>= 0` |
+| `note` | VARCHAR(500) | Optional reason for the adjustment |
+| `created_by_email` / `updated_by_email` | VARCHAR | Actor from the JWT |
+| `deleted_at` | DATETIME | Soft delete — the unique key spans deleted rows, so re-creating a key revives it |
+
 ### `amazon_stock_country_snapshots`
 Deduped Amazon FBA inventory, one row per `(date_ran, country, asin, company)`. Comma-separated FNSKU/SKU lists let a single row carry multi-FNSKU pools (re-stickered units, returns). Non-DE/UK marketplaces dedup against DE's FNSKU set to avoid double-counting Pan-EU / EFN inventory.
 
@@ -328,8 +417,12 @@ One row per listed SKU per country per day, carrying the SKU→FNSKU mapping and
 ### `amazon_report_jobs`
 Job tracker for the two-phase SP-API flow. One row per `(batch_date, account, country, report_type)`, with `status` progressing `REQUESTED → DONE → PROCESSED` (or `FAILED`). Populated by `amazonRequester`, consumed by `amazonCollector`.
 
-### `allowed_emails`
-Email allowlist for API access control (checked against the Google JWT email claim).
+### `shipping_allowed_emails`
+This app's user allowlist — checked against the Google JWT email claim on every request, managed through `/api/v1/users`. Columns: `id`, `email` (unique, lower-cased), `display_name`, `type`, `created_at`, `updated_at`.
+
+`type` is free-form, not an enum: the set of roles is whatever `SELECT DISTINCT type` currently returns (`/api/v1/user-types`), so introducing a role means assigning it to someone — never a deploy. Writes are validated on shape only (lower-case letters/digits/`-`/`_`, ≤32 chars). Two roles are structural and always offered even with no rows: `standard` (the default) and `admin` (the one that unlocks the admin-gated routes). A role stops being listed once its last user is removed.
+
+It is deliberately **not** `allowed_emails`: that table is shared with joshdex's API (`perp.js` runs against the same `jfa` schema and exposes its own `/allowed-emails` CRUD), so a grant or revoke there changed who could log into both apps. `shipping_allowed_emails` was seeded once with a copy of those rows and is ShipLine's alone from then on; `allowed_emails` is left untouched for joshdex. See [src/lib/allowed-emails.js](src/lib/allowed-emails.js).
 
 ### `landed_costs`
 Reference table mapping JF codes to ASINs — used by the Mintsoft snapshot to know which products to track.
@@ -373,7 +466,60 @@ Reference table mapping JF codes to ASINs — used by the Mintsoft snapshot to k
 
 ---
 
+## Environments
+
+Two CloudFormation stacks, both in `eu-north-1`:
+
+| Deploy command | Stage | `envName` | Stack | Secret | Schedules |
+|---|---|---|---|---|---|
+| `bash deploy.sh` | `dev` | **`prod`** | `shipping-serverless-dev` | `shipping/prod` | enabled |
+| `bash deploy.sh test` | `test` | `test` | `shipping-serverless-test` | `shipping/test` | disabled |
+
+> **The stage `dev` IS production.** The live stack was first deployed under the
+> Serverless default stage and a CloudFormation stack cannot be renamed in place —
+> renaming would mean a brand-new stack, a new API Gateway URL and an S3 data
+> migration. So the stage stays `dev` and `custom.envName` in `serverless.yml`
+> maps it to the honest name. **Everything new keys off `custom.envName`, never
+> the raw stage.** The only remaining "dev" is the existing stack/bucket names in
+> the AWS console.
+
+The test stack is a full parallel copy — its own API Gateway URL, Lambdas and
+`shipping-purchase-orders-test` bucket — pointed at the `explorer-test` DB
+replica. Every schedule is gated by `custom.schedulesEnabled` (default `false`),
+so the test stack never ingests orders, mutates Mintsoft, registers ShipsGo
+containers or sends supplier email. The EventBridge rules still exist (visible,
+DISABLED), so `aws lambda invoke` against a test function still works when you
+deliberately want it to.
+
+---
+
 ## Environment Variables
+
+Config lives in **two places**, and they are not the same place:
+
+- **Deployed Lambdas** read one flat JSON secret per environment in AWS Secrets
+  Manager — `shipping/prod` and `shipping/test`. `serverless.yml` resolves it at
+  **deploy time** (`custom.secrets`) and bakes the values into the Lambda
+  environment: no runtime fetch, no added latency, no code changes. Rotating a
+  value means updating the secret **and redeploying**. Whoever deploys needs
+  `secretsmanager:GetSecretValue`.
+- **Local runs** (`npm run dev`, `node src/handlers/*.js`, `node tools/*.js`)
+  read `.env` directly via `dotenv` and never touch Secrets Manager. `.env` is
+  local-only and not committed.
+
+```bash
+# Update a value (then redeploy for it to reach the Lambdas)
+aws secretsmanager put-secret-value --secret-id shipping/prod \
+  --secret-string file://prod.secret.json --region eu-north-1
+```
+
+> **Gotcha:** several vars have a fallback chain (`DB_PROXY_HOST` → `DB_HOST`) or
+> a default (`FRONT_API_TOKEN, ''`). A key that should "not be set" must be
+> **absent from the secret JSON entirely** — an empty string is a present value
+> and wins over the fallback. This is why `shipping/test` has no
+> `DB_PROXY_HOST`: the test replica is reached directly, not through the proxy.
+
+The keys below are the same in both the secret and `.env`:
 
 ```bash
 # Database
@@ -455,16 +601,57 @@ Requires the relevant `amazon_report_jobs` rows to already exist for today (i.e.
 ### Deploy
 
 ```bash
-npm run deploy
-# Deploys all functions to AWS Lambda (eu-north-1)
+bash deploy.sh          # stage "dev"  -> PRODUCTION (shipping-serverless-dev)
+bash deploy.sh test     # stage "test" -> the test stack (shipping-serverless-test)
 ```
+
+Use `deploy.sh`, not `npm run deploy` — on Windows, packaging the full
+`node_modules` tree blows past the OS file-handle limit and `serverless deploy`
+bails with `EMFILE: too many open files`. The script prunes to production deps
+and preloads `graceful-fs` to get under it, then restores devDeps.
+
+Resolve the config for either stage **without deploying** — this reads the
+Secrets Manager secret, so it's the way to check a value landed:
+
+```bash
+serverless print --path provider.environment.DB_HOST
+serverless print --stage test --path provider.environment.DB_HOST
+serverless print --stage test --path functions.frontStatusImport
+```
+
+(`--path` reports "not found" for a value that resolves to an empty string; use
+`--path provider.environment --format json` to see those.)
 
 ---
 
 ## Authentication
 
-- **Production:** Google JWT via API Gateway HTTP API authorizer. The email claim from the JWT is checked against the `allowed_emails` table.
-- **Local dev:** Bypassed when `IS_OFFLINE` or `NODE_ENV=development` is set. Requests are attributed to `local@dev`.
+- **Production:** Google JWT via API Gateway HTTP API authorizer. The email claim from the JWT is checked against the `shipping_allowed_emails` table on every request (no cache — a grant or revoke lands on that user's next request). The row's `type` is exposed to the frontend as the `X-User-Type` response header and to routes as `req.userType`; `admin` is the only role the API itself treats specially.
+- **Local dev:** Bypassed when `IS_OFFLINE` or `NODE_ENV=development` is set. Requests are attributed to `local@dev`, with the role taken from `LOCAL_USER_TYPE` (default `standard`) so admin-gated routes can be exercised locally.
+- **Bootstrap:** on a schema with no users to copy, the comma-separated `BOOTSTRAP_ADMIN_EMAILS` env var seeds the first admins — without it every authed request would 401.
+
+### Managing users — `/api/v1/users`
+
+Full CRUD over the allowlist. Admin-only apart from `GET /me`, since the list decides who can reach the API at all. Every mutation is written to `audit_log` under `entity_type='user'`.
+
+| Method | Path | Notes |
+|---|---|---|
+| `GET` | `/api/v1/users?type=&q=` | List; optional role filter and email/name search |
+| `GET` | `/api/v1/users/me` | The caller's own record — open to every allowlisted user |
+| `GET` | `/api/v1/users/:email` | One user |
+| `POST` | `/api/v1/users` | `{ email, type?, displayName? }` → 201, or 409 if already granted |
+| `PATCH`/`PUT` | `/api/v1/users/:email` | `{ type?, displayName? }`. The email is the identity and can't be changed |
+| `DELETE` | `/api/v1/users/:email` | Revokes access immediately |
+| `GET` | `/api/v1/user-types` | The roles in use (live `DISTINCT` + `standard`/`admin`), for a UI dropdown |
+
+Lockout guards: an admin can't remove their own access, and the last admin can't be removed or demoted.
+
+Smoke test (drives the real routes against the DB, cleans up after itself):
+
+```bash
+node tools/test-allowed-emails.js                        # as an admin
+LOCAL_USER_TYPE=standard node tools/test-allowed-emails.js   # checks the 403 gate
+```
 
 ---
 

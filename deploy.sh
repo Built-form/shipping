@@ -12,8 +12,15 @@
 # It's installed --no-save after the prune so package.json stays clean and
 # graceful-fs only exists in node_modules during the deploy window.
 #
-# Usage:  bash deploy.sh
+# Usage:  bash deploy.sh          -> stage "dev", which IS production
+#         bash deploy.sh test     -> stage "test", the parallel test stack
+#
+# The live production stack was first deployed under the Serverless default
+# stage "dev" and can't be renamed in place; serverless.yml maps stage -> an
+# honest envName (dev -> prod). See the note at the top of serverless.yml.
 set -e
+
+STAGE="${1:-dev}"
 
 echo "==> Pruning dev dependencies..."
 npm prune --production
@@ -27,9 +34,9 @@ rm -rf .deploy-tools
 mkdir -p .deploy-tools
 npm install --prefix .deploy-tools graceful-fs --no-save --no-package-lock --no-fund --no-audit
 
-echo "==> Deploying with graceful-fs preloaded..."
+echo "==> Deploying stage '$STAGE' with graceful-fs preloaded..."
 GFS_PATH="$(pwd -W 2>/dev/null || pwd)/.deploy-tools/node_modules/graceful-fs"
-NODE_OPTIONS="--require $GFS_PATH" serverless deploy
+NODE_OPTIONS="--require $GFS_PATH" serverless deploy --stage "$STAGE"
 
 echo "==> Cleaning up .deploy-tools/..."
 rm -rf .deploy-tools

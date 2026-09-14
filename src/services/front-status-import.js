@@ -854,6 +854,17 @@ async function importStatusUpdatesFromFront(conn, {
                     const ex = refinedByOrder.get(order.id) || extract;
                     const sug = T.suggestionFor(order.status, ex.milestone, { isFqc, qcFailed: ex.qcFailed });
 
+                    // Daisy must not auto-suggest a move INTO READY_FOR_QC while the
+                    // estimated ready date is still in the future: production isn't
+                    // finished, so there's nothing to inspect yet. Downgrade to a no-move
+                    // data_update (the ready date the email carries still gets captured)
+                    // rather than propose a premature QC move. Prefer the date this email
+                    // provides, else the order's current one.
+                    if (sug.target === 'READY_FOR_QC') {
+                        const erd = asDateStr((ex.fields && ex.fields.estimatedReadyDate) ?? order.estimated_ready_date);
+                        if (erd && erd > today) { sug.target = null; sug.category = null; sug.remaining = null; }
+                    }
+
                     // Field list: for a status MOVE, the target's gate/milestone
                     // fields PLUS the stage data fields; for NO move, just the stage
                     // data fields (e.g. an estimated ready date) — which become a

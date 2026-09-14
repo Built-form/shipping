@@ -90,14 +90,39 @@ async function ensureContainersTable(conn) {
     }
 }
 
+// ISO 6346: 3-letter owner code + equipment category (U/J/Z) + 6 digits + check
+// digit. Operators sometimes put an AWB or a courier tracking number in
+// external_container_number; ShipsGo rejects those with a 422 that still costs
+// us a request against the account rate limit, so they're filtered out here.
+const CONTAINER_NUMBER_RE = /^[A-Z]{4}\d{7}$/;
+
+// Statuses past the point ShipsGo tells us anything new — the goods are already
+// at (or through) the warehouse. A container is only re-fetched while at least
+// one of its orders is still short of these, which keeps the per-run request
+// count down: the account rate limit is shared across every ShipsGo call, and
+// most container numbers on file belong to long-since-received orders.
+const SETTLED_STATUSES = [
+    'ARRIVED_AT_WAREHOUSE', 'RECEIVED', 'PARTIALLY_RECEIVED',
+    'IN_WAREHOUSE', 'MINTSOFT', 'DESTROYED',
+];
+
 async function getDistinctExternalContainers(conn) {
     const [rows] = await conn.query(`
-        SELECT DISTINCT TRIM(external_container_number) AS cn
+        SELECT TRIM(external_container_number) AS cn
         FROM orders
         WHERE external_container_number IS NOT NULL
           AND TRIM(external_container_number) <> ''
-    `);
-    return rows.map(r => r.cn).filter(Boolean);
+          AND deleted_at IS NULL
+        GROUP BY TRIM(external_container_number)
+        HAVING SUM(status NOT IN (?)) > 0
+    `, [SETTLED_STATUSES]);
+    const all = rows.map(r => r.cn).filter(Boolean);
+    const valid = all.filter(cn => CONTAINER_NUMBER_RE.test(cn.toUpperCase()));
+    const skipped = all.filter(cn => !CONTAINER_NUMBER_RE.test(cn.toUpperCase()));
+    if (skipped.length) {
+        log.info(`[shipsgo-containers] skipping ${skipped.length} non-container values: ${skipped.join(', ')}`);
+    }
+    return valid;
 }
 
 // Source of truth for the writable column list. Excludes container_number

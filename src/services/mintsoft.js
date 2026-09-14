@@ -18,7 +18,17 @@ const mintsoftClient = axios.create({
     params: { APIKey: MINTSOFT_API_KEY }
 });
 
-const SKU_SUFFIXES = ['_USA','_QC', '_READY', '_pp','_LABELLED','_PACKED','_IFU','_FRANCE',''];
+// Which child SKUs of a JF code count toward its stock. Deliberately a
+// WHITELIST, not a `<CODE>_<anything>` pattern: Mintsoft also carries children
+// that must never inflate the figure — _GOMPELS (customer-allocated), _OLD,
+// _FAULTY, and pack variants like _50 / _SINGLE whose "units" aren't singles.
+// A 2026-07-29 sweep found pattern-matching would have added 19,193 units
+// across 428 codes, a quarter of it one customer's allocated stock.
+//
+// _TR (trade) counts — trade units are sellable stock like any other.
+// New suffixes must be added here explicitly; until then they're invisible,
+// which is the safe failure direction.
+const SKU_SUFFIXES = ['_USA', '_QC', '_READY', '_pp', '_LABELLED', '_PACKED', '_IFU', '_FRANCE', '_TR', ''];
 
 async function getProductsByJfCode(jfCode) {
     if (!jfCode) throw new Error('JF code is required');
@@ -26,6 +36,7 @@ async function getProductsByJfCode(jfCode) {
     const skusToCheck = new Set(
         [jfCode, ...SKU_SUFFIXES.map(s => jfCode + s)].map(s => s.toUpperCase())
     );
+    const isMatch = (sku) => skusToCheck.has(sku);
 
     const res = await mintsoftClient.get('/Product/Search', {
         params: {
@@ -40,7 +51,7 @@ async function getProductsByJfCode(jfCode) {
     if (!data) throw new Error(`No response data for JF code "${jfCode}"`);
 
     const results = Array.isArray(data) ? data : [data];
-    const matched = results.filter(p => p?.ID && p.SKU && skusToCheck.has(p.SKU.toUpperCase()));
+    const matched = results.filter(p => p?.ID && p.SKU && isMatch(p.SKU.toUpperCase()));
 
     if (matched.length === 0) return [];
 
@@ -227,6 +238,47 @@ async function createAsn({ warehouseId, poReference, supplier, quantity, items, 
     return detailRes.data;
 }
 
+// ── Stock movements (the UI's "Book Stock" form) ───────────────────────────
+// POST /Warehouse/StockMovement?Action=<n> with a BookStockRequest body. The
+// Action enum is 20 unnamed integers in Mintsoft's swagger; these are the ones
+// we use, identified empirically on 2026-07-29 (the API echoes the action name
+// in its response Message — full map in the commit that added this).
+//
+// Quarantining moves units OUT of the sellable pool: StockLevel and OnHand both
+// drop by the quantity and InQuarantine rises by it, which is what
+// getProductStock() already nets out via `available = level - quarantine`.
+const STOCK_ACTION = { QUARANTINE: 7, UN_QUARANTINE: 8 };
+
+// BatchNo AND ExpiryDate together identify WHICH units to move — Mintsoft holds
+// stock as batch+expiry storage items, so sending the batch alone finds nothing
+// when the units carry an expiry and the movement is refused with "not enough
+// could be found in the selected location". Live-verified 2026-07-29 against
+// ASN-received stock: same product, location and batch, refused without
+// ExpiryDate, accepted with it. Both must mirror what the goods-in used.
+async function moveStock(action, { productId, warehouseId, locationId, quantity, batchNo, expiryDate, comment }) {
+    const res = await mintsoftClient.post('/Warehouse/StockMovement', {
+        ProductId: productId,
+        WarehouseId: warehouseId,
+        LocationId: locationId,
+        Quantity: quantity,
+        BatchNo: batchNo || null,
+        ExpiryDate: expiryDate || null,
+        Comment: comment || '',
+    }, { params: { ...mintsoftClient.defaults.params, Action: action } });
+
+    const result = res?.data;
+    // Mintsoft answers 200 with Success:false for domain failures (e.g. "not
+    // enough stock in the selected location"), so the status code alone is not
+    // enough to tell whether the units actually moved.
+    if (!result || result.Success === false) {
+        throw new Error(`Mintsoft stock movement (Action ${action}) rejected: ${result?.Message || 'no message'}`);
+    }
+    return result;
+}
+
+const quarantineStock = (params) => moveStock(STOCK_ACTION.QUARANTINE, params);
+const unQuarantineStock = (params) => moveStock(STOCK_ACTION.UN_QUARANTINE, params);
+
 async function receiveAsnItems(asnId, allocations) {
     // Complete: false records the allocation without auto-promoting to DELIVERED.
     // Then MarkAwaitingPutAway (→ AWAITINGPUTAWAY) and MarkPutAwayComplete
@@ -258,4 +310,4 @@ async function receiveAsnItems(asnId, allocations) {
     return res.data;
 }
 
-module.exports = { getProductsByJfCode, getProductStock, getProductDetails, getProductCartons, createAsn, receiveAsnItems, getWarehouses, getLocations, getProductImageUrl };
+module.exports = { getProductsByJfCode, getProductStock, getProductDetails, getProductCartons, createAsn, receiveAsnItems, getWarehouses, getLocations, getProductImageUrl, quarantineStock, unQuarantineStock, STOCK_ACTION };

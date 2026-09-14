@@ -59,8 +59,10 @@ async function ensureTable(conn) {
 
 // ── Per-JF-code snapshot (reusable) ────────────────────────────────────────────
 // Fetches Mintsoft stock for one JF code and upserts stock_snapshots rows for
-// today's dateRan. Used by both the scheduled batch run and the live
-// post-receive refresh in orders.js.
+// today's dateRan. Used by the scheduled batch run, the live post-receive
+// refresh, and the on-demand /stock-snapshots/refresh endpoint — all three
+// resolve the same SKU set (bare code + the SKU_SUFFIXES whitelist, trade
+// included), so a code reads the same whichever one last touched it.
 async function snapshotJfCode(conn, jfCode, asin = '') {
     const dateRan = new Date().toISOString().slice(0, 10);
     const products = await getProductsByJfCode(jfCode);

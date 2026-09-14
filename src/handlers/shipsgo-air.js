@@ -50,14 +50,24 @@ async function ensureAirShipmentsTable(conn) {
     `);
 }
 
+// Mirrors shipsgo-containers: stop re-fetching an AWB once every order on it
+// has reached the warehouse, so the shared ShipsGo rate limit is spent on
+// shipments still in transit.
+const SETTLED_STATUSES = [
+    'ARRIVED_AT_WAREHOUSE', 'RECEIVED', 'PARTIALLY_RECEIVED',
+    'IN_WAREHOUSE', 'MINTSOFT', 'DESTROYED',
+];
+
 async function getDistinctAwbNumbers(conn) {
     const [rows] = await conn.query(`
-        SELECT DISTINCT TRIM(awb_number) AS awb
+        SELECT TRIM(awb_number) AS awb
         FROM orders
         WHERE awb_number IS NOT NULL
           AND TRIM(awb_number) <> ''
           AND deleted_at IS NULL
-    `);
+        GROUP BY TRIM(awb_number)
+        HAVING SUM(status NOT IN (?)) > 0
+    `, [SETTLED_STATUSES]);
     return rows.map(r => r.awb).filter(Boolean);
 }
 

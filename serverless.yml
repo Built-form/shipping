@@ -1,11 +1,56 @@
 service: shipping-serverless
 
 frameworkVersion: '3'
-useDotenv: true
+
+# ── Stage → environment naming ────────────────────────────────────────────────
+# The live PRODUCTION stack was first deployed under the Serverless default
+# stage "dev", and a CloudFormation stack cannot be renamed in place — renaming
+# would mean a brand-new stack, a new API Gateway URL, new Lambdas and an S3
+# data migration. So the stage stays "dev" and envName maps it to the honest
+# name: everything new (Secrets Manager secret names, schedule gating) keys off
+# custom.envName, never the raw stage. The only remaining "dev" is the existing
+# stack/bucket names in the AWS console.
+#   prod deploy:  bash deploy.sh          (stage dev  → envName prod)
+#   test deploy:  bash deploy.sh test     (stage test → envName test)
+custom:
+  envName: ${self:custom.envNames.${sls:stage}, sls:stage}
+  envNames:
+    dev: prod
+    test: test
+  # All deploy-time config/credentials live in AWS Secrets Manager, one flat
+  # JSON secret per environment: shipping/prod and shipping/test (eu-north-1).
+  # Resolved once at DEPLOY time via the SSM reference path and baked into the
+  # Lambda environment — no runtime fetch, no added latency. Rotating a value
+  # means updating the secret AND redeploying. Local runs (node tools/*.js) still
+  # read .env directly via dotenv and never touch this. Whoever runs a deploy
+  # needs secretsmanager:GetSecretValue.
+  #
+  # GOTCHA: for the fallback chains below (e.g. DB_PROXY_HOST → DB_HOST), a key
+  # that should "not be set" must be ABSENT from the secret JSON entirely — an
+  # empty string is a present value and wins over the fallback.
+  secrets: ${ssm:/aws/reference/secretsmanager/shipping/${self:custom.envName}}
+  # EventBridge schedules only run in prod: the test stack gets the same code and
+  # endpoints but must never ingest orders, mutate Mintsoft, register ShipsGo
+  # containers or send supplier email. Default false, so a new stage is silent
+  # until it's deliberately opted in. Disabled schedules still create the
+  # EventBridge rules (visible in the console, DISABLED) — a manual
+  # `aws lambda invoke` against the test stack still works when you want it to.
+  schedulesEnabled:
+    dev: true     # the "dev" stage IS production — see the note above
+    test: false
+  # Inverse gate for the nightly live→test S3 mirror: it runs from the TEST
+  # stack only (it reads the live bucket and writes the test one — prod never
+  # needs it). Keep its cron AFTER the nightly explorer→explorer-test DB
+  # replication finishes.
+  s3SyncEnabled:
+    test: true
 
 provider:
   name: aws
   runtime: nodejs18.x
+  # Explicit so the "dev" default is a documented choice, not an accident —
+  # see the stage → envName note at the top of this file.
+  stage: ${opt:stage, 'dev'}
   region: eu-north-1
   memorySize: 512
   timeout: 900
@@ -31,46 +76,50 @@ provider:
         audience:
           - '1085148951708-8qfkho7ilq084vvpo52jvc6fgg9ecdjt.apps.googleusercontent.com'
   environment:
+    # Every value below comes from the per-environment Secrets Manager secret
+    # (custom.secrets), resolved at deploy time. Local runs read .env directly
+    # via dotenv and never see this block.
+    #
     # Deployed Lambdas connect through the RDS Proxy (private VPC endpoint) via
-    # DB_PROXY_HOST; falls back to the direct instance (DB_HOST) if it's unset.
-    # Local runs read .env directly and never see this block, so they stay on
-    # DB_HOST = the publicly-reachable direct instance. (Same pattern as joshdex.)
-    DB_HOST: ${env:DB_PROXY_HOST, env:DB_HOST}
-    DB_USER: ${env:DB_USER}
-    DB_PASSWORD: ${env:DB_PASSWORD}
-    DB_NAME: ${env:DB_NAME}
-    DB_PORT: ${env:DB_PORT}
-    MINTSOFT_API_KEY: ${env:MINTSOFT_API_KEY}
-    MINTSOFT_CLIENT_ID: ${env:MINTSOFT_CLIENT_ID}
-    ASANA_PAT: ${env:ASANA_PAT}
-    AMAZON_SP_CLIENT_ID: ${env:AMAZON_SP_CLIENT_ID}
-    AMAZON_SP_CLIENT_SECRET: ${env:AMAZON_SP_CLIENT_SECRET}
-    AMAZON_SP_REFRESH_TOKEN: ${env:AMAZON_SP_REFRESH_TOKEN}
-    AMAZON_SP_CLIENT_ID_HW: ${env:AMAZON_SP_CLIENT_ID_HW}
-    AMAZON_SP_CLIENT_SECRET_HW: ${env:AMAZON_SP_CLIENT_SECRET_HW}
-    AMAZON_SP_REFRESH_TOKEN_HW: ${env:AMAZON_SP_REFRESH_TOKEN_HW}
+    # DB_PROXY_HOST; falls back to the direct instance (DB_HOST) if that key is
+    # absent from the secret. Local runs stay on DB_HOST = the publicly-reachable
+    # direct instance. (Same pattern as joshdex / jfpro.)
+    DB_HOST: ${self:custom.secrets.DB_PROXY_HOST, self:custom.secrets.DB_HOST}
+    DB_USER: ${self:custom.secrets.DB_USER}
+    DB_PASSWORD: ${self:custom.secrets.DB_PASSWORD}
+    DB_NAME: ${self:custom.secrets.DB_NAME}
+    DB_PORT: ${self:custom.secrets.DB_PORT}
+    MINTSOFT_API_KEY: ${self:custom.secrets.MINTSOFT_API_KEY}
+    MINTSOFT_CLIENT_ID: ${self:custom.secrets.MINTSOFT_CLIENT_ID}
+    ASANA_PAT: ${self:custom.secrets.ASANA_PAT}
+    AMAZON_SP_CLIENT_ID: ${self:custom.secrets.AMAZON_SP_CLIENT_ID}
+    AMAZON_SP_CLIENT_SECRET: ${self:custom.secrets.AMAZON_SP_CLIENT_SECRET}
+    AMAZON_SP_REFRESH_TOKEN: ${self:custom.secrets.AMAZON_SP_REFRESH_TOKEN}
+    AMAZON_SP_CLIENT_ID_HW: ${self:custom.secrets.AMAZON_SP_CLIENT_ID_HW}
+    AMAZON_SP_CLIENT_SECRET_HW: ${self:custom.secrets.AMAZON_SP_CLIENT_SECRET_HW}
+    AMAZON_SP_REFRESH_TOKEN_HW: ${self:custom.secrets.AMAZON_SP_REFRESH_TOKEN_HW}
     # Hangerworld US (North America) — same HW app, NA-authorized refresh token
-    AMAZON_SP_REFRESH_TOKEN_US: ${env:AMAZON_SP_REFRESH_TOKEN_US}
-    SHIPSGO_API_KEY: ${env:SHIPSGO_API_KEY}
-    MAKE_PO_SENT_WEBHOOK_URL: ${env:MAKE_PO_SENT_WEBHOOK_URL, ''}
+    AMAZON_SP_REFRESH_TOKEN_US: ${self:custom.secrets.AMAZON_SP_REFRESH_TOKEN_US}
+    SHIPSGO_API_KEY: ${self:custom.secrets.SHIPSGO_API_KEY}
+    MAKE_PO_SENT_WEBHOOK_URL: ${self:custom.secrets.MAKE_PO_SENT_WEBHOOK_URL, ''}
     PO_DOCS_BUCKET: shipping-purchase-orders-${sls:stage}
-    FRONT_API_TOKEN: ${env:FRONT_API_TOKEN, ''}
-    FRONT_CHANNEL_ID: ${env:FRONT_CHANNEL_ID, ''}
-    GEMINI_API_KEY: ${env:GEMINI_API_KEY, ''}
+    FRONT_API_TOKEN: ${self:custom.secrets.FRONT_API_TOKEN, ''}
+    FRONT_CHANNEL_ID: ${self:custom.secrets.FRONT_CHANNEL_ID, ''}
+    GEMINI_API_KEY: ${self:custom.secrets.GEMINI_API_KEY, ''}
     # Email receipt confirmation: optional static page (e.g. an S3-hosted
     # confirmation page) that the "Confirm receipt" click 302-redirects to after
     # recording it. Leave blank to render the built-in thank-you page from the
     # emailReceiptApi Lambda instead.
-    EMAIL_RECEIPT_REDIRECT_URL: ${env:EMAIL_RECEIPT_REDIRECT_URL, ''}
+    EMAIL_RECEIPT_REDIRECT_URL: ${self:custom.secrets.EMAIL_RECEIPT_REDIRECT_URL, ''}
     # Absolute base URL (scheme + host) of this API. The interactive confirm
     # endpoint derives it from the inbound request, but the auto-reminder sweep
     # (sendReceiptReminders) has no request — it needs this to build absolute
     # confirm links. Unset → the sweep skips (logs a warning), sending nothing.
-    PUBLIC_API_BASE_URL: ${env:PUBLIC_API_BASE_URL, ''}
+    PUBLIC_API_BASE_URL: ${self:custom.secrets.PUBLIC_API_BASE_URL, ''}
     # Email-receipt auto-reminders: hours between reminders per email, and the
     # cap on how many to ever send. Set MAX to 0 to disable auto-reminders.
-    RECEIPT_REMINDER_INTERVAL_HOURS: ${env:RECEIPT_REMINDER_INTERVAL_HOURS, '48'}
-    RECEIPT_REMINDER_MAX: ${env:RECEIPT_REMINDER_MAX, '5'}
+    RECEIPT_REMINDER_INTERVAL_HOURS: ${self:custom.secrets.RECEIPT_REMINDER_INTERVAL_HOURS, '48'}
+    RECEIPT_REMINDER_MAX: ${self:custom.secrets.RECEIPT_REMINDER_MAX, '5'}
     # Front -> Gemini order-status suggestion importer (frontStatusImport).
     # STATUS_IMPORT_DOMAINS: comma-separated extra supplier/forwarder domains
     # and/or full addresses to scan, on top of the suppliers tables. Hardcoded
@@ -78,31 +127,31 @@ provider:
     # whose order-linked emails the importer wasn't reaching). CONF_MIN: min
     # Gemini confidence (0..1) to surface a suggestion. MAX_GEMINI: per-run cap.
     STATUS_IMPORT_DOMAINS: 'szsunmed.com,roosin.com,kingphar.cn,yohohangers.com,likesgreen.com,joghninsole.com,dcglogistics.com,owentek.net,owentek.com,fabricfun.cn,china-fk.com,haodymedical.com.cn,tapeningbo.com,ullwin.com,aliyun.com,chinalongbow.com,dynamic-medical.com,intco.com,iso-medical.com.cn,yerconlab.com,youcareyk.com.cn,gxflight.com,medoffice.com.tr,packrich.com,realmould.com,rennington.com.cn,savinodelbene.com,tamhangers.com,aojmedical.com,eurofarm-spa.com,europa-worldwide.com,hangersfactorychina.com,qualityfreight.co.uk,yunhan.ltd,zhende.com,arisen-ltd.com,brightnonwoven.com,china-a2u.cn,healthandbeyond.cn,jiangheyicai.onaliyun.com,mkbmedical.com,mypocdoc.com,nbpassion.com.cn,pengfeihanger.com'
-    STATUS_IMPORT_CONF_MIN: ${env:STATUS_IMPORT_CONF_MIN, '0.6'}
-    STATUS_IMPORT_MAX_GEMINI: ${env:STATUS_IMPORT_MAX_GEMINI, '40'}
+    STATUS_IMPORT_CONF_MIN: ${self:custom.secrets.STATUS_IMPORT_CONF_MIN, '0.6'}
+    STATUS_IMPORT_MAX_GEMINI: ${self:custom.secrets.STATUS_IMPORT_MAX_GEMINI, '40'}
     # Incremental look-back: each run scans since the last fully-drained run minus
     # OVERLAP_HOURS, never further back than MAX_LOOKBACK_DAYS (outage cap).
-    STATUS_IMPORT_OVERLAP_HOURS: ${env:STATUS_IMPORT_OVERLAP_HOURS, '6'}
-    STATUS_IMPORT_MAX_LOOKBACK_DAYS: ${env:STATUS_IMPORT_MAX_LOOKBACK_DAYS, '7'}
+    STATUS_IMPORT_OVERLAP_HOURS: ${self:custom.secrets.STATUS_IMPORT_OVERLAP_HOURS, '6'}
+    STATUS_IMPORT_MAX_LOOKBACK_DAYS: ${self:custom.secrets.STATUS_IMPORT_MAX_LOOKBACK_DAYS, '7'}
     # Front email → order indexer (frontEmailIndex). Deterministic identifier
     # matching (PO/container/AWB/SKU/lot) over ALL recent Front mail, with a gated
     # Gemini Flash fallback on the no-identifier residual. MAX_GEMINI: per-run Flash
     # cap (cost guard). OVERLAP/MAX_LOOKBACK mirror the status importer's window.
-    EMAIL_INDEX_MAX_GEMINI: ${env:EMAIL_INDEX_MAX_GEMINI, '25'}
-    EMAIL_INDEX_OVERLAP_HOURS: ${env:EMAIL_INDEX_OVERLAP_HOURS, '6'}
-    EMAIL_INDEX_MAX_LOOKBACK_DAYS: ${env:EMAIL_INDEX_MAX_LOOKBACK_DAYS, '30'}
+    EMAIL_INDEX_MAX_GEMINI: ${self:custom.secrets.EMAIL_INDEX_MAX_GEMINI, '25'}
+    EMAIL_INDEX_OVERLAP_HOURS: ${self:custom.secrets.EMAIL_INDEX_OVERLAP_HOURS, '6'}
+    EMAIL_INDEX_MAX_LOOKBACK_DAYS: ${self:custom.secrets.EMAIL_INDEX_MAX_LOOKBACK_DAYS, '30'}
     # Absolute hard ceiling: no run (incremental OR a manual sinceDays backfill)
     # ever indexes email older than this. Six months.
-    EMAIL_INDEX_MAX_IMPORT_DAYS: ${env:EMAIL_INDEX_MAX_IMPORT_DAYS, '180'}
+    EMAIL_INDEX_MAX_IMPORT_DAYS: ${self:custom.secrets.EMAIL_INDEX_MAX_IMPORT_DAYS, '180'}
     # Remaining tunables (so the deployed Lambda can be retuned via env, not a
     # redeploy — most importantly the Flash model id if the preview is retired).
-    EMAIL_INDEX_GEMINI_MODEL: ${env:EMAIL_INDEX_GEMINI_MODEL, 'gemini-3-flash-preview'}
-    EMAIL_INDEX_MAX_CONVERSATIONS: ${env:EMAIL_INDEX_MAX_CONVERSATIONS, '4000'}
-    EMAIL_INDEX_MAX_PRODUCT_FANOUT: ${env:EMAIL_INDEX_MAX_PRODUCT_FANOUT, '12'}
-    EMAIL_INDEX_FUZZY_CAP: ${env:EMAIL_INDEX_FUZZY_CAP, '3'}
+    EMAIL_INDEX_GEMINI_MODEL: ${self:custom.secrets.EMAIL_INDEX_GEMINI_MODEL, 'gemini-3-flash-preview'}
+    EMAIL_INDEX_MAX_CONVERSATIONS: ${self:custom.secrets.EMAIL_INDEX_MAX_CONVERSATIONS, '4000'}
+    EMAIL_INDEX_MAX_PRODUCT_FANOUT: ${self:custom.secrets.EMAIL_INDEX_MAX_PRODUCT_FANOUT, '12'}
+    EMAIL_INDEX_FUZZY_CAP: ${self:custom.secrets.EMAIL_INDEX_FUZZY_CAP, '3'}
     # Shared six-digit code for the PUBLIC carton-scan receiving API
     # (cartonScanApi). Sent on the X-Quick-Auth header; checked in-handler.
-    RECEIVING_QUICK_AUTH_CODE: ${env:RECEIVING_QUICK_AUTH_CODE, ''}
+    RECEIVING_QUICK_AUTH_CODE: ${self:custom.secrets.RECEIVING_QUICK_AUTH_CODE, ''}
   iam:
     role:
       statements:
@@ -112,6 +161,28 @@ provider:
             - s3:GetObject
           Resource:
             - arn:aws:s3:::shipping-purchase-orders-${sls:stage}/*
+        # Nightly live→test S3 mirror (s3-sync-live-to-test.js; its schedule is
+        # enabled in the TEST stack only): list both sides, read live, write
+        # test. Bucket names are literal because the pairing is fixed regardless
+        # of which stack the role belongs to — the prod role simply never
+        # exercises these, since the function is only ever triggered in test.
+        - Effect: Allow
+          Action:
+            - s3:ListBucket
+          Resource:
+            - arn:aws:s3:::shipping-purchase-orders-dev
+            - arn:aws:s3:::shipping-purchase-orders-test
+        - Effect: Allow
+          Action:
+            - s3:GetObject
+          Resource:
+            - arn:aws:s3:::shipping-purchase-orders-dev/*
+        - Effect: Allow
+          Action:
+            - s3:PutObject
+            - s3:DeleteObject
+          Resource:
+            - arn:aws:s3:::shipping-purchase-orders-test/*
   # ── RDS Proxy access (VPC + NAT) ─────────────────────────────────────────
   # Every function joins the VPC so it can reach the shared RDS Proxy's private
   # endpoint (DB_PROXY_HOST). It connects to the SAME proxy / RDS instance as
@@ -259,7 +330,7 @@ functions:
     events:
       - schedule:
           rate: rate(1 hour)
-          enabled: true
+          enabled: ${self:custom.schedulesEnabled.${sls:stage}, false}
 
   # ── Amazon Stock Snapshot: requester ──
   # Runs hourly. Idempotent: only fires POST /reports for missing/FAILED jobs
@@ -272,7 +343,7 @@ functions:
     events:
       - schedule:
           rate: cron(0 7-21 * * ? *)
-          enabled: true
+          enabled: ${self:custom.schedulesEnabled.${sls:stage}, false}
 
   # ── Amazon Stock Snapshot: collector (polls + processes one unit per run) ──
   amazonStockCollector:
@@ -281,13 +352,16 @@ functions:
     events:
       - schedule:
           rate: cron(0/5 7-21 * * ? *)
-          enabled: true
+          enabled: ${self:custom.schedulesEnabled.${sls:stage}, false}
       # Daily backfill sweep after all units should be processed
       - schedule:
           rate: cron(30 21 * * ? *)
-          enabled: true
+          enabled: ${self:custom.schedulesEnabled.${sls:stage}, false}
           input: '{"job":"backfill"}'
 
+  # Retired importer — deliberately OFF in every environment (orders are no
+  # longer sourced from Asana), so this is a hard `false`, not the per-stage
+  # schedulesEnabled gate. Turning it back on means changing this line.
   importAsanaOrders:
     handler: src/handlers/import-asana-orders.handler
     reservedConcurrency: 2
@@ -302,16 +376,16 @@ functions:
     events:
       - schedule:
           rate: cron(55 8 * * ? *)
-          enabled: true
+          enabled: ${self:custom.schedulesEnabled.${sls:stage}, false}
       - schedule:
           rate: cron(55 11 * * ? *)
-          enabled: true
+          enabled: ${self:custom.schedulesEnabled.${sls:stage}, false}
       - schedule:
           rate: cron(55 14 * * ? *)
-          enabled: true
+          enabled: ${self:custom.schedulesEnabled.${sls:stage}, false}
       - schedule:
           rate: cron(55 17 * * ? *)
-          enabled: true
+          enabled: ${self:custom.schedulesEnabled.${sls:stage}, false}
 
   mintsoftLocationsSync:
     handler: src/handlers/mintsoft-locations-sync.handler
@@ -320,7 +394,7 @@ functions:
     events:
       - schedule:
           rate: cron(0 2 * * ? *)
-          enabled: true
+          enabled: ${self:custom.schedulesEnabled.${sls:stage}, false}
 
   shipsgoContainers:
     handler: src/handlers/shipsgo-containers.handler
@@ -331,7 +405,7 @@ functions:
           # Hourly: registration is the billed event, data pulls are free, so
           # tighter polling surfaces ETA slips / milestones sooner at ~zero cost.
           rate: rate(1 hour)
-          enabled: true
+          enabled: ${self:custom.schedulesEnabled.${sls:stage}, false}
 
   shipsgoAir:
     handler: src/handlers/shipsgo-air.handler
@@ -340,7 +414,7 @@ functions:
     events:
       - schedule:
           rate: rate(1 hour)
-          enabled: true
+          enabled: ${self:custom.schedulesEnabled.${sls:stage}, false}
 
   ordersFromShipsgo:
     handler: src/handlers/orders-from-shipsgo.handler
@@ -349,7 +423,7 @@ functions:
     events:
       - schedule:
           rate: rate(1 hour)
-          enabled: true
+          enabled: ${self:custom.schedulesEnabled.${sls:stage}, false}
 
   updateImportedDates:
     handler: src/handlers/update-imported-dates.handler
@@ -357,16 +431,16 @@ functions:
     events:
       - schedule:
           rate: cron(0 9 * * ? *)
-          enabled: true
+          enabled: ${self:custom.schedulesEnabled.${sls:stage}, false}
       - schedule:
           rate: cron(0 12 * * ? *)
-          enabled: true
+          enabled: ${self:custom.schedulesEnabled.${sls:stage}, false}
       - schedule:
           rate: cron(0 15 * * ? *)
-          enabled: true
+          enabled: ${self:custom.schedulesEnabled.${sls:stage}, false}
       - schedule:
           rate: cron(0 18 * * ? *)
-          enabled: true
+          enabled: ${self:custom.schedulesEnabled.${sls:stage}, false}
 
   # ── QC reports: auto-import from Front ──
   # Pulls new AQI inspection reports (attachment or jianguoyun link) out of Front
@@ -380,7 +454,7 @@ functions:
     events:
       - schedule:
           rate: rate(1 hour)
-          enabled: true
+          enabled: ${self:custom.schedulesEnabled.${sls:stage}, false}
 
   # ── Front -> Gemini order-status suggestions (hourly) ──
   # Reads recent inbound supplier emails from Front, asks Gemini to infer an
@@ -398,7 +472,7 @@ functions:
     events:
       - schedule:
           rate: rate(1 hour)
-          enabled: true
+          enabled: ${self:custom.schedulesEnabled.${sls:stage}, false}
 
   # ── Front email → order indexer (hourly) ──
   # Walks recent Front conversations (ALL senders), matches known order
@@ -415,7 +489,7 @@ functions:
     events:
       - schedule:
           rate: rate(1 hour)
-          enabled: true
+          enabled: ${self:custom.schedulesEnabled.${sls:stage}, false}
 
   # ── Daily alerts generator (nightly) ──
   # Aggregates the day's container ETAs + supplier ready dates into the
@@ -430,7 +504,7 @@ functions:
     events:
       - schedule:
           rate: cron(0 4 * * ? *)
-          enabled: true
+          enabled: ${self:custom.schedulesEnabled.${sls:stage}, false}
 
   # ── Email-receipt auto-reminders ──
   # Chases suppliers who haven't confirmed receipt of an email. The per-email
@@ -446,7 +520,25 @@ functions:
     events:
       - schedule:
           rate: rate(6 hours)
-          enabled: true
+          enabled: ${self:custom.schedulesEnabled.${sls:stage}, false}
+
+  # ── Nightly live→test S3 mirror ─────────────────────────────────────────────
+  # Copies new/changed objects from the live PO-docs bucket into the test bucket
+  # and deletes strays, so the S3 keys carried by the nightly DB replica resolve
+  # in the test app instead of 404ing against an empty bucket. Copies are
+  # server-side, so the inherited 512 MB is plenty regardless of object sizes;
+  # it stays on the provider VPC because those subnets already carry the free S3
+  # gateway endpoint. Schedule is enabled in the TEST stack ONLY (s3SyncEnabled)
+  # — 04:30 UTC, intended to land after the nightly explorer→explorer-test DB
+  # replication; move it if that window changes. concurrency 1 so a manual
+  # invoke can't overlap the tick.
+  s3SyncLiveToTest:
+    handler: src/handlers/s3-sync-live-to-test.handler
+    reservedConcurrency: 1
+    events:
+      - schedule:
+          rate: cron(30 4 * * ? *)
+          enabled: ${self:custom.s3SyncEnabled.${sls:stage}, false}
 
 #plugins:
 #  - serverless-offline

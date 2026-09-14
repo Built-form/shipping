@@ -21,7 +21,10 @@ const ORDER_SELECT = `
            COALESCE((SELECT SUM(quantity) FROM order_receipts WHERE order_id = orders.id AND type = 'not_received'), 0) AS not_received_quantity,
            (SELECT JSON_ARRAYAGG(draft_container_name)
               FROM draft_container_allocations
-             WHERE order_id = orders.id) AS draft_container_names
+             WHERE order_id = orders.id) AS draft_container_names,
+           (SELECT JSON_ARRAYAGG(planned_container_name)
+              FROM planned_container_allocations
+             WHERE order_id = orders.id) AS planned_container_names
     FROM orders
     WHERE orders.deleted_at IS NULL
 `;
@@ -31,8 +34,17 @@ function parseDates(raw) {
     return raw || {};
 }
 
+// MySQL's zero date ('0000-00-00 00:00:00') comes back from mysql2 as a JS
+// Date whose time value is NaN, and toISOString() on one throws RangeError —
+// which, from inside a .map() over the result set, fails the WHOLE request. A
+// single unrepresentable cell in one row 500s every order in the list, so these
+// helpers report an unusable date as "no date" rather than throwing.
+function isUnrepresentableDate(val) {
+    return val instanceof Date && Number.isNaN(val.getTime());
+}
+
 function formatDate(val) {
-    if (!val) return null;
+    if (!val || isUnrepresentableDate(val)) return null;
     return val.toISOString?.().slice(0, 10) ?? val;
 }
 
@@ -41,7 +53,7 @@ function formatDate(val) {
 // the calendar day. Returns a full ISO string for Date inputs, passes strings
 // through untouched.
 function formatDateTime(val) {
-    if (!val) return null;
+    if (!val || isUnrepresentableDate(val)) return null;
     return val.toISOString?.() ?? val;
 }
 
@@ -77,7 +89,8 @@ function receiptToJson(row) {
         idempotencyKey: row.idempotency_key || null,
         batchNo: row.batch_no || null,
         expiryDate: formatDate(row.expiry_date),
-        receivedAt: row.received_at?.toISOString?.() ?? row.received_at,
+        quarantined: !!row.quarantined,
+        receivedAt: formatDateTime(row.received_at),
     };
 }
 
@@ -94,6 +107,13 @@ function rowToOrder(row) {
             ? JSON.parse(row.draft_container_names)
             : row.draft_container_names;
     }
+    // Same treatment for the independent planned-container stream.
+    let partPlannedContainer = [];
+    if (row.planned_container_names) {
+        partPlannedContainer = typeof row.planned_container_names === 'string'
+            ? JSON.parse(row.planned_container_names)
+            : row.planned_container_names;
+    }
     return {
         id: row.id,
         jfCode: row.jf_code || null,
@@ -104,6 +124,7 @@ function rowToOrder(row) {
         notReceivedQuantity,
         outstandingQuantity: Math.max(quantity - receivedQuantity - notReceivedQuantity, 0),
         partDraftContainer,
+        partPlannedContainer,
         status: row.status,
         poNumber: row.po_number || null,
         supplier: row.supplier || null,

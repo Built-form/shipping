@@ -12,7 +12,7 @@
 // releases. Domain errors are thrown as `ReceiveError` carrying an HTTP status
 // + payload so each handler maps them to a response identically.
 
-const { getProductsByJfCode, createAsn, receiveAsnItems } = require('./mintsoft');
+const { getProductsByJfCode, createAsn, receiveAsnItems, quarantineStock } = require('./mintsoft');
 const { norm, normLot } = require('./qc-report-check');
 const { ORDER_SELECT, rowToOrder, receiptToJson, parseDates, normalizeExpiry } = require('../lib/order-shape');
 const { recordAudit } = require('../lib/audit');
@@ -33,7 +33,7 @@ class ReceiveError extends Error {
 // Validate + normalise the request inputs. Throws ReceiveError(400) on bad
 // input. Returns the cleaned values used by receiveOrderStock. Centralised here
 // so the authed API and the scan API enforce identical rules.
-function parseReceiveInput({ quantity, locationId, warehouseId, goodsInType, idempotencyKey, lotNumber, expiryDate }) {
+function parseReceiveInput({ quantity, locationId, warehouseId, goodsInType, idempotencyKey, lotNumber, expiryDate, quarantine }) {
     if (!locationId) throw new ReceiveError('INVALID_LOCATION', 400, 'locationId is required.');
     if (!warehouseId) throw new ReceiveError('INVALID_WAREHOUSE', 400, 'warehouseId is required.');
     if (!quantity || Number(quantity) <= 0) {
@@ -75,7 +75,20 @@ function parseReceiveInput({ quantity, locationId, warehouseId, goodsInType, ide
         idemKey = idempotencyKey;
     }
 
-    return { qty, suppliedLot, suppliedExpiry, goodsInTypeId, idemKey };
+    // Optional: book the units straight into quarantine instead of leaving them
+    // as normal sellable stock. Strict boolean — a typo'd string must not
+    // silently quarantine a receipt, so only true/false (and the string forms a
+    // form post sends) are accepted.
+    let quarantineFlag = false;
+    if (quarantine !== undefined && quarantine !== null && quarantine !== '') {
+        if (quarantine === true || quarantine === 'true' || quarantine === 1 || quarantine === '1') {
+            quarantineFlag = true;
+        } else if (!(quarantine === false || quarantine === 'false' || quarantine === 0 || quarantine === '0')) {
+            throw new ReceiveError('INVALID_QUARANTINE', 400, 'quarantine must be a boolean.');
+        }
+    }
+
+    return { qty, suppliedLot, suppliedExpiry, goodsInTypeId, idemKey, quarantineFlag };
 }
 
 // Receives a portion of an order into a Mintsoft location. Mirrors the original
@@ -94,13 +107,17 @@ function parseReceiveInput({ quantity, locationId, warehouseId, goodsInType, ide
 // replay `jfCode` is null (no snapshot needed), matching the original.
 async function receiveOrderStock(conn, params) {
     const { orderId, actorEmail } = params;
-    const { qty, suppliedLot, suppliedExpiry, goodsInTypeId, idemKey } = parseReceiveInput(params);
+    const { qty, suppliedLot, suppliedExpiry, goodsInTypeId, idemKey, quarantineFlag } = parseReceiveInput(params);
     const id = orderId;
 
     let committed = false;
     let asn = null;
     let jfCode = null;
     let orderRow = null;
+    // Set by the post-put-away quarantine movement; surfaced on the response so
+    // the caller can tell "quarantined" from "booked in as normal stock".
+    let quarantineApplied = false;
+    let quarantineError = null;
     try {
         await conn.beginTransaction();
 
@@ -263,17 +280,53 @@ async function receiveOrderStock(conn, params) {
             });
         }
 
+        // Optional quarantine (POST /Warehouse/StockMovement?Action=7). Mintsoft
+        // has no quarantine flag on goods-in, so this is a second call against
+        // the stock the put-away just created.
+        //
+        // Deliberately NOT inside the try above: the units are physically booked
+        // in by this point, so failing the whole receive (and rolling back our
+        // receipt row) would leave Mintsoft holding stock we have no record of —
+        // strictly worse than stock that's in the wrong state. Instead the
+        // receipt persists with quarantined = 0, which is the truth, and the
+        // caller gets `quarantine.error` to act on.
+        if (quarantineFlag) {
+            try {
+                await quarantineStock({
+                    productId,
+                    warehouseId: params.warehouseId,
+                    locationId: params.locationId,
+                    quantity: qty,
+                    // Must be the SAME batch + expiry the ASN allocation used —
+                    // that pair is how Mintsoft finds the units to move.
+                    batchNo: orderLot,
+                    expiryDate: orderExpiry,
+                    comment: `Order ${id} receipt${idemKey ? ` (${idemKey})` : ''}`,
+                });
+                quarantineApplied = true;
+            } catch (err) {
+                quarantineError = err?.response?.data?.Message || err.message;
+                log.error('[order-receive] quarantine failed AFTER stock was booked in', {
+                    orderId: id, jfCode, productId, quantity: qty,
+                    locationId: params.locationId, asnId: asn?.ID, error: quarantineError,
+                });
+            }
+        }
+
         // Persist receipt + (maybe) flip status
         await conn.query(
             `INSERT INTO order_receipts
                 (order_id, jf_code, quantity, location_id, warehouse_id,
-                 asn_id, asn_item_id, idempotency_key, batch_no, expiry_date, type)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'received')`,
+                 asn_id, asn_item_id, idempotency_key, batch_no, expiry_date, type, quarantined)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'received', ?)`,
             [
                 id, jfCode, qty, params.locationId, params.warehouseId,
                 asn.ID, asnItemId, idemKey,
                 orderLot,
                 orderExpiry,
+                // Records what Mintsoft actually did, not what was asked for —
+                // a failed quarantine leaves this 0 because the stock is normal.
+                quarantineApplied ? 1 : 0,
             ]
         );
 
@@ -333,6 +386,11 @@ async function receiveOrderStock(conn, params) {
             idempotent: false,
             jfCode,
             asin: orderRow.asin || '',
+            quarantine: {
+                requested: quarantineFlag,
+                applied: quarantineApplied,
+                error: quarantineError,
+            },
         };
     } catch (err) {
         if (!committed) {
