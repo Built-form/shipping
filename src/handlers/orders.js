@@ -18,6 +18,10 @@ const {
 // Mintsoft receiving path (see src/services/order-receive.js).
 const { ORDER_SELECT, parseDates, formatDate, formatDateTime, normalizeExpiry, receiptToJson, rowToOrder } = require('../lib/order-shape');
 const { recordAudit } = require('../lib/audit');
+// Draft-container registry + event writer: every draft mutation lands in
+// audit_log as entity_type 'draft_container' against a stable registry id, so
+// a draft's history outlives renames, conversion and deletion.
+const draftAudit = require('../lib/draft-audit');
 const {
     ensureEmailReceiptsSchema, apiBaseUrlFromReq, createEmailReceipt,
     linkReceiptToSend, appendReceiptLink,
@@ -267,6 +271,38 @@ const draftContainerAllocationsSchemaReady = (async () => {
                 if (!String(e.message || '').includes('Duplicate column')) throw e;
             }
         }
+        // Registry of every draft-container name that has ever existed. Drafts
+        // are otherwise implicit (defined by their allocation rows), so this is
+        // what gives audit_log a stable integer entity_id per draft: renames
+        // keep the id, and a row is never deleted — closing (conversion into a
+        // real container, or deletion) only stamps closed_* so the history stays
+        // reachable after the draft is gone. See src/lib/draft-audit.js.
+        await conn.query(`
+            CREATE TABLE IF NOT EXISTS draft_containers (
+                id INT NOT NULL AUTO_INCREMENT,
+                name VARCHAR(100) NOT NULL,
+                created_by_email VARCHAR(255) NULL,
+                created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+                last_activity_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+                closed_reason VARCHAR(16) NULL,
+                closed_at DATETIME NULL,
+                closed_by_email VARCHAR(255) NULL,
+                container_number VARCHAR(100) NULL,
+                PRIMARY KEY (id),
+                UNIQUE KEY uk_name (name),
+                KEY idx_last_activity (last_activity_at)
+            )
+        `);
+        // One-shot data migrations claim a row here (INSERT IGNORE inside the
+        // migration's own transaction) so they run exactly once across
+        // concurrent cold starts.
+        await conn.query(`
+            CREATE TABLE IF NOT EXISTS app_migrations (
+                name VARCHAR(64) NOT NULL,
+                applied_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (name)
+            )
+        `);
     } finally {
         conn.release();
     }
@@ -366,6 +402,24 @@ const qualityAssuranceSchemaReady = (async () => {
         conn.release();
     }
 })().catch(err => log.error('[orders] quality_assurance schema migration failed', err));
+
+// Draft registry + its one-time backfill. The backfill reads allocations,
+// draft documents AND quality_assurance_documents, so it waits for both
+// schemas; every draft route awaits this instead of the allocations schema so
+// a legacy draft is registered (with its reconstructed history) before any new
+// event is written against it.
+const draftRegistryReady = (async () => {
+    await draftContainerAllocationsSchemaReady;
+    await qualityAssuranceSchemaReady;
+    await auditLogSchemaReady;
+    const conn = await pool.getConnection();
+    try {
+        const { ran } = await draftAudit.backfillDraftRegistry(conn);
+        if (ran) log.info('[orders] draft_containers registry backfilled from existing drafts');
+    } finally {
+        conn.release();
+    }
+})().catch(err => log.error('[orders] draft_containers registry backfill failed', err));
 
 // deepEqual / diffSnapshots / recordAudit moved to src/lib/audit.js (imported
 // above) so the receive service can write identical before/after audit rows.
@@ -2627,6 +2681,7 @@ app.post('/api/v1/draft-containers', async (req, res) => {
         if (!name) return res.status(400).json({ error: 'draftContainerName is required.' });
         if (!Number.isFinite(qty) || qty < 0) return res.status(400).json({ error: 'allocated must be a non-negative number.' });
 
+        await draftRegistryReady;
         const result = await withConnection(async (conn) => {
             const [orderRows] = await conn.query('SELECT id FROM orders WHERE id = ? AND deleted_at IS NULL', [oid]);
             if (!orderRows.length) return { orderNotFound: true };
@@ -2636,6 +2691,14 @@ app.post('/api/v1/draft-containers', async (req, res) => {
                     [oid, name, qty]
                 );
                 const [rs] = await conn.query(`${DRAFT_ALLOC_SELECT} WHERE dca.id = ?`, [ins.insertId]);
+                // First line into a new name registers the draft (its "create"
+                // event); every line records itself against the draft's id.
+                const reg = await draftAudit.ensureDraftRegistered(conn, name, req.userEmail);
+                await draftAudit.recordDraftAudit(conn, {
+                    draftId: reg.id, action: 'line_added',
+                    after: { draftName: reg.name, ...draftAudit.lineSnapshot(rs[0]) },
+                    userEmail: req.userEmail,
+                });
                 return { row: rs[0] };
             } catch (e) {
                 if (e.code === 'ER_DUP_ENTRY') return { duplicate: true };
@@ -2675,14 +2738,46 @@ app.put('/api/v1/draft-containers/:id', async (req, res) => {
         }
         if (!fields.length) return res.status(400).json({ error: 'No fields to update.' });
 
+        await draftRegistryReady;
         const result = await withConnection(async (conn) => {
-            const [existing] = await conn.query('SELECT id FROM draft_container_allocations WHERE id = ?', [id]);
+            const [existing] = await conn.query(`${DRAFT_ALLOC_SELECT} WHERE dca.id = ?`, [id]);
             if (!existing.length) return { notFound: true };
+            const before = existing[0];
             try {
                 values.push(id);
                 await conn.query(`UPDATE draft_container_allocations SET ${fields.join(', ')} WHERE id = ?`, values);
                 const [rs] = await conn.query(`${DRAFT_ALLOC_SELECT} WHERE dca.id = ?`, [id]);
-                return { row: rs[0] };
+                const after = rs[0];
+
+                // A per-line name change is the line MOVING between drafts (the
+                // whole-draft rename is POST /draft-containers/rename): removed
+                // from the old draft, added to the new. A quantity change on the
+                // same draft is line_updated.
+                const beforeSnap = draftAudit.lineSnapshot(before);
+                const afterSnap = draftAudit.lineSnapshot(after);
+                if (before.draft_container_name !== after.draft_container_name) {
+                    const src = await draftAudit.ensureDraftRegistered(conn, before.draft_container_name, req.userEmail);
+                    await draftAudit.recordDraftAudit(conn, {
+                        draftId: src.id, action: 'line_removed',
+                        before: { draftName: src.name, ...beforeSnap, movedTo: after.draft_container_name },
+                        userEmail: req.userEmail,
+                    });
+                    const dst = await draftAudit.ensureDraftRegistered(conn, after.draft_container_name, req.userEmail);
+                    await draftAudit.recordDraftAudit(conn, {
+                        draftId: dst.id, action: 'line_added',
+                        after: { draftName: dst.name, ...afterSnap, movedFrom: before.draft_container_name },
+                        userEmail: req.userEmail,
+                    });
+                } else if (beforeSnap.allocated !== afterSnap.allocated) {
+                    const reg = await draftAudit.ensureDraftRegistered(conn, after.draft_container_name, req.userEmail);
+                    await draftAudit.recordDraftAudit(conn, {
+                        draftId: reg.id, action: 'line_updated',
+                        before: { draftName: reg.name, ...beforeSnap },
+                        after: { draftName: reg.name, ...afterSnap },
+                        userEmail: req.userEmail,
+                    });
+                }
+                return { row: after };
             } catch (e) {
                 if (e.code === 'ER_DUP_ENTRY') return { duplicate: true };
                 throw e;
@@ -2697,19 +2792,122 @@ app.put('/api/v1/draft-containers/:id', async (req, res) => {
     }
 });
 
-// Hard delete — these rows are pure planning state, no audit history to keep.
+// Hard delete of one line. The row itself is planning state, but its removal
+// is recorded against the draft's registry id so the draft's history keeps it.
 app.delete('/api/v1/draft-containers/:id', async (req, res) => {
     try {
-        await draftContainerAllocationsSchemaReady;
+        await draftRegistryReady;
         const { id } = req.params;
         const deleted = await withConnection(async (conn) => {
+            const [existing] = await conn.query(`${DRAFT_ALLOC_SELECT} WHERE dca.id = ?`, [id]);
             const [r] = await conn.query('DELETE FROM draft_container_allocations WHERE id = ?', [id]);
+            if (r.affectedRows > 0 && existing.length) {
+                const row = existing[0];
+                const reg = await draftAudit.ensureDraftRegistered(conn, row.draft_container_name, req.userEmail);
+                await draftAudit.recordDraftAudit(conn, {
+                    draftId: reg.id, action: 'line_removed',
+                    before: { draftName: reg.name, ...draftAudit.lineSnapshot(row) },
+                    userEmail: req.userEmail,
+                });
+            }
             return r.affectedRows > 0;
         });
         if (!deleted) return res.status(404).json({ error: `Allocation ${id} not found.` });
         res.json({ ok: true, id: Number(id) });
     } catch (error) {
         log.error('[DELETE /draft-containers/:id]', error);
+        res.status(500).json({ error: 'An internal error occurred.' });
+    }
+});
+
+// ── Draft container lifecycle (whole-draft operations) ────────────────────
+// Rename a draft everywhere it is keyed by name — allocations, quote/forwarder
+// documents, QA documents — in one transaction, under its existing registry
+// id. Replaces the per-line PUT fan-out (which could split a draft in two on a
+// partial failure and left the draft's documents behind under the old name).
+// Body: { from, to }. 404 unknown draft · 409 target name already in use.
+app.post('/api/v1/draft-containers/rename', async (req, res) => {
+    try {
+        await draftRegistryReady;
+        const { from, to } = req.body || {};
+        if (typeof from !== 'string' || !from.trim()) return res.status(400).json({ error: 'from is required.' });
+        if (typeof to !== 'string' || !to.trim()) return res.status(400).json({ error: 'to is required.' });
+        if (to.trim().length > 100) return res.status(400).json({ error: 'to must be 100 characters or fewer.' });
+
+        const result = await withConnection(async (conn) => {
+            await conn.beginTransaction();
+            try {
+                const r = await draftAudit.renameDraft(conn, { from, to, userEmail: req.userEmail });
+                if (r.notFound || r.conflict || r.invalid || r.unchanged) { await conn.rollback(); return r; }
+                await conn.commit();
+                return r;
+            } catch (e) {
+                await conn.rollback();
+                throw e;
+            }
+        });
+        if (result.invalid) return res.status(400).json({ error: 'from and to are required.' });
+        if (result.notFound) return res.status(404).json({ error: `Draft container "${from.trim()}" not found.` });
+        if (result.conflict) return res.status(409).json({ error: `A draft container named "${to.trim()}" already exists.` });
+        if (result.unchanged) return res.json({ ok: true, name: from.trim(), allocations: 0, documents: 0, qaDocuments: 0, unchanged: true });
+        res.json({ ok: true, id: result.id, name: result.name, allocations: result.allocations, documents: result.documents, qaDocuments: result.qaDocuments });
+    } catch (error) {
+        log.error('[POST /draft-containers/rename]', error);
+        res.status(500).json({ error: 'An internal error occurred.' });
+    }
+});
+
+// Close a draft: delete every allocation in one statement and record why.
+// Body: { name, reason: 'deleted' | 'converted', containerNumber?,
+//         externalContainerNumber?, vesselName?, eta?, etd?, freightType?,
+//         port?, awbNumber?, packs? } — the conversion details are stored on
+// the 'converted' event so the history says which real container it became.
+// Idempotent: closing an already-closed draft is a no-op 200.
+app.post('/api/v1/draft-containers/close', async (req, res) => {
+    try {
+        await draftRegistryReady;
+        const body = req.body || {};
+        const { name, reason } = body;
+        if (typeof name !== 'string' || !name.trim()) return res.status(400).json({ error: 'name is required.' });
+        if (reason !== 'deleted' && reason !== 'converted') return res.status(400).json({ error: "reason must be 'deleted' or 'converted'." });
+        if (reason === 'converted' && (typeof body.containerNumber !== 'string' || !body.containerNumber.trim())) {
+            return res.status(400).json({ error: 'containerNumber is required when reason is converted.' });
+        }
+
+        const result = await withConnection(async (conn) => {
+            await conn.beginTransaction();
+            try {
+                const r = await draftAudit.closeDraft(conn, { name, reason, userEmail: req.userEmail, details: body });
+                if (r.notFound || r.invalid) { await conn.rollback(); return r; }
+                await conn.commit();
+                return r;
+            } catch (e) {
+                await conn.rollback();
+                throw e;
+            }
+        });
+        if (result.invalid) return res.status(400).json({ error: 'name and reason are required.' });
+        if (result.notFound) return res.status(404).json({ error: `Draft container "${name.trim()}" not found.` });
+        res.json({ ok: true, id: result.id, name: result.name, reason, deleted: result.deleted, alreadyClosed: !!result.alreadyClosed });
+    } catch (error) {
+        log.error('[POST /draft-containers/close]', error);
+        res.status(500).json({ error: 'An internal error occurred.' });
+    }
+});
+
+// Registry of every draft container that has ever existed, with live counts,
+// newest activity first. Query: ?name= exact lookup · ?q= substring on name /
+// container number · ?status= open | empty | converted | deleted | closed ·
+// ?limit= (default 500, max 2000). A draft's history is then
+// GET /audit-log?entityType=draft_container&entityId=<id>.
+app.get('/api/v1/draft-container-registry', async (req, res) => {
+    try {
+        await draftRegistryReady;
+        const { name, q, status, limit } = req.query;
+        const data = await withConnection(conn => draftAudit.listDraftRecords(conn, { name, q, status, limit }));
+        res.json({ data });
+    } catch (error) {
+        log.error('[GET /draft-container-registry]', error);
         res.status(500).json({ error: 'An internal error occurred.' });
     }
 });
@@ -3210,32 +3408,54 @@ app.post(/^\/api\/v1\/draft-containers\/(.+)\/generate\/?$/, async (req, res) =>
         // the forwarder email can attach the whole set.
         const batchId = wantSplit ? uuidv4() : null;
 
+        await draftRegistryReady;
         const result = await withConnection(async (conn) => {
             const main = await generateDraftDocument(conn, {
                 name, docType, supplierName, comments, generatedByEmail: req.userEmail, batchId,
             });
             if (main.noLines) return { noLines: true };
-            if (!wantSplit) return { main };
 
-            // One PDF per supplier, best-effort: a single supplier failing (or
-            // having no lines after filtering) must not lose the main PDF or the
-            // other suppliers. Collect outcomes for the response.
-            const suppliers = await loadDraftSuppliers(conn, name);
-            const supplierDocuments = [];
-            const failedSuppliers = [];
-            for (const s of suppliers) {
-                try {
-                    const doc = await generateDraftDocument(conn, {
-                        name, docType: 'forwarder-quote', supplierName: s,
-                        comments, generatedByEmail: req.userEmail, batchId,
-                    });
-                    if (!doc.noLines) supplierDocuments.push(doc);
-                } catch (err) {
-                    log.error(`[generate] supplier-quote failed for "${s}"`, err);
-                    failedSuppliers.push(s);
+            let out = { main };
+            if (wantSplit) {
+                // One PDF per supplier, best-effort: a single supplier failing (or
+                // having no lines after filtering) must not lose the main PDF or the
+                // other suppliers. Collect outcomes for the response.
+                const suppliers = await loadDraftSuppliers(conn, name);
+                const supplierDocuments = [];
+                const failedSuppliers = [];
+                for (const s of suppliers) {
+                    try {
+                        const doc = await generateDraftDocument(conn, {
+                            name, docType: 'forwarder-quote', supplierName: s,
+                            comments, generatedByEmail: req.userEmail, batchId,
+                        });
+                        if (!doc.noLines) supplierDocuments.push(doc);
+                    } catch (err) {
+                        log.error(`[generate] supplier-quote failed for "${s}"`, err);
+                        failedSuppliers.push(s);
+                    }
                 }
+                out = { main, supplierDocuments, failedSuppliers };
             }
-            return { main, supplierDocuments, failedSuppliers };
+
+            // One event per generate run (a split run lists its per-supplier
+            // copies inside the event rather than becoming N rows).
+            const reg = await draftAudit.ensureDraftRegistered(conn, name, req.userEmail);
+            await draftAudit.recordDraftAudit(conn, {
+                draftId: reg.id, action: 'document_generated',
+                after: {
+                    draftName: reg.name,
+                    documentId: main.documentId, type: docType, supplier: supplierName, version: main.version,
+                    url: main.url, csvUrl: main.csvUrl, batchId,
+                    comments: comments ? String(comments).slice(0, 500) : null,
+                    supplierDocuments: (out.supplierDocuments || []).map(d => ({
+                        documentId: d.documentId, supplier: d.supplier, version: d.version, url: d.url, csvUrl: d.csvUrl,
+                    })),
+                    failedSuppliers: out.failedSuppliers || [],
+                },
+                userEmail: req.userEmail,
+            });
+            return out;
         });
 
         if (result.noLines) {
@@ -3347,6 +3567,7 @@ app.get(/^\/api\/v1\/draft-containers\/(.+)\/documents\/?$/, async (req, res) =>
 app.post('/api/v1/draft-container-documents/:id/email', async (req, res) => {
     try {
         await draftContainerAllocationsSchemaReady;
+        await draftRegistryReady;
         await auditLogSchemaReady;
         await emailTemplatesSchemaReady;
         await emailReceiptsSchemaReady;
@@ -3509,6 +3730,23 @@ app.post('/api/v1/draft-container-documents/:id/email', async (req, res) => {
             const sentAt = sentRow[0]?.sent_at?.toISOString?.() ?? sentRow[0]?.sent_at ?? null;
             await linkReceiptToSend(conn, receiptToken, 'draft_container_document_sends', primarySendId);
 
+            // One email = one draft event, listing every PDF it carried.
+            const reg = await draftAudit.ensureDraftRegistered(conn, doc.draft_container_name, req.userEmail);
+            await draftAudit.recordDraftAudit(conn, {
+                draftId: reg.id, action: 'document_sent',
+                after: {
+                    draftName: reg.name,
+                    documentId: doc.id, type: doc.type || 'quote', supplier: doc.supplier || null, version: doc.version,
+                    sendId: primarySendId, sentTo: toAddresses, subject: finalSubject,
+                    frontMessageUid, frontConversationId, receiptToken,
+                    attachments: attachments.map(a => ({
+                        documentId: a.doc.id, type: a.doc.type || 'quote', supplier: a.doc.supplier || null,
+                        version: a.doc.version, filename: a.pdf.filename, csvFilename: a.csv ? a.csv.filename : null,
+                    })),
+                },
+                userEmail: req.userEmail,
+            });
+
             return {
                 ok: true,
                 sendId: primarySendId,
@@ -3640,6 +3878,7 @@ async function loadQualityAssuranceForPdf(conn, orderIds, qcUnitsByOrderId) {
 app.post('/api/v1/quality-assurance/generate', async (req, res) => {
     try {
         await qualityAssuranceSchemaReady;
+        await draftRegistryReady;
         if (!PO_BUCKET) return res.status(500).json({ error: 'PO_DOCS_BUCKET env var not configured.' });
         // orderIds: which orders become rows (and the rows shown are limited to
         // these). qcUnits: optional { orderId: number } map printed in the QC
@@ -3722,6 +3961,19 @@ app.post('/api/v1/quality-assurance/generate', async (req, res) => {
                       WHERE id = ?`,
                     [ref, s3Key, publicUrl, pdfBuffer.length, csvS3Key, csvPublicUrl, csvBuffer.length, newId]
                 );
+                // A QA sheet raised from a draft container is part of that
+                // draft's story; untagged sheets belong to no draft.
+                if (draftName) {
+                    const reg = await draftAudit.ensureDraftRegistered(conn, draftName, req.userEmail);
+                    await draftAudit.recordDraftAudit(conn, {
+                        draftId: reg.id, action: 'qa_document_generated',
+                        after: {
+                            draftName: reg.name, documentId: newId, ref, version, orderIds: ids, rowCount: lines.length,
+                            url: publicUrl, csvUrl: csvPublicUrl, comments: comments ? String(comments).slice(0, 500) : null,
+                        },
+                        userEmail: req.userEmail,
+                    });
+                }
                 await conn.commit();
                 return { documentId: newId, ref, version, draftContainerName: draftName, publicUrl, csvPublicUrl, fileSize: pdfBuffer.length, csvFileSize: csvBuffer.length, rowCount: lines.length };
             } catch (err) {
@@ -3835,6 +4087,7 @@ app.get('/api/v1/quality-assurance/documents', async (req, res) => {
 app.post('/api/v1/quality-assurance-documents/:id/email', async (req, res) => {
     try {
         await qualityAssuranceSchemaReady;
+        await draftRegistryReady;
         await emailTemplatesSchemaReady;
         await emailReceiptsSchemaReady;
 
@@ -3856,7 +4109,8 @@ app.post('/api/v1/quality-assurance-documents/:id/email', async (req, res) => {
 
         const result = await withConnection(async (conn) => {
             const [docRows] = await conn.query(
-                `SELECT id, ref, version, s3_key, csv_s3_key, order_ids, qc_units FROM quality_assurance_documents
+                `SELECT id, ref, version, s3_key, csv_s3_key, order_ids, qc_units, draft_container_name
+                   FROM quality_assurance_documents
                   WHERE id = ? AND deleted_at IS NULL`,
                 [id]
             );
@@ -3956,6 +4210,19 @@ app.post('/api/v1/quality-assurance-documents/:id/email', async (req, res) => {
             );
             const sentAt = sentRow[0]?.sent_at?.toISOString?.() ?? sentRow[0]?.sent_at ?? null;
             await linkReceiptToSend(conn, receiptToken, 'quality_assurance_document_sends', sendInsert.insertId);
+
+            if (doc.draft_container_name) {
+                const reg = await draftAudit.ensureDraftRegistered(conn, doc.draft_container_name, req.userEmail);
+                await draftAudit.recordDraftAudit(conn, {
+                    draftId: reg.id, action: 'qa_document_sent',
+                    after: {
+                        draftName: reg.name, documentId: doc.id, ref: refLabel, version: doc.version,
+                        sendId: sendInsert.insertId, sentTo: toAddresses, subject: finalSubject,
+                        frontMessageUid, frontConversationId, receiptToken, filename,
+                    },
+                    userEmail: req.userEmail,
+                });
+            }
 
             return {
                 ok: true,

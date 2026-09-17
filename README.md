@@ -241,6 +241,17 @@ All endpoints require a Google JWT `Authorization` header (bypassed in local dev
 | `POST` | `/api/v1/containers/pack` | Bulk-pack orders into a container |
 | `PATCH` | `/api/v1/containers/:containerNumber/status` | Update status for all orders in a container |
 
+### Draft containers — lifecycle and history
+
+Every draft container has a permanent history (lines, documents, emails, renames, conversion / deletion) kept in `audit_log` as `entity_type = 'draft_container'` against a stable id from the `draft_containers` registry. See [docs/draft-container-audit-frontend.md](docs/draft-container-audit-frontend.md).
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/v1/draft-containers/rename` | Rename a draft everywhere it is keyed by name (lines, documents, QA sheets) in one transaction; `409` if the target name is in use |
+| `POST` | `/api/v1/draft-containers/close` | Delete every line of a draft and record why — `reason: 'deleted'` or `'converted'` (+ the real container's details) |
+| `GET` | `/api/v1/draft-container-registry` | Every draft that ever existed, with status and live counts (`?name=`, `?q=`, `?status=`, `?limit=`) |
+| `GET` | `/api/v1/audit-log?entityType=draft_container&entityId=…` | One draft's full history |
+
 ### Stock Snapshots
 
 | Method | Path | Description |
@@ -573,6 +584,35 @@ npm run offline
 ```
 
 Auth is bypassed locally when `NODE_ENV=development` or `IS_OFFLINE` is set — requests are attributed to `local@dev`.
+
+### Frontend against a local API (no deploy)
+
+Same arrangement as JFPRO's `api/`: run this backend on your machine and point a
+local ShipLine at it, so routes can be tried before they are deployed anywhere.
+
+```bash
+# 1. here — auth bypassed (IS_OFFLINE), role admin, port 3031 (JFPRO's local
+#    api/ owns 3001 and is often up at the same time). Prints the database it
+#    will write to first: keep .env on the TEST instance.
+npm run dev:local
+
+# 2. in ../ShipLine — one gitignored file, one line:
+#      .env.development.local   →   VITE_API_BASE_URL=http://localhost:3031
+#    then the frontend on port 3030 (mode development reads that file;
+#    `vite build` never does)
+npm run dev:local
+# -> http://localhost:3030 talking to http://localhost:3031
+```
+
+`ORDERS_PORT` and `LOCAL_USER_TYPE` (`admin` | `standard`) override the
+defaults. Other gateways (JFPRO, Cashboard, Workflows) still resolve to their
+TEST stacks — only ShipLine's own API is local. Delete
+`.env.development.local` to go back to the deployed test stack. Mind that
+emails (Front), Mintsoft and S3 are the real integrations from `.env`.
+
+Sanity check while it runs: `node tools/test-draft-container-audit.js <orderA> <orderB>`
+(the older `tools/test-*.js` scripts default to port 3001 — pass
+`TEST_BASE_URL=http://localhost:3031` to point them here).
 
 ### Invoke a scheduled Lambda manually
 
