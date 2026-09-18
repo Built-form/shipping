@@ -31,9 +31,9 @@ orders when they move through the old routes or the hourly ShipsGo sync, but a
 ROAD shipment marked in transit is never pulled back by its `CONSOLIDATED` orders.
 `storedStage` and `derivedStage` are returned too.
 
-**Booked shipments read from their orders.** For `BOOKED` and later, `eta`,
-`vesselName` and `trackingRef` come from the member orders (the ShipsGo sync
-keeps those current), falling back to the stored values.
+**Booked shipments read from their orders.** For `BOOKED` and later, `etd`,
+`eta`, `vesselName` and `trackingRef` come from the member orders (the ShipsGo
+sync keeps those current), falling back to the stored values.
 
 **Drafts and planned containers are shipments.** A draft is a `DRAFT` shipment
 whose lines are its allocations; a planned container is a `PLANNED` one. Reusing
@@ -153,8 +153,10 @@ line) · `404 LINE_NOT_FOUND` · `409 NOT_OPEN`.
 
 One transaction: packs the draft's lines (or the given subset of them) exactly
 as `POST /containers/pack` does — a full line updates the order, a partial line
-splits it — **plus** the carrier ref (on the right column by its shape) and the
-ETD that today's two-call flow loses; closes the legacy draft as `converted`;
+splits it — **plus** what Create Real used to write order by order afterwards:
+the carrier ref (on the right column by its shape), the ETD
+(`estimatedDepartureDate`) and the origin port (`port`); closes the legacy
+draft as `converted`;
 moves the shipment to `BOOKED`. The reference is the explicit one, else the
 number the draft's name reserves if still free, else the next in the mode's
 sequence (`ROAD` needs an explicit one). Either everything happens or nothing

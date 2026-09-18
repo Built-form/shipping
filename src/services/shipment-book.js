@@ -21,9 +21,10 @@
 //      /scan Lambda can commit during the lock wait, and a plain SUM would read
 //      the older snapshot). A partial pack of an order with receipts refuses the
 //      whole booking;
-//   5. pack: a full pack is exactly the UPDATE legacy pack issues, plus the
-//      carrier ref and estimated_departure_date that legacy loses; a partial
-//      pack is splitOrder;
+//   5. pack: a full pack is exactly the UPDATE legacy pack issues, plus what
+//      ShipLine's Create Real used to write order by order afterwards — the
+//      carrier ref, estimated_departure_date and the origin port (orders.port);
+//      a partial pack is splitOrder, with the same values on the packed slice;
 //   6. close the legacy draft ('converted', with the form details) through
 //      draftAudit.closeDraft, realise the manifest (one line per packed order
 //      row), move the shipment to BOOKED, audit.
@@ -230,6 +231,7 @@ function makeBookShipment(deps) {
                 const vals = [reference, vesselName, eta, JSON.stringify(dates), ship.id];
                 if (carrierCol) { sets.push(`${carrierCol} = ?`); vals.push(trackingRef); }
                 if (etd) { sets.push('estimated_departure_date = ?'); vals.push(etd); }
+                if (originPort) { sets.push('port = ?'); vals.push(originPort); }
                 await conn.query(`UPDATE orders SET ${sets.join(', ')} WHERE id = ?`, [...vals, order.id]);
                 packedRowIds.push(order.id);
                 audits.push({ id: order.id, before: beforeById.get(order.id), action: 'update' });
@@ -237,6 +239,7 @@ function makeBookShipment(deps) {
                 const overrides = { container_number: reference, vessel_name: vesselName, eta };
                 if (carrierCol) overrides[carrierCol] = trackingRef;
                 if (etd) overrides.estimated_departure_date = etd;
+                if (originPort) overrides.port = originPort;
                 const r = await splitOrder(conn, {
                     order, splitQuantity: qty, overrides, status: 'CONSOLIDATED', receiptsByOrderId: received,
                 });

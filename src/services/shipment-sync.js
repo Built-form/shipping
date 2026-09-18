@@ -999,7 +999,7 @@ function shipmentSelect({ where = [], effectiveWhere = [], orderBy = 'COALESCE(z
             FROM (
               SELECT s.*,
                      COALESCE(m.member_count, 0) AS member_count,
-                     m.member_eta, m.member_vessel, m.member_ext, m.member_awb,
+                     m.member_eta, m.member_etd, m.member_vessel, m.member_ext, m.member_awb,
                      COALESCE(l.line_count, 0) AS line_count,
                      CASE WHEN s.stage IN (${BOOKED_IN}) THEN COALESCE(m.member_units, 0)
                           ELSE COALESCE(l.line_units, 0) END AS total_units,
@@ -1017,6 +1017,7 @@ function shipmentSelect({ where = [], effectiveWhere = [], orderBy = 'COALESCE(z
                            SUM(o.status = 'ARRIVED_AT_WAREHOUSE') AS n_arrived,
                            SUM(o.status IN ('ON_SEA', 'ON_AIR')) AS n_transit,
                            MAX(o.eta) AS member_eta,
+                           MAX(o.estimated_departure_date) AS member_etd,
                            MAX(NULLIF(TRIM(o.vessel_name), '')) AS member_vessel,
                            MAX(NULLIF(TRIM(o.external_container_number), '')) AS member_ext,
                            MAX(NULLIF(TRIM(o.awb_number), '')) AS member_awb

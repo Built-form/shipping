@@ -269,8 +269,8 @@ function num(v) {
 // API shape of a shipments row. When the row comes from the effective-stage
 // query (SHIPMENT_SELECT in shipment-sync.js) it carries derived_stage,
 // effective_stage and the member aggregates; for a booked shipment the member
-// orders' eta / vessel / carrier ref win over the stored copies (those exist
-// for rollout step 4).
+// orders' etd / eta / vessel / carrier ref win over the stored copies (those
+// exist for rollout step 4).
 function rowToShipment(row) {
     if (!row) return null;
     const stored = row.stage;
@@ -298,7 +298,7 @@ function rowToShipment(row) {
         forwarder: row.forwarder || null,
         vesselName: (booked && clean(row.member_vessel)) || row.vessel_name || null,
         originPort: row.origin_port || null,
-        etd: dateOnly(row.etd),
+        etd: (booked && dateOnly(row.member_etd)) || dateOnly(row.etd),
         eta: (booked && dateOnly(row.member_eta)) || dateOnly(row.eta),
         ata: dateOnly(row.ata),
         notes: row.notes || null,

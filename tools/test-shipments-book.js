@@ -42,15 +42,18 @@ async function run() {
     const booked = r.data;
     check('header from the form: tracking ref, etd, origin port', booked.trackingRef === 'SHPU7654321' && booked.etd === '2026-10-15' && booked.originPort === 'Ningbo', booked);
     const a = await H.getOrder(A.id);
-    check('full pack: A is CONSOLIDATED in R1 with the carrier ref and ETD legacy used to lose',
+    check('full pack: A is CONSOLIDATED in R1 with the carrier ref, ETD and port Create Real used to write afterwards',
         a.status === 'CONSOLIDATED' && a.container_number === R1 && a.external_container_number === 'SHPU7654321'
-        && a.estimated_departure_date === '2026-10-15' && a.vessel_name === 'SHIPTEST VESSEL' && a.shipment_id === s.id, a);
+        && a.estimated_departure_date === '2026-10-15' && a.vessel_name === 'SHIPTEST VESSEL' && a.port === 'Ningbo'
+        && a.shipment_id === s.id, a);
     const b = await H.getOrder(B.id);
     const [child] = await H.sql(`SELECT * FROM orders WHERE container_number = ? AND id <> ? AND deleted_at IS NULL`, [R1, A.id]);
     check('partial pack: B keeps 60, untouched otherwise', b.quantity === 60 && b.status === 'READY' && b.container_number === null && b.shipment_id === null, b);
     check('partial pack: the split child carries 40 in R1 and copies the order',
         child && child.quantity === 40 && child.status === 'CONSOLIDATED' && child.shipment_id === s.id
-        && child.lot_number === 'SHIPLOT' && Number(child.unit_price) === 1.25 && child.jf_code === B.jfCode, child);
+        && child.lot_number === 'SHIPLOT' && Number(child.unit_price) === 1.25 && child.jf_code === B.jfCode
+        && child.port === 'Ningbo', child);
+    check('partial pack: the remaining order keeps its own port', b.port === B.port || (b.port == null && B.port == null), { was: B.port, now: b.port });
     if (child) H.created.orders.push(child.id);
     const d = await H.shipment(s.id);
     check('the manifest is the packed rows', d.lines.length === 2 && d.lines.some(l => l.orderId === A.id && l.quantity === 100)

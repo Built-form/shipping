@@ -141,6 +141,10 @@ function verifySummary(v) {
 
 async function cleanup() {
     console.log('\nCleanup');
+    // A partial pack splits the order server-side and the slice copies its JF
+    // code, so no suite tracks it: sweep this run's fixtures by code as well.
+    const strays = await sql(`SELECT id FROM orders WHERE deleted_at IS NULL AND jf_code LIKE ?`, [`SHIPTEST-${STAMP}-%`]);
+    for (const { id } of strays) if (!created.orders.includes(id)) created.orders.push(id);
     let orders = 0;
     for (const id of created.orders) {
         const r = await api.delete(`/api/v1/orders/${id}`);

@@ -169,20 +169,23 @@ test('auditSnapshot strips shipmentId and nothing else', () => {
     assert.equal(S.auditSnapshot(plain), plain);
 });
 
-test('rowToShipment: booked shipments read eta / vessel / carrier ref from their members', () => {
+test('rowToShipment: booked shipments read etd / eta / vessel / carrier ref from their members', () => {
     const s = S.rowToShipment({
         id: 5, reference: '308', stage: 'BOOKED', derived_stage: 'IN_TRANSIT', effective_stage: 'IN_TRANSIT', mode: 'SEA',
         tracking_ref: 'OLDU0000000', member_ext: 'MRKU4645188', member_awb: null, eta: '2026-09-01', member_eta: '2026-09-20',
+        etd: null, member_etd: '2026-08-19',
         vessel_name: null, member_vessel: 'EVER GIVEN', needs_review: 0, member_count: 26, total_units: '1000',
     });
     assert.equal(s.stage, 'IN_TRANSIT');
     assert.equal(s.storedStage, 'BOOKED');
     assert.equal(s.trackingRef, 'MRKU4645188');
+    assert.equal(s.etd, '2026-08-19');
     assert.equal(s.eta, '2026-09-20');
     assert.equal(s.vesselName, 'EVER GIVEN');
     assert.equal(s.totalUnits, 1000);
-    const d = S.rowToShipment({ id: 6, stage: 'DRAFT', open_key: 'D:x', tracking_ref: 'X', member_ext: 'Y' });
+    const d = S.rowToShipment({ id: 6, stage: 'DRAFT', open_key: 'D:x', tracking_ref: 'X', member_ext: 'Y', etd: '2026-10-01', member_etd: '2026-11-01' });
     assert.equal(d.trackingRef, 'X', 'a draft has no members to read from');
+    assert.equal(d.etd, '2026-10-01', 'a draft keeps its own etd');
 });
 
 // ── shadow(): arming, kill switch, both transaction modes ─────────────────
