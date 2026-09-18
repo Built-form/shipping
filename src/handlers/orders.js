@@ -960,6 +960,10 @@ const purchaseOrdersSchemaReady = (async () => {
             `ALTER TABLE purchase_orders ADD KEY idx_company_id (company_id)`,
             `ALTER TABLE purchase_orders ADD COLUMN deleted_at DATETIME NULL`,
             `ALTER TABLE purchase_order_documents ADD COLUMN public_url VARCHAR(1000) NULL`,
+            // DELETE /purchase-orders/:id soft-deletes a PO's documents with it.
+            // The column was never created, so that route 500ed after it had
+            // already soft-deleted the PO and its orders.
+            `ALTER TABLE purchase_order_documents ADD COLUMN deleted_at DATETIME NULL`,
             // NOTE: `allowed_emails` (joshdex's shared table) is deliberately no
             // longer migrated from here — this app owns shipping_allowed_emails
             // instead. See src/lib/allowed-emails.js.
@@ -8229,7 +8233,9 @@ async function loadPurchaseOrdersForOrders(conn, orders) {
     const liveIds = pos.map(p => p.id);
     const ph = liveIds.map(() => '?').join(',');
 
-    // Documents (+ their email sends). This table has no deleted_at column.
+    // Documents (+ their email sends). A document is only ever soft-deleted
+    // together with its PO, and deleted POs are already excluded above, so
+    // there is no deleted_at filter here.
     const [docRows] = await conn.query(
         `SELECT id, purchase_order_id, version, s3_key, public_url, file_size,
                 generated_by_email, generated_at
