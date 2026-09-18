@@ -58,6 +58,55 @@ It's attached to each invoice in the existing invoices list — no new fetch:
 ] }
 ```
 
+### Cross-PO feed — `GET /api/v1/purchase-order-invoice-payments`
+
+For screens that need every payment instruction at once (ShipLine's
+**Payments flow** page), rather than one PO at a time:
+
+```json
+{ "data": [ { "id": 1, "invoiceId": 59, "purchaseOrderId": 307, "paymentType": "deposit", "…": "…" } ] }
+```
+
+- Same row shape as the `payment` object above, one row per invoice.
+- Only invoices and POs that are not soft-deleted; all `paymentStatus` values
+  are included — filter client-side.
+- No query parameters or pagination (a few hundred small rows at most).
+- `GET /api/v1/orders` is unchanged: its PO bundles still carry `latestCheck`
+  per invoice but not `payment`. Join this feed to the bundle by `invoiceId`.
+
+### Company payment rules — `/api/v1/payment-rules`
+
+The company's own policy layered over the supplier's terms, used only by the
+Payments flow page: grace days, "deposit only after artwork is confirmed",
+"balance only once the telex is released / a document is attached", a fixed
+deposit %. One `default` rule plus per-supplier overrides.
+
+```
+GET    /api/v1/payment-rules          → { data: PaymentRule[] }   (any allowlisted user)
+PUT    /api/v1/payment-rules          → PaymentRule               (admin only; upsert by scope + supplierName)
+DELETE /api/v1/payment-rules/:id      → 204                       (admin only; the default rule cannot be deleted)
+```
+
+```json
+{
+  "scope": "supplier",                 // "default" | "supplier"
+  "supplierName": "Suzhou Sunmed Co., Ltd",   // required for supplier scope; matched punctuation-blind to the PO's supplier / JFPRO name
+  "depositPct": null,                  // 0–100, null = from the terms
+  "depositTrigger": "artwork_confirmed", // null | po_sent | artwork_confirmed | pi_uploaded | pi_signed
+  "depositGraceDays": 0,               // 0–90; on a supplier rule 0 = use the default's
+  "balanceTrigger": "telex_release",   // null | before_dispatch | bl | telex_release | container_document | arrival | delivery | invoice
+  "balanceDocumentType": null,         // required when balanceTrigger = container_document
+  "balanceOffsetDays": null,           // -180–365, null = from the terms, negative = before the trigger
+  "balanceGraceDays": 2,               // 0–90
+  "notes": "..."
+}
+```
+
+Telex / document triggers need the container entity (separate branch) to
+report `telexReleasedAt` / attached documents; until then the page dates them
+from the B/L and flags them "awaiting telex / document". Every write is
+recorded in `audit_log` as `entity_type = 'payment_rule'`.
+
 ### Important rendering rules
 
 - **`payment` is `null` until the check finishes.** Upload kicks off the check

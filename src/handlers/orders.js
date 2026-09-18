@@ -7473,6 +7473,238 @@ app.put('/api/v1/purchase-orders/:poId/invoices/:invoiceId/payment-status', asyn
     }
 });
 
+// GET /api/v1/purchase-order-invoice-payments
+// Every extracted payment instruction across all live POs, in one query — the
+// cross-PO feed the Payments flow page joins against the orders + PO bundles
+// it already holds. Same JSON per row as the `payment` object on
+// GET /purchase-orders/:id/invoices; rows whose invoice or PO is soft-deleted
+// are left out. All statuses are included (pending/arranged/paid/skipped) —
+// the client decides what counts. Read-only, so no role check beyond the
+// allowlist middleware. Deliberately NOT folded into GET /orders: that payload
+// is polled every 5 s by every operator screen and stays as it is.
+app.get('/api/v1/purchase-order-invoice-payments', async (req, res) => {
+    try {
+        await purchaseOrdersSchemaReady;
+        const rows = await withConnection(async (conn) => {
+            const [payRows] = await conn.query(
+                `SELECT p.*
+                   FROM purchase_order_invoice_payments p
+                   JOIN purchase_order_invoices i ON i.id = p.purchase_order_invoice_id AND i.deleted_at IS NULL
+                   JOIN purchase_orders po        ON po.id = p.purchase_order_id        AND po.deleted_at IS NULL
+                  ORDER BY p.purchase_order_id, p.id`
+            );
+            return payRows;
+        });
+        res.json({ data: rows.map(invoicePaymentRowToJson) });
+    } catch (error) {
+        log.error('[GET /purchase-order-invoice-payments]', error);
+        res.status(500).json({ error: 'An internal error occurred.' });
+    }
+});
+
+// ── Payment rules ────────────────────────────────────────────────────────
+// The company's own payment policy, layered over the supplier's terms: grace
+// days, "deposit only after artwork is confirmed", "balance only once the
+// telex is released", a fixed deposit % that overrides the PI text. One
+// `default` rule (supplier_name '') plus per-supplier overrides, keyed by the
+// JFPRO supplier name lower-cased. Every field is nullable except grace —
+// null means "take it from the terms". Read by everyone, written by admins.
+// The Payments flow page (ShipLine) is the only consumer.
+const PAYMENT_RULE_DEPOSIT_TRIGGERS = ['po_sent', 'artwork_confirmed', 'pi_uploaded', 'pi_signed'];
+const PAYMENT_RULE_BALANCE_TRIGGERS = ['before_dispatch', 'bl', 'telex_release', 'container_document', 'arrival', 'delivery', 'invoice'];
+
+const paymentRulesSchemaReady = (async () => {
+    const conn = await pool.getConnection();
+    try {
+        await conn.query(`
+            CREATE TABLE IF NOT EXISTS payment_rules (
+                id INT NOT NULL AUTO_INCREMENT,
+                scope ENUM('default', 'supplier') NOT NULL,
+                supplier_name VARCHAR(255) NOT NULL DEFAULT '',
+                supplier_label VARCHAR(255) NULL,
+                deposit_pct DECIMAL(6,3) NULL,
+                deposit_trigger VARCHAR(32) NULL,
+                deposit_grace_days INT NOT NULL DEFAULT 0,
+                balance_trigger VARCHAR(32) NULL,
+                balance_document_type VARCHAR(64) NULL,
+                balance_offset_days INT NULL,
+                balance_grace_days INT NOT NULL DEFAULT 0,
+                notes VARCHAR(500) NULL,
+                updated_by_email VARCHAR(255) NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                PRIMARY KEY (id),
+                UNIQUE KEY uk_scope_supplier (scope, supplier_name)
+            )
+        `);
+    } finally {
+        conn.release();
+    }
+})().catch(err => log.error('[orders] payment_rules schema migration failed', err));
+
+function paymentRuleRowToJson(r) {
+    if (!r) return null;
+    return {
+        id: r.id,
+        scope: r.scope,
+        supplierName: r.scope === 'supplier' ? r.supplier_name : null,
+        supplierLabel: r.supplier_label || null,
+        depositPct: r.deposit_pct != null ? Number(r.deposit_pct) : null,
+        depositTrigger: r.deposit_trigger || null,
+        depositGraceDays: Number(r.deposit_grace_days) || 0,
+        balanceTrigger: r.balance_trigger || null,
+        balanceDocumentType: r.balance_document_type || null,
+        balanceOffsetDays: r.balance_offset_days != null ? Number(r.balance_offset_days) : null,
+        balanceGraceDays: Number(r.balance_grace_days) || 0,
+        notes: r.notes || null,
+        updatedByEmail: r.updated_by_email || null,
+        createdAt: r.created_at?.toISOString?.() ?? r.created_at,
+        updatedAt: r.updated_at?.toISOString?.() ?? r.updated_at,
+    };
+}
+
+// Validates and normalises a rule body. Returns { error } or { row }.
+function parsePaymentRuleBody(body) {
+    const b = body && typeof body === 'object' ? body : {};
+    const scope = b.scope === 'supplier' ? 'supplier' : b.scope === 'default' ? 'default' : null;
+    if (!scope) return { error: 'scope must be "default" or "supplier".' };
+    const label = typeof b.supplierName === 'string' ? b.supplierName.trim() : '';
+    if (scope === 'supplier' && !label) return { error: 'supplierName is required for a supplier rule.' };
+    const intOrNull = (v, name, min, max) => {
+        if (v == null || v === '') return { value: null };
+        const n = Number(v);
+        if (!Number.isInteger(n) || n < min || n > max) return { error: `${name} must be a whole number between ${min} and ${max}.` };
+        return { value: n };
+    };
+    const pct = b.depositPct == null || b.depositPct === '' ? { value: null } : (() => {
+        const n = Number(b.depositPct);
+        return Number.isFinite(n) && n >= 0 && n <= 100 ? { value: n } : { error: 'depositPct must be between 0 and 100.' };
+    })();
+    if (pct.error) return { error: pct.error };
+    const depositTrigger = b.depositTrigger == null || b.depositTrigger === '' ? null : String(b.depositTrigger);
+    if (depositTrigger && !PAYMENT_RULE_DEPOSIT_TRIGGERS.includes(depositTrigger)) return { error: `depositTrigger must be one of: ${PAYMENT_RULE_DEPOSIT_TRIGGERS.join(', ')}.` };
+    const balanceTrigger = b.balanceTrigger == null || b.balanceTrigger === '' ? null : String(b.balanceTrigger);
+    if (balanceTrigger && !PAYMENT_RULE_BALANCE_TRIGGERS.includes(balanceTrigger)) return { error: `balanceTrigger must be one of: ${PAYMENT_RULE_BALANCE_TRIGGERS.join(', ')}.` };
+    const docType = typeof b.balanceDocumentType === 'string' && b.balanceDocumentType.trim() ? b.balanceDocumentType.trim().slice(0, 64) : null;
+    if (balanceTrigger === 'container_document' && !docType) return { error: 'balanceDocumentType is required when the balance is due on a container document.' };
+    const depGrace = intOrNull(b.depositGraceDays, 'depositGraceDays', 0, 90);
+    const balGrace = intOrNull(b.balanceGraceDays, 'balanceGraceDays', 0, 90);
+    const offset = intOrNull(b.balanceOffsetDays, 'balanceOffsetDays', -180, 365);
+    for (const r of [depGrace, balGrace, offset]) if (r.error) return { error: r.error };
+    return {
+        row: {
+            scope,
+            supplier_name: scope === 'supplier' ? label.toLowerCase() : '',
+            supplier_label: scope === 'supplier' ? label : null,
+            deposit_pct: pct.value,
+            deposit_trigger: depositTrigger,
+            deposit_grace_days: depGrace.value ?? 0,
+            balance_trigger: balanceTrigger,
+            balance_document_type: balanceTrigger === 'container_document' ? docType : null,
+            balance_offset_days: offset.value,
+            balance_grace_days: balGrace.value ?? 0,
+            notes: typeof b.notes === 'string' && b.notes.trim() ? b.notes.trim().slice(0, 500) : null,
+        },
+    };
+}
+
+// GET /api/v1/payment-rules — every rule, default first.
+app.get('/api/v1/payment-rules', async (req, res) => {
+    try {
+        await paymentRulesSchemaReady;
+        const rows = await withConnection(async (conn) => {
+            const [r] = await conn.query(`SELECT * FROM payment_rules ORDER BY scope = 'default' DESC, supplier_label, id`);
+            return r;
+        });
+        res.json({ data: rows.map(paymentRuleRowToJson) });
+    } catch (error) {
+        log.error('[GET /payment-rules]', error);
+        res.status(500).json({ error: 'An internal error occurred.' });
+    }
+});
+
+// PUT /api/v1/payment-rules — upsert by (scope, supplierName). Admin only.
+// Body: { scope, supplierName?, depositPct?, depositTrigger?, depositGraceDays?,
+//         balanceTrigger?, balanceDocumentType?, balanceOffsetDays?, balanceGraceDays?, notes? }
+app.put('/api/v1/payment-rules', async (req, res) => {
+    try {
+        if (req.userType !== 'admin') return res.status(403).json({ error: 'Admin access required.' });
+        await auditLogSchemaReady;
+        await paymentRulesSchemaReady;
+        const parsed = parsePaymentRuleBody(req.body);
+        if (parsed.error) return res.status(400).json({ error: parsed.error });
+        const row = parsed.row;
+        const saved = await withConnection(async (conn) => {
+            const [existing] = await conn.query(
+                `SELECT * FROM payment_rules WHERE scope = ? AND supplier_name = ?`,
+                [row.scope, row.supplier_name]
+            );
+            const before = existing[0] ? paymentRuleRowToJson(existing[0]) : null;
+            await conn.query(
+                `INSERT INTO payment_rules
+                    (scope, supplier_name, supplier_label, deposit_pct, deposit_trigger, deposit_grace_days,
+                     balance_trigger, balance_document_type, balance_offset_days, balance_grace_days, notes, updated_by_email)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 ON DUPLICATE KEY UPDATE
+                    supplier_label = VALUES(supplier_label), deposit_pct = VALUES(deposit_pct),
+                    deposit_trigger = VALUES(deposit_trigger), deposit_grace_days = VALUES(deposit_grace_days),
+                    balance_trigger = VALUES(balance_trigger), balance_document_type = VALUES(balance_document_type),
+                    balance_offset_days = VALUES(balance_offset_days), balance_grace_days = VALUES(balance_grace_days),
+                    notes = VALUES(notes), updated_by_email = VALUES(updated_by_email)`,
+                [row.scope, row.supplier_name, row.supplier_label, row.deposit_pct, row.deposit_trigger, row.deposit_grace_days,
+                 row.balance_trigger, row.balance_document_type, row.balance_offset_days, row.balance_grace_days, row.notes, req.userEmail || null]
+            );
+            const [rb] = await conn.query(`SELECT * FROM payment_rules WHERE scope = ? AND supplier_name = ?`, [row.scope, row.supplier_name]);
+            const after = paymentRuleRowToJson(rb[0]);
+            await recordAudit(conn, {
+                entityType: 'payment_rule',
+                entityId: after.id,
+                action: before ? 'update' : 'create',
+                before,
+                after,
+                userEmail: req.userEmail,
+            });
+            return after;
+        });
+        res.json(saved);
+    } catch (error) {
+        log.error('[PUT /payment-rules]', error);
+        res.status(500).json({ error: 'An internal error occurred.' });
+    }
+});
+
+// DELETE /api/v1/payment-rules/:id — admin only; the default rule cannot be deleted.
+app.delete('/api/v1/payment-rules/:id', async (req, res) => {
+    try {
+        if (req.userType !== 'admin') return res.status(403).json({ error: 'Admin access required.' });
+        await auditLogSchemaReady;
+        await paymentRulesSchemaReady;
+        const id = Number(req.params.id);
+        if (!Number.isInteger(id)) return res.status(400).json({ error: 'Invalid rule id.' });
+        const result = await withConnection(async (conn) => {
+            const [rows] = await conn.query(`SELECT * FROM payment_rules WHERE id = ?`, [id]);
+            if (!rows.length) return { notFound: true };
+            if (rows[0].scope === 'default') return { isDefault: true };
+            await conn.query(`DELETE FROM payment_rules WHERE id = ?`, [id]);
+            await recordAudit(conn, {
+                entityType: 'payment_rule',
+                entityId: id,
+                action: 'delete',
+                before: paymentRuleRowToJson(rows[0]),
+                after: null,
+                userEmail: req.userEmail,
+            });
+            return {};
+        });
+        if (result.notFound) return res.status(404).json({ error: 'Rule not found.' });
+        if (result.isDefault) return res.status(400).json({ error: 'The default rule cannot be deleted — clear its fields instead.' });
+        res.status(204).end();
+    } catch (error) {
+        log.error('[DELETE /payment-rules/:id]', error);
+        res.status(500).json({ error: 'An internal error occurred.' });
+    }
+});
+
 // ── Purchase Order Signed PIs (PI_signed) ────────────────────────────────
 // A signed proforma invoice attached to a PO. Same upload mechanics as
 // purchase_order_invoices (base64 → public S3 under a `signed-pis/` prefix),
