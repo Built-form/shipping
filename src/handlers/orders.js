@@ -37,6 +37,16 @@ const { ensureDailyAlertsSchema, listAlerts, listHistory, actOnAlert, getSuggest
 // plus the /api/v1/users CRUD that manages it.
 const { ensureAllowedEmailsSchema, lookupUserType, registerUserRoutes } = require('../lib/allowed-emails');
 const T = require('../lib/order-transitions');
+// Shipments: one row per physical movement of goods. Through rollout step 3
+// it is a derived shadow of the legacy container columns and the draft /
+// planned tables: the routes that write those call one fail-soft hook
+// (shipmentSync.shadow) that is inert until the backfill arms it. See
+// src/services/shipment-sync.js and the /api/v1/shipments routes registered at
+// the bottom of this file.
+const shipmentSync = require('../services/shipment-sync');
+const { registerShipmentRoutes } = require('../services/shipment-routes');
+const { makeSplitOrder } = require('../services/order-split');
+const shipmentsLib = require('../lib/shipments');
 
 const app = express();
 
@@ -972,6 +982,48 @@ const purchaseOrdersSchemaReady = (async () => {
     }
 })().catch(err => log.error('[orders] purchase_orders schema migration failed', err));
 
+// Shipments tables + the shipment_id columns on orders, draft_containers,
+// draft_container_documents and quality_assurance_documents. The migration
+// files (src/db/migrations/2026-09-18_*) are hand-applied before each deploy;
+// this is the fallback for a fresh environment. The prerequisite schemas are
+// awaited BEFORE taking a connection: with connectionLimit 1, holding it while
+// waiting would hang every later request in this warm Lambda.
+const shipmentsSchemaReady = (async () => {
+    await draftContainerAllocationsSchemaReady;
+    await qualityAssuranceSchemaReady;
+    await purchaseOrdersSchemaReady;
+    const conn = await pool.getConnection();
+    try {
+        await shipmentSync.ensureShipmentsSchema(conn);
+    } finally {
+        conn.release();
+    }
+})().catch(err => log.error('[orders] shipments schema migration failed', err));
+
+// Failure-row key for an order-membership hook: the shipment reference when the
+// orders carry one (so a bulk operation failing repeatedly is one row with a
+// counter), else the order ids.
+function membershipKey(orders, reference = null) {
+    const ref = shipmentsLib.clean(reference);
+    if (ref) return { keyKind: 'reference', keyValue: ref };
+    const refs = [...new Set((orders || []).map(o => shipmentsLib.clean(o && o.containerNumber)).filter(Boolean))].sort();
+    if (refs.length) return { keyKind: 'reference', keyValue: refs.join(',') };
+    return {
+        keyKind: 'order',
+        keyValue: (orders || []).map(o => o && o.id).filter(Boolean).sort((a, b) => a - b).join(','),
+    };
+}
+
+// Put the shipmentId a membership hook settled on into the response orders.
+// Called only after the route's audit rows and webhook, so it never reaches
+// either.
+function patchShipmentIds(orders, byOrderId) {
+    if (!byOrderId) return;
+    for (const o of orders) {
+        if (o && Object.prototype.hasOwnProperty.call(byOrderId, o.id)) o.shipmentId = byOrderId[o.id];
+    }
+}
+
 // ── Email whitelist middleware ────────────────────────────────────────────
 // Checks `shipping_allowed_emails` — THIS app's own table, managed through
 // /api/v1/users. It used to read `allowed_emails`, which joshdex's API creates
@@ -1461,7 +1513,7 @@ function buildNettedStatusMap(rows, reflectedSettledFor) {
 app.get('/api/v1/orders', async (req, res) => {
     try {
         await purchaseOrdersSchemaReady;
-        const { orders, purchaseOrders } = await withConnection(async (conn) => {
+        const { orders, purchaseOrders, shipments } = await withConnection(async (conn) => {
             const [rows] = await conn.query(`${ORDER_SELECT} ORDER BY orders.created_at DESC`);
             const orders = rows.map(rowToOrder);
             // Deduplicated side-map: every PO referenced by these orders
@@ -1469,9 +1521,13 @@ app.get('/api/v1/orders', async (req, res) => {
             // signed-PI/payment bundle, keyed by PO id. Many order lines share
             // one PO, so we attach it once here rather than per-line.
             const purchaseOrders = await loadPurchaseOrdersForOrders(conn, orders);
-            return { orders, purchaseOrders };
+            // Same pattern for the shipment each order travels in (by
+            // orders.shipment_id). Never fails the list: a missing table or
+            // column just yields {}.
+            const shipments = await shipmentSync.loadShipmentsForOrders(conn, orders);
+            return { orders, purchaseOrders, shipments };
         });
-        res.status(200).json({ data: orders, purchaseOrders });
+        res.status(200).json({ data: orders, purchaseOrders, shipments });
     } catch (error) {
         log.error('[GET /orders]', error);
         res.status(500).json({ error: 'An internal error occurred.' });
@@ -1483,6 +1539,7 @@ app.post('/api/v1/orders', async (req, res) => {
     try {
         await auditLogSchemaReady;
         await poSentWebhooksSchemaReady;
+        await shipmentsSchemaReady;
         const b = req.body || {};
         const status = typeof b.status === 'string' ? b.status.trim() : '';
         if (!status) return res.status(400).json({ error: 'status is required.' });
@@ -1503,12 +1560,16 @@ app.post('/api/v1/orders', async (req, res) => {
             const created = rowToOrder(rows[0]);
             await recordAudit(conn, {
                 entityType: 'order', entityId: created.id, action: 'create',
-                before: null, after: created, userEmail: req.userEmail,
+                before: null, after: shipmentsLib.auditSnapshot(created), userEmail: req.userEmail,
             });
             await recordPoAttachmentChange(conn, {
                 before: null, after: created, userEmail: req.userEmail,
             });
             await firePoSentWebhookIfNeeded(conn, created);
+            const linked = await shipmentSync.shadow(conn, {
+                site: 'POST /orders', inTx: false, ...membershipKey([created]),
+            }, c => shipmentSync.syncOrderMembership(c, [created.id], { userEmail: req.userEmail }));
+            patchShipmentIds([created], linked);
             return created;
         });
         res.status(201).json(order);
@@ -1523,6 +1584,7 @@ app.put('/api/v1/orders/:id', async (req, res) => {
     try {
         await auditLogSchemaReady;
         await poSentWebhooksSchemaReady;
+        await shipmentsSchemaReady;
         const result = await withConnection(async (conn) => {
             const { id } = req.params;
             const b = req.body || {};
@@ -1614,6 +1676,10 @@ app.put('/api/v1/orders/:id', async (req, res) => {
                 before: beforeOrder, after: updated, userEmail: req.userEmail,
             });
             await firePoSentWebhookIfNeeded(conn, updated);
+            const linked = await shipmentSync.shadow(conn, {
+                site: 'PUT /orders/:id', inTx: false, ...membershipKey([updated, beforeOrder]),
+            }, c => shipmentSync.syncOrderMembership(c, [updated.id], { userEmail: req.userEmail }));
+            patchShipmentIds([updated], linked);
             return { order: updated };
         });
 
@@ -1632,6 +1698,7 @@ app.patch('/api/v1/orders/:id/status', async (req, res) => {
     try {
         await auditLogSchemaReady;
         await poSentWebhooksSchemaReady;
+        await shipmentsSchemaReady;
         const { status } = req.body || {};
         if (!status) return res.status(400).json({ error: 'status is required.' });
 
@@ -1657,6 +1724,10 @@ app.patch('/api/v1/orders/:id/status', async (req, res) => {
                 before: beforeOrder, after: updated, userEmail: req.userEmail,
             });
             await firePoSentWebhookIfNeeded(conn, updated);
+            const linked = await shipmentSync.shadow(conn, {
+                site: 'PATCH /orders/:id/status', inTx: false, ...membershipKey([updated]),
+            }, c => shipmentSync.syncOrderMembership(c, [updated.id], { userEmail: req.userEmail }));
+            patchShipmentIds([updated], linked);
             return { order: updated };
         });
 
@@ -1675,6 +1746,7 @@ app.patch('/api/v1/orders/:id/status', async (req, res) => {
 app.delete('/api/v1/orders/:id', async (req, res) => {
     try {
         await auditLogSchemaReady;
+        await shipmentsSchemaReady;
         const { id } = req.params;
         const result = await withConnection(async (conn) => {
             const [existing] = await conn.query(`${ORDER_SELECT} AND orders.id = ?`, [id]);
@@ -1693,13 +1765,17 @@ app.delete('/api/v1/orders/:id', async (req, res) => {
             );
             await recordAudit(conn, {
                 entityType: 'order', entityId: Number(id), action: 'delete',
-                before: beforeOrder, after: null, userEmail: req.userEmail,
+                before: shipmentsLib.auditSnapshot(beforeOrder), after: null, userEmail: req.userEmail,
             });
             // A soft-deleted order is effectively detached from its PO from
             // every read path's perspective — surface that on the PO timeline.
             await recordPoAttachmentChange(conn, {
                 before: beforeOrder, after: null, userEmail: req.userEmail,
             });
+            // It leaves its booked manifest; draft / planned lines stay, as in legacy.
+            await shipmentSync.shadow(conn, {
+                site: 'DELETE /orders/:id', inTx: false, ...membershipKey([beforeOrder]),
+            }, c => shipmentSync.syncOrderMembership(c, [Number(id)], { userEmail: req.userEmail }));
             return { ok: true };
         });
         if (result.notFound) return res.status(404).json({ error: `Order ${result.notFound} not found.` });
@@ -2134,6 +2210,7 @@ app.get('/api/v1/mintsoft/warehouses/:warehouseId/locations', async (req, res) =
 app.post('/api/v1/orders/:id/split', async (req, res) => {
     try {
         await auditLogSchemaReady;
+        await shipmentsSchemaReady;
         const { splitQuantity, containerNumber } = req.body || {};
 
         if (!splitQuantity || splitQuantity <= 0) {
@@ -2191,15 +2268,19 @@ app.post('/api/v1/orders/:id/split', async (req, res) => {
                 });
                 await recordAudit(conn, {
                     entityType: 'order', entityId: createdOrder.id, action: 'create',
-                    before: null, after: createdOrder, userEmail: req.userEmail,
+                    before: null, after: shipmentsLib.auditSnapshot(createdOrder), userEmail: req.userEmail,
                 });
                 // The clone inherits purchase_order_id from the original via
                 // orderInsertValues, so the PO gains a new line in audit terms.
                 await recordPoAttachmentChange(conn, {
                     before: null, after: createdOrder, userEmail: req.userEmail,
                 });
+                const linked = await shipmentSync.shadow(conn, {
+                    site: 'POST /orders/:id/split', inTx: true, ...membershipKey([createdOrder], containerNumber),
+                }, c => shipmentSync.syncOrderMembership(c, [updatedOriginal.id, createdOrder.id], { userEmail: req.userEmail }));
 
                 await conn.commit();
+                patchShipmentIds([updatedOriginal, createdOrder], linked);
 
                 return { originalOrder: updatedOriginal, newOrder: createdOrder };
             } catch (err) {
@@ -2226,6 +2307,7 @@ app.post('/api/v1/orders/:id/split', async (req, res) => {
 app.post('/api/v1/containers/pack', async (req, res) => {
     try {
         await auditLogSchemaReady;
+        await shipmentsSchemaReady;
         const { containerNumber, vesselName, eta, packs } = req.body || {};
 
         if (!containerNumber) {
@@ -2300,7 +2382,7 @@ app.post('/api/v1/containers/pack', async (req, res) => {
                     const after = ordersById.get(entry.id) || null;
                     await recordAudit(conn, {
                         entityType: 'order', entityId: entry.id, action: entry.action,
-                        before: entry.before, after,
+                        before: shipmentsLib.auditSnapshot(entry.before), after: shipmentsLib.auditSnapshot(after),
                         userEmail: req.userEmail,
                     });
                     // Full-pack rows keep their PO (no-op in the helper), but
@@ -2312,8 +2394,12 @@ app.post('/api/v1/containers/pack', async (req, res) => {
                         userEmail: req.userEmail,
                     });
                 }
+                const linked = await shipmentSync.shadow(conn, {
+                    site: 'POST /containers/pack', inTx: true, ...membershipKey(orders, containerNumber),
+                }, c => shipmentSync.syncOrderMembership(c, affected, { userEmail: req.userEmail }));
 
                 await conn.commit();
+                patchShipmentIds(orders, linked);
                 return { data: orders };
             } catch (err) {
                 await conn.rollback();
@@ -2338,6 +2424,7 @@ app.post('/api/v1/containers/pack', async (req, res) => {
 app.patch('/api/v1/containers/:containerNumber/status', async (req, res) => {
     try {
         await auditLogSchemaReady;
+        await shipmentsSchemaReady;
         const { status } = req.body || {};
         if (!status) return res.status(400).json({ error: 'status is required.' });
 
@@ -2368,6 +2455,12 @@ app.patch('/api/v1/containers/:containerNumber/status', async (req, res) => {
                     userEmail: req.userEmail,
                 });
             }
+            // Status never changes membership; the hook keeps the stored
+            // copies fresh. The shipment's stage follows at read time.
+            const linked = await shipmentSync.shadow(conn, {
+                site: 'PATCH /containers/:cn/status', inTx: false, ...membershipKey(afterOrders, containerNumber),
+            }, c => shipmentSync.syncOrderMembership(c, afterOrders.map(o => o.id), { userEmail: req.userEmail }));
+            patchShipmentIds(afterOrders, linked);
             return { data: afterOrders };
         });
 
@@ -2673,6 +2766,7 @@ app.get('/api/v1/draft-containers/:id', async (req, res) => {
 app.post('/api/v1/draft-containers', async (req, res) => {
     try {
         await draftContainerAllocationsSchemaReady;
+        await shipmentsSchemaReady;
         const { orderId, draftContainerName, allocated } = req.body || {};
         const oid = Number(orderId);
         const name = typeof draftContainerName === 'string' ? draftContainerName.trim() : '';
@@ -2699,6 +2793,9 @@ app.post('/api/v1/draft-containers', async (req, res) => {
                     after: { draftName: reg.name, ...draftAudit.lineSnapshot(rs[0]) },
                     userEmail: req.userEmail,
                 });
+                await shipmentSync.shadow(conn, {
+                    site: 'POST /draft-containers', inTx: false, keyKind: 'draft', keyValue: name,
+                }, c => shipmentSync.syncDraft(c, name, { userEmail: req.userEmail }));
                 return { row: rs[0] };
             } catch (e) {
                 if (e.code === 'ER_DUP_ENTRY') return { duplicate: true };
@@ -2720,6 +2817,7 @@ app.post('/api/v1/draft-containers', async (req, res) => {
 app.put('/api/v1/draft-containers/:id', async (req, res) => {
     try {
         await draftContainerAllocationsSchemaReady;
+        await shipmentsSchemaReady;
         const { id } = req.params;
         const { draftContainerName, allocated } = req.body || {};
         const fields = [];
@@ -2777,6 +2875,15 @@ app.put('/api/v1/draft-containers/:id', async (req, res) => {
                         userEmail: req.userEmail,
                     });
                 }
+                // A name change moves the line, so both drafts re-sync.
+                await shipmentSync.shadow(conn, {
+                    site: 'PUT /draft-containers/:id', inTx: false, keyKind: 'draft', keyValue: after.draft_container_name,
+                }, async (c) => {
+                    await shipmentSync.syncDraft(c, after.draft_container_name, { userEmail: req.userEmail });
+                    if (before.draft_container_name !== after.draft_container_name) {
+                        await shipmentSync.syncDraft(c, before.draft_container_name, { userEmail: req.userEmail });
+                    }
+                });
                 return { row: after };
             } catch (e) {
                 if (e.code === 'ER_DUP_ENTRY') return { duplicate: true };
@@ -2797,9 +2904,13 @@ app.put('/api/v1/draft-containers/:id', async (req, res) => {
 app.delete('/api/v1/draft-containers/:id', async (req, res) => {
     try {
         await draftRegistryReady;
+        await shipmentsSchemaReady;
         const { id } = req.params;
         const deleted = await withConnection(async (conn) => {
             const [existing] = await conn.query(`${DRAFT_ALLOC_SELECT} WHERE dca.id = ?`, [id]);
+            // The name, read without the live-order join, so the shadow also
+            // follows the removal of a line whose order was soft-deleted.
+            const [raw] = await conn.query('SELECT draft_container_name FROM draft_container_allocations WHERE id = ?', [id]);
             const [r] = await conn.query('DELETE FROM draft_container_allocations WHERE id = ?', [id]);
             if (r.affectedRows > 0 && existing.length) {
                 const row = existing[0];
@@ -2809,6 +2920,12 @@ app.delete('/api/v1/draft-containers/:id', async (req, res) => {
                     before: { draftName: reg.name, ...draftAudit.lineSnapshot(row) },
                     userEmail: req.userEmail,
                 });
+            }
+            if (r.affectedRows > 0 && raw.length) {
+                const name = raw[0].draft_container_name;
+                await shipmentSync.shadow(conn, {
+                    site: 'DELETE /draft-containers/:id', inTx: false, keyKind: 'draft', keyValue: name,
+                }, c => shipmentSync.syncDraft(c, name, { userEmail: req.userEmail }));
             }
             return r.affectedRows > 0;
         });
@@ -2829,6 +2946,7 @@ app.delete('/api/v1/draft-containers/:id', async (req, res) => {
 app.post('/api/v1/draft-containers/rename', async (req, res) => {
     try {
         await draftRegistryReady;
+        await shipmentsSchemaReady;
         const { from, to } = req.body || {};
         if (typeof from !== 'string' || !from.trim()) return res.status(400).json({ error: 'from is required.' });
         if (typeof to !== 'string' || !to.trim()) return res.status(400).json({ error: 'to is required.' });
@@ -2839,6 +2957,14 @@ app.post('/api/v1/draft-containers/rename', async (req, res) => {
             try {
                 const r = await draftAudit.renameDraft(conn, { from, to, userEmail: req.userEmail });
                 if (r.notFound || r.conflict || r.invalid || r.unchanged) { await conn.rollback(); return r; }
+                // The open shipment follows the name (its open_key moves); the
+                // old name is then left with nothing to mirror.
+                await shipmentSync.shadow(conn, {
+                    site: 'POST /draft-containers/rename', inTx: true, keyKind: 'draft', keyValue: r.name,
+                }, async (c) => {
+                    await shipmentSync.syncDraft(c, r.name, { userEmail: req.userEmail });
+                    await shipmentSync.syncDraft(c, from, { userEmail: req.userEmail });
+                });
                 await conn.commit();
                 return r;
             } catch (e) {
@@ -2866,6 +2992,7 @@ app.post('/api/v1/draft-containers/rename', async (req, res) => {
 app.post('/api/v1/draft-containers/close', async (req, res) => {
     try {
         await draftRegistryReady;
+        await shipmentsSchemaReady;
         const body = req.body || {};
         const { name, reason } = body;
         if (typeof name !== 'string' || !name.trim()) return res.status(400).json({ error: 'name is required.' });
@@ -2879,6 +3006,16 @@ app.post('/api/v1/draft-containers/close', async (req, res) => {
             try {
                 const r = await draftAudit.closeDraft(conn, { name, reason, userEmail: req.userEmail, details: body });
                 if (r.notFound || r.invalid) { await conn.rollback(); return r; }
+                // A repeat close (alreadyClosed) is a legacy no-op, and one here.
+                // 'deleted' cancels the draft's shipment; 'converted' into N
+                // merges it with N's holder (shipmentSync.syncDraftClose).
+                if (!r.alreadyClosed) {
+                    await shipmentSync.shadow(conn, {
+                        site: 'POST /draft-containers/close', inTx: true, keyKind: 'draft', keyValue: name.trim(),
+                    }, c => shipmentSync.syncDraftClose(c, {
+                        name, reason, details: body, closeResult: r, userEmail: req.userEmail,
+                    }));
+                }
                 await conn.commit();
                 return r;
             } catch (e) {
@@ -2999,6 +3136,7 @@ app.get('/api/v1/planned-containers/:id', async (req, res) => {
 app.post('/api/v1/planned-containers', async (req, res) => {
     try {
         await plannedContainerAllocationsSchemaReady;
+        await shipmentsSchemaReady;
         const { orderId, plannedContainerName, allocated } = req.body || {};
         const oid = Number(orderId);
         const name = typeof plannedContainerName === 'string' ? plannedContainerName.trim() : '';
@@ -3016,6 +3154,9 @@ app.post('/api/v1/planned-containers', async (req, res) => {
                     [oid, name, qty]
                 );
                 const [rs] = await conn.query(`${PLANNED_ALLOC_SELECT} WHERE pca.id = ?`, [ins.insertId]);
+                await shipmentSync.shadow(conn, {
+                    site: 'POST /planned-containers', inTx: false, keyKind: 'planned', keyValue: name,
+                }, c => shipmentSync.syncPlanned(c, name, { userEmail: req.userEmail }));
                 return { row: rs[0] };
             } catch (e) {
                 if (e.code === 'ER_DUP_ENTRY') return { duplicate: true };
@@ -3037,6 +3178,7 @@ app.post('/api/v1/planned-containers', async (req, res) => {
 app.put('/api/v1/planned-containers/:id', async (req, res) => {
     try {
         await plannedContainerAllocationsSchemaReady;
+        await shipmentsSchemaReady;
         const { id } = req.params;
         const { plannedContainerName, allocated } = req.body || {};
         const fields = [];
@@ -3056,12 +3198,22 @@ app.put('/api/v1/planned-containers/:id', async (req, res) => {
         if (!fields.length) return res.status(400).json({ error: 'No fields to update.' });
 
         const result = await withConnection(async (conn) => {
-            const [existing] = await conn.query('SELECT id FROM planned_container_allocations WHERE id = ?', [id]);
+            const [existing] = await conn.query('SELECT id, planned_container_name FROM planned_container_allocations WHERE id = ?', [id]);
             if (!existing.length) return { notFound: true };
             try {
                 values.push(id);
                 await conn.query(`UPDATE planned_container_allocations SET ${fields.join(', ')} WHERE id = ?`, values);
                 const [rs] = await conn.query(`${PLANNED_ALLOC_SELECT} WHERE pca.id = ?`, [id]);
+                // A name change moves the line, so both planned containers re-sync.
+                const oldName = existing[0].planned_container_name;
+                const [cur] = await conn.query('SELECT planned_container_name FROM planned_container_allocations WHERE id = ?', [id]);
+                const newName = cur.length ? cur[0].planned_container_name : oldName;
+                await shipmentSync.shadow(conn, {
+                    site: 'PUT /planned-containers/:id', inTx: false, keyKind: 'planned', keyValue: newName,
+                }, async (c) => {
+                    await shipmentSync.syncPlanned(c, newName, { userEmail: req.userEmail });
+                    if (newName !== oldName) await shipmentSync.syncPlanned(c, oldName, { userEmail: req.userEmail });
+                });
                 return { row: rs[0] };
             } catch (e) {
                 if (e.code === 'ER_DUP_ENTRY') return { duplicate: true };
@@ -3081,9 +3233,18 @@ app.put('/api/v1/planned-containers/:id', async (req, res) => {
 app.delete('/api/v1/planned-containers/:id', async (req, res) => {
     try {
         await plannedContainerAllocationsSchemaReady;
+        await shipmentsSchemaReady;
         const { id } = req.params;
         const deleted = await withConnection(async (conn) => {
+            const [existing] = await conn.query('SELECT planned_container_name FROM planned_container_allocations WHERE id = ?', [id]);
             const [r] = await conn.query('DELETE FROM planned_container_allocations WHERE id = ?', [id]);
+            if (r.affectedRows > 0 && existing.length) {
+                // Removing the last line ends the planned container, and cancels its shipment.
+                const name = existing[0].planned_container_name;
+                await shipmentSync.shadow(conn, {
+                    site: 'DELETE /planned-containers/:id', inTx: false, keyKind: 'planned', keyValue: name,
+                }, c => shipmentSync.syncPlanned(c, name, { userEmail: req.userEmail }));
+            }
             return r.affectedRows > 0;
         });
         if (!deleted) return res.status(404).json({ error: `Allocation ${id} not found.` });
@@ -3372,6 +3533,62 @@ function draftNameFromPath(raw) {
     return s.trim();
 }
 
+// Build + store one generate run's document set for a draft and record its one
+// 'document_generated' event. For a split forwarder quote that is the combined
+// PDF plus one per-supplier copy, all sharing a batch id so the forwarder email
+// can attach the whole set. Extracted from the generate route below so POST
+// /shipments/:id/documents produces exactly the same set. Returns { noLines }
+// or { main, batchId, supplierDocuments?, failedSuppliers? }.
+async function generateDraftDocumentSet(conn, { name, docType, supplierName, comments, wantSplit, userEmail }) {
+    const batchId = wantSplit ? uuidv4() : null;
+    const main = await generateDraftDocument(conn, {
+        name, docType, supplierName, comments, generatedByEmail: userEmail, batchId,
+    });
+    if (main.noLines) return { noLines: true };
+
+    let out = { main, batchId };
+    if (wantSplit) {
+        // One PDF per supplier, best-effort: a single supplier failing (or
+        // having no lines after filtering) must not lose the main PDF or the
+        // other suppliers. Collect outcomes for the response.
+        const suppliers = await loadDraftSuppliers(conn, name);
+        const supplierDocuments = [];
+        const failedSuppliers = [];
+        for (const s of suppliers) {
+            try {
+                const doc = await generateDraftDocument(conn, {
+                    name, docType: 'forwarder-quote', supplierName: s,
+                    comments, generatedByEmail: userEmail, batchId,
+                });
+                if (!doc.noLines) supplierDocuments.push(doc);
+            } catch (err) {
+                log.error(`[generate] supplier-quote failed for "${s}"`, err);
+                failedSuppliers.push(s);
+            }
+        }
+        out = { main, batchId, supplierDocuments, failedSuppliers };
+    }
+
+    // One event per generate run (a split run lists its per-supplier copies
+    // inside the event rather than becoming N rows).
+    const reg = await draftAudit.ensureDraftRegistered(conn, name, userEmail);
+    await draftAudit.recordDraftAudit(conn, {
+        draftId: reg.id, action: 'document_generated',
+        after: {
+            draftName: reg.name,
+            documentId: main.documentId, type: docType, supplier: supplierName, version: main.version,
+            url: main.url, csvUrl: main.csvUrl, batchId,
+            comments: comments ? String(comments).slice(0, 500) : null,
+            supplierDocuments: (out.supplierDocuments || []).map(d => ({
+                documentId: d.documentId, supplier: d.supplier, version: d.version, url: d.url, csvUrl: d.csvUrl,
+            })),
+            failedSuppliers: out.failedSuppliers || [],
+        },
+        userEmail,
+    });
+    return out;
+}
+
 app.post(/^\/api\/v1\/draft-containers\/(.+)\/generate\/?$/, async (req, res) => {
     try {
         await draftContainerAllocationsSchemaReady;
@@ -3404,59 +3621,20 @@ app.post(/^\/api\/v1\/draft-containers\/(.+)\/generate\/?$/, async (req, res) =>
         const splitFlag = req.body ? req.body.splitBySupplier : undefined;
         const wantSplit = docType === 'forwarder-quote' && splitFlag !== false;
 
-        // Shared batch id ties the main forwarder PDF to its per-supplier PDFs so
-        // the forwarder email can attach the whole set.
-        const batchId = wantSplit ? uuidv4() : null;
-
         await draftRegistryReady;
+        await shipmentsSchemaReady;
         const result = await withConnection(async (conn) => {
-            const main = await generateDraftDocument(conn, {
-                name, docType, supplierName, comments, generatedByEmail: req.userEmail, batchId,
+            const out = await generateDraftDocumentSet(conn, {
+                name, docType, supplierName, comments, wantSplit, userEmail: req.userEmail,
             });
-            if (main.noLines) return { noLines: true };
-
-            let out = { main };
-            if (wantSplit) {
-                // One PDF per supplier, best-effort: a single supplier failing (or
-                // having no lines after filtering) must not lose the main PDF or the
-                // other suppliers. Collect outcomes for the response.
-                const suppliers = await loadDraftSuppliers(conn, name);
-                const supplierDocuments = [];
-                const failedSuppliers = [];
-                for (const s of suppliers) {
-                    try {
-                        const doc = await generateDraftDocument(conn, {
-                            name, docType: 'forwarder-quote', supplierName: s,
-                            comments, generatedByEmail: req.userEmail, batchId,
-                        });
-                        if (!doc.noLines) supplierDocuments.push(doc);
-                    } catch (err) {
-                        log.error(`[generate] supplier-quote failed for "${s}"`, err);
-                        failedSuppliers.push(s);
-                    }
-                }
-                out = { main, supplierDocuments, failedSuppliers };
-            }
-
-            // One event per generate run (a split run lists its per-supplier
-            // copies inside the event rather than becoming N rows).
-            const reg = await draftAudit.ensureDraftRegistered(conn, name, req.userEmail);
-            await draftAudit.recordDraftAudit(conn, {
-                draftId: reg.id, action: 'document_generated',
-                after: {
-                    draftName: reg.name,
-                    documentId: main.documentId, type: docType, supplier: supplierName, version: main.version,
-                    url: main.url, csvUrl: main.csvUrl, batchId,
-                    comments: comments ? String(comments).slice(0, 500) : null,
-                    supplierDocuments: (out.supplierDocuments || []).map(d => ({
-                        documentId: d.documentId, supplier: d.supplier, version: d.version, url: d.url, csvUrl: d.csvUrl,
-                    })),
-                    failedSuppliers: out.failedSuppliers || [],
-                },
-                userEmail: req.userEmail,
-            });
+            if (out.noLines) return out;
+            // Stamps the new documents with the draft's shipment.
+            await shipmentSync.shadow(conn, {
+                site: 'POST /draft-containers/:name/generate', inTx: false, keyKind: 'draft', keyValue: name,
+            }, c => shipmentSync.syncDraft(c, name, { userEmail: req.userEmail }));
             return out;
         });
+        const batchId = result.batchId;
 
         if (result.noLines) {
             const msg = docType === 'supplier-quote'
@@ -3879,6 +4057,7 @@ app.post('/api/v1/quality-assurance/generate', async (req, res) => {
     try {
         await qualityAssuranceSchemaReady;
         await draftRegistryReady;
+        await shipmentsSchemaReady;
         if (!PO_BUCKET) return res.status(500).json({ error: 'PO_DOCS_BUCKET env var not configured.' });
         // orderIds: which orders become rows (and the rows shown are limited to
         // these). qcUnits: optional { orderId: number } map printed in the QC
@@ -3973,6 +4152,11 @@ app.post('/api/v1/quality-assurance/generate', async (req, res) => {
                         },
                         userEmail: req.userEmail,
                     });
+                    // Stamps the sheet with the draft's shipment: its open one,
+                    // or, for a draft already converted, the booked one.
+                    await shipmentSync.shadow(conn, {
+                        site: 'POST /quality-assurance/generate', inTx: true, keyKind: 'draft', keyValue: draftName,
+                    }, c => shipmentSync.syncDraft(c, draftName, { userEmail: req.userEmail }));
                 }
                 await conn.commit();
                 return { documentId: newId, ref, version, draftContainerName: draftName, publicUrl, csvPublicUrl, fileSize: pdfBuffer.length, csvFileSize: csvBuffer.length, rowCount: lines.length };
@@ -6495,6 +6679,7 @@ app.delete('/api/v1/purchase-orders/:id', async (req, res) => {
     try {
         await purchaseOrdersSchemaReady;
         await auditLogSchemaReady;
+        await shipmentsSchemaReady;
         const { id } = req.params;
         const result = await withConnection(async (conn) => {
             const [existingRows] = await conn.query('SELECT * FROM purchase_orders WHERE id = ? AND deleted_at IS NULL', [id]);
@@ -6525,8 +6710,16 @@ app.delete('/api/v1/purchase-orders/:id', async (req, res) => {
             for (const o of cascadeOrders) {
                 await recordAudit(conn, {
                     entityType: 'order', entityId: o.id, action: 'delete',
-                    before: o, after: null, userEmail: req.userEmail,
+                    before: shipmentsLib.auditSnapshot(o), after: null, userEmail: req.userEmail,
                 });
+            }
+            // The cascaded orders leave their booked manifests.
+            if (cascadeOrders.length) {
+                const key = membershipKey(cascadeOrders);
+                await shipmentSync.shadow(conn, {
+                    site: 'DELETE /purchase-orders/:id', inTx: false,
+                    ...(key.keyKind === 'order' ? { keyKind: 'purchase_order', keyValue: String(id) } : key),
+                }, c => shipmentSync.syncOrderMembership(c, cascadeOrders.map(o => o.id), { userEmail: req.userEmail }));
             }
             return { deleted: true };
         });
@@ -9542,6 +9735,7 @@ app.patch('/api/v1/alerts/:id/approve', async (req, res) => {
         await dailyAlertsSchemaReady;
         await auditLogSchemaReady;
         await poSentWebhooksSchemaReady;
+        await shipmentsSchemaReady;
         const id = Number(req.params.id);
         if (!Number.isInteger(id) || id <= 0) {
             return res.status(400).json({ error: 'A valid alert id is required.' });
@@ -9695,8 +9889,11 @@ app.patch('/api/v1/alerts/:id/approve', async (req, res) => {
                 const acted = await actOnSuggestion(conn, {
                     id, userEmail: req.userEmail, action: 'approve', note: req.body && req.body.note,
                 });
+                const linked = await shipmentSync.shadow(conn, {
+                    site: 'PATCH /alerts/:id/approve', inTx: true, ...membershipKey([updated]),
+                }, c => shipmentSync.syncOrderMembership(c, [orderId], { userEmail: req.userEmail }));
                 await conn.commit();
-                return { order: updated, alert: acted.alert, appliedStatus: status, appliedFields, skippedFields };
+                return { order: updated, alert: acted.alert, appliedStatus: status, appliedFields, skippedFields, linked };
             } catch (e) {
                 await conn.rollback();
                 throw e;
@@ -9720,6 +9917,7 @@ app.patch('/api/v1/alerts/:id/approve', async (req, res) => {
 
         // Webhook fires outside the lock window, only if the approve committed.
         await withConnection(conn => firePoSentWebhookIfNeeded(conn, result.order));
+        patchShipmentIds([result.order], result.linked);
         res.json({
             order: result.order, alert: result.alert, appliedStatus: result.appliedStatus,
             appliedFields: result.appliedFields || [], skippedFields: result.skippedFields || [],
@@ -9770,6 +9968,33 @@ app.patch('/api/v1/alerts/:id/acknowledge', async (req, res) => {
         log.error('[PATCH /alerts/:id/acknowledge]', error);
         res.status(500).json({ error: 'An internal error occurred.' });
     }
+});
+
+// ── Shipments (/api/v1/shipments) ────────────────────────────────────────
+// Registered last: the handlers close over UPDATABLE_FIELDS, ORDER_INSERT_COLS
+// and s3, which only exist once the module has evaluated this far (registering
+// beside registerUserRoutes would hit their temporal dead zone). No other route
+// overlaps /api/v1/shipments, so the position is otherwise irrelevant.
+registerShipmentRoutes(app, {
+    withConnection,
+    ready: async () => {
+        await shipmentsSchemaReady;
+        await draftRegistryReady;
+        await auditLogSchemaReady;
+        await plannedContainerAllocationsSchemaReady;
+        await qualityAssuranceSchemaReady;
+        await purchaseOrdersSchemaReady;
+    },
+    ORDER_SELECT, rowToOrder, parseDates, setDateKey, recordAudit, recordPoAttachmentChange, draftAudit,
+    splitOrder: makeSplitOrder({ ORDER_INSERT_COLS, ORDER_INSERT_PLACEHOLDERS, orderInsertValues, setDateKey, parseDates }),
+    statusLevel: T.statusLevel,
+    isFqcOrder: T.isFqcOrder,
+    generateDraftDocumentSet,
+    publicS3Url,
+    poBucket: () => PO_BUCKET,
+    rowToContainer,
+    rowToAirShipment,
+    log,
 });
 
 // ── Serverless export ────────────────────────────────────────────────────

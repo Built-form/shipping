@@ -166,6 +166,7 @@ function rowToOrder(row) {
         orderedDate: formatDate(row.ordered_date),
         estimatedReadyDate: formatDate(row.estimated_ready_date),
         artworkConfirmedDate: formatDate(row.artwork_confirmed_date),
+        shipmentId: row.shipment_id ?? null,
     };
 }
 

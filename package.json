@@ -25,7 +25,7 @@
   "scripts": {
     "dev": "node src/handlers/orders.js",
     "dev:local": "node tools/dev-server.js",
-    "test:unit": "node --test tools/test-draft-audit-lib.js",
+    "test:unit": "node --test tools/test-draft-audit-lib.js tools/test-shipments-lib.js",
     "deploy": "serverless deploy",
     "offline": "serverless offline"
   }

@@ -34,6 +34,12 @@ console.log(`[dev-server] database ${process.env.DB_USER || '?'}@${host}/${db}${
 console.log(`[dev-server] auth bypassed: every request is local@dev (${process.env.LOCAL_USER_TYPE})`);
 
 const { app } = require('../src/handlers/orders');
+
+// Which database this server writes to, so the HTTP suites that create, pack
+// and close real orders (tools/test-shipments-*.js) can refuse to run against
+// anything that does not look like the TEST instance. Local server only.
+app.get('/api/v1/_dev/db', (req, res) => res.json({ host, database: db, looksTest }));
+
 const port = Number(process.env.ORDERS_PORT);
 app.listen(port, () => {
     console.log(`[dev-server] http://localhost:${port}  (Ctrl+C to stop)`);
