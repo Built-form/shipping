@@ -232,6 +232,21 @@ test('rowToDraftRecord: status derives from closed_reason, then live line count'
     assert.equal(rec.totalUnits, 750);
 });
 
+test('registry counts only lines whose order is still live — "open" must mean what the Draft tab shows', async () => {
+    // The Draft tab lists allocations INNER JOINed to live orders. A row left
+    // behind under a deleted order is invisible there, so it must not keep a
+    // draft "open" (or pad its line / unit counts) in the registry.
+    const conn = fakeConn(() => [[]]);
+    await lib.listDraftRecords(conn, {});
+    const sql = conn.calls[0].sql;
+    const lineCount = sql.slice(sql.indexOf('(SELECT COUNT(*) FROM draft_container_allocations'), sql.indexOf('AS line_count'));
+    const totalUnits = sql.slice(sql.indexOf('(SELECT COALESCE(SUM(a.allocated)'), sql.indexOf('AS total_units'));
+    for (const [label, fragment] of [['line_count', lineCount], ['total_units', totalUnits]]) {
+        assert.ok(fragment.includes('INNER JOIN orders'), `${label} joins orders`);
+        assert.ok(fragment.includes('deleted_at IS NULL'), `${label} skips soft-deleted orders`);
+    }
+});
+
 test('backfillDraftRegistry: claims the migration marker once; a lost claim does nothing', async () => {
     const won = fakeConn((sql) => {
         if (sql.includes('INSERT IGNORE INTO app_migrations')) return [{ affectedRows: 1 }];

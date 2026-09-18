@@ -40,11 +40,21 @@ const DRAFT_LINE_SELECT = `
 // Registry row + live counts. `line_count` is what makes 'open' vs 'empty' —
 // an open registry row whose lines were all removed one at a time (the
 // pre-registry delete path) has nothing left to show but its history.
+//
+// Lines are counted the way the Draft tab lists them (DRAFT_ALLOC_SELECT in
+// orders.js): INNER JOIN to a live order. An allocation left behind under a
+// deleted order is invisible in the UI — the old delete path could only remove
+// the rows it could see — so counting it kept drafts "open" here that the
+// Draft tab no longer showed (9 vs 7 on prod, 2026-09-17).
 const DRAFT_REGISTRY_SELECT = `
     SELECT dc.id, dc.name, dc.created_by_email, dc.created_at, dc.last_activity_at,
            dc.closed_reason, dc.closed_at, dc.closed_by_email, dc.container_number,
-           (SELECT COUNT(*) FROM draft_container_allocations a WHERE a.draft_container_name = dc.name) AS line_count,
-           (SELECT COALESCE(SUM(a.allocated), 0) FROM draft_container_allocations a WHERE a.draft_container_name = dc.name) AS total_units,
+           (SELECT COUNT(*) FROM draft_container_allocations a
+             INNER JOIN orders o ON o.id = a.order_id AND o.deleted_at IS NULL
+             WHERE a.draft_container_name = dc.name) AS line_count,
+           (SELECT COALESCE(SUM(a.allocated), 0) FROM draft_container_allocations a
+             INNER JOIN orders o ON o.id = a.order_id AND o.deleted_at IS NULL
+             WHERE a.draft_container_name = dc.name) AS total_units,
            (SELECT COUNT(*) FROM draft_container_documents d WHERE d.draft_container_name = dc.name AND d.deleted_at IS NULL) AS document_count,
            (SELECT COUNT(*) FROM quality_assurance_documents q WHERE q.draft_container_name = dc.name AND q.deleted_at IS NULL) AS qa_document_count,
            (SELECT COUNT(*) FROM audit_log al WHERE al.entity_type = '${ENTITY_TYPE}' AND al.entity_id = dc.id) AS event_count
