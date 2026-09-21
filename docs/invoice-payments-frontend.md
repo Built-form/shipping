@@ -74,6 +74,11 @@ For screens that need every payment instruction at once (ShipLine's
 - `GET /api/v1/orders` is unchanged: its PO bundles still carry `latestCheck`
   per invoice but not `payment`. Join this feed to the bundle by `invoiceId`.
 
+> **Deposits live here; balances do not.** A balance is settled per shipment
+> for the lines that actually travelled in it, so it is recorded against
+> shipment × supplier with a per-PO split — see
+> [shipment-payments-frontend.md](shipment-payments-frontend.md).
+
 ### Company payment rules — `/api/v1/payment-rules`
 
 The company's own policy layered over the supplier's terms, used only by the
@@ -92,20 +97,46 @@ DELETE /api/v1/payment-rules/:id      → 204                       (admin only;
   "scope": "supplier",                 // "default" | "supplier"
   "supplierName": "Suzhou Sunmed Co., Ltd",   // required for supplier scope; matched punctuation-blind to the PO's supplier / JFPRO name
   "depositPct": null,                  // 0–100, null = from the terms
-  "depositTrigger": "artwork_confirmed", // null | po_sent | artwork_confirmed | pi_uploaded | pi_signed
+  "depositTrigger": "artwork_confirmed", // null (supplier rule: inherit the default) | po_sent | artwork_confirmed | pi_uploaded | pi_signed
+  "depositOffsetDays": 7,              // -180–365, null = on the trigger day ("1 week after artwork is confirmed")
   "depositGraceDays": 0,               // 0–90; on a supplier rule 0 = use the default's
-  "balanceTrigger": "telex_release",   // null | before_dispatch | bl | telex_release | container_document | arrival | delivery | invoice
+  "balanceTrigger": "telex_release",   // null (supplier rule: inherit the default) | terms | before_dispatch | bl | telex_release | container_document | arrival | delivery | invoice
   "balanceDocumentType": null,         // required when balanceTrigger = container_document
   "balanceOffsetDays": null,           // -180–365, null = from the terms, negative = before the trigger
   "balanceGraceDays": 2,               // 0–90
+  "estimates": {                       // lead times used to DATE an event that has not happened yet; each says what it counts from
+    "artwork":  { "from": "pi", "days": 14 },          // from: po | pi | pi_signed
+    "pi":       null,                                  // from: po | artwork
+    "piSigned": null,                                  // from: pi | po | artwork
+    "ready":    { "from": "deposit_paid", "days": 42 },// from: po | pi | pi_signed | artwork | deposit_paid
+    "telex":    { "from": "bl", "days": 7 },           // from: bl | etd | arrival
+    "document": null,                                  // from: bl | etd | arrival
+    "transit":  { "sea": 35, "air": 5, "road": 14 }    // ETD → arrival by mode, days; null = none
+  },
   "notes": "..."
 }
 ```
 
-Telex / document triggers need the container entity (separate branch) to
-report `telexReleasedAt` / attached documents; until then the page dates them
-from the B/L and flags them "awaiting telex / document". Every write is
-recorded in `audit_log` as `entity_type = 'payment_rule'`.
+Estimates never make anything payable: an item whose trigger has not happened
+stays "not payable yet"; the estimate only gives it a forecast date (flagged
+estimated, hatched on the chart) instead of no date. The page resolves events
+as a chain — every anchor is its real date when known, else its own estimate —
+so "ready 6 weeks after the deposit is paid" follows the deposit's own date,
+real or forecast. Days are 0–365; the allowed anchors per step keep the chain
+acyclic (the backend rejects others). On a supplier rule a null step inherits
+the default's; transit inherits per mode. Stored as one JSON column
+(`estimates_json`).
+
+A supplier rule overrides the default field by field; a null field inherits
+the default's value. To give a supplier *less* than the default, say so:
+`depositTrigger: "po_sent"` (deposit with the PO) and `balanceTrigger: "terms"`
+(balance as the supplier's own terms say) override the default with nothing.
+One row per supplier — ShipLine saves the same rule for several suppliers as
+several PUTs. Telex / document triggers: the shipment entity has no telex date
+and only generated documents (quote / forwarder-quote / supplier-quote / QA
+sheet) today, so the page dates those from the B/L and flags them "awaiting
+telex / document". Every write is recorded in `audit_log` as
+`entity_type = 'payment_rule'`.
 
 ### Important rendering rules
 

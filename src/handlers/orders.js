@@ -47,6 +47,8 @@ const shipmentSync = require('../services/shipment-sync');
 const { registerShipmentRoutes } = require('../services/shipment-routes');
 const { makeSplitOrder } = require('../services/order-split');
 const shipmentsLib = require('../lib/shipments');
+const shipmentPaymentsService = require('../services/shipment-payments');
+const { runShipmentPaymentExtraction } = require('../services/shipment-payment-extract');
 
 const app = express();
 
@@ -7508,10 +7510,13 @@ app.get('/api/v1/purchase-order-invoice-payments', async (req, res) => {
 // telex is released", a fixed deposit % that overrides the PI text. One
 // `default` rule (supplier_name '') plus per-supplier overrides, keyed by the
 // JFPRO supplier name lower-cased. Every field is nullable except grace —
-// null means "take it from the terms". Read by everyone, written by admins.
+// null means "take it from the default rule, else from the terms". A supplier
+// rule that wants LESS than the default says so explicitly: deposit trigger
+// 'po_sent' (with the PO) and balance trigger 'terms' (as the supplier's terms
+// say) override the default with nothing. Read by everyone, written by admins.
 // The Payments flow page (ShipLine) is the only consumer.
 const PAYMENT_RULE_DEPOSIT_TRIGGERS = ['po_sent', 'artwork_confirmed', 'pi_uploaded', 'pi_signed'];
-const PAYMENT_RULE_BALANCE_TRIGGERS = ['before_dispatch', 'bl', 'telex_release', 'container_document', 'arrival', 'delivery', 'invoice'];
+const PAYMENT_RULE_BALANCE_TRIGGERS = ['terms', 'before_dispatch', 'bl', 'telex_release', 'container_document', 'arrival', 'delivery', 'invoice'];
 
 const paymentRulesSchemaReady = (async () => {
     const conn = await pool.getConnection();
@@ -7537,10 +7542,86 @@ const paymentRulesSchemaReady = (async () => {
                 UNIQUE KEY uk_scope_supplier (scope, supplier_name)
             )
         `);
+        // Added 2026-09-18: deposit timing relative to its trigger, and the
+        // lead-time estimates the page uses to date an event that has not
+        // happened yet ("artwork about 2 weeks after the PI", "goods ready 6
+        // weeks after the deposit is paid", transit by sea / air / road). One
+        // JSON document, validated by parsePaymentRuleEstimates. (The TEST
+        // database also carries seven est_*_days columns from an earlier cut
+        // the same day — unused, safe to drop.)
+        for (const col of [
+            'deposit_offset_days INT NULL',
+            'estimates_json TEXT NULL',
+        ]) {
+            try {
+                await conn.query(`ALTER TABLE payment_rules ADD COLUMN ${col}`);
+            } catch (e) {
+                if (!String(e.message || '').includes('Duplicate column')) throw e;
+            }
+        }
     } finally {
         conn.release();
     }
 })().catch(err => log.error('[orders] payment_rules schema migration failed', err));
+
+// Each estimate step counts from one event; the anchors allowed per step keep
+// the chain acyclic (artwork cannot count from ready, ready cannot count from
+// arrival…). Transit is per mode from the ETD.
+const PAYMENT_RULE_ESTIMATE_STEPS = {
+    artwork: ['po', 'pi', 'pi_signed'],
+    pi: ['po', 'artwork'],
+    piSigned: ['pi', 'po', 'artwork'],
+    ready: ['po', 'pi', 'pi_signed', 'artwork', 'deposit_paid'],
+    telex: ['bl', 'etd', 'arrival'],
+    document: ['bl', 'etd', 'arrival'],
+};
+const PAYMENT_RULE_FREIGHT_MODES = ['sea', 'air', 'road'];
+const EMPTY_PAYMENT_RULE_ESTIMATES = () => ({
+    artwork: null, pi: null, piSigned: null, ready: null, telex: null, document: null,
+    transit: { sea: null, air: null, road: null },
+});
+
+// { error } or { value: estimates } — always the full shape, nulls for unset.
+function parsePaymentRuleEstimates(input) {
+    const out = EMPTY_PAYMENT_RULE_ESTIMATES();
+    if (input == null) return { value: out };
+    if (typeof input !== 'object') return { error: 'estimates must be an object.' };
+    const days = (v, name) => {
+        const n = Number(v);
+        return Number.isInteger(n) && n >= 0 && n <= 365 ? { value: n } : { error: `${name} must be a whole number of days between 0 and 365.` };
+    };
+    for (const [key, anchors] of Object.entries(PAYMENT_RULE_ESTIMATE_STEPS)) {
+        const step = input[key];
+        if (step == null || step === '') continue;
+        if (typeof step !== 'object') return { error: `estimates.${key} must be { from, days }.` };
+        if (!anchors.includes(step.from)) return { error: `estimates.${key}.from must be one of: ${anchors.join(', ')}.` };
+        const d = days(step.days, `estimates.${key}.days`);
+        if (d.error) return { error: d.error };
+        out[key] = { from: step.from, days: d.value };
+    }
+    const transit = input.transit;
+    if (transit != null) {
+        if (typeof transit !== 'object') return { error: 'estimates.transit must be { sea, air, road }.' };
+        for (const mode of PAYMENT_RULE_FREIGHT_MODES) {
+            const v = transit[mode];
+            if (v == null || v === '') continue;
+            const d = days(v, `estimates.transit.${mode}`);
+            if (d.error) return { error: d.error };
+            out.transit[mode] = d.value;
+        }
+    }
+    return { value: out };
+}
+
+function parseStoredEstimates(raw) {
+    if (!raw) return EMPTY_PAYMENT_RULE_ESTIMATES();
+    try {
+        const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        return parsePaymentRuleEstimates(parsed).value ?? EMPTY_PAYMENT_RULE_ESTIMATES();
+    } catch {
+        return EMPTY_PAYMENT_RULE_ESTIMATES();
+    }
+}
 
 function paymentRuleRowToJson(r) {
     if (!r) return null;
@@ -7556,6 +7637,8 @@ function paymentRuleRowToJson(r) {
         balanceDocumentType: r.balance_document_type || null,
         balanceOffsetDays: r.balance_offset_days != null ? Number(r.balance_offset_days) : null,
         balanceGraceDays: Number(r.balance_grace_days) || 0,
+        depositOffsetDays: r.deposit_offset_days != null ? Number(r.deposit_offset_days) : null,
+        estimates: parseStoredEstimates(r.estimates_json),
         notes: r.notes || null,
         updatedByEmail: r.updated_by_email || null,
         createdAt: r.created_at?.toISOString?.() ?? r.created_at,
@@ -7590,7 +7673,11 @@ function parsePaymentRuleBody(body) {
     const depGrace = intOrNull(b.depositGraceDays, 'depositGraceDays', 0, 90);
     const balGrace = intOrNull(b.balanceGraceDays, 'balanceGraceDays', 0, 90);
     const offset = intOrNull(b.balanceOffsetDays, 'balanceOffsetDays', -180, 365);
-    for (const r of [depGrace, balGrace, offset]) if (r.error) return { error: r.error };
+    const depOffset = intOrNull(b.depositOffsetDays, 'depositOffsetDays', -180, 365);
+    for (const r of [depGrace, balGrace, offset, depOffset]) if (r.error) return { error: r.error };
+    const est = parsePaymentRuleEstimates(b.estimates);
+    if (est.error) return { error: est.error };
+    const hasEstimate = Object.entries(est.value).some(([k, v]) => (k === 'transit' ? Object.values(v).some(x => x != null) : v != null));
     return {
         row: {
             scope,
@@ -7603,6 +7690,8 @@ function parsePaymentRuleBody(body) {
             balance_document_type: balanceTrigger === 'container_document' ? docType : null,
             balance_offset_days: offset.value,
             balance_grace_days: balGrace.value ?? 0,
+            deposit_offset_days: depOffset.value,
+            estimates_json: hasEstimate ? JSON.stringify(est.value) : null,
             notes: typeof b.notes === 'string' && b.notes.trim() ? b.notes.trim().slice(0, 500) : null,
         },
     };
@@ -7624,8 +7713,9 @@ app.get('/api/v1/payment-rules', async (req, res) => {
 });
 
 // PUT /api/v1/payment-rules — upsert by (scope, supplierName). Admin only.
-// Body: { scope, supplierName?, depositPct?, depositTrigger?, depositGraceDays?,
-//         balanceTrigger?, balanceDocumentType?, balanceOffsetDays?, balanceGraceDays?, notes? }
+// Body: { scope, supplierName?, depositPct?, depositTrigger?, depositOffsetDays?, depositGraceDays?,
+//         balanceTrigger?, balanceDocumentType?, balanceOffsetDays?, balanceGraceDays?,
+//         estimates?: { artwork?, pi?, piSigned?, ready?, telex?, document?: { from, days }, transit?: { sea?, air?, road? } }, notes? }
 app.put('/api/v1/payment-rules', async (req, res) => {
     try {
         if (req.userType !== 'admin') return res.status(403).json({ error: 'Admin access required.' });
@@ -7643,16 +7733,19 @@ app.put('/api/v1/payment-rules', async (req, res) => {
             await conn.query(
                 `INSERT INTO payment_rules
                     (scope, supplier_name, supplier_label, deposit_pct, deposit_trigger, deposit_grace_days,
-                     balance_trigger, balance_document_type, balance_offset_days, balance_grace_days, notes, updated_by_email)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     balance_trigger, balance_document_type, balance_offset_days, balance_grace_days, deposit_offset_days,
+                     estimates_json, notes, updated_by_email)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                  ON DUPLICATE KEY UPDATE
                     supplier_label = VALUES(supplier_label), deposit_pct = VALUES(deposit_pct),
                     deposit_trigger = VALUES(deposit_trigger), deposit_grace_days = VALUES(deposit_grace_days),
                     balance_trigger = VALUES(balance_trigger), balance_document_type = VALUES(balance_document_type),
                     balance_offset_days = VALUES(balance_offset_days), balance_grace_days = VALUES(balance_grace_days),
+                    deposit_offset_days = VALUES(deposit_offset_days), estimates_json = VALUES(estimates_json),
                     notes = VALUES(notes), updated_by_email = VALUES(updated_by_email)`,
                 [row.scope, row.supplier_name, row.supplier_label, row.deposit_pct, row.deposit_trigger, row.deposit_grace_days,
-                 row.balance_trigger, row.balance_document_type, row.balance_offset_days, row.balance_grace_days, row.notes, req.userEmail || null]
+                 row.balance_trigger, row.balance_document_type, row.balance_offset_days, row.balance_grace_days, row.deposit_offset_days,
+                 row.estimates_json, row.notes, req.userEmail || null]
             );
             const [rb] = await conn.query(`SELECT * FROM payment_rules WHERE scope = ? AND supplier_name = ?`, [row.scope, row.supplier_name]);
             const after = paymentRuleRowToJson(rb[0]);
@@ -8123,7 +8216,7 @@ app.delete('/api/v1/purchase-order-invoices/:id', async (req, res) => {
 // upload and the manual /check endpoint, so both paths produce identical
 // rows. A given invoice accumulates a check row per attempt — query the
 // table to see the full history.
-const { compare: comparePoInvoice, upsertInvoicePaymentTerms } = require('../services/po-invoice-check');
+const { compare: comparePoInvoice, upsertInvoicePaymentTerms, toDateOnlyOrNull } = require('../services/po-invoice-check');
 
 function invoiceCheckRowToJson(r) {
     if (!r) return null;
@@ -10207,6 +10300,1044 @@ app.patch('/api/v1/alerts/:id/acknowledge', async (req, res) => {
         res.status(500).json({ error: 'An internal error occurred.' });
     }
 });
+
+// ── Shipment balance payments (/api/v1/shipment-payments) ────────────────
+// A deposit is a fact about a purchase order; a BALANCE is not. It is settled
+// per shipment for the lines that actually travelled in it, so one PO spread
+// over a dozen containers pays a dozen times, and one container holding eight
+// suppliers has eight payables. These routes are the ledger of those
+// settlements: one record per shipment x supplier (per invoice, when a
+// supplier bills in parts) with a per-PO split underneath it, so the Payments
+// flow page can stop pro-rating and show the figure that was actually agreed.
+//
+// Deposits stay where they are (purchase_order_invoice_payments plus the PI
+// status chips on the Purchase Orders page). Reading a supplier's balance
+// invoice never marks anything paid: the record lands 'pending' and an
+// operator flips it, or a remittance proof does.
+//
+// The shipments entity is read here, never written: it is still a rebuildable
+// shadow of the legacy columns, so every record keeps the shipment's reference
+// (what orders carry as container_number) beside its id, reads report a `link`
+// of ok / merged / missing, and POST /shipment-payments/relink repairs the
+// pointers after a re-seed.
+const SHIPMENT_PAYMENT_STATUSES = ['pending', 'arranged', 'paid', 'skipped'];
+const SHIPMENT_ALLOCATION_SOURCES = ['manual', 'share', 'extracted'];
+// Allocations are compared to the invoice total in whole cents; this absorbs
+// float noise without letting a real penny through.
+const SHIPMENT_ALLOCATION_EPS = 0.005;
+
+const shipmentPaymentsSchemaReady = (async () => {
+    const conn = await pool.getConnection();
+    try {
+        // No FKs, no charset/engine clauses, VARCHAR enums validated in code —
+        // the conventions the rest of this schema follows.
+        await conn.query(`
+            CREATE TABLE IF NOT EXISTS shipment_payments (
+                id INT NOT NULL AUTO_INCREMENT,
+                shipment_id INT NOT NULL,
+                shipment_reference VARCHAR(100) NOT NULL,
+                supplier_name VARCHAR(255) NOT NULL,
+                supplier_key VARCHAR(255) NOT NULL,
+                kind VARCHAR(16) NOT NULL DEFAULT 'balance',
+                amount DECIMAL(14,2) NOT NULL,
+                currency CHAR(3) NOT NULL,
+                invoice_number VARCHAR(100) NULL,
+                invoice_date DATE NULL,
+                due_date DATE NULL,
+                invoice_total DECIMAL(14,2) NULL,
+                deposit_deducted DECIMAL(14,2) NULL,
+                status VARCHAR(16) NOT NULL DEFAULT 'pending',
+                paid_on DATE NULL,
+                bank_ref VARCHAR(255) NULL,
+                note VARCHAR(2000) NULL,
+                source VARCHAR(16) NOT NULL DEFAULT 'manual',
+                created_by_email VARCHAR(255) NULL,
+                updated_by_email VARCHAR(255) NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                deleted_at DATETIME NULL,
+                PRIMARY KEY (id),
+                KEY idx_shipment (shipment_id),
+                KEY idx_reference (shipment_reference),
+                KEY idx_supplier_key (supplier_key),
+                KEY idx_status (status)
+            )
+        `);
+        // Replaced wholesale on every write, so no updated_at: the parent's
+        // updated_at is bumped instead and drives the page's polling.
+        await conn.query(`
+            CREATE TABLE IF NOT EXISTS shipment_payment_allocations (
+                id INT NOT NULL AUTO_INCREMENT,
+                payment_id INT NOT NULL,
+                purchase_order_id INT NULL,
+                po_ref VARCHAR(100) NOT NULL,
+                amount DECIMAL(14,2) NOT NULL,
+                source VARCHAR(16) NOT NULL DEFAULT 'manual',
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (id),
+                KEY idx_payment (payment_id),
+                KEY idx_purchase_order (purchase_order_id)
+            )
+        `);
+        // The paper behind a record: the supplier's balance invoice, or a
+        // remittance advice proving we paid it. extract_status tracks the
+        // background read, so the page can show it without a second table.
+        await conn.query(`
+            CREATE TABLE IF NOT EXISTS shipment_payment_documents (
+                id INT NOT NULL AUTO_INCREMENT,
+                shipment_id INT NOT NULL,
+                shipment_reference VARCHAR(100) NOT NULL,
+                supplier_name VARCHAR(255) NULL,
+                supplier_key VARCHAR(255) NULL,
+                payment_id INT NULL,
+                doc_kind VARCHAR(20) NOT NULL DEFAULT 'balance_invoice',
+                filename VARCHAR(200) NOT NULL,
+                s3_key VARCHAR(500) NOT NULL,
+                public_url VARCHAR(1000) NULL,
+                content_type VARCHAR(100) NULL,
+                file_size INT NULL,
+                notes VARCHAR(2000) NULL,
+                extract_status VARCHAR(20) NOT NULL DEFAULT 'none',
+                extract_json JSON NULL,
+                model_used VARCHAR(64) NULL,
+                extract_error TEXT NULL,
+                extracted_at TIMESTAMP NULL,
+                uploaded_by_email VARCHAR(255) NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                deleted_at DATETIME NULL,
+                PRIMARY KEY (id),
+                KEY idx_shipment (shipment_id),
+                KEY idx_payment (payment_id),
+                KEY idx_extract_status (extract_status)
+            )
+        `);
+    } finally {
+        conn.release();
+    }
+})().catch(err => log.error('[orders] shipment_payments schema migration failed', err));
+
+function shipmentPaymentAllocationRowToJson(r) {
+    return {
+        id: r.id,
+        purchaseOrderId: r.purchase_order_id ?? null,
+        poRef: r.po_ref || null,
+        poNumber: r.po_number || r.po_ref || null,
+        amount: r.amount != null ? Number(r.amount) : 0,
+        source: r.source || 'manual',
+    };
+}
+
+function shipmentPaymentRowToJson(r, { allocations = [], documents = [], link = 'ok', mergedIntoId = null } = {}) {
+    const amount = r.amount != null ? Number(r.amount) : 0;
+    const allocatedTotal = Math.round(allocations.reduce((a, x) => a + (x.amount || 0), 0) * 100) / 100;
+    return {
+        id: r.id,
+        shipmentId: r.shipment_id,
+        shipmentReference: r.shipment_reference,
+        link,
+        mergedIntoId,
+        supplierName: r.supplier_name,
+        supplierKey: r.supplier_key,
+        kind: r.kind || 'balance',
+        amount,
+        currency: r.currency,
+        invoiceNumber: r.invoice_number || null,
+        invoiceDate: r.invoice_date || null,
+        dueDate: r.due_date || null,
+        invoiceTotal: r.invoice_total != null ? Number(r.invoice_total) : null,
+        depositDeducted: r.deposit_deducted != null ? Number(r.deposit_deducted) : null,
+        status: r.status,
+        paidOn: r.paid_on || null,
+        bankRef: r.bank_ref || null,
+        note: r.note || null,
+        source: r.source || 'manual',
+        allocations,
+        allocatedTotal,
+        unallocated: Math.round((amount - allocatedTotal) * 100) / 100,
+        fullyAllocated: Math.abs(amount - allocatedTotal) <= SHIPMENT_ALLOCATION_EPS,
+        documents,
+        createdByEmail: r.created_by_email || null,
+        updatedByEmail: r.updated_by_email || null,
+        createdAt: r.created_at?.toISOString?.() ?? r.created_at,
+        updatedAt: r.updated_at?.toISOString?.() ?? r.updated_at,
+    };
+}
+
+// Validates and normalises a record body. Returns { error, code } or
+// { row, allocations, allocate }. `partial` (PUT) only checks what was sent.
+function parseShipmentPaymentBody(body, { partial = false } = {}) {
+    const b = body && typeof body === 'object' ? body : {};
+    const has = k => Object.prototype.hasOwnProperty.call(b, k) && b[k] !== undefined;
+    const row = {};
+
+    const text = (key, column, max) => {
+        if (!has(key)) return null;
+        const v = b[key];
+        if (v === null || v === '') { row[column] = null; return null; }
+        if (typeof v !== 'string') return { error: `${key} must be a string.`, code: 'BAD_FIELD' };
+        row[column] = v.trim().slice(0, max);
+        return null;
+    };
+    const money = (key, column, { positive = false } = {}) => {
+        if (!has(key)) return null;
+        const v = b[key];
+        if (v === null || v === '') { row[column] = null; return null; }
+        const n = Number(v);
+        if (!Number.isFinite(n) || n < 0) return { error: `${key} must be a number of 0 or more.`, code: 'BAD_FIELD' };
+        if (positive && n <= 0) return { error: `${key} must be greater than 0.`, code: 'BAD_FIELD' };
+        row[column] = Math.round(n * 100) / 100;
+        return null;
+    };
+    const date = (key, column) => {
+        if (!has(key)) return null;
+        const v = b[key];
+        if (v === null || v === '') { row[column] = null; return null; }
+        const parsed = toDateOnlyOrNull(v);
+        if (!parsed) return { error: `${key} must be a date (YYYY-MM-DD).`, code: 'BAD_FIELD' };
+        row[column] = parsed;
+        return null;
+    };
+
+    if (has('supplierName')) {
+        const name = typeof b.supplierName === 'string' ? b.supplierName.trim() : '';
+        if (!name) return { error: 'supplierName is required.', code: 'BAD_FIELD' };
+        row.supplier_name = name.slice(0, 255);
+        row.supplier_key = shipmentPaymentsService.supplierKey(name).slice(0, 255);
+    } else if (!partial) {
+        return { error: 'supplierName is required.', code: 'BAD_FIELD' };
+    }
+
+    if (has('amount')) {
+        const err = money('amount', 'amount', { positive: true });
+        if (err) return err;
+        if (row.amount == null) return { error: 'amount is required.', code: 'BAD_FIELD' };
+    } else if (!partial) {
+        return { error: 'amount is required.', code: 'BAD_FIELD' };
+    }
+
+    if (has('currency')) {
+        const cur = String(b.currency || '').trim().toUpperCase();
+        if (!/^[A-Z]{3}$/.test(cur)) return { error: 'currency must be a 3-letter ISO code.', code: 'BAD_FIELD' };
+        row.currency = cur;
+    } else if (!partial) {
+        return { error: 'currency is required.', code: 'BAD_FIELD' };
+    }
+
+    for (const err of [
+        text('invoiceNumber', 'invoice_number', 100),
+        text('bankRef', 'bank_ref', 255),
+        text('note', 'note', 2000),
+        date('invoiceDate', 'invoice_date'),
+        date('dueDate', 'due_date'),
+        date('paidOn', 'paid_on'),
+        money('invoiceTotal', 'invoice_total'),
+        money('depositDeducted', 'deposit_deducted'),
+    ]) if (err) return err;
+
+    if (has('status')) {
+        const status = String(b.status || '');
+        if (!SHIPMENT_PAYMENT_STATUSES.includes(status)) {
+            return { error: `status must be one of: ${SHIPMENT_PAYMENT_STATUSES.join(', ')}.`, code: 'BAD_STATUS' };
+        }
+        row.status = status;
+    }
+
+    let allocations = null;
+    if (has('allocations')) {
+        if (b.allocations === null) allocations = [];
+        else {
+            const parsed = parseShipmentPaymentAllocations(b.allocations);
+            if (parsed.error) return parsed;
+            allocations = parsed.allocations;
+        }
+    }
+
+    let allocate = null;
+    if (has('allocate') && b.allocate) {
+        const mode = String(b.allocate.mode || 'share');
+        if (mode !== 'share') return { error: "allocate.mode must be 'share'.", code: 'BAD_ALLOCATIONS' };
+        const ids = Array.isArray(b.allocate.purchaseOrderIds) ? b.allocate.purchaseOrderIds.map(Number) : null;
+        if (ids && ids.some(n => !Number.isInteger(n) || n <= 0)) {
+            return { error: 'allocate.purchaseOrderIds must be purchase order ids.', code: 'BAD_ALLOCATIONS' };
+        }
+        allocate = { mode, purchaseOrderIds: ids };
+    }
+
+    return { row, allocations, allocate };
+}
+
+function parseShipmentPaymentAllocations(raw) {
+    if (!Array.isArray(raw)) return { error: 'allocations must be an array.', code: 'BAD_ALLOCATIONS' };
+    const out = [];
+    const seen = new Set();
+    for (const entry of raw) {
+        if (!entry || typeof entry !== 'object') return { error: 'each allocation must be an object.', code: 'BAD_ALLOCATIONS' };
+        const poId = entry.purchaseOrderId == null || entry.purchaseOrderId === '' ? null : Number(entry.purchaseOrderId);
+        const poRef = typeof entry.poRef === 'string' ? entry.poRef.trim().slice(0, 100) : null;
+        if (poId != null && (!Number.isInteger(poId) || poId <= 0)) {
+            return { error: 'allocations[].purchaseOrderId must be a purchase order id.', code: 'BAD_ALLOCATIONS' };
+        }
+        if (poId == null && !poRef) {
+            return { error: 'each allocation needs a purchaseOrderId or a poRef.', code: 'BAD_ALLOCATIONS' };
+        }
+        const amount = Number(entry.amount);
+        if (!Number.isFinite(amount) || amount < 0) {
+            return { error: 'allocations[].amount must be a number of 0 or more.', code: 'BAD_ALLOCATIONS' };
+        }
+        const key = poId != null ? `id:${poId}` : `ref:${poRef.toLowerCase()}`;
+        if (seen.has(key)) return { error: `allocations list ${poRef || poId} twice.`, code: 'BAD_ALLOCATIONS' };
+        seen.add(key);
+        const source = SHIPMENT_ALLOCATION_SOURCES.includes(entry.source) ? entry.source : 'manual';
+        out.push({ purchaseOrderId: poId, poRef, amount: Math.round(amount * 100) / 100, source });
+    }
+    return { allocations: out };
+}
+
+// Every live document for these payments / shipments. Phase 1 databases have
+// no documents table yet, so a missing table reads as "none".
+async function loadShipmentPaymentDocumentRows(conn, { paymentIds = null, shipmentIds = null } = {}) {
+    const where = ['deleted_at IS NULL'];
+    const params = [];
+    if (paymentIds && paymentIds.length) {
+        where.push(`payment_id IN (${paymentIds.map(() => '?').join(',')})`);
+        params.push(...paymentIds);
+    }
+    if (shipmentIds && shipmentIds.length) {
+        where.push(`shipment_id IN (${shipmentIds.map(() => '?').join(',')})`);
+        params.push(...shipmentIds);
+    }
+    try {
+        const [rows] = await conn.query(
+            `SELECT * FROM shipment_payment_documents WHERE ${where.join(' AND ')} ORDER BY id DESC`, params
+        );
+        return rows;
+    } catch (e) {
+        if (e.errno === 1146) return [];
+        throw e;
+    }
+}
+
+function shipmentPaymentDocumentRowToJson(r) {
+    return {
+        id: r.id,
+        shipmentId: r.shipment_id,
+        shipmentReference: r.shipment_reference,
+        supplierName: r.supplier_name || null,
+        supplierKey: r.supplier_key || null,
+        paymentId: r.payment_id ?? null,
+        docKind: r.doc_kind || 'balance_invoice',
+        filename: r.filename,
+        url: r.public_url || publicS3Url(r.s3_key),
+        contentType: r.content_type || null,
+        fileSize: r.file_size ?? null,
+        notes: r.notes || null,
+        extractStatus: r.extract_status || 'none',
+        modelUsed: r.model_used || null,
+        extractError: r.extract_error || null,
+        extractedAt: r.extracted_at?.toISOString?.() ?? r.extracted_at ?? null,
+        extracted: parseJsonColumn(r.extract_json),
+        uploadedByEmail: r.uploaded_by_email || null,
+        createdAt: r.created_at?.toISOString?.() ?? r.created_at,
+    };
+}
+
+// The shipment summaries these records point at, plus a `link` verdict per
+// shipment id: ok (live), merged (its orders and balances moved to the
+// survivor, which is returned too) or missing (the shadow was re-seeded).
+async function loadShipmentPaymentShipments(conn, shipmentIds) {
+    const ids = [...new Set(shipmentIds.filter(n => Number.isInteger(n) && n > 0))];
+    const byId = new Map();
+    const linkById = new Map();
+    if (!ids.length) return { summaries: {}, linkById };
+    let rows = await shipmentSync.selectShipments(conn, { ids });
+    for (const row of rows) byId.set(row.id, shipmentsLib.rowToShipment(row));
+    // One extra hop for merge survivors: deeper chains are the relink tool's job.
+    const survivorIds = rows.map(r => r.merged_into_id).filter(n => n && !byId.has(n));
+    if (survivorIds.length) {
+        const extra = await shipmentSync.selectShipments(conn, { ids: [...new Set(survivorIds)] });
+        for (const row of extra) byId.set(row.id, shipmentsLib.rowToShipment(row));
+    }
+    for (const id of ids) {
+        const s = byId.get(id);
+        if (!s) { linkById.set(id, { link: 'missing', mergedIntoId: null }); continue; }
+        if (s.mergedIntoId) { linkById.set(id, { link: 'merged', mergedIntoId: s.mergedIntoId }); continue; }
+        if (s.deletedAt) { linkById.set(id, { link: 'missing', mergedIntoId: null }); continue; }
+        linkById.set(id, { link: 'ok', mergedIntoId: null });
+    }
+    const summaries = {};
+    for (const [id, s] of byId) {
+        summaries[String(id)] = { ...shipmentsLib.shipmentSummary(s), mergedIntoId: s.mergedIntoId ?? null };
+    }
+    return { summaries, linkById };
+}
+
+// Rows -> full JSON (allocations, documents, link, shipments side-map).
+async function hydrateShipmentPayments(conn, rows) {
+    if (!rows.length) return { data: [], documents: [], shipments: {} };
+    const ids = rows.map(r => r.id);
+    const ph = ids.map(() => '?').join(',');
+    const [allocRows] = await conn.query(
+        `SELECT a.*, po.po_number
+           FROM shipment_payment_allocations a
+           LEFT JOIN purchase_orders po ON po.id = a.purchase_order_id
+          WHERE a.payment_id IN (${ph})
+          ORDER BY a.id`,
+        ids
+    );
+    const allocByPayment = new Map();
+    for (const a of allocRows) {
+        if (!allocByPayment.has(a.payment_id)) allocByPayment.set(a.payment_id, []);
+        allocByPayment.get(a.payment_id).push(shipmentPaymentAllocationRowToJson(a));
+    }
+    const shipmentIds = rows.map(r => r.shipment_id);
+    const docRows = await loadShipmentPaymentDocumentRows(conn, { shipmentIds });
+    const docsByPayment = new Map();
+    const documents = [];
+    for (const d of docRows) {
+        const json = shipmentPaymentDocumentRowToJson(d);
+        documents.push(json);
+        if (json.paymentId == null) continue;
+        if (!docsByPayment.has(json.paymentId)) docsByPayment.set(json.paymentId, []);
+        docsByPayment.get(json.paymentId).push(json);
+    }
+    const { summaries, linkById } = await loadShipmentPaymentShipments(conn, shipmentIds);
+    const data = rows.map(r => shipmentPaymentRowToJson(r, {
+        allocations: allocByPayment.get(r.id) || [],
+        documents: docsByPayment.get(r.id) || [],
+        ...(linkById.get(r.shipment_id) || { link: 'missing', mergedIntoId: null }),
+    }));
+    return { data, documents, shipments: summaries };
+}
+
+async function loadShipmentPaymentById(conn, id) {
+    const [rows] = await conn.query(`SELECT * FROM shipment_payments WHERE id = ? AND deleted_at IS NULL`, [id]);
+    if (!rows.length) return null;
+    const { data } = await hydrateShipmentPayments(conn, rows);
+    return data[0] || null;
+}
+
+// Replace a record's allocations wholesale and bump the parent's updated_at
+// (the page polls on it).
+async function writeShipmentPaymentAllocations(conn, paymentId, allocations) {
+    await conn.query(`DELETE FROM shipment_payment_allocations WHERE payment_id = ?`, [paymentId]);
+    for (const a of allocations) {
+        await conn.query(
+            `INSERT INTO shipment_payment_allocations (payment_id, purchase_order_id, po_ref, amount, source)
+             VALUES (?, ?, ?, ?, ?)`,
+            [paymentId, a.purchaseOrderId, a.poRef || '', a.amount, a.source || 'manual']
+        );
+    }
+    await conn.query(`UPDATE shipment_payments SET updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [paymentId]);
+}
+
+// Turn the body's allocations / allocate into rows, checking every structured
+// link against the shipment's actual membership. Supplier spelling differs per
+// PO on the same shipment, so a supplier mismatch is a warning, never a block.
+function resolveShipmentPaymentAllocations({ allocations, allocate, amount, memberPos, supplierKeyValue }) {
+    const warnings = [];
+    const byId = new Map(memberPos.map(p => [p.id, p]));
+    if (allocations) {
+        const out = [];
+        for (const a of allocations) {
+            if (a.purchaseOrderId == null) { out.push({ ...a, poRef: a.poRef || '' }); continue; }
+            const po = byId.get(a.purchaseOrderId);
+            if (!po) {
+                return {
+                    error: `Purchase order ${a.purchaseOrderId} has no lines on this shipment.`,
+                    code: 'PO_NOT_IN_SHIPMENT', payload: { purchaseOrderId: a.purchaseOrderId },
+                };
+            }
+            if (po.supplierKey && supplierKeyValue && po.supplierKey !== supplierKeyValue) {
+                warnings.push(`${po.poNumber} is filed under "${po.supplier}".`);
+            }
+            out.push({ ...a, poRef: a.poRef || po.poNumber });
+        }
+        return { allocations: out, warnings };
+    }
+    if (allocate) {
+        const pool = allocate.purchaseOrderIds
+            ? allocate.purchaseOrderIds.map(id => byId.get(id) || { missing: id })
+            : memberPos.filter(p => !supplierKeyValue || p.supplierKey === supplierKeyValue);
+        const missing = pool.find(p => p.missing);
+        if (missing) {
+            return {
+                error: `Purchase order ${missing.missing} has no lines on this shipment.`,
+                code: 'PO_NOT_IN_SHIPMENT', payload: { purchaseOrderId: missing.missing },
+            };
+        }
+        if (!pool.length) {
+            return { error: 'No purchase orders on this shipment to split across.', code: 'NO_MEMBER_POS' };
+        }
+        for (const po of pool) {
+            if (po.supplierKey && supplierKeyValue && po.supplierKey !== supplierKeyValue) {
+                warnings.push(`${po.poNumber} is filed under "${po.supplier}".`);
+            }
+        }
+        return { allocations: shipmentPaymentsService.shareAllocations(amount, pool), warnings };
+    }
+    return { allocations: null, warnings };
+}
+
+// Shared shipment lookup for the write routes: 404 / 409 MERGED / 422 NOT_BOOKED.
+async function requireBookedShipment(conn, { shipmentId, shipmentReference }) {
+    const resolved = await shipmentPaymentsService.resolveShipment(conn, { id: shipmentId, reference: shipmentReference });
+    if (resolved.notFound) {
+        return { status: 404, error: 'Shipment not found.', code: 'NOT_FOUND' };
+    }
+    if (resolved.merged) {
+        return {
+            status: 409, error: `That shipment was merged into ${resolved.mergedIntoId}.`,
+            code: 'MERGED', payload: { mergedIntoId: resolved.mergedIntoId },
+        };
+    }
+    if (!shipmentsLib.isBookedStage(resolved.row.stage)) {
+        return {
+            status: 422, error: 'Balances are recorded once a shipment is booked.',
+            code: 'NOT_BOOKED', payload: { stage: resolved.row.stage },
+        };
+    }
+    return { shipment: resolved.row };
+}
+
+function sendShipmentPaymentError(res, e) {
+    return res.status(e.status).json({ error: e.error, code: e.code, ...(e.payload || {}) });
+}
+
+// GET /api/v1/shipment-payments — the cross-shipment feed the Payments flow
+// page joins to its own model. Small by design (a few hundred rows), so no
+// pagination; `updatedSince` exists for cheap polling.
+app.get('/api/v1/shipment-payments', async (req, res) => {
+    try {
+        await shipmentPaymentsSchemaReady;
+        await shipmentsSchemaReady;
+        const where = ['p.deleted_at IS NULL'];
+        const params = [];
+        const statusParam = typeof req.query.status === 'string' ? req.query.status.trim() : '';
+        if (statusParam) {
+            const wanted = statusParam === 'open'
+                ? ['pending', 'arranged']
+                : statusParam.split(',').map(s => s.trim()).filter(s => SHIPMENT_PAYMENT_STATUSES.includes(s));
+            if (!wanted.length) return res.status(400).json({ error: `status must be 'open' or any of: ${SHIPMENT_PAYMENT_STATUSES.join(', ')}.`, code: 'BAD_FIELD' });
+            where.push(`p.status IN (${wanted.map(() => '?').join(',')})`);
+            params.push(...wanted);
+        }
+        if (req.query.shipmentId) { where.push('p.shipment_id = ?'); params.push(Number(req.query.shipmentId)); }
+        if (req.query.shipmentReference) { where.push('p.shipment_reference = ?'); params.push(String(req.query.shipmentReference).trim()); }
+        if (req.query.supplier) { where.push('p.supplier_key LIKE ?'); params.push(`%${shipmentPaymentsService.supplierKey(req.query.supplier)}%`); }
+        if (req.query.purchaseOrderId) {
+            where.push('EXISTS (SELECT 1 FROM shipment_payment_allocations a WHERE a.payment_id = p.id AND a.purchase_order_id = ?)');
+            params.push(Number(req.query.purchaseOrderId));
+        }
+        if (req.query.updatedSince) {
+            const since = new Date(String(req.query.updatedSince));
+            if (Number.isNaN(since.getTime())) return res.status(400).json({ error: 'updatedSince must be a date.', code: 'BAD_FIELD' });
+            where.push('p.updated_at >= ?');
+            params.push(since);
+        }
+        const out = await withConnection(async (conn) => {
+            const [rows] = await conn.query(
+                `SELECT p.* FROM shipment_payments p WHERE ${where.join(' AND ')} ORDER BY p.id DESC`, params
+            );
+            const hydrated = await hydrateShipmentPayments(conn, rows);
+            // Documents that have no payment yet (extraction running or failed)
+            // still belong on the page, so the feed carries every live one.
+            if (!rows.length) {
+                const docRows = await loadShipmentPaymentDocumentRows(conn, {});
+                hydrated.documents = docRows.map(shipmentPaymentDocumentRowToJson);
+            }
+            return hydrated;
+        });
+        res.json(out);
+    } catch (error) {
+        log.error('[GET /shipment-payments]', error);
+        res.status(500).json({ error: 'An internal error occurred.' });
+    }
+});
+
+// GET /api/v1/shipment-payments/context?shipmentId=|shipmentReference=
+// What the "record a balance" form needs: the shipment, the purchase orders
+// with lines on board (with the value each contributes, the default split
+// basis) and the deposit already on file for each.
+app.get('/api/v1/shipment-payments/context', async (req, res) => {
+    try {
+        await shipmentPaymentsSchemaReady;
+        await shipmentsSchemaReady;
+        await purchaseOrdersSchemaReady;
+        const shipmentId = req.query.shipmentId ? Number(req.query.shipmentId) : null;
+        const shipmentReference = req.query.shipmentReference ? String(req.query.shipmentReference) : null;
+        if (!shipmentId && !shipmentReference) {
+            return res.status(400).json({ error: 'shipmentId or shipmentReference is required.', code: 'BAD_FIELD' });
+        }
+        const out = await withConnection(async (conn) => {
+            const resolved = await requireBookedShipment(conn, { shipmentId, shipmentReference });
+            if (resolved.status) return { fail: resolved };
+            const purchaseOrders = await shipmentPaymentsService.loadRecordContext(conn, resolved.shipment);
+            const [existing] = await conn.query(
+                `SELECT id FROM shipment_payments WHERE shipment_id = ? AND deleted_at IS NULL ORDER BY id`,
+                [resolved.shipment.id]
+            );
+            const { summaries } = await loadShipmentPaymentShipments(conn, [resolved.shipment.id]);
+            return {
+                shipment: summaries[String(resolved.shipment.id)] || null,
+                purchaseOrders,
+                existingPaymentIds: existing.map(r => r.id),
+            };
+        });
+        if (out.fail) return sendShipmentPaymentError(res, out.fail);
+        res.json(out);
+    } catch (error) {
+        log.error('[GET /shipment-payments/context]', error);
+        res.status(500).json({ error: 'An internal error occurred.' });
+    }
+});
+
+// POST /api/v1/shipment-payments/relink — repair shipment pointers after the
+// shadow entity was re-seeded or two shipments merged. Admin only; dry by
+// default so the damage is inspected before it is fixed.
+app.post('/api/v1/shipment-payments/relink', async (req, res) => {
+    try {
+        if (req.userType !== 'admin') return res.status(403).json({ error: 'Admin access required.', code: 'ADMIN_ONLY' });
+        await shipmentPaymentsSchemaReady;
+        await auditLogSchemaReady;
+        const dryRun = (req.body || {}).dryRun !== false;
+        const out = await withConnection(conn => shipmentPaymentsService.relinkShipmentPayments(conn, {
+            apply: !dryRun, recordAudit, userEmail: req.userEmail,
+        }));
+        res.json({ dryRun, ...out });
+    } catch (error) {
+        log.error('[POST /shipment-payments/relink]', error);
+        res.status(500).json({ error: 'An internal error occurred.' });
+    }
+});
+
+// POST /api/v1/shipment-payments — record a balance for one shipment x
+// supplier. Always lands 'pending': paying is a separate, deliberate act.
+app.post('/api/v1/shipment-payments', async (req, res) => {
+    try {
+        await shipmentPaymentsSchemaReady;
+        await shipmentsSchemaReady;
+        await auditLogSchemaReady;
+        const parsed = parseShipmentPaymentBody(req.body, { partial: false });
+        if (parsed.error) return res.status(400).json({ error: parsed.error, code: parsed.code });
+        const body = req.body || {};
+        const result = await withConnection(async (conn) => {
+            const resolved = await requireBookedShipment(conn, {
+                shipmentId: body.shipmentId ? Number(body.shipmentId) : null,
+                shipmentReference: body.shipmentReference || null,
+            });
+            if (resolved.status) return { fail: resolved };
+            const shipment = resolved.shipment;
+            const memberPos = await shipmentPaymentsService.loadMemberPurchaseOrders(conn, shipment.id);
+            const alloc = resolveShipmentPaymentAllocations({
+                allocations: parsed.allocations,
+                allocate: parsed.allocate,
+                amount: parsed.row.amount,
+                memberPos,
+                supplierKeyValue: parsed.row.supplier_key,
+            });
+            if (alloc.error) return { fail: { status: 422, ...alloc } };
+            const allocations = alloc.allocations || [];
+            const allocated = allocations.reduce((a, x) => a + x.amount, 0);
+            if (allocated > parsed.row.amount + SHIPMENT_ALLOCATION_EPS) {
+                return { fail: { status: 422, error: 'The split adds up to more than the invoice.', code: 'OVER_ALLOCATED', payload: { allocated: Math.round(allocated * 100) / 100, amount: parsed.row.amount } } };
+            }
+            const warnings = [...alloc.warnings];
+            if (parsed.row.invoice_number) {
+                const [dupes] = await conn.query(
+                    `SELECT id FROM shipment_payments
+                      WHERE deleted_at IS NULL AND supplier_key = ? AND invoice_number = ? LIMIT 1`,
+                    [parsed.row.supplier_key, parsed.row.invoice_number]
+                );
+                if (dupes.length && body.force !== true) {
+                    return { fail: { status: 409, error: `Invoice ${parsed.row.invoice_number} is already recorded for this supplier.`, code: 'DUPLICATE_INVOICE', payload: { existingId: dupes[0].id } } };
+                }
+            }
+            const [open] = await conn.query(
+                `SELECT id FROM shipment_payments
+                  WHERE deleted_at IS NULL AND shipment_id = ? AND supplier_key = ? AND status IN ('pending','arranged') LIMIT 1`,
+                [shipment.id, parsed.row.supplier_key]
+            );
+            if (open.length) warnings.push(`This supplier already has an open balance on ${shipment.reference || shipment.id}.`);
+
+            await conn.beginTransaction();
+            try {
+                const [ins] = await conn.query(
+                    `INSERT INTO shipment_payments
+                        (shipment_id, shipment_reference, supplier_name, supplier_key, kind, amount, currency,
+                         invoice_number, invoice_date, due_date, invoice_total, deposit_deducted,
+                         status, bank_ref, note, source, created_by_email)
+                     VALUES (?, ?, ?, ?, 'balance', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                    [
+                        shipment.id, shipment.reference || String(shipment.id),
+                        parsed.row.supplier_name, parsed.row.supplier_key,
+                        parsed.row.amount, parsed.row.currency,
+                        parsed.row.invoice_number ?? null, parsed.row.invoice_date ?? null, parsed.row.due_date ?? null,
+                        parsed.row.invoice_total ?? null, parsed.row.deposit_deducted ?? null,
+                        parsed.row.status || 'pending', parsed.row.bank_ref ?? null, parsed.row.note ?? null,
+                        typeof body.source === 'string' && body.source === 'extracted' ? 'extracted' : 'manual',
+                        req.userEmail || null,
+                    ]
+                );
+                if (allocations.length) await writeShipmentPaymentAllocations(conn, ins.insertId, allocations);
+                const json = await loadShipmentPaymentById(conn, ins.insertId);
+                await recordAudit(conn, {
+                    entityType: 'shipment_payment', entityId: ins.insertId, action: 'create',
+                    before: null, after: json, userEmail: req.userEmail,
+                });
+                await conn.commit();
+                return { json, warnings };
+            } catch (e) {
+                await conn.rollback().catch(() => {});
+                throw e;
+            }
+        });
+        if (result.fail) return sendShipmentPaymentError(res, result.fail);
+        res.status(201).json({ ...result.json, warnings: result.warnings });
+    } catch (error) {
+        log.error('[POST /shipment-payments]', error);
+        res.status(500).json({ error: 'An internal error occurred.' });
+    }
+});
+
+// PUT /api/v1/shipment-payments/:id — edit the figures, the split, or the
+// status. The shipment is not editable (that is what relink is for), so a
+// re-seeded pointer never blocks marking something paid — only an allocation
+// edit needs the shipment to resolve.
+app.put('/api/v1/shipment-payments/:id(\\d+)', async (req, res) => {
+    try {
+        await shipmentPaymentsSchemaReady;
+        await shipmentsSchemaReady;
+        await auditLogSchemaReady;
+        const id = Number(req.params.id);
+        const parsed = parseShipmentPaymentBody(req.body, { partial: true });
+        if (parsed.error) return res.status(400).json({ error: parsed.error, code: parsed.code });
+        const result = await withConnection(async (conn) => {
+            const before = await loadShipmentPaymentById(conn, id);
+            if (!before) return { fail: { status: 404, error: `Shipment payment ${id} not found.`, code: 'NOT_FOUND' } };
+            const warnings = [];
+            let allocations = null;
+            if (parsed.allocations || parsed.allocate) {
+                const resolved = await shipmentPaymentsService.resolveShipment(conn, { id: before.shipmentId, reference: before.shipmentReference });
+                if (resolved.notFound || resolved.merged) {
+                    return { fail: { status: 409, error: 'That shipment no longer resolves — run relink before editing the split.', code: 'SHIPMENT_UNRESOLVED', payload: { mergedIntoId: resolved.mergedIntoId ?? null } } };
+                }
+                const memberPos = await shipmentPaymentsService.loadMemberPurchaseOrders(conn, resolved.row.id);
+                const alloc = resolveShipmentPaymentAllocations({
+                    allocations: parsed.allocations,
+                    allocate: parsed.allocate,
+                    amount: parsed.row.amount ?? before.amount,
+                    memberPos,
+                    supplierKeyValue: parsed.row.supplier_key ?? before.supplierKey,
+                });
+                if (alloc.error) return { fail: { status: 422, ...alloc } };
+                allocations = alloc.allocations || [];
+                warnings.push(...alloc.warnings);
+            }
+            const nextAmount = parsed.row.amount ?? before.amount;
+            const nextAllocations = allocations ?? before.allocations.map(a => ({
+                purchaseOrderId: a.purchaseOrderId, poRef: a.poRef, amount: a.amount, source: a.source,
+            }));
+            const allocated = nextAllocations.reduce((a, x) => a + x.amount, 0);
+            if (allocated > nextAmount + SHIPMENT_ALLOCATION_EPS) {
+                return { fail: { status: 422, error: 'The split adds up to more than the invoice.', code: 'OVER_ALLOCATED', payload: { allocated: Math.round(allocated * 100) / 100, amount: nextAmount } } };
+            }
+            const nextStatus = parsed.row.status ?? before.status;
+            if (nextStatus === 'paid' && Math.abs(nextAmount - allocated) > SHIPMENT_ALLOCATION_EPS) {
+                return { fail: { status: 422, error: 'Split the whole invoice across purchase orders before marking it paid.', code: 'NOT_FULLY_ALLOCATED', payload: { allocated: Math.round(allocated * 100) / 100, amount: nextAmount } } };
+            }
+
+            const sets = [];
+            const params = [];
+            for (const [column, value] of Object.entries(parsed.row)) {
+                sets.push(`${column} = ?`);
+                params.push(value);
+            }
+            // Paying stamps the day unless one was given; un-paying clears it.
+            if (nextStatus === 'paid' && before.status !== 'paid' && parsed.row.paid_on === undefined) {
+                sets.push('paid_on = ?'); params.push(londonToday());
+            }
+            if (nextStatus !== 'paid' && before.status === 'paid' && parsed.row.paid_on === undefined) {
+                sets.push('paid_on = NULL');
+            }
+            sets.push('updated_by_email = ?'); params.push(req.userEmail || null);
+
+            await conn.beginTransaction();
+            try {
+                if (sets.length) await conn.query(`UPDATE shipment_payments SET ${sets.join(', ')} WHERE id = ?`, [...params, id]);
+                if (allocations) await writeShipmentPaymentAllocations(conn, id, allocations);
+                const after = await loadShipmentPaymentById(conn, id);
+                await recordAudit(conn, {
+                    entityType: 'shipment_payment', entityId: id,
+                    action: parsed.row.status && parsed.row.status !== before.status ? 'status' : 'update',
+                    before, after, userEmail: req.userEmail,
+                });
+                await conn.commit();
+                return { json: after, warnings };
+            } catch (e) {
+                await conn.rollback().catch(() => {});
+                throw e;
+            }
+        });
+        if (result.fail) return sendShipmentPaymentError(res, result.fail);
+        res.json({ ...result.json, warnings: result.warnings });
+    } catch (error) {
+        log.error('[PUT /shipment-payments/:id]', error);
+        res.status(500).json({ error: 'An internal error occurred.' });
+    }
+});
+
+// DELETE /api/v1/shipment-payments/:id — admin only, soft. Any document stays
+// on file with its payment_id, so the paper trail survives the record.
+app.delete('/api/v1/shipment-payments/:id(\\d+)', async (req, res) => {
+    try {
+        if (req.userType !== 'admin') return res.status(403).json({ error: 'Admin access required.', code: 'ADMIN_ONLY' });
+        await shipmentPaymentsSchemaReady;
+        await auditLogSchemaReady;
+        const id = Number(req.params.id);
+        const result = await withConnection(async (conn) => {
+            const before = await loadShipmentPaymentById(conn, id);
+            if (!before) return { notFound: true };
+            await conn.query(`UPDATE shipment_payments SET deleted_at = NOW() WHERE id = ?`, [id]);
+            await recordAudit(conn, {
+                entityType: 'shipment_payment', entityId: id, action: 'delete',
+                before, after: null, userEmail: req.userEmail,
+            });
+            return { ok: true };
+        });
+        if (result.notFound) return res.status(404).json({ error: `Shipment payment ${id} not found.`, code: 'NOT_FOUND' });
+        res.status(204).end();
+    } catch (error) {
+        log.error('[DELETE /shipment-payments/:id]', error);
+        res.status(500).json({ error: 'An internal error occurred.' });
+    }
+});
+
+// ── Balance invoice documents (/api/v1/shipment-payment-documents) ───────
+// The paper behind a balance record: the supplier's invoice, or a remittance
+// advice proving we paid it. Uploaded the same way a PI is (base64 in the
+// body — these are one- to three-page PDFs, and the page already has that
+// code path), then read in the background by Gemini, which fills in the
+// figures and the per-PO split.
+//
+// Reading a document never marks anything paid. An invoice asks for money; the
+// record it creates lands 'pending' and an operator flips it. A re-run
+// refreshes a record that is still pending and machine-written, and leaves
+// anything an operator has touched alone.
+const SHIPMENT_PAYMENT_DOC_KINDS = ['balance_invoice', 'remittance', 'other'];
+
+app.post('/api/v1/shipment-payment-documents', async (req, res) => {
+    try {
+        await shipmentPaymentsSchemaReady;
+        await shipmentsSchemaReady;
+        await auditLogSchemaReady;
+        if (!PO_BUCKET) return res.status(500).json({ error: 'PO_DOCS_BUCKET env var not configured.' });
+        const b = req.body || {};
+
+        const filename = typeof b.filename === 'string' ? b.filename.trim() : '';
+        if (!filename) return res.status(400).json({ error: 'filename is required.', code: 'BAD_FIELD' });
+        if (!b.dataBase64 || typeof b.dataBase64 !== 'string') {
+            return res.status(400).json({ error: 'dataBase64 is required.', code: 'BAD_FIELD' });
+        }
+        const docKind = b.docKind == null || b.docKind === '' ? 'balance_invoice' : String(b.docKind);
+        if (!SHIPMENT_PAYMENT_DOC_KINDS.includes(docKind)) {
+            return res.status(400).json({ error: `docKind must be one of: ${SHIPMENT_PAYMENT_DOC_KINDS.join(', ')}.`, code: 'BAD_FIELD' });
+        }
+        const rawB64 = b.dataBase64.replace(/^data:[^;]+;base64,/, '');
+        let buffer;
+        try { buffer = Buffer.from(rawB64, 'base64'); }
+        catch { return res.status(400).json({ error: 'dataBase64 is not valid base64.', code: 'BAD_FIELD' }); }
+        if (buffer.length === 0) return res.status(400).json({ error: 'dataBase64 decoded to an empty file.', code: 'BAD_FIELD' });
+        if (buffer.length > INVOICE_UPLOAD_MAX_BYTES) {
+            return res.status(413).json({ error: `File too large (max ${INVOICE_UPLOAD_MAX_BYTES} bytes).`, code: 'TOO_LARGE' });
+        }
+
+        const result = await withConnection(async (conn) => {
+            const resolved = await requireBookedShipment(conn, {
+                shipmentId: b.shipmentId ? Number(b.shipmentId) : null,
+                shipmentReference: b.shipmentReference || null,
+            });
+            if (resolved.status) return { fail: resolved };
+            const shipment = resolved.shipment;
+
+            // Attaching a remittance to a record it does not belong to would
+            // pin the wrong payment to the wrong box.
+            let paymentId = null;
+            if (b.paymentId != null && b.paymentId !== '') {
+                const [rows] = await conn.query(
+                    `SELECT id, shipment_id FROM shipment_payments WHERE id = ? AND deleted_at IS NULL`,
+                    [Number(b.paymentId)]
+                );
+                if (!rows.length) return { fail: { status: 404, error: `Shipment payment ${b.paymentId} not found.`, code: 'NOT_FOUND' } };
+                if (rows[0].shipment_id !== shipment.id) {
+                    return { fail: { status: 422, error: 'That balance record belongs to a different shipment.', code: 'PAYMENT_NOT_ON_SHIPMENT' } };
+                }
+                paymentId = rows[0].id;
+            }
+
+            const supplierName = typeof b.supplierName === 'string' && b.supplierName.trim()
+                ? b.supplierName.trim().slice(0, 255) : null;
+            if (b.force !== true) {
+                const [dupes] = await conn.query(
+                    `SELECT id FROM shipment_payment_documents
+                      WHERE deleted_at IS NULL AND shipment_id = ? AND filename = ? AND file_size = ?
+                      LIMIT 1`,
+                    [shipment.id, filename.slice(0, 200), buffer.length]
+                );
+                if (dupes.length) {
+                    return { fail: { status: 409, error: `${filename} is already on this shipment.`, code: 'DUPLICATE_DOCUMENT', payload: { existingId: dupes[0].id } } };
+                }
+            }
+
+            const safeFilename = filename.slice(0, 200).replace(SAFE_FILENAME_RE, '_');
+            const s3Key = `shipment-payments/${uuidv4()}/${safeFilename}`;
+            const contentType = (typeof b.contentType === 'string' && b.contentType.trim()) || 'application/octet-stream';
+            await s3.send(new PutObjectCommand({
+                Bucket: PO_BUCKET,
+                Key: s3Key,
+                Body: buffer,
+                ContentType: contentType,
+                ContentDisposition: `inline; filename="${safeFilename}"`,
+            }));
+
+            // A remittance is filed, not read, unless asked for: it proves a
+            // payment rather than requesting one.
+            const wantExtract = b.extract === undefined ? docKind === 'balance_invoice' : b.extract === true;
+            const [ins] = await conn.query(
+                `INSERT INTO shipment_payment_documents
+                    (shipment_id, shipment_reference, supplier_name, supplier_key, payment_id, doc_kind,
+                     filename, s3_key, public_url, content_type, file_size, notes, extract_status, uploaded_by_email)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                [
+                    shipment.id, shipment.reference || String(shipment.id),
+                    supplierName, supplierName ? shipmentPaymentsService.supplierKey(supplierName) : null,
+                    paymentId, docKind,
+                    filename.slice(0, 200), s3Key, publicS3Url(s3Key), contentType, buffer.length,
+                    typeof b.notes === 'string' && b.notes.trim() ? b.notes.trim().slice(0, 2000) : null,
+                    wantExtract ? 'processing' : 'none',
+                    req.userEmail || null,
+                ]
+            );
+            const [readback] = await conn.query(`SELECT * FROM shipment_payment_documents WHERE id = ?`, [ins.insertId]);
+            await recordAudit(conn, {
+                entityType: 'shipment_payment_document', entityId: ins.insertId, action: 'create',
+                before: null,
+                after: { shipmentId: shipment.id, filename: filename.slice(0, 200), docKind, fileSize: buffer.length },
+                userEmail: req.userEmail,
+            });
+            return { document: shipmentPaymentDocumentRowToJson(readback[0]), wantExtract, documentId: ins.insertId };
+        });
+
+        if (result.fail) return sendShipmentPaymentError(res, result.fail);
+        res.status(201).json({ document: result.document });
+
+        if (result.wantExtract) startShipmentPaymentExtraction(req, result.documentId);
+    } catch (error) {
+        log.error('[POST /shipment-payment-documents]', error);
+        if (!res.headersSent) res.status(500).json({ error: 'An internal error occurred.' });
+    }
+});
+
+// POST /api/v1/shipment-payment-documents/:id/extract — read it again. Used
+// after a failure, or when a document was filed without being read.
+app.post('/api/v1/shipment-payment-documents/:id(\\d+)/extract', async (req, res) => {
+    try {
+        await shipmentPaymentsSchemaReady;
+        await auditLogSchemaReady;
+        const id = Number(req.params.id);
+        const result = await withConnection(async (conn) => {
+            const [rows] = await conn.query(`SELECT * FROM shipment_payment_documents WHERE id = ? AND deleted_at IS NULL`, [id]);
+            const row = rows[0];
+            if (!row) return { notFound: true };
+            // A Lambda killed mid-read leaves a row stuck 'processing'; after
+            // ten minutes a re-run is allowed to take over.
+            const startedAt = row.extracted_at ? new Date(row.extracted_at).getTime() : new Date(row.created_at).getTime();
+            if (row.extract_status === 'processing' && Date.now() - startedAt < 10 * 60_000) {
+                return { alreadyRunning: true, document: shipmentPaymentDocumentRowToJson(row) };
+            }
+            await conn.query(
+                `UPDATE shipment_payment_documents SET extract_status = 'processing', extract_error = NULL WHERE id = ?`,
+                [id]
+            );
+            const [readback] = await conn.query(`SELECT * FROM shipment_payment_documents WHERE id = ?`, [id]);
+            return { document: shipmentPaymentDocumentRowToJson(readback[0]) };
+        });
+        if (result.notFound) return res.status(404).json({ error: `Document ${id} not found.`, code: 'NOT_FOUND' });
+        res.status(202).json({ document: result.document, alreadyRunning: !!result.alreadyRunning });
+        if (!result.alreadyRunning) startShipmentPaymentExtraction(req, id);
+    } catch (error) {
+        log.error('[POST /shipment-payment-documents/:id/extract]', error);
+        if (!res.headersSent) res.status(500).json({ error: 'An internal error occurred.' });
+    }
+});
+
+// GET /api/v1/shipment-payment-documents?shipmentId=|shipmentReference=|paymentId=
+app.get('/api/v1/shipment-payment-documents', async (req, res) => {
+    try {
+        await shipmentPaymentsSchemaReady;
+        const where = ['deleted_at IS NULL'];
+        const params = [];
+        if (req.query.shipmentId) { where.push('shipment_id = ?'); params.push(Number(req.query.shipmentId)); }
+        if (req.query.shipmentReference) { where.push('shipment_reference = ?'); params.push(String(req.query.shipmentReference).trim()); }
+        if (req.query.paymentId) { where.push('payment_id = ?'); params.push(Number(req.query.paymentId)); }
+        const rows = await withConnection(async (conn) => {
+            try {
+                const [r] = await conn.query(
+                    `SELECT * FROM shipment_payment_documents WHERE ${where.join(' AND ')} ORDER BY id DESC`, params
+                );
+                return r;
+            } catch (e) {
+                if (e.errno === 1146) return [];
+                throw e;
+            }
+        });
+        res.json({ data: rows.map(shipmentPaymentDocumentRowToJson) });
+    } catch (error) {
+        log.error('[GET /shipment-payment-documents]', error);
+        res.status(500).json({ error: 'An internal error occurred.' });
+    }
+});
+
+// DELETE /api/v1/shipment-payment-documents/:id — admin only, soft. The
+// record it produced stays: the figures were checked by a person.
+app.delete('/api/v1/shipment-payment-documents/:id(\\d+)', async (req, res) => {
+    try {
+        if (req.userType !== 'admin') return res.status(403).json({ error: 'Admin access required.', code: 'ADMIN_ONLY' });
+        await shipmentPaymentsSchemaReady;
+        await auditLogSchemaReady;
+        const id = Number(req.params.id);
+        const result = await withConnection(async (conn) => {
+            const [rows] = await conn.query(`SELECT * FROM shipment_payment_documents WHERE id = ? AND deleted_at IS NULL`, [id]);
+            if (!rows.length) return { notFound: true };
+            await conn.query(`UPDATE shipment_payment_documents SET deleted_at = NOW() WHERE id = ?`, [id]);
+            await recordAudit(conn, {
+                entityType: 'shipment_payment_document', entityId: id, action: 'delete',
+                before: shipmentPaymentDocumentRowToJson(rows[0]), after: null, userEmail: req.userEmail,
+            });
+            return { ok: true };
+        });
+        if (result.notFound) return res.status(404).json({ error: `Document ${id} not found.`, code: 'NOT_FOUND' });
+        res.status(204).end();
+    } catch (error) {
+        log.error('[DELETE /shipment-payment-documents/:id]', error);
+        res.status(500).json({ error: 'An internal error occurred.' });
+    }
+});
+
+// The read runs after the response, on its own connection: Lambda would
+// otherwise freeze the container the moment the response is built. Same dance
+// as the PO-vs-PI check.
+function startShipmentPaymentExtraction(req, documentId) {
+    if (req.lambdaContext) req.lambdaContext.callbackWaitsForEmptyEventLoop = true;
+    const userEmail = req.userEmail || null;
+    (async () => {
+        try {
+            const out = await runShipmentPaymentExtraction(pool, { documentId, userEmail });
+            if (out && out.failed) log.warn('[shipment-payment-documents] extraction failed', { documentId, code: out.failed });
+        } catch (e) {
+            log.warn('[shipment-payment-documents] extraction threw', { documentId, error: e.message });
+        }
+    })();
+}
 
 // ── Shipments (/api/v1/shipments) ────────────────────────────────────────
 // Registered last: the handlers close over UPDATABLE_FIELDS, ORDER_INSERT_COLS
