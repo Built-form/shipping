@@ -250,7 +250,11 @@ currency; and an amount above 105 % of what this supplier has on board.
   same three POs, so references match on letters+digits, then on the digit core
   when that identifies exactly one PO on the shipment. Anything it cannot map is
   kept verbatim as `poRef` with no id, and counts as unallocated. A document
-  naming only PO references is split by what each PO has on board.
+  naming only PO references is split by what each PO has on board. Lines bill
+  the goods while the payable is often the goods less the deposit, so when the
+  lines add up to MORE than the amount due the split is scaled to it, each PO
+  keeping its share of the lines, in whole cents (`scaledToAmount: true`);
+  lines adding up to LESS are left as read and the gap stays unallocated.
   **Unless `fit.verdict` is `mismatch`**: then no record is made
   (`noPaymentCreated: "mismatch"`) and the page offers "record it anyway"
   (`POST /shipment-payments` with `documentId`). No amount →

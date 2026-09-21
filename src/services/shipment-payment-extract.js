@@ -158,6 +158,21 @@ function matchPoRef(ref, index) {
     return hits && hits.length === 1 ? hits[0] : null;
 }
 
+/** Allocations read off line values, scaled so they cover `amount` in the same
+ *  proportion the lines covered `lineTotal` — in whole cents, remainder to the
+ *  largest, so a full set of lines sums to `amount` exactly. */
+function scaleToAmount(allocations, lineTotal, amount) {
+    const weights = allocations.map(a => Math.round(a.amount * 100));
+    const weightSum = weights.reduce((a, b) => a + b, 0);
+    if (!(weightSum > 0) || !(lineTotal > 0)) return allocations;
+    const target = Math.round(amount * 100 * (weightSum / 100 / lineTotal));
+    const parts = weights.map(w => Math.floor((target * w) / weightSum));
+    let left = target - parts.reduce((a, b) => a + b, 0);
+    const order = weights.map((_, i) => i).sort((a, b) => weights[b] - weights[a] || a - b);
+    for (let i = 0; left > 0; i = (i + 1) % order.length) { parts[order[i]] += 1; left -= 1; }
+    return allocations.map((a, i) => ({ ...a, amount: parts[i] / 100 }));
+}
+
 /** Extracted lines/refs → allocations. Lines win; a document that names only
  *  PO references splits by what each has on board; one that names nothing is
  *  left for a human (needsAllocation). */
@@ -177,14 +192,26 @@ function matchLinesToPos(extract, memberPos, amount) {
     }
 
     if (byPo.size || unmatched.length) {
-        const allocations = [...byPo.values()].map(x => ({
+        let allocations = [...byPo.values()].map(x => ({
             purchaseOrderId: x.po.id, poRef: x.po.poNumber, amount: Math.round(x.amount * 100) / 100, source: 'extracted',
         }));
         for (const u of unmatched) {
             if (!u.poRef) continue;
             allocations.push({ purchaseOrderId: null, poRef: String(u.poRef).slice(0, 100), amount: Math.round(u.amount * 100) / 100, source: 'extracted' });
         }
-        return { allocations, matchedLines: byPo.size, unmatchedLines: unmatched.length, lineTotal: Math.round(lineTotal * 100) / 100 };
+        // The lines bill the goods; the payable is often the goods less the
+        // deposit ("LESS 30% DEPOSIT"). A split taken straight off the lines
+        // would then exceed the balance and could never be marked paid, so it
+        // is scaled to the amount due, each PO keeping its share of the lines.
+        // Lines that add up to LESS are left as read: the gap stays unallocated
+        // and is flagged, rather than stretched over POs the document may not
+        // cover.
+        const scaled = amount > 0 && lineTotal > amount + 0.005 && allocations.length > 0;
+        if (scaled) allocations = scaleToAmount(allocations, lineTotal, amount);
+        return {
+            allocations, matchedLines: byPo.size, unmatchedLines: unmatched.length,
+            lineTotal: Math.round(lineTotal * 100) / 100, scaledToAmount: scaled,
+        };
     }
 
     // No usable lines: fall back to the PO references on the document.
@@ -462,6 +489,7 @@ async function runShipmentPaymentExtraction(pool, { documentId, userEmail = null
             matchedLines: matched.matchedLines,
             unmatchedLines: matched.unmatchedLines,
             lineTotal: matched.lineTotal,
+            scaledToAmount: !!matched.scaledToAmount,
             splitByShare: !!matched.splitByShare,
             needsAllocation: !!matched.needsAllocation,
         };
