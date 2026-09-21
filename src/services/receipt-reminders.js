@@ -12,7 +12,7 @@
 //   • the manual "resend" button — POST /api/v1/email-receipts/:id/resend (orders.js).
 const log = require('../lib/logger');
 const {
-    ensureEmailReceiptsSchema, appendReceiptLink,
+    appendReceiptLink,
     renderReminderEmailHtml, recordReminderSend, parseRecipients,
 } = require('../lib/email-receipt');
 
@@ -100,7 +100,6 @@ async function runReceiptReminders(pool, opts = {}) {
 
     const conn = await pool.getConnection();
     try {
-        await ensureEmailReceiptsSchema(conn);
         // intervalHours/limit are sanitized ints → safe to inline (INTERVAL and
         // LIMIT can't be bound params in MySQL). maxReminders is bound.
         const [rows] = await conn.query(

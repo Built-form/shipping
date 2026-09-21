@@ -13,7 +13,6 @@
 require('dotenv').config();
 const log = require('../lib/logger');
 const { getPool } = require('../db');
-const { ensureDailyAlertsSchema } = require('../services/daily-alerts');
 const { importStatusUpdatesFromFront } = require('../services/front-status-import');
 
 // By default the importer is INCREMENTAL: it scans only since the last
@@ -30,10 +29,6 @@ async function handler(event = {}) {
     const sinceDays = Number(event && event.sinceDays) > 0 ? Number(event.sinceDays) : undefined;
 
     const pool = getPool();
-    // daily_alerts is shared with the nightly generator + the authed API; ensure
-    // it exists before we upsert suggestion rows into it.
-    await ensureDailyAlertsSchema(pool);
-
     const conn = await pool.getConnection();
     try {
         const res = await importStatusUpdatesFromFront(conn, {

@@ -44,3 +44,13 @@ const port = Number(process.env.ORDERS_PORT);
 app.listen(port, () => {
     console.log(`[dev-server] http://localhost:${port}  (Ctrl+C to stop)`);
 });
+
+// The app runs no DDL: schema comes from src/db/migrate/. Say so up front when
+// this database is behind, rather than as a 500 on the first route that needs it.
+const { getPool } = require('../src/db');
+const { findPendingMigrations } = require('../src/lib/schema-migrations');
+findPendingMigrations(getPool()).then((pending) => {
+    const fix = `node tools/migrate.js --apply --confirm-host ${host}`;
+    if (pending === null) console.log(`[dev-server] this database has never been migrated (no schema_migrations): ${fix}`);
+    else if (pending.length) console.log(`[dev-server] ${pending.length} migration(s) not applied here (${pending.join(', ')}): ${fix}`);
+}).catch(err => console.log(`[dev-server] schema check failed: ${err.message}`));

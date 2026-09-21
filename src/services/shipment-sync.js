@@ -44,100 +44,6 @@ const KILL_SWITCH_TTL_MS = 60_000;
 const BOOKED_IN = `'BOOKED','IN_TRANSIT','ARRIVED','CLOSED'`;
 const LIVE = 's.deleted_at IS NULL AND s.merged_into_id IS NULL';
 
-// ── Schema ───────────────────────────────────────────────────────────────
-// Canonical copies live in src/db/migrations/2026-09-18_*.sql, which are
-// hand-applied ahead of each deploy. These statements are the cold-start
-// fallback for a fresh environment: idempotent CREATEs and duplicate-tolerant
-// ALTERs, and never a SET SESSION (that would pin the RDS Proxy connection).
-const SCHEMA_STATEMENTS = [
-    `CREATE TABLE IF NOT EXISTS shipments (
-        id INT NOT NULL AUTO_INCREMENT,
-        reference VARCHAR(100) NULL,
-        reference_seq INT NULL,
-        name VARCHAR(100) NULL,
-        open_key VARCHAR(110) NULL,
-        mode VARCHAR(8) NULL,
-        mode_source VARCHAR(16) NOT NULL DEFAULT 'default',
-        stage VARCHAR(16) NOT NULL DEFAULT 'DRAFT',
-        tracking_ref VARCHAR(255) NULL,
-        booking_ref VARCHAR(100) NULL,
-        bl_number VARCHAR(100) NULL,
-        forwarder VARCHAR(255) NULL,
-        vessel_name VARCHAR(255) NULL,
-        origin_port VARCHAR(255) NULL,
-        etd DATE NULL,
-        eta DATE NULL,
-        ata DATE NULL,
-        notes TEXT NULL,
-        needs_review TINYINT(1) NOT NULL DEFAULT 0,
-        review_note VARCHAR(255) NULL,
-        origin VARCHAR(16) NOT NULL DEFAULT 'api',
-        source_draft_id INT NULL,
-        merged_into_id INT NULL,
-        created_by_email VARCHAR(255) NULL,
-        created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-        booked_at DATETIME NULL,
-        departed_at DATETIME NULL,
-        arrived_at DATETIME NULL,
-        closed_at DATETIME NULL,
-        cancelled_at DATETIME NULL,
-        cancelled_reason VARCHAR(32) NULL,
-        deleted_at DATETIME NULL,
-        PRIMARY KEY (id),
-        UNIQUE KEY uk_reference (reference),
-        UNIQUE KEY uk_open_key (open_key),
-        KEY idx_tracking_ref (tracking_ref),
-        KEY idx_stage_mode (stage, mode),
-        KEY idx_mode_seq (mode, reference_seq),
-        KEY idx_source_draft (source_draft_id)
-    )`,
-    `CREATE TABLE IF NOT EXISTS shipment_lines (
-        id INT NOT NULL AUTO_INCREMENT,
-        shipment_id INT NOT NULL,
-        order_id INT NOT NULL,
-        quantity INT NOT NULL DEFAULT 0,
-        created_by_email VARCHAR(255) NULL,
-        created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-        PRIMARY KEY (id),
-        UNIQUE KEY uk_shipment_order (shipment_id, order_id),
-        KEY idx_order_id (order_id)
-    )`,
-    `CREATE TABLE IF NOT EXISTS shipment_sync_failures (
-        id INT NOT NULL AUTO_INCREMENT,
-        site VARCHAR(64) NOT NULL,
-        key_kind VARCHAR(16) NOT NULL,
-        key_value VARCHAR(255) NOT NULL,
-        error VARCHAR(500) NULL,
-        dedup_key VARCHAR(340) NULL,
-        occurrences INT NOT NULL DEFAULT 1,
-        created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
-        last_seen_at DATETIME NULL,
-        resolved_at DATETIME NULL,
-        PRIMARY KEY (id),
-        UNIQUE KEY uk_dedup (dedup_key),
-        KEY idx_unresolved (resolved_at, created_at)
-    )`,
-    `ALTER TABLE orders ADD COLUMN shipment_id INT NULL`,
-    `ALTER TABLE orders ADD KEY idx_shipment_id (shipment_id)`,
-    `ALTER TABLE draft_containers ADD COLUMN shipment_id INT NULL`,
-    `ALTER TABLE draft_containers ADD KEY idx_shipment_id (shipment_id)`,
-    `ALTER TABLE draft_container_documents ADD COLUMN shipment_id INT NULL`,
-    `ALTER TABLE draft_container_documents ADD KEY idx_shipment_id (shipment_id)`,
-    `ALTER TABLE quality_assurance_documents ADD COLUMN shipment_id INT NULL`,
-    `ALTER TABLE quality_assurance_documents ADD KEY idx_shipment_id (shipment_id)`,
-];
-
-async function ensureShipmentsSchema(conn) {
-    for (const sql of SCHEMA_STATEMENTS) {
-        try { await conn.query(sql); } catch (e) {
-            const msg = e.message || '';
-            if (!msg.includes('Duplicate column') && !msg.includes('Duplicate key name')) throw e;
-        }
-    }
-}
-
 // ── Arming + kill switch ─────────────────────────────────────────────────
 // The hooks do nothing until the backfill has written its marker into
 // app_migrations; inserting the kill-switch row there turns them off again
@@ -1884,8 +1790,6 @@ async function documentLinkDrift(conn) {
 module.exports = {
     BACKFILL_MARKER,
     KILL_SWITCH,
-    SCHEMA_STATEMENTS,
-    ensureShipmentsSchema,
     shadowArmed,
     resetFlagCache,
     isFatal,

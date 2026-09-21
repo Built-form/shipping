@@ -188,7 +188,8 @@ shipping/
 
     db/
       index.js                      # MySQL connection pool (singleton)
-      migrations/                   # One-off schema migrations
+      migrate/                      # Schema migrations, applied by deploy.sh (see "Schema changes")
+      migrations/                   # Archive of the old hand-applied SQL; never executed
 
     lib/
       logger.js                     # Structured logging
@@ -390,7 +391,7 @@ Hourly Mintsoft warehouse stock levels, keyed by SKU + warehouse + date.
 | `quarantine` | INT | In quarantine |
 
 ### `adjusted_sales`
-Manually adjusted sales figures, one live row per `(asin, country)`. See [Adjusted Sales](#adjusted-sales) above; canonical DDL in [src/db/migrations/2026-08-03_adjusted_sales.sql](src/db/migrations/2026-08-03_adjusted_sales.sql).
+Manually adjusted sales figures, one live row per `(asin, country)`. See [Adjusted Sales](#adjusted-sales) above; schema in [src/db/migrate/2026-09-21_00_baseline.sql](src/db/migrate/2026-09-21_00_baseline.sql).
 
 | Column | Type | Notes |
 |---|---|---|
@@ -645,10 +646,17 @@ bash deploy.sh          # stage "dev"  -> PRODUCTION (shipping-serverless-dev)
 bash deploy.sh test     # stage "test" -> the test stack (shipping-serverless-test)
 ```
 
-Use `deploy.sh`, not `npm run deploy` — on Windows, packaging the full
-`node_modules` tree blows past the OS file-handle limit and `serverless deploy`
-bails with `EMFILE: too many open files`. The script prunes to production deps
-and preloads `graceful-fs` to get under it, then restores devDeps.
+`deploy.sh` first applies pending schema migrations to that stage's database
+(`node tools/migrate.js --stage <stage> --apply`, see [Schema changes](#schema-changes));
+a failed migration stops the deploy before any code ships. The deployer needs
+`secretsmanager:GetSecretValue` on `shipping/prod` / `shipping/test`, as for the
+deploy itself.
+
+Use `deploy.sh`, not `npm run deploy` — it skips the migrations, and on Windows,
+packaging the full `node_modules` tree blows past the OS file-handle limit and
+`serverless deploy` bails with `EMFILE: too many open files`. The script prunes
+to production deps and preloads `graceful-fs` to get under it, then restores
+devDeps.
 
 Resolve the config for either stage **without deploying** — this reads the
 Secrets Manager secret, so it's the way to check a value landed:
@@ -661,6 +669,66 @@ serverless print --stage test --path functions.frontStatusImport
 
 (`--path` reports "not found" for a value that resolves to an empty string; use
 `--path provider.environment --format json` to see those.)
+
+### Schema changes
+
+The Lambdas run no DDL. Schema lives in [src/db/migrate/](src/db/migrate/), one
+file per change, applied in filename order by [tools/migrate.js](tools/migrate.js)
+and recorded in the `schema_migrations` table. `deploy.sh` runs it before
+`serverless deploy`.
+
+```bash
+node tools/migrate.js --stage test             # dry run: what is pending on TEST
+node tools/migrate.js --stage test --apply     # apply it (deploy.sh does this for you)
+node tools/migrate.js --stage dev --status     # production: applied / pending / changed files, missing views
+npm run test:unit                              # includes tools/test-migrate-lib.js
+```
+
+`--stage` reads the database from the stage's secret (`dev` -> `shipping/prod`,
+`test` -> `shipping/test`) and connects to its direct `DB_HOST`, not the RDS
+Proxy, which is unreachable from outside the VPC. It refuses a stage whose host
+does not look like it (TEST must contain "test", production must not). Without
+`--stage` it uses `.env`, and writing then needs `--confirm-host <DB_HOST>`.
+
+Writing a migration:
+
+- Name it `YYYY-MM-DD_NN_what_it_does.sql` (or `.js` exporting
+  `up(conn, { log, env })`), dated after the newest file.
+- Make it safe to run twice. MySQL DDL is not transactional, so a failed run
+  can leave half a file applied, and the file is recorded only once every
+  statement has run: `CREATE TABLE IF NOT EXISTS`, **one clause per `ALTER`**,
+  `INSERT IGNORE` for seeds. "Already exists" errors (table, column, index,
+  and for `DROP` "already gone") are skipped, so a re-run finishes the job.
+- Additive first: the DDL lands a few minutes before the code that uses it,
+  and the old code must keep working against it. Drop or rename in a later
+  deploy, once nothing reads the old shape.
+- Never edit an applied file (it is not re-run; `--status` flags the changed
+  checksum). Add a new one.
+- No `SET SESSION` in files: the runner sets `lock_wait_timeout = 5` itself,
+  so an `ALTER` on a busy table fails fast (and the deploy with it; just re-run)
+  instead of queueing every query behind its metadata lock.
+
+The first file, `2026-09-21_00_baseline.sql`, is the app's tables as they stood
+when this was introduced, generated from production with `--dump-baseline`. It
+runs only on an empty database. A populated database with no ledger (production
+before its first migrated deploy) is *adopted* instead: `--apply` first checks it
+against the baseline (`--verify-baseline` shows the same report), records the
+baseline without running it, then applies the rest. It refuses a database that
+lacks part of the baseline. `--adopt` does the check-and-record step on its own.
+
+`explorer-test` is rebuilt from production's latest snapshot every third day
+(02:00 UTC, days 1, 4, 7, … of the month), ledger included: it comes back
+knowing exactly what production has applied, and the next `deploy.sh test`
+re-applies whatever is newer, which the idempotency rule makes safe.
+
+`src/db/migrations/` is the archive of the old hand-applied files and is never
+executed; the views over `jfpro` (`product_carton_sizes`, `suppliers`,
+`supplier_emails`) still come from there, applied by hand as admin.
+
+Each Lambda container checks once, on its first request, that every bundled
+migration is in `schema_migrations`, and logs `[schema] database schema is
+behind the code` if not (e.g. after a deploy that skipped `deploy.sh`). It never
+blocks a request.
 
 ---
 
@@ -703,4 +771,5 @@ LOCAL_USER_TYPE=standard node tools/test-allowed-emails.js   # checks the 403 ga
 - **Per-country latest-date joins:** Stock-snapshot queries resolve the most recent snapshot per `(asin, country)` independently, so a mid-morning refresh showing today in DE and yesterday in ES/FR/IT displays the correct value for each rather than dropping the stragglers.
 - **Snapshot-based stock tracking:** Stock levels are recorded as point-in-time snapshots rather than event streams, enabling historical trend queries over configurable date ranges.
 - **Graceful degradation:** If an Amazon unit fails all day, the daily backfill copies the last successful snapshot so dashboards never show empty data.
-- **Connection pooling:** A singleton MySQL pool ([src/db/index.js](src/db/index.js), limit 5) shared across Lambda invocations via container reuse.
+- **Connection pooling:** A singleton MySQL pool ([src/db/index.js](src/db/index.js), `connectionLimit: 1`) shared across Lambda invocations via container reuse. With one connection, code must never wait on a second checkout while holding the first.
+- **No runtime DDL:** schema is applied at deploy time from `src/db/migrate/` (see [Schema changes](#schema-changes)). The cold-start `CREATE TABLE` / `ALTER TABLE` blocks it replaced failed silently on most cold starts (connection timeouts at container init) and took metadata locks on `orders` at every one.

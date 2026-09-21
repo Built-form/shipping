@@ -9,26 +9,8 @@ const { mapGoodsOnSeaStatus, mapGoodsOnAirStatus, mapOrdersStatus } = require('.
 // For this refactoring, the CREATE TABLE statement is removed from the handler.
 
 // Mirror every importer-attached order line as a PO-level audit event.
-// Assumes the audit_log table was created lazily by the orders handler — we
-// run CREATE TABLE IF NOT EXISTS here too so the importer is safe to invoke
-// in isolation (e.g. a cold environment where /api/v1/orders has never been
-// hit yet). Batched 200 rows per INSERT to keep the round-trip count low.
+// Batched 200 rows per INSERT to keep the round-trip count low.
 async function auditImporterAttachments(conn) {
-    await conn.execute(`
-        CREATE TABLE IF NOT EXISTS audit_log (
-            id BIGINT NOT NULL AUTO_INCREMENT,
-            entity_type VARCHAR(32) NOT NULL,
-            entity_id INT NOT NULL,
-            action VARCHAR(16) NOT NULL,
-            before_json JSON NULL,
-            after_json JSON NULL,
-            user_email VARCHAR(255) NULL,
-            created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (id),
-            KEY idx_entity (entity_type, entity_id, created_at)
-        )
-    `);
-
     const [linkedRows] = await conn.query(`
         SELECT id, purchase_order_id, jf_code, asin, product_name,
                quantity, po_number, supplier
@@ -322,40 +304,6 @@ exports.handler = async (event) => {
         // Validate before truncating
         if (!seaRows.length && !airRows.length && !orderRows.length) {
             throw new Error('No data fetched from Asana projects — aborting to preserve existing data');
-        }
-
-        // Ensure columns exist (idempotent — ignore if already present)
-        const columnsToAdd = [
-            'ALTER TABLE orders ADD COLUMN delivery_date DATE NULL',
-            'ALTER TABLE orders ADD COLUMN lot_number VARCHAR(255) NULL',
-            'ALTER TABLE orders ADD COLUMN mfg_date DATE NULL',
-            'ALTER TABLE orders ADD COLUMN exp_date DATE NULL',
-            'ALTER TABLE orders ADD COLUMN delivery_time VARCHAR(100) NULL',
-            'ALTER TABLE orders ADD COLUMN container_status VARCHAR(100) NULL',
-            'ALTER TABLE orders ADD COLUMN booking_status VARCHAR(100) NULL',
-            'ALTER TABLE orders ADD COLUMN arrived_date DATE NULL',
-            'ALTER TABLE orders ADD COLUMN external_container_number VARCHAR(255) NULL',
-            'ALTER TABLE orders ADD COLUMN order_cbm DECIMAL(10,3) NULL',
-            'ALTER TABLE orders ADD COLUMN port VARCHAR(255) NULL',
-            'ALTER TABLE orders ADD COLUMN carton_cbm DECIMAL(10,6) NULL',
-            'ALTER TABLE orders ADD COLUMN units_per_carton INT NULL',
-            'ALTER TABLE orders ADD COLUMN pack_size VARCHAR(100) NULL',
-            'ALTER TABLE orders ADD COLUMN scheduled_date DATE NULL',
-            'ALTER TABLE orders ADD COLUMN po_date DATE NULL',
-            'ALTER TABLE orders ADD COLUMN qc_status VARCHAR(100) NULL',
-            'ALTER TABLE orders ADD COLUMN qc_date DATE NULL',
-            'ALTER TABLE orders ADD COLUMN qc_invoice_number VARCHAR(100) NULL',
-            'ALTER TABLE orders ADD COLUMN purchase_order_id INT NULL',
-            'ALTER TABLE orders ADD COLUMN unit_price DECIMAL(10,4) NULL',
-            'ALTER TABLE orders ADD COLUMN actual_ready_date DATE NULL',
-            'ALTER TABLE orders ADD COLUMN estimated_departure_date DATE NULL',
-            'ALTER TABLE orders ADD COLUMN shipped_date DATE NULL',
-            'ALTER TABLE orders ADD COLUMN ordered_date DATE NULL',
-            'ALTER TABLE orders ADD COLUMN estimated_ready_date DATE NULL',
-            'ALTER TABLE orders ADD COLUMN artwork_confirmed_date DATE NULL',
-        ];
-        for (const ddl of columnsToAdd) {
-            try { await conn.execute(ddl); } catch (e) { /* already exists */ }
         }
 
         // Only truncate after successful fetch

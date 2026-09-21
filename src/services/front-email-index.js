@@ -401,92 +401,6 @@ function resolveClues(idx, clues) {
     return res;
 }
 
-// ── Schema (idempotent) ──────────────────────────────────────────────────────
-async function ensureSchema(conn) {
-    // The searchable link table: one row per (conversation, order).
-    await conn.query(`
-        CREATE TABLE IF NOT EXISTS order_emails (
-            id BIGINT NOT NULL AUTO_INCREMENT,
-            order_id          BIGINT NOT NULL,
-            conversation_id   VARCHAR(100) NOT NULL,
-            subject           VARCHAR(512) NULL,
-            preview           VARCHAR(1000) NULL,
-            from_email        VARCHAR(255) NULL,
-            participants      JSON NULL,
-            direction         VARCHAR(16) NULL,
-            front_url         VARCHAR(255) NULL,
-            match_tier        VARCHAR(16) NOT NULL DEFAULT 'product',
-            match_basis       JSON NULL,
-            source            VARCHAR(16) NOT NULL DEFAULT 'rule',
-            confidence        DECIMAL(4,3) NULL,
-            message_count     INT NOT NULL DEFAULT 0,
-            first_message_at  DATETIME NULL,
-            last_message_at   DATETIME NULL,
-            created_at        TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at        TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-            PRIMARY KEY (id),
-            UNIQUE KEY uk_convo_order (conversation_id, order_id),
-            KEY idx_order_recent (order_id, last_message_at),
-            KEY idx_convo (conversation_id)
-        )
-    `);
-    // Per-conversation provenance + dedup ledger. The FULL thread body lives here
-    // — ONCE per conversation — and order_emails references it by conversation_id,
-    // so a thread linked to N orders stores its body once, not N times.
-    await conn.query(`
-        CREATE TABLE IF NOT EXISTS front_email_index (
-            id BIGINT NOT NULL AUTO_INCREMENT,
-            conversation_id   VARCHAR(100) NOT NULL,
-            subject           VARCHAR(512) NULL,
-            from_email        VARCHAR(255) NULL,
-            front_url         VARCHAR(255) NULL,
-            body_full         MEDIUMTEXT NULL,
-            message_count     INT NOT NULL DEFAULT 0,
-            last_message_at   DATETIME NULL,
-            last_message_ms   BIGINT NULL,
-            matched_order_count INT NOT NULL DEFAULT 0,
-            order_ids         JSON NULL,
-            ambiguous         TINYINT(1) NOT NULL DEFAULT 0,
-            gemini_used       TINYINT(1) NOT NULL DEFAULT 0,
-            gemini_confidence DECIMAL(4,3) NULL,
-            signals           JSON NULL,
-            scanned_at        TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-            PRIMARY KEY (id),
-            UNIQUE KEY uk_convo (conversation_id),
-            KEY idx_last_msg (last_message_at),
-            FULLTEXT KEY ftx_body (subject, body_full)
-        )
-    `);
-    // Single-row incremental watermark (epoch SECONDS, like front_status_import).
-    await conn.query(`
-        CREATE TABLE IF NOT EXISTS front_email_scan_state (
-            id TINYINT NOT NULL,
-            last_run_ts BIGINT NULL,
-            updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-            PRIMARY KEY (id)
-        )
-    `);
-
-    // Additive guards: if an earlier version created the tables without the
-    // Gemini-fallback columns, backfill them (dup-column errno 1060 = no-op).
-    const addCol = async (sql) => {
-        try { await conn.query(sql); }
-        catch (e) { if (e && (e.errno === 1060 || e.errno === 1061)) return; throw e; }
-    };
-    await addCol(`ALTER TABLE order_emails ADD COLUMN source VARCHAR(16) NOT NULL DEFAULT 'rule'`);
-    await addCol(`ALTER TABLE order_emails ADD COLUMN confidence DECIMAL(4,3) NULL`);
-    await addCol(`ALTER TABLE front_email_index ADD COLUMN gemini_used TINYINT(1) NOT NULL DEFAULT 0`);
-    await addCol(`ALTER TABLE front_email_index ADD COLUMN gemini_confidence DECIMAL(4,3) NULL`);
-    await addCol(`ALTER TABLE front_email_index ADD COLUMN last_message_ms BIGINT NULL`);
-    // The body lives on the per-conversation ledger (one copy), NOT per link.
-    await addCol(`ALTER TABLE front_email_index ADD COLUMN body_full MEDIUMTEXT NULL`);
-    await addCol(`ALTER TABLE front_email_index ADD FULLTEXT KEY ftx_body (subject, body_full)`);
-    // Drop the de-normalized per-link body if an earlier version created it
-    // (errno 1091 = column doesn't exist → no-op).
-    try { await conn.query(`ALTER TABLE order_emails DROP COLUMN body_full`); }
-    catch (e) { if (e && e.errno !== 1091) throw e; }
-}
-
 async function getLastRunMs(conn) {
     const [rows] = await conn.query(`SELECT last_run_ts FROM front_email_scan_state WHERE id = 1`);
     return rows.length && rows[0].last_run_ts ? Number(rows[0].last_run_ts) * 1000 : null;
@@ -634,7 +548,6 @@ async function indexEmailsFromFront(conn, {
         e.code = 'NOT_CONFIGURED';
         throw e;
     }
-    await ensureSchema(conn);
 
     // The Flash fallback is best-effort: only on if explicitly wanted, keyed, AND
     // given a positive budget. maxGemini<=0 means "Gemini off" (NOT "cap at zero",
@@ -850,7 +763,6 @@ async function indexEmailsFromFront(conn, {
 
 module.exports = {
     indexEmailsFromFront,
-    ensureSchema,
     buildOrderIndex,
     matchConversation,
     resolveClues,

@@ -104,52 +104,6 @@ function normalizePo(s) {
     return String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
 }
 
-// ── Schema (idempotent) ──────────────────────────────────────────────────────
-// Provenance + dedup ledger: one row per Front MESSAGE processed (UNIQUE
-// source_ref), recording what Gemini saw, what we matched, and the outcome.
-async function ensureSchema(conn) {
-    await conn.query(`
-        CREATE TABLE IF NOT EXISTS front_status_imports (
-            id BIGINT NOT NULL AUTO_INCREMENT,
-            source_ref          VARCHAR(255) NOT NULL,
-            conversation_id     VARCHAR(100) NULL,
-            message_id          VARCHAR(100) NULL,
-            from_email          VARCHAR(255) NULL,
-            subject             VARCHAR(512) NULL,
-            received_at         DATETIME NULL,
-            extracted_po        VARCHAR(100) NULL,
-            po_found            TINYINT(1) NULL,
-            inferred_status     VARCHAR(32) NULL,
-            status_stated       TINYINT(1) NULL,
-            confidence          DECIMAL(4,3) NULL,
-            rationale           VARCHAR(1000) NULL,
-            matched_order_count INT NOT NULL DEFAULT 0,
-            order_ids           JSON NULL,
-            alert_ids           JSON NULL,
-            model_used          VARCHAR(64) NULL,
-            usage_json          JSON NULL,
-            outcome             VARCHAR(24) NOT NULL DEFAULT 'pending',
-            error_message       VARCHAR(1000) NULL,
-            source_meta         JSON NULL,
-            created_at          TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (id),
-            UNIQUE KEY uk_source_ref (source_ref),
-            KEY idx_outcome (outcome),
-            KEY idx_created (created_at)
-        )
-    `);
-    // Single-row watermark for incremental look-back. Stored as epoch SECONDS to
-    // sidestep mysql2 DATETIME/timezone conversion entirely.
-    await conn.query(`
-        CREATE TABLE IF NOT EXISTS front_status_import_state (
-            id TINYINT NOT NULL,
-            last_run_ts BIGINT NULL,
-            updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-            PRIMARY KEY (id)
-        )
-    `);
-}
-
 // Epoch ms of the last fully-drained run's start, or null if never run.
 async function getLastRunMs(conn) {
     const [rows] = await conn.query(`SELECT last_run_ts FROM front_status_import_state WHERE id = 1`);
@@ -549,7 +503,6 @@ async function importStatusUpdatesFromFront(conn, {
         e.code = 'NOT_CONFIGURED';
         throw e;
     }
-    await ensureSchema(conn);
 
     const today = londonToday();
     const overlapHours = envNum('STATUS_IMPORT_OVERLAP_HOURS', DEFAULT_OVERLAP_HOURS);
@@ -954,7 +907,6 @@ async function importStatusUpdatesFromFront(conn, {
 
 module.exports = {
     importStatusUpdatesFromFront,
-    ensureSchema,
     matchOrdersByPo,
     matchOrdersByContainer,
     matchOrdersByJfCode,

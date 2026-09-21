@@ -23,69 +23,6 @@ const crypto = require('crypto');
 // handler (src/handlers/email-receipt.js).
 const CONFIRM_PATH = '/api/v1/confirm-receipt';
 
-// Idempotent table create. Takes a live connection so both the orders Lambda
-// (cold-start migration) and the supplier-portal Lambda can call it without
-// depending on which warmed first.
-async function ensureEmailReceiptsSchema(conn) {
-    await conn.query(`
-        CREATE TABLE IF NOT EXISTS email_receipts (
-            id INT NOT NULL AUTO_INCREMENT,
-            token VARCHAR(64) NOT NULL,
-            email_type VARCHAR(48) NOT NULL,
-            send_table VARCHAR(64) NULL,
-            send_id INT NULL,
-            sent_to TEXT NULL,
-            subject VARCHAR(500) NULL,
-            created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
-            opened_at DATETIME NULL,
-            open_count INT NOT NULL DEFAULT 0,
-            confirmed_at DATETIME NULL,
-            confirmed_ip VARCHAR(64) NULL,
-            confirmed_user_agent VARCHAR(500) NULL,
-            reminder_count INT NOT NULL DEFAULT 0,
-            last_reminder_at DATETIME NULL,
-            PRIMARY KEY (id),
-            UNIQUE KEY uk_token (token),
-            KEY idx_send (send_table, send_id)
-        )
-    `);
-    // Additive migration for any table created before the two-state model
-    // (opened = weak GET signal, confirmed = strong POST-button signal). Each
-    // ALTER is a no-op if the column already exists (errno 1060 = duplicate).
-    const addColumns = [
-        `ALTER TABLE email_receipts ADD COLUMN opened_at DATETIME NULL`,
-        `ALTER TABLE email_receipts ADD COLUMN open_count INT NOT NULL DEFAULT 0`,
-        `ALTER TABLE email_receipts ADD COLUMN confirmed_at DATETIME NULL`,
-        `ALTER TABLE email_receipts ADD COLUMN confirmed_ip VARCHAR(64) NULL`,
-        `ALTER TABLE email_receipts ADD COLUMN confirmed_user_agent VARCHAR(500) NULL`,
-        `ALTER TABLE email_receipts ADD COLUMN reminder_count INT NOT NULL DEFAULT 0`,
-        `ALTER TABLE email_receipts ADD COLUMN last_reminder_at DATETIME NULL`,
-    ];
-    for (const sql of addColumns) {
-        try { await conn.query(sql); }
-        catch (e) { if (!e || e.errno !== 1060) throw e; }
-    }
-    // Ledger of individual follow-up (reminder) sends, one row per send. The
-    // parent's reminder_count/last_reminder_at is the summary; this is the
-    // detail the UI lists. sent_by_email is NULL for the automated sweep, the
-    // operator's email for a manual "resend" click.
-    await conn.query(`
-        CREATE TABLE IF NOT EXISTS email_receipt_reminders (
-            id INT NOT NULL AUTO_INCREMENT,
-            email_receipt_id INT NOT NULL,
-            reminder_number INT NOT NULL,
-            sent_to TEXT NULL,
-            subject VARCHAR(500) NULL,
-            front_message_uid VARCHAR(255) NULL,
-            front_conversation_id VARCHAR(255) NULL,
-            sent_by_email VARCHAR(255) NULL,
-            created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (id),
-            KEY idx_receipt (email_receipt_id, id)
-        )
-    `);
-}
-
 // Absolute base URL (scheme + host) for building the confirm link. Prefers an
 // explicit PUBLIC_API_BASE_URL override (e.g. a custom domain); otherwise
 // derives it from the inbound request — the confirm endpoint lives on the SAME
@@ -378,7 +315,6 @@ function renderConfirmButtonHtml(receipt, actionUrl) {
 
 module.exports = {
     CONFIRM_PATH,
-    ensureEmailReceiptsSchema,
     apiBaseUrlFromReq,
     createEmailReceipt,
     linkReceiptToSend,

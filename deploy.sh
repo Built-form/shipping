@@ -22,6 +22,14 @@ set -e
 
 STAGE="${1:-dev}"
 
+# Schema first: apply pending src/db/migrate/ files to this stage's database
+# (secret shipping/<prod|test>, direct host). The Lambdas run no DDL, so a
+# failed migration must stop the deploy here (set -e) rather than ship code
+# against a schema it does not match. Migrations are additive, so the code
+# still live keeps working in the minutes before the new code lands.
+echo "==> Applying database migrations for stage '$STAGE'..."
+node tools/migrate.js --stage "$STAGE" --apply
+
 echo "==> Pruning dev dependencies..."
 npm prune --production
 

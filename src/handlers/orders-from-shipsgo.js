@@ -32,23 +32,6 @@ const AIR_DEPARTED_STATUSES = new Set(['EN_ROUTE', 'LANDED', 'DELIVERED']);
 // order's history shows ShipsGo (not a person) moved it to ON_SEA / ON_AIR.
 const AUDIT_USER = 'shipsgo';
 
-async function ensureAuditLogTable(conn) {
-    await conn.execute(`
-        CREATE TABLE IF NOT EXISTS audit_log (
-            id BIGINT NOT NULL AUTO_INCREMENT,
-            entity_type VARCHAR(32) NOT NULL,
-            entity_id INT NOT NULL,
-            action VARCHAR(16) NOT NULL,
-            before_json JSON NULL,
-            after_json JSON NULL,
-            user_email VARCHAR(255) NULL,
-            created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (id),
-            KEY idx_entity (entity_type, entity_id, created_at)
-        )
-    `);
-}
-
 // One audit row per auto-advance, matching the shape orders.js writes for a
 // status change (entity 'order', action 'update', diffed before/after).
 async function recordStatusAdvance(conn, orderId, fromStatus, toStatus) {
@@ -183,7 +166,6 @@ exports.handler = async () => {
     const conn = await pool.getConnection();
     try {
         log.info('[orders-from-shipsgo] starting');
-        await ensureAuditLogTable(conn);
         const sea = await syncOrdersFromShipsGo(conn);
 
         // Air sync is best-effort: air_shipments is created by shipsgo-air,

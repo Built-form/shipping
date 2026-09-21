@@ -44,62 +44,10 @@ const pool = getPool();
 const QUICK_AUTH_CODE = process.env.RECEIVING_QUICK_AUTH_CODE || '';
 const QUICK_AUTH_NORM = normalizeCode(QUICK_AUTH_CODE);
 
-// Cold-start setup. Self-contained so this Lambda works even if it warms before
-// ordersApi: ensure order_receipts has the idempotency columns/index the
-// receive path needs, and that audit_log exists. All idempotent.
-const schemaReady = (async () => {
-    const conn = await pool.getConnection();
-    try {
-        const migrations = [
-            `ALTER TABLE order_receipts ADD COLUMN idempotency_key VARCHAR(64) NULL AFTER asn_item_id`,
-            `ALTER TABLE order_receipts ADD UNIQUE KEY uk_order_idempotency (order_id, idempotency_key)`,
-            `ALTER TABLE order_receipts ADD COLUMN type VARCHAR(16) NOT NULL DEFAULT 'received'`,
-            // Mirrors ordersApi — the shared receive path writes this column, so
-            // this Lambda must be able to create it if it warms up first.
-            `ALTER TABLE order_receipts ADD COLUMN quarantined TINYINT(1) NOT NULL DEFAULT 0`,
-        ];
-        for (const sql of migrations) {
-            try { await conn.query(sql); } catch (e) {
-                const msg = e.message || '';
-                if (!msg.includes('Duplicate column') && !msg.includes('Duplicate key name')) throw e;
-            }
-        }
-        await conn.query(`
-            CREATE TABLE IF NOT EXISTS audit_log (
-                id BIGINT NOT NULL AUTO_INCREMENT,
-                entity_type VARCHAR(32) NOT NULL,
-                entity_id INT NOT NULL,
-                action VARCHAR(16) NOT NULL,
-                before_json JSON NULL,
-                after_json JSON NULL,
-                user_email VARCHAR(255) NULL,
-                created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (id),
-                KEY idx_entity (entity_type, entity_id, created_at)
-            )
-        `);
-        // ORDER_SELECT (src/lib/order-shape.js) aggregates planned-container
-        // names as a subquery, so every order read from this Lambda touches
-        // this table. ordersApi owns it, but create it here too so a cold
-        // carton-scan that warms first doesn't 500 on a missing table.
-        await conn.query(`
-            CREATE TABLE IF NOT EXISTS planned_container_allocations (
-                id INT NOT NULL AUTO_INCREMENT,
-                order_id INT NOT NULL,
-                planned_container_name VARCHAR(100) NOT NULL,
-                allocated INT NOT NULL DEFAULT 0,
-                created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                PRIMARY KEY (id),
-                UNIQUE KEY uk_order_planned (order_id, planned_container_name),
-                KEY idx_planned_name (planned_container_name),
-                KEY idx_order_id (order_id)
-            )
-        `);
-    } finally {
-        conn.release();
-    }
-})().catch(err => log.error('[carton-scan] schema migration failed', err));
+// Schema (the order_receipts idempotency columns, audit_log, and the planned
+// allocations ORDER_SELECT reads) is applied at deploy time from
+// src/db/migrate/: this Lambda runs no DDL. Kept so the routes' awaits stand.
+const schemaReady = Promise.resolve();
 
 async function withConnection(fn) {
     const conn = await pool.getConnection();

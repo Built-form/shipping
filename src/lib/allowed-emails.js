@@ -36,83 +36,56 @@ const USER_TYPE_MAX_LEN = 32;   // matches the column
 const EMAIL_MAX_LEN = 255;
 const DISPLAY_NAME_MAX_LEN = 255;
 
-// ── Schema ────────────────────────────────────────────────────────────────
-
-let schemaPromise;
+// ── Seed ──────────────────────────────────────────────────────────────────
+// The table itself is schema (src/db/migrate/, applied by deploy.sh). The
+// seed below runs from migration 2026-09-21_13_seed_allowed_emails.js.
 
 /**
- * Create the table and, on first run only, seed it from the shared
- * `allowed_emails`.
+ * First run only: seed the table from the shared `allowed_emails`.
  *
- * The seed is gated on the new table being EMPTY, so a later run never
- * re-copies — otherwise removing a user here would resurrect them from the
- * shared table on the next cold start. Nothing is written to `allowed_emails`;
- * joshdex keeps it untouched.
+ * The seed is gated on the table being EMPTY, so a later run never re-copies —
+ * otherwise removing a user here would resurrect them from the shared table.
+ * Nothing is written to `allowed_emails`; joshdex keeps it untouched.
  *
  * If there is nothing to copy (fresh schema, no legacy table), the
- * comma-separated BOOTSTRAP_ADMIN_EMAILS seeds the first admins — without it a
- * fresh deploy would 401 everyone, including whoever needs to add user #1.
+ * comma-separated `bootstrapAdminEmails` (BOOTSTRAP_ADMIN_EMAILS) seeds the
+ * first admins — without it a fresh database would 401 everyone, including
+ * whoever needs to add user #1.
  */
-function ensureAllowedEmailsSchema(pool) {
-    if (!schemaPromise) {
-        schemaPromise = (async () => {
-            const conn = await pool.getConnection();
-            try {
-                // Surrogate `id` (email stays unique) purely so audit_log —
-                // whose entity_id is an INT — can key user changes like every
-                // other entity in this API.
-                await conn.query(`
-                    CREATE TABLE IF NOT EXISTS ${TABLE} (
-                        id INT NOT NULL AUTO_INCREMENT,
-                        email VARCHAR(${EMAIL_MAX_LEN}) NOT NULL,
-                        display_name VARCHAR(${DISPLAY_NAME_MAX_LEN}) NULL,
-                        type VARCHAR(32) NOT NULL DEFAULT '${DEFAULT_USER_TYPE}',
-                        created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
-                        updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                        PRIMARY KEY (id),
-                        UNIQUE KEY uk_email (email)
-                    )
-                `);
+async function seedAllowedEmails(conn, { bootstrapAdminEmails = '' } = {}) {
+    const [[{ c: count }]] = await conn.query(`SELECT COUNT(*) AS c FROM ${TABLE}`);
+    if (count > 0) return;
 
-                const [[{ c: count }]] = await conn.query(`SELECT COUNT(*) AS c FROM ${TABLE}`);
-                if (count > 0) return;
-
-                const [legacy] = await conn.query(
-                    `SELECT TABLE_NAME FROM information_schema.TABLES
-                      WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?`,
-                    [LEGACY_TABLE]
-                );
-                if (legacy.length > 0) {
-                    const [result] = await conn.query(`
-                        INSERT IGNORE INTO ${TABLE} (email, type, created_at)
-                        SELECT LOWER(email), COALESCE(NULLIF(type, ''), '${DEFAULT_USER_TYPE}'), created_at
-                          FROM ${LEGACY_TABLE}
-                    `);
-                    log.info(`[allowed-emails] seeded ${result.affectedRows} user(s) from ${LEGACY_TABLE}`);
-                }
-
-                const [[{ c: seeded }]] = await conn.query(`SELECT COUNT(*) AS c FROM ${TABLE}`);
-                if (seeded > 0) return;
-
-                const bootstrap = (process.env.BOOTSTRAP_ADMIN_EMAILS || '')
-                    .split(',').map(e => e.trim().toLowerCase()).filter(Boolean);
-                for (const email of bootstrap) {
-                    await conn.query(
-                        `INSERT IGNORE INTO ${TABLE} (email, type) VALUES (?, 'admin')`,
-                        [email]
-                    );
-                }
-                if (bootstrap.length) {
-                    log.info(`[allowed-emails] seeded ${bootstrap.length} bootstrap admin(s)`);
-                } else {
-                    log.warn(`[allowed-emails] ${TABLE} is EMPTY and BOOTSTRAP_ADMIN_EMAILS is unset — every authed request will 401.`);
-                }
-            } finally {
-                conn.release();
-            }
-        })();
+    const [legacy] = await conn.query(
+        `SELECT TABLE_NAME FROM information_schema.TABLES
+          WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?`,
+        [LEGACY_TABLE]
+    );
+    if (legacy.length > 0) {
+        const [result] = await conn.query(`
+            INSERT IGNORE INTO ${TABLE} (email, type, created_at)
+            SELECT LOWER(email), COALESCE(NULLIF(type, ''), '${DEFAULT_USER_TYPE}'), created_at
+              FROM ${LEGACY_TABLE}
+        `);
+        log.info(`[allowed-emails] seeded ${result.affectedRows} user(s) from ${LEGACY_TABLE}`);
     }
-    return schemaPromise;
+
+    const [[{ c: seeded }]] = await conn.query(`SELECT COUNT(*) AS c FROM ${TABLE}`);
+    if (seeded > 0) return;
+
+    const bootstrap = String(bootstrapAdminEmails || '')
+        .split(',').map(e => e.trim().toLowerCase()).filter(Boolean);
+    for (const email of bootstrap) {
+        await conn.query(
+            `INSERT IGNORE INTO ${TABLE} (email, type) VALUES (?, 'admin')`,
+            [email]
+        );
+    }
+    if (bootstrap.length) {
+        log.info(`[allowed-emails] seeded ${bootstrap.length} bootstrap admin(s)`);
+    } else {
+        log.warn(`[allowed-emails] ${TABLE} is EMPTY and BOOTSTRAP_ADMIN_EMAILS is unset — every authed request will 401.`);
+    }
 }
 
 /**
@@ -120,7 +93,6 @@ function ensureAllowedEmailsSchema(pool) {
  * address isn't on the allowlist (→ 401).
  */
 async function lookupUserType(pool, email) {
-    await ensureAllowedEmailsSchema(pool);
     const conn = await pool.getConnection();
     try {
         const [rows] = await conn.query(
@@ -238,18 +210,6 @@ function registerUserRoutes(app, pool) {
         res.status(403).json({ error: 'Admin access required.' });
         return false;
     };
-
-    // Every route needs the table to exist; do it once here rather than in
-    // seven handlers.
-    router.use(async (req, res, next) => {
-        try {
-            await ensureAllowedEmailsSchema(pool);
-            next();
-        } catch (error) {
-            log.error('[users] schema not ready', error);
-            res.status(500).json({ error: 'An internal error occurred.' });
-        }
-    });
 
     // GET /api/v1/users/me — the caller's own record. Open to every allowlisted
     // user (the frontend needs its own type to decide what to render), so it
@@ -473,7 +433,6 @@ function registerUserRoutes(app, pool) {
     // list of role names, and the UI needs it before it knows the viewer's own.
     app.get('/api/v1/user-types', async (req, res) => {
         try {
-            await ensureAllowedEmailsSchema(pool);
             const conn = await pool.getConnection();
             try {
                 res.json({ data: await listUserTypes(conn) });
@@ -493,7 +452,7 @@ module.exports = {
     TABLE,
     BASE_USER_TYPES,
     DEFAULT_USER_TYPE,
-    ensureAllowedEmailsSchema,
+    seedAllowedEmails,
     lookupUserType,
     listUserTypes,
     registerUserRoutes,

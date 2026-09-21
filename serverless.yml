@@ -210,6 +210,13 @@ package:
   patterns:
     - '!.env'
     - '!.git/**'
+    # Local-only: CLIs, tests and docs, and the hand-applied SQL archive. Never
+    # required by a Lambda. (src/db/migrate/ does ship: the runtime schema
+    # check compares its file list with the schema_migrations ledger.)
+    - '!.env.*'
+    - '!tools/**'
+    - '!docs/**'
+    - '!src/db/migrations/**'
     - '!node_modules/.cache/**'
     # npm's atomic-install staging dirs (`.<pkg>-<hash>`) left behind by an
     # interrupted `npm install`. Each is a full package copy, so the walker

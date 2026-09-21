@@ -352,27 +352,12 @@ async function httpGetBufferFront(url) {
     return Buffer.from(await resp.arrayBuffer());
 }
 
-// ── Schema (additive, idempotent) ─────────────────────────────────────────────
-// qc_reports already exists (created by orders.js). We only add origin columns.
-async function ensureSchema(conn) {
-    const addCol = async (sql) => {
-        try { await conn.query(sql); }
-        catch (e) { if (e && (e.errno === 1060 || e.errno === 1061)) return; throw e; } // dup column / dup key
-    };
-    await addCol(`ALTER TABLE qc_reports ADD COLUMN source VARCHAR(32) NULL`);
-    await addCol(`ALTER TABLE qc_reports ADD COLUMN source_ref VARCHAR(255) NULL`);
-    await addCol(`ALTER TABLE qc_reports ADD COLUMN source_meta JSON NULL`);
-    await addCol(`ALTER TABLE qc_reports ADD COLUMN source_received_at DATETIME NULL`);
-    await addCol(`ALTER TABLE qc_reports ADD UNIQUE KEY uk_source_ref (source_ref)`);
-}
-
 // Hard-deletes everything THIS importer previously created (rows + their order
 // links) so a `--reset` re-fetch starts clean. A plain soft-delete wouldn't do:
 // the row lingers, so the UNIQUE(source_ref) + the dedup lookup would make the
 // re-import skip it. Only ever touches source='front-%' rows — never manual
 // uploads.
 async function resetFrontImports(conn) {
-    await ensureSchema(conn);
     const [rows] = await conn.query(`SELECT id FROM qc_reports WHERE source LIKE 'front-%'`);
     const ids = rows.map(r => r.id);
     if (!ids.length) return { deleted: 0, ids: [] };
@@ -391,7 +376,6 @@ async function importQcReportsFromFront(conn, { sinceDays = 14, dryRun = false }
         e.code = 'NOT_CONFIGURED';
         throw e;
     }
-    await ensureSchema(conn);
 
     const cutoffMs = Date.now() - sinceDays * 86400000;
     const query = `from:${SUPPLIER_DOMAIN} after:${Math.floor(cutoffMs / 1000)}`;

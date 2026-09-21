@@ -116,73 +116,6 @@ function clampLimit(limit, fallback = 200) {
     return Math.min(Math.max(n, 1), 1000);
 }
 
-// ── Schema (lazy CREATE + idempotent ALTERs, memoized) ───────────────────────
-let schemaPromise = null;
-function ensureDailyAlertsSchema(pool) {
-    if (!schemaPromise) {
-        schemaPromise = (async () => {
-            const conn = await pool.getConnection();
-            try {
-                await conn.query(`
-                    CREATE TABLE IF NOT EXISTS daily_alerts (
-                        id BIGINT NOT NULL AUTO_INCREMENT,
-                        dedup_key VARCHAR(255) NOT NULL,
-                        type VARCHAR(32) NOT NULL,
-                        severity VARCHAR(16) NOT NULL DEFAULT 'today',
-                        event_date DATE NOT NULL,
-                        title VARCHAR(255) NOT NULL,
-                        body VARCHAR(1000) NULL,
-                        entity_type VARCHAR(32) NULL,
-                        entity_id VARCHAR(100) NULL,
-                        meta JSON NULL,
-                        acknowledged_at DATETIME NULL,
-                        acknowledged_by VARCHAR(255) NULL,
-                        snoozed_until DATETIME NULL,
-                        dismissed_at DATETIME NULL,
-                        resolved_at DATETIME NULL,
-                        last_seen_at DATETIME NULL,
-                        last_action VARCHAR(16) NULL,
-                        action_note VARCHAR(1000) NULL,
-                        created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
-                        PRIMARY KEY (id),
-                        UNIQUE KEY uk_dedup (dedup_key),
-                        KEY idx_event_date (event_date),
-                        KEY idx_type (type),
-                        KEY idx_last_seen (last_seen_at),
-                        KEY idx_lifecycle (dismissed_at, resolved_at, snoozed_until)
-                    )
-                `);
-                // Idempotent column adds for a table created by an earlier
-                // (pre-lifecycle) version. Duplicate-column errors are expected.
-                const migrations = [
-                    `ALTER TABLE daily_alerts ADD COLUMN acknowledged_at DATETIME NULL`,
-                    `ALTER TABLE daily_alerts ADD COLUMN acknowledged_by VARCHAR(255) NULL`,
-                    `ALTER TABLE daily_alerts ADD COLUMN snoozed_until DATETIME NULL`,
-                    `ALTER TABLE daily_alerts ADD COLUMN dismissed_at DATETIME NULL`,
-                    `ALTER TABLE daily_alerts ADD COLUMN resolved_at DATETIME NULL`,
-                    `ALTER TABLE daily_alerts ADD COLUMN last_seen_at DATETIME NULL`,
-                    `ALTER TABLE daily_alerts ADD COLUMN last_action VARCHAR(16) NULL`,
-                    // Free-text note an operator leaves when actioning an AI
-                    // status suggestion (esp. on 'acknowledge' — what they did
-                    // instead of applying the AI's change). Surfaced in history.
-                    `ALTER TABLE daily_alerts ADD COLUMN action_note VARCHAR(1000) NULL`,
-                ];
-                for (const sql of migrations) {
-                    try { await conn.query(sql); } catch (e) {
-                        if (!String(e.message || '').includes('Duplicate column')) throw e;
-                    }
-                }
-            } finally {
-                conn.release();
-            }
-        })().catch((err) => {
-            schemaPromise = null; // allow a later caller to retry
-            throw err;
-        });
-    }
-    return schemaPromise;
-}
-
 // SELECT with a computed is_snoozed flag (evaluated in SQL against the DB clock,
 // so the snooze boundary never depends on the Node host's timezone). All reads
 // go through this so rowToAlert always has is_snoozed.
@@ -468,7 +401,6 @@ async function upsertAlerts(conn, alerts, runTs) {
 
 // ── Generation (called by the nightly Lambda) ───────────────────────────────
 async function generateDailyAlerts(pool, { today = londonToday() } = {}) {
-    await ensureDailyAlertsSchema(pool);
     const conn = await pool.getConnection();
     try {
         // Single DB-clock timestamp marks this run; rows not stamped with it are
@@ -768,7 +700,6 @@ async function actOnSuggestion(conn, { id, userEmail, action, note }) {
 }
 
 module.exports = {
-    ensureDailyAlertsSchema,
     generateDailyAlerts,
     listAlerts,
     listHistory,

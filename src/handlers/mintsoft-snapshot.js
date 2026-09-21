@@ -38,25 +38,6 @@ async function loadJfCodes(conn) {
     return rows.map(r => ({ jfCode: r.jf_code.trim(), asin: (r.asin || '').trim() }));
 }
 
-// ── Ensure table exists ────────────────────────────────────────────────────────
-async function ensureTable(conn) {
-    // Assuming 'stock_snapshots' table is managed by migrations.
-    const migrations = [
-        `ALTER TABLE stock_snapshots ADD COLUMN asin VARCHAR(50) NOT NULL DEFAULT '' AFTER jf_code`,
-        `ALTER TABLE stock_snapshots ADD COLUMN warehouse_id INT NOT NULL DEFAULT 0 AFTER product_id`,
-        `ALTER TABLE stock_snapshots ADD COLUMN allocated INT NOT NULL DEFAULT 0 AFTER available`,
-        `ALTER TABLE stock_snapshots ADD COLUMN quarantine INT NOT NULL DEFAULT 0 AFTER allocated`,
-        // "Last refreshed" timestamp — bumped on every upsert so the stock-sum
-        // views can tell whether an order receipt is already reflected here.
-        `ALTER TABLE stock_snapshots ADD COLUMN updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP`,
-    ];
-    for (const sql of migrations) {
-        try { await conn.execute(sql); } catch (e) {
-            if (!e.message.includes('Duplicate column')) throw e;
-        }
-    }
-}
-
 // ── Per-JF-code snapshot (reusable) ────────────────────────────────────────────
 // Fetches Mintsoft stock for one JF code and upserts stock_snapshots rows for
 // today's dateRan. Used by the scheduled batch run, the live post-receive
@@ -126,8 +107,6 @@ const handler = async () => {
     const db = await getPool().getConnection();
 
     try {
-        await ensureTable(db);
-
         const jfCodes = await loadJfCodes(db);
         if (jfCodes.length === 0) {
             log.warn('No JF codes found in landed_costs — nothing to snapshot');

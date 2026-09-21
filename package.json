@@ -25,7 +25,9 @@
   "scripts": {
     "dev": "node src/handlers/orders.js",
     "dev:local": "node tools/dev-server.js",
-    "test:unit": "node --test tools/test-draft-audit-lib.js tools/test-shipments-lib.js",
+    "test:unit": "node --test tools/test-draft-audit-lib.js tools/test-shipments-lib.js tools/test-packing-list-compare.js tools/test-migrate-lib.js",
+    "migrate": "node tools/migrate.js",
+    "migrate:status": "node tools/migrate.js --status",
     "deploy": "serverless deploy",
     "offline": "serverless offline"
   }

@@ -220,8 +220,10 @@ it came from (the `draft_container` vocabulary in
 
 ## Operations
 
-- Schema: `src/db/migrations/2026-09-18_*.sql`, hand-applied before a deploy
-  (`node tools/sql.js -f …`), one file per table.
+- Schema: `src/db/migrate/2026-09-21_01_shipments_tables.sql` and
+  `2026-09-21_02_shipment_id_columns.sql`, applied by `deploy.sh` (through
+  `tools/migrate.js`) before the code ships. The tables are inert until the
+  backfill below arms them.
 - `node tools/backfill-shipments.js` — dry-run report; `--apply --confirm-host
   <DB_HOST> [--link-by-name-hint] [--exclude-hint-ids …]` seeds the shipments and
   arms the dual-write hooks (`shipments_backfill_v1` in `app_migrations`).

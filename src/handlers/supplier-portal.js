@@ -34,31 +34,17 @@ app.use(express.json({ limit: '256kb' }));
 
 const pool = getPool();
 
-// Cold-start setup. Self-contained: ensures the suppliers.portal_code column +
-// codes exist, and that audit_log exists (normally created by orders.js, but we
-// don't want to depend on which Lambda warmed first). Both are idempotent.
+// Cold-start setup: make sure every live JFPro supplier has a portal access
+// code (a data top-up on jfpro.suppliers, idempotent). Schema, audit_log
+// included, is applied at deploy time from src/db/migrate/.
 const schemaReady = (async () => {
     const conn = await pool.getConnection();
     try {
         await ensureSupplierPortalCodes(conn);
-        await conn.query(`
-            CREATE TABLE IF NOT EXISTS audit_log (
-                id BIGINT NOT NULL AUTO_INCREMENT,
-                entity_type VARCHAR(32) NOT NULL,
-                entity_id INT NOT NULL,
-                action VARCHAR(16) NOT NULL,
-                before_json JSON NULL,
-                after_json JSON NULL,
-                user_email VARCHAR(255) NULL,
-                created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (id),
-                KEY idx_entity (entity_type, entity_id, created_at)
-            )
-        `);
     } finally {
         conn.release();
     }
-})().catch(err => log.error('[portal] schema migration failed', err));
+})().catch(err => log.error('[portal] supplier portal-code setup failed', err));
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 async function withConnection(fn) {

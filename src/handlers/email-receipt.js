@@ -21,7 +21,7 @@ const cors = require('cors');
 const { getPool } = require('../db');
 const log = require('../lib/logger');
 const {
-    CONFIRM_PATH, ensureEmailReceiptsSchema,
+    CONFIRM_PATH,
     markReceiptOpened, markReceiptConfirmed,
     renderConfirmButtonHtml, renderThankYouHtml,
 } = require('../lib/email-receipt');
@@ -31,17 +31,9 @@ app.use(cors());
 
 const pool = getPool();
 
-// Cold-start setup. Self-contained + idempotent: ensures the email_receipts
-// table exists (also created by orders.js, but we don't depend on which Lambda
-// warmed first).
-const schemaReady = (async () => {
-    const conn = await pool.getConnection();
-    try {
-        await ensureEmailReceiptsSchema(conn);
-    } finally {
-        conn.release();
-    }
-})().catch(err => log.error('[email-receipt] schema migration failed', err));
+// email_receipts is schema applied at deploy time from src/db/migrate/: this
+// Lambda runs no DDL. Kept so the routes' awaits stand.
+const schemaReady = Promise.resolve();
 
 async function withConnection(fn) {
     const conn = await pool.getConnection();

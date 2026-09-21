@@ -181,7 +181,7 @@ function printReport(r) {
         const [t] = await conn.query(`SHOW TABLES LIKE 'shipments'`);
         const [c] = await conn.query(`SHOW COLUMNS FROM orders LIKE 'shipment_id'`);
         if (!t.length || !c.length) {
-            console.error('The shipments schema is not applied here. Hand-apply src/db/migrations/2026-09-18_*.sql first.');
+            console.error('The shipments schema is not applied here. Run `node tools/migrate.js --apply` for this database first (deploy.sh does it per stage).');
             process.exit(2);
         }
         const started = Date.now();

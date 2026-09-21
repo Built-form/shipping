@@ -23,7 +23,7 @@ const { recordAudit } = require('../lib/audit');
 // a draft's history outlives renames, conversion and deletion.
 const draftAudit = require('../lib/draft-audit');
 const {
-    ensureEmailReceiptsSchema, apiBaseUrlFromReq, createEmailReceipt,
+    apiBaseUrlFromReq, createEmailReceipt,
     linkReceiptToSend, appendReceiptLink,
     getReceiptForResend, recordReminderSend, listReminders,
 } = require('../lib/email-receipt');
@@ -32,10 +32,12 @@ const { receiveOrderStock, ReceiveError } = require('../services/order-receive')
 const { listWarehousesWithLocations, listLocationsForWarehouse } = require('../services/mintsoft-locations');
 // Daily alerts (slide-out alert window). Generation logic lives in the service
 // so the nightly Lambda reuses it; here we only expose the read/ack routes.
-const { ensureDailyAlertsSchema, listAlerts, listHistory, actOnAlert, getSuggestionForUpdate, actOnSuggestion, londonToday } = require('../services/daily-alerts');
+const { listAlerts, listHistory, actOnAlert, getSuggestionForUpdate, actOnSuggestion, londonToday } = require('../services/daily-alerts');
 // This app's own user allowlist: the table the auth middleware below checks,
 // plus the /api/v1/users CRUD that manages it.
-const { ensureAllowedEmailsSchema, lookupUserType, registerUserRoutes } = require('../lib/allowed-emails');
+const { lookupUserType, registerUserRoutes } = require('../lib/allowed-emails');
+const { DEFAULT_EMAIL_TEMPLATES } = require('../lib/email-template-defaults');
+const { checkSchemaOnce } = require('../lib/schema-migrations');
 const T = require('../lib/order-transitions');
 // Shipments: one row per physical movement of goods. Through rollout step 3
 // it is a derived shadow of the legacy container columns and the draft /
@@ -45,6 +47,7 @@ const T = require('../lib/order-transitions');
 // the bottom of this file.
 const shipmentSync = require('../services/shipment-sync');
 const { registerShipmentRoutes } = require('../services/shipment-routes');
+const { registerPackingListRoutes } = require('../services/packing-list-routes');
 const { makeSplitOrder } = require('../services/order-split');
 const shipmentsLib = require('../lib/shipments');
 const shipmentPaymentsService = require('../services/shipment-payments');
@@ -65,46 +68,21 @@ app.use(express.json({ limit: '12mb' }));
 // Database pool — declared before middleware that depends on it
 const pool = getPool();
 
-// Lazily migrate order_receipts to support idempotent retries. The unique
-// (order_id, idempotency_key) index is what enforces dedupe; NULL keys are
-// treated as distinct by MySQL so legacy rows without a key still coexist.
-const orderReceiptsSchemaReady = (async () => {
-    const conn = await pool.getConnection();
-    try {
-        const migrations = [
-            `ALTER TABLE order_receipts ADD COLUMN idempotency_key VARCHAR(64) NULL AFTER asn_item_id`,
-            `ALTER TABLE order_receipts ADD UNIQUE KEY uk_order_idempotency (order_id, idempotency_key)`,
-            `ALTER TABLE order_receipts ADD COLUMN type VARCHAR(16) NOT NULL DEFAULT 'received'`,
-            // Did these units go into Mintsoft quarantine rather than normal
-            // sellable stock? Reflects what Mintsoft actually did.
-            `ALTER TABLE order_receipts ADD COLUMN quarantined TINYINT(1) NOT NULL DEFAULT 0`,
-        ];
-        for (const sql of migrations) {
-            try { await conn.query(sql); } catch (e) {
-                const msg = e.message || '';
-                if (!msg.includes('Duplicate column') && !msg.includes('Duplicate key name')) throw e;
-            }
-        }
-    } finally {
-        conn.release();
-    }
-})().catch(err => log.error('[orders] order_receipts schema migration failed', err));
+// Logs an error, once per container, when the database is behind the
+// migrations bundled with this code (a deploy that skipped deploy.sh).
+// Never blocks or fails the request. See src/lib/schema-migrations.js.
+app.use((req, res, next) => {
+    checkSchemaOnce(pool);
+    next();
+});
 
-// Give stock_snapshots a real "last refreshed" timestamp (bumped on every
-// upsert) so the stock-sum views can gate order receipts against the cached
-// Mintsoft number — netting a receipt only once the snapshot reflects it.
-const stockSnapshotsSchemaReady = (async () => {
-    const conn = await pool.getConnection();
-    try {
-        await conn.query(
-            `ALTER TABLE stock_snapshots ADD COLUMN updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP`
-        );
-    } catch (e) {
-        if (!(e.message || '').includes('Duplicate column')) throw e;
-    } finally {
-        conn.release();
-    }
-})().catch(err => log.error('[orders] stock_snapshots schema migration failed', err));
+// Schema lives in src/db/migrate/ and is applied by tools/migrate.js, which
+// deploy.sh runs before the code ships: this Lambda runs no DDL. The
+// *SchemaReady / *Ready names below were cold-start migrations. They stay as
+// resolved promises so the routes' existing awaits need no change.
+const orderReceiptsSchemaReady = Promise.resolve();
+
+const stockSnapshotsSchemaReady = Promise.resolve();
 
 // Manually adjusted sales figures — an ops override of the sales number used
 // for an ASIN in a given marketplace, held at the same (asin, country) grain as
@@ -114,211 +92,17 @@ const stockSnapshotsSchemaReady = (async () => {
 // One live row per (asin, country); country 'ALL' is the reserved cross-market
 // entry. The unique key covers soft-deleted rows too, so re-creating a deleted
 // key revives that row rather than inserting a second one (see POST below).
-const adjustedSalesSchemaReady = (async () => {
-    const conn = await pool.getConnection();
-    try {
-        await conn.query(`
-            CREATE TABLE IF NOT EXISTS adjusted_sales (
-                id INT NOT NULL AUTO_INCREMENT,
-                asin VARCHAR(20) NOT NULL,
-                country VARCHAR(8) NOT NULL,
-                adjusted_sales DECIMAL(12,2) NOT NULL,
-                note VARCHAR(500) NULL,
-                created_by_email VARCHAR(255) NULL,
-                updated_by_email VARCHAR(255) NULL,
-                created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                deleted_at DATETIME NULL,
-                PRIMARY KEY (id),
-                UNIQUE KEY uk_asin_country (asin, country),
-                KEY idx_asin (asin)
-            )
-        `);
-    } finally {
-        conn.release();
-    }
-})().catch(err => log.error('[orders] adjusted_sales schema migration failed', err));
+const adjustedSalesSchemaReady = Promise.resolve();
 
-// Lazy-create the daily_alerts table (shared with the nightly generator). Each
-// alert route awaits this before touching the table.
-const dailyAlertsSchemaReady = ensureDailyAlertsSchema(pool)
-    .catch(err => log.error('[orders] daily_alerts schema migration failed', err));
+const dailyAlertsSchemaReady = Promise.resolve();
 
-// Lazy-create the audit_log table. Captures before/after JSON for every
-// mutation on orders and purchase_orders performed through this API. The
-// Asana importer is intentionally NOT audited (TRUNCATE + bulk insert every
-// 10 min would spam the table).
-const auditLogSchemaReady = (async () => {
-    const conn = await pool.getConnection();
-    try {
-        await conn.query(`
-            CREATE TABLE IF NOT EXISTS audit_log (
-                id BIGINT NOT NULL AUTO_INCREMENT,
-                entity_type VARCHAR(32) NOT NULL,
-                entity_id INT NOT NULL,
-                action VARCHAR(16) NOT NULL,
-                before_json JSON NULL,
-                after_json JSON NULL,
-                user_email VARCHAR(255) NULL,
-                created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (id),
-                KEY idx_entity (entity_type, entity_id, created_at)
-            )
-        `);
-        // `action` started life as VARCHAR(16), which silently truncated longer
-        // action names in non-strict MySQL (e.g. 'qc_report_downloaded' was
-        // stored as 'qc_report_downlo', so ?action= filtering never matched).
-        // Widen it — data-preserving and idempotent. Existing already-truncated
-        // rows stay as-is; new writes keep the full name.
-        try { await conn.query(`ALTER TABLE audit_log MODIFY COLUMN action VARCHAR(64) NOT NULL`); }
-        catch (e) { log.warn('[orders] audit_log action widen skipped', e.message); }
-    } finally {
-        conn.release();
-    }
-})().catch(err => log.error('[orders] audit_log schema migration failed', err));
+const auditLogSchemaReady = Promise.resolve();
 
 // Join table linking orders to user-named "draft containers" — a planning
 // step before a real container is booked. One order can sit in many drafts
 // with different allocated quantities; (order_id, draft_container_name) is
 // unique so the same order can't appear twice in the same draft.
-const draftContainerAllocationsSchemaReady = (async () => {
-    const conn = await pool.getConnection();
-    try {
-        await conn.query(`
-            CREATE TABLE IF NOT EXISTS draft_container_allocations (
-                id INT NOT NULL AUTO_INCREMENT,
-                order_id INT NOT NULL,
-                draft_container_name VARCHAR(100) NOT NULL,
-                allocated INT NOT NULL DEFAULT 0,
-                created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                PRIMARY KEY (id),
-                UNIQUE KEY uk_order_draft (order_id, draft_container_name),
-                KEY idx_draft_name (draft_container_name),
-                KEY idx_order_id (order_id)
-            )
-        `);
-        // Versioned PDFs of a draft container, used to request delivery
-        // quotes from freight forwarders. Mirrors purchase_order_documents.
-        // The draft is identified by name (no parent table — drafts are
-        // implicit, defined by the existence of allocations).
-        await conn.query(`
-            CREATE TABLE IF NOT EXISTS draft_container_documents (
-                id INT NOT NULL AUTO_INCREMENT,
-                draft_container_name VARCHAR(100) NOT NULL,
-                version INT NOT NULL,
-                s3_key VARCHAR(500) NOT NULL,
-                public_url VARCHAR(1000) NULL,
-                file_size INT NULL,
-                generated_by_email VARCHAR(255) NULL,
-                generated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
-                deleted_at DATETIME NULL,
-                PRIMARY KEY (id),
-                KEY idx_draft_version (draft_container_name, version)
-            )
-        `);
-        // One row per send attempt (same as purchase_order_document_sends).
-        await conn.query(`
-            CREATE TABLE IF NOT EXISTS draft_container_document_sends (
-                id INT NOT NULL AUTO_INCREMENT,
-                draft_container_document_id INT NOT NULL,
-                sent_to JSON NOT NULL,
-                subject VARCHAR(255) NULL,
-                front_message_uid VARCHAR(128) NULL,
-                front_conversation_id VARCHAR(64) NULL,
-                sent_by_email VARCHAR(255) NULL,
-                sent_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (id),
-                KEY idx_document_id (draft_container_document_id),
-                KEY idx_sent_at (sent_at)
-            )
-        `);
-        // PDF flavour: 'quote' (default delivery quote request),
-        // 'forwarder-quote' (detailed carton-level forwarder quote) or
-        // 'supplier-quote' (forwarder layout filtered to a single supplier).
-        // Versions are sequenced per (draft, type, supplier).
-        try {
-            await conn.query(
-                `ALTER TABLE draft_container_documents ADD COLUMN type VARCHAR(32) NOT NULL DEFAULT 'quote'`
-            );
-        } catch (e) {
-            if (!String(e.message || '').includes('Duplicate column')) throw e;
-        }
-        // supplier is NULL for 'quote'/'forwarder-quote'; the supplier name for
-        // 'supplier-quote' (orders store supplier as a free-text string).
-        try {
-            await conn.query(
-                `ALTER TABLE draft_container_documents ADD COLUMN supplier VARCHAR(255) NULL`
-            );
-        } catch (e) {
-            if (!String(e.message || '').includes('Duplicate column')) throw e;
-        }
-        // batch_id groups the documents produced by a single generate call (a
-        // forwarder-quote plus its per-supplier supplier-quotes), so emailing the
-        // forwarder-quote can attach the whole set. NULL for standalone docs.
-        try {
-            await conn.query(
-                `ALTER TABLE draft_container_documents ADD COLUMN batch_id VARCHAR(64) NULL`
-            );
-        } catch (e) {
-            if (!String(e.message || '').includes('Duplicate column')) throw e;
-        }
-        try {
-            await conn.query(
-                `ALTER TABLE draft_container_documents ADD KEY idx_batch_id (batch_id)`
-            );
-        } catch (e) {
-            if (!String(e.message || '').includes('Duplicate key')) throw e;
-        }
-        // CSV companion of the PDF — generated, stored in S3 and served at its own
-        // public URL exactly like the PDF. NULL on documents generated before this
-        // was added (their email send rebuilds the CSV on the fly as a fallback).
-        const draftDocCsvMigrations = [
-            `ALTER TABLE draft_container_documents ADD COLUMN csv_s3_key VARCHAR(500) NULL`,
-            `ALTER TABLE draft_container_documents ADD COLUMN csv_public_url VARCHAR(1000) NULL`,
-            `ALTER TABLE draft_container_documents ADD COLUMN csv_file_size INT NULL`,
-        ];
-        for (const sql of draftDocCsvMigrations) {
-            try { await conn.query(sql); } catch (e) {
-                if (!String(e.message || '').includes('Duplicate column')) throw e;
-            }
-        }
-        // Registry of every draft-container name that has ever existed. Drafts
-        // are otherwise implicit (defined by their allocation rows), so this is
-        // what gives audit_log a stable integer entity_id per draft: renames
-        // keep the id, and a row is never deleted — closing (conversion into a
-        // real container, or deletion) only stamps closed_* so the history stays
-        // reachable after the draft is gone. See src/lib/draft-audit.js.
-        await conn.query(`
-            CREATE TABLE IF NOT EXISTS draft_containers (
-                id INT NOT NULL AUTO_INCREMENT,
-                name VARCHAR(100) NOT NULL,
-                created_by_email VARCHAR(255) NULL,
-                created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
-                last_activity_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
-                closed_reason VARCHAR(16) NULL,
-                closed_at DATETIME NULL,
-                closed_by_email VARCHAR(255) NULL,
-                container_number VARCHAR(100) NULL,
-                PRIMARY KEY (id),
-                UNIQUE KEY uk_name (name),
-                KEY idx_last_activity (last_activity_at)
-            )
-        `);
-        // One-shot data migrations claim a row here (INSERT IGNORE inside the
-        // migration's own transaction) so they run exactly once across
-        // concurrent cold starts.
-        await conn.query(`
-            CREATE TABLE IF NOT EXISTS app_migrations (
-                name VARCHAR(64) NOT NULL,
-                applied_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (name)
-            )
-        `);
-    } finally {
-        conn.release();
-    }
-})().catch(err => log.error('[orders] draft_container_allocations schema migration failed', err));
+const draftContainerAllocationsSchemaReady = Promise.resolve();
 
 // Join table linking orders to user-named "planned containers" — the same
 // planning shape as draft containers (see above) but a separate, independent
@@ -327,111 +111,17 @@ const draftContainerAllocationsSchemaReady = (async () => {
 // or email side, by design. One order can sit in many planned containers with
 // different allocated quantities; (order_id, planned_container_name) is unique
 // so the same order can't appear twice in the same planned container.
-const plannedContainerAllocationsSchemaReady = (async () => {
-    const conn = await pool.getConnection();
-    try {
-        await conn.query(`
-            CREATE TABLE IF NOT EXISTS planned_container_allocations (
-                id INT NOT NULL AUTO_INCREMENT,
-                order_id INT NOT NULL,
-                planned_container_name VARCHAR(100) NOT NULL,
-                allocated INT NOT NULL DEFAULT 0,
-                created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                PRIMARY KEY (id),
-                UNIQUE KEY uk_order_planned (order_id, planned_container_name),
-                KEY idx_planned_name (planned_container_name),
-                KEY idx_order_id (order_id)
-            )
-        `);
-    } finally {
-        conn.release();
-    }
-})().catch(err => log.error('[orders] planned_container_allocations schema migration failed', err));
+const plannedContainerAllocationsSchemaReady = Promise.resolve();
 
 // Quality Assurance documents — a QC inspection sheet built from an explicit
 // set of order ids (not tied to a draft container). Mirrors the draft/PO
 // document + sends pattern: versioned PDFs in S3, emailed to suppliers via
 // Front. Versions are sequenced per `order_ids_key` (the sorted id set) so
 // regenerating the same selection bumps the version.
-const qualityAssuranceSchemaReady = (async () => {
-    const conn = await pool.getConnection();
-    try {
-        await conn.query(`
-            CREATE TABLE IF NOT EXISTS quality_assurance_documents (
-                id INT NOT NULL AUTO_INCREMENT,
-                ref VARCHAR(100) NULL,
-                version INT NOT NULL,
-                draft_container_name VARCHAR(100) NULL,
-                order_ids JSON NOT NULL,
-                order_ids_key VARCHAR(255) NOT NULL,
-                qc_units JSON NULL,
-                s3_key VARCHAR(500) NOT NULL,
-                public_url VARCHAR(1000) NULL,
-                file_size INT NULL,
-                comments TEXT NULL,
-                generated_by_email VARCHAR(255) NULL,
-                generated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
-                deleted_at DATETIME NULL,
-                PRIMARY KEY (id),
-                KEY idx_order_ids_key (order_ids_key, version)
-            )
-        `);
-        await conn.query(`
-            CREATE TABLE IF NOT EXISTS quality_assurance_document_sends (
-                id INT NOT NULL AUTO_INCREMENT,
-                quality_assurance_document_id INT NOT NULL,
-                sent_to JSON NOT NULL,
-                subject VARCHAR(255) NULL,
-                front_message_uid VARCHAR(128) NULL,
-                front_conversation_id VARCHAR(64) NULL,
-                sent_by_email VARCHAR(255) NULL,
-                sent_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (id),
-                KEY idx_qa_document_id (quality_assurance_document_id),
-                KEY idx_sent_at (sent_at)
-            )
-        `);
-        // draft_container_name was added after the initial release — backfill
-        // the column + index on already-created tables. Optional tag set at
-        // generate time so the list can be scoped to a draft container.
-        const migrations = [
-            `ALTER TABLE quality_assurance_documents ADD COLUMN draft_container_name VARCHAR(100) NULL`,
-            `ALTER TABLE quality_assurance_documents ADD KEY idx_draft_container_name (draft_container_name)`,
-            // CSV companion of the PDF — stored in S3 and served at its own public
-            // URL exactly like the PDF. NULL on documents predating this column.
-            `ALTER TABLE quality_assurance_documents ADD COLUMN csv_s3_key VARCHAR(500) NULL`,
-            `ALTER TABLE quality_assurance_documents ADD COLUMN csv_public_url VARCHAR(1000) NULL`,
-            `ALTER TABLE quality_assurance_documents ADD COLUMN csv_file_size INT NULL`,
-        ];
-        for (const sql of migrations) {
-            try { await conn.query(sql); } catch (e) {
-                const msg = e.message || '';
-                if (!msg.includes('Duplicate column') && !msg.includes('Duplicate key name')) throw e;
-            }
-        }
-    } finally {
-        conn.release();
-    }
-})().catch(err => log.error('[orders] quality_assurance schema migration failed', err));
+const qualityAssuranceSchemaReady = Promise.resolve();
 
-// Draft registry + its one-time backfill. The backfill reads allocations,
-// draft documents AND quality_assurance_documents, so it waits for both
-// schemas; every draft route awaits this instead of the allocations schema so
-// a legacy draft is registered (with its reconstructed history) before any new
-// event is written against it.
-const draftRegistryReady = (async () => {
-    await draftContainerAllocationsSchemaReady;
-    await qualityAssuranceSchemaReady;
-    await auditLogSchemaReady;
-    const conn = await pool.getConnection();
-    try {
-        const { ran } = await draftAudit.backfillDraftRegistry(conn);
-        if (ran) log.info('[orders] draft_containers registry backfilled from existing drafts');
-    } finally {
-        conn.release();
-    }
-})().catch(err => log.error('[orders] draft_containers registry backfill failed', err));
+// The draft registry backfill runs as migration 2026-09-21_10_draft_registry_backfill.js.
+const draftRegistryReady = Promise.resolve();
 
 // deepEqual / diffSnapshots / recordAudit moved to src/lib/audit.js (imported
 // above) so the receive service can write identical before/after audit rows.
@@ -485,24 +175,7 @@ async function recordPoAttachmentChange(conn, { before, after, userEmail }) {
     }
 }
 
-// Lazy-create the po_sent_webhooks dedup table. Persistent (not truncated by
-// the Asana import) so a (po_number, jf_code) pair fires the Make webhook
-// at most once across the order's lifetime, even if the row is recreated.
-const poSentWebhooksSchemaReady = (async () => {
-    const conn = await pool.getConnection();
-    try {
-        await conn.query(`
-            CREATE TABLE IF NOT EXISTS po_sent_webhooks (
-                po_number VARCHAR(100) NOT NULL,
-                jf_code VARCHAR(50) NOT NULL,
-                fired_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (po_number, jf_code)
-            )
-        `);
-    } finally {
-        conn.release();
-    }
-})().catch(err => log.error('[orders] po_sent_webhooks schema migration failed', err));
+const poSentWebhooksSchemaReady = Promise.resolve();
 
 const PO_SENT_WEBHOOK_URL = process.env.MAKE_PO_SENT_WEBHOOK_URL
     || 'https://hook.eu1.make.com/ufykbn3v7pxz4yn9wyrdchy7fumuyifr';
@@ -567,122 +240,16 @@ const supplierEmailsSchemaReady = (async () => {
 
 // ── Email templates ──────────────────────────────────────────────────────
 // Subject/body HTML used when emailing documents to suppliers/forwarders via
-// Front. Previously hardcoded in the send handlers; now stored in the
-// email_templates table so ops can edit the copy without a deploy. The send
-// handlers read by template_key and fall back to these in-code defaults if
-// the row is missing. Subjects support {placeholder} tokens that are
-// substituted with per-send values (e.g. {poNumber}) at send time.
-const DEFAULT_EMAIL_TEMPLATES = [
-    {
-        key: 'purchase_order',
-        name: 'Purchase Order',
-        category: 'Purchasing',
-        description: 'Emailed to a supplier with a PO PDF attached. Tokens: {poNumber}.',
-        subject: '{poNumber}',
-        bodyHtml: [
-            '<div style="font-family:Helvetica,Arial,sans-serif;font-size:14px;color:#222;line-height:1.5;">',
-            '<p>Greetings,</p>',
-            '<p>Please see attached PO. Please send back a PI. I will send artwork shortly.</p>',
-            '<p>Thank you.</p>',
-            '<p>Kind Regards,<br>Operations Team.<br>JFA Medical Ltd.</p>',
-            '</div>',
-        ].join(''),
-    },
-    {
-        key: 'draft_container_quote',
-        name: 'Delivery Quote Request',
-        category: 'Logistics',
-        description: 'Emailed to a freight forwarder with a draft container PDF attached. Tokens: {draftContainerName}.',
-        subject: 'Delivery Quote Request – {draftContainerName}',
-        bodyHtml: [
-            '<div style="font-family:Helvetica,Arial,sans-serif;font-size:14px;color:#222;line-height:1.5;">',
-            '<p>Greetings,</p>',
-            '<p>Please see attached our delivery quote request. Could you please provide a quote for shipping the listed goods to our UK warehouse?</p>',
-            '<p>Thank you.</p>',
-            '<p>Kind Regards,<br>Operations Team.<br>JFA Medical Ltd.</p>',
-            '</div>',
-        ].join(''),
-    },
-    {
-        key: 'purchase_order_signed_pi',
-        name: 'Signed Proforma Invoice',
-        category: 'Purchasing',
-        description: 'Emailed with a signed proforma invoice (PI_signed) attached. Tokens: {poNumber}.',
-        subject: 'Signed PI – {poNumber}',
-        bodyHtml: [
-            '<div style="font-family:Helvetica,Arial,sans-serif;font-size:14px;color:#222;line-height:1.5;">',
-            '<p>Greetings,</p>',
-            '<p>Please find attached the signed proforma invoice for your records.</p>',
-            '<p>Thank you.</p>',
-            '<p>Kind Regards,<br>Operations Team.<br>JFA Medical Ltd.</p>',
-            '</div>',
-        ].join(''),
-    },
-    {
-        key: 'quality_assurance',
-        name: 'Quality Assurance',
-        category: 'Quality',
-        description: 'Emailed to a QC inspector/supplier with a quality assurance sheet attached. Tokens: {ref}.',
-        subject: 'Quality Assurance – {ref}',
-        bodyHtml: [
-            '<div style="font-family:Helvetica,Arial,sans-serif;font-size:14px;color:#222;line-height:1.5;">',
-            '<p>Greetings,</p>',
-            '<p>Please see attached our quality assurance sheet. Could you please carry out QC inspection on the listed items per the QC Units indicated?</p>',
-            '<p>Thank you.</p>',
-            '<p>Kind Regards,<br>Operations Team.<br>JFA Medical Ltd.</p>',
-            '</div>',
-        ].join(''),
-    },
-];
+// Front, stored in the email_templates table so ops can edit the copy without
+// a deploy. The send handlers read by template_key and fall back to the
+// in-code defaults (src/lib/email-template-defaults.js, which migration
+// 2026-09-21_11_seed_email_templates.js seeds from) if the row is missing.
+// Subjects support {placeholder} tokens substituted per send (e.g. {poNumber}).
 const DEFAULT_TEMPLATES_BY_KEY = new Map(DEFAULT_EMAIL_TEMPLATES.map(t => [t.key, t]));
 
-const emailTemplatesSchemaReady = (async () => {
-    const conn = await pool.getConnection();
-    try {
-        await conn.query(`
-            CREATE TABLE IF NOT EXISTS email_templates (
-                id INT NOT NULL AUTO_INCREMENT,
-                template_key VARCHAR(64) NOT NULL,
-                name VARCHAR(255) NOT NULL,
-                category VARCHAR(64) NULL,
-                description TEXT NULL,
-                subject VARCHAR(500) NULL,
-                body_html MEDIUMTEXT NOT NULL,
-                created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                deleted_at DATETIME NULL,
-                PRIMARY KEY (id),
-                UNIQUE KEY uk_template_key (template_key)
-            )
-        `);
-        // Additive migration for tables that predate the category column.
-        try { await conn.query(`ALTER TABLE email_templates ADD COLUMN category VARCHAR(64) NULL AFTER name`); }
-        catch (e) { if (!e || e.errno !== 1060) throw e; } // 1060 = duplicate column, already migrated
-        // Seed the built-in templates. INSERT IGNORE so an ops edit is never
-        // clobbered on redeploy — only missing keys get (re)created.
-        for (const t of DEFAULT_EMAIL_TEMPLATES) {
-            await conn.query(
-                `INSERT IGNORE INTO email_templates (template_key, name, category, description, subject, body_html)
-                 VALUES (?, ?, ?, ?, ?, ?)`,
-                [t.key, t.name, t.category || null, t.description || null, t.subject || null, t.bodyHtml]
-            );
-        }
-    } finally {
-        conn.release();
-    }
-})().catch(err => log.error('[orders] email_templates schema migration failed', err));
+const emailTemplatesSchemaReady = Promise.resolve();
 
-// Lazy-create the email_receipts table (shared with the public supplier-portal
-// Lambda, which serves the confirm-receipt click endpoint). Each send handler
-// awaits this before minting a receipt token.
-const emailReceiptsSchemaReady = (async () => {
-    const conn = await pool.getConnection();
-    try {
-        await ensureEmailReceiptsSchema(conn);
-    } finally {
-        conn.release();
-    }
-})().catch(err => log.error('[orders] email_receipts schema migration failed', err));
+const emailReceiptsSchemaReady = Promise.resolve();
 
 // Resolve an email template by key, falling back to the in-code default if
 // the row was deleted or the table isn't ready yet. Never throws — a missing
@@ -711,300 +278,9 @@ function renderTemplate(str, vars) {
     return String(str).replace(/\{(\w+)\}/g, (m, k) => (vars[k] != null ? String(vars[k]) : m));
 }
 
-// Lazy-create the purchase_orders parent table and the nullable
-// orders.purchase_order_id column. No FK constraint — orders is TRUNCATEd
-// by the Asana importer every 10 min, which InnoDB blocks on a referencing FK.
-const purchaseOrdersSchemaReady = (async () => {
-    const conn = await pool.getConnection();
-    try {
-        await conn.query(`
-            CREATE TABLE IF NOT EXISTS purchase_orders (
-                id INT NOT NULL AUTO_INCREMENT,
-                po_number VARCHAR(100) NOT NULL,
-                supplier VARCHAR(255) NULL,
-                notes TEXT NULL,
-                currency CHAR(3) NULL DEFAULT 'USD',
-                shipping_total DECIMAL(10,2) NULL DEFAULT 0,
-                created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                deleted_at DATETIME NULL,
-                PRIMARY KEY (id),
-                UNIQUE KEY uk_po_number (po_number)
-            )
-        `);
-        await conn.query(`
-            CREATE TABLE IF NOT EXISTS purchase_order_documents (
-                id INT NOT NULL AUTO_INCREMENT,
-                purchase_order_id INT NOT NULL,
-                version INT NOT NULL,
-                s3_key VARCHAR(500) NOT NULL,
-                public_url VARCHAR(1000) NULL,
-                file_size INT NULL,
-                generated_by_email VARCHAR(255) NULL,
-                generated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (id),
-                KEY idx_po_version (purchase_order_id, version)
-            )
-        `);
-        // One row per send attempt (a given PDF version can be emailed many
-        // times — to different suppliers, to corrected addresses, etc.).
-        // Captures the recipients, Front's IDs (for cross-referencing with
-        // the Front conversation), and the user who triggered the send.
-        await conn.query(`
-            CREATE TABLE IF NOT EXISTS purchase_order_document_sends (
-                id INT NOT NULL AUTO_INCREMENT,
-                purchase_order_document_id INT NOT NULL,
-                sent_to JSON NOT NULL,
-                subject VARCHAR(255) NULL,
-                front_message_uid VARCHAR(128) NULL,
-                front_conversation_id VARCHAR(64) NULL,
-                sent_by_email VARCHAR(255) NULL,
-                sent_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (id),
-                KEY idx_document_id (purchase_order_document_id),
-                KEY idx_sent_at (sent_at)
-            )
-        `);
-        // Supplier-issued invoices attached to a PO. Many-to-one with
-        // purchase_orders. Files live next to the generated PO PDFs in the
-        // same public S3 bucket (different prefix). Notes are editable; the
-        // file itself is immutable once uploaded — re-upload creates a new row.
-        await conn.query(`
-            CREATE TABLE IF NOT EXISTS purchase_order_invoices (
-                id INT NOT NULL AUTO_INCREMENT,
-                purchase_order_id INT NOT NULL,
-                filename VARCHAR(255) NOT NULL,
-                s3_key VARCHAR(500) NOT NULL,
-                public_url VARCHAR(1000) NULL,
-                content_type VARCHAR(128) NULL,
-                file_size INT NULL,
-                notes TEXT NULL,
-                uploaded_by_email VARCHAR(255) NULL,
-                uploaded_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                deleted_at DATETIME NULL,
-                PRIMARY KEY (id),
-                KEY idx_purchase_order_id (purchase_order_id),
-                KEY idx_uploaded_at (uploaded_at)
-            )
-        `);
-        // One row per check run — auto-fired on upload + manual re-runs.
-        // A given invoice can have many check rows (history of attempts,
-        // re-runs after model upgrades, retries after a failed run, etc.).
-        await conn.query(`
-            CREATE TABLE IF NOT EXISTS purchase_order_invoice_checks (
-                id INT NOT NULL AUTO_INCREMENT,
-                purchase_order_invoice_id INT NOT NULL,
-                status ENUM('pending', 'succeeded', 'failed') NOT NULL,
-                verdict VARCHAR(32) NULL,
-                discrepancy_count INT NULL,
-                result_json JSON NULL,
-                model_used VARCHAR(64) NULL,
-                input_tokens INT NULL,
-                output_tokens INT NULL,
-                total_tokens INT NULL,
-                error_code VARCHAR(64) NULL,
-                error_message TEXT NULL,
-                triggered_by VARCHAR(32) NULL,
-                triggered_by_email VARCHAR(255) NULL,
-                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (id),
-                KEY idx_invoice_id (purchase_order_invoice_id),
-                KEY idx_created_at (created_at)
-            )
-        `);
-        // Payment instructions extracted from a supplier invoice (PI): how much
-        // to pay now (deposit/upfront or full), by when, and the beneficiary
-        // bank details — so a downstream job (e.g. WorldFirst) can arrange the
-        // transfer. One row per invoice/PI (UNIQUE on the invoice id): a newly
-        // uploaded PI gets its own row. Populated by the Gemini invoice check
-        // (folded into the same call). `payment_status` is owned by the operator
-        // / payment job and is deliberately NOT overwritten when a re-check
-        // re-extracts the terms.
-        await conn.query(`
-            CREATE TABLE IF NOT EXISTS purchase_order_invoice_payments (
-                id INT NOT NULL AUTO_INCREMENT,
-                purchase_order_invoice_id INT NOT NULL,
-                purchase_order_id INT NOT NULL,
-                payment_type VARCHAR(32) NULL,
-                amount_due DECIMAL(14,2) NULL,
-                currency CHAR(3) NULL,
-                deposit_percentage DECIMAL(6,3) NULL,
-                invoice_total DECIMAL(14,2) NULL,
-                due_date DATE NULL,
-                due_terms VARCHAR(500) NULL,
-                beneficiary_name VARCHAR(255) NULL,
-                bank_name VARCHAR(255) NULL,
-                bank_address VARCHAR(500) NULL,
-                account_number VARCHAR(100) NULL,
-                iban VARCHAR(64) NULL,
-                swift_bic VARCHAR(32) NULL,
-                intermediary_bank VARCHAR(255) NULL,
-                payment_reference VARCHAR(255) NULL,
-                raw_terms_text TEXT NULL,
-                payment_status ENUM('pending', 'arranged', 'paid', 'skipped') NOT NULL DEFAULT 'pending',
-                extracted_from_check_id INT NULL,
-                model_used VARCHAR(64) NULL,
-                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                PRIMARY KEY (id),
-                UNIQUE KEY uk_invoice (purchase_order_invoice_id),
-                KEY idx_purchase_order_id (purchase_order_id),
-                KEY idx_payment_status (payment_status)
-            )
-        `);
-        // Payment documents attached to a PO (bank transfer confirmations,
-        // SWIFT receipts, wire proofs, etc.). Same shape as invoices —
-        // separate table to keep concerns clean and audit trails distinct.
-        await conn.query(`
-            CREATE TABLE IF NOT EXISTS purchase_order_payments (
-                id INT NOT NULL AUTO_INCREMENT,
-                purchase_order_id INT NOT NULL,
-                filename VARCHAR(255) NOT NULL,
-                s3_key VARCHAR(500) NOT NULL,
-                public_url VARCHAR(1000) NULL,
-                content_type VARCHAR(128) NULL,
-                file_size INT NULL,
-                notes TEXT NULL,
-                uploaded_by_email VARCHAR(255) NULL,
-                uploaded_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                deleted_at DATETIME NULL,
-                PRIMARY KEY (id),
-                KEY idx_purchase_order_id (purchase_order_id),
-                KEY idx_uploaded_at (uploaded_at)
-            )
-        `);
-        // Signed proforma invoices attached to a PO ("PI_signed"). Same shape
-        // as purchase_order_invoices — a supplier-/buyer-signed copy of the PI,
-        // uploaded as a file, separate table to keep its audit trail distinct.
-        // No Gemini PO-vs-PI check (it's a signed copy, not for verification).
-        await conn.query(`
-            CREATE TABLE IF NOT EXISTS purchase_order_signed_pis (
-                id INT NOT NULL AUTO_INCREMENT,
-                purchase_order_id INT NOT NULL,
-                filename VARCHAR(255) NOT NULL,
-                s3_key VARCHAR(500) NOT NULL,
-                public_url VARCHAR(1000) NULL,
-                content_type VARCHAR(128) NULL,
-                file_size INT NULL,
-                notes TEXT NULL,
-                uploaded_by_email VARCHAR(255) NULL,
-                uploaded_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                deleted_at DATETIME NULL,
-                PRIMARY KEY (id),
-                KEY idx_purchase_order_id (purchase_order_id),
-                KEY idx_uploaded_at (uploaded_at)
-            )
-        `);
-        // One row per send attempt for a signed PI (same as the document sends
-        // tables). A given signed PI can be emailed many times.
-        await conn.query(`
-            CREATE TABLE IF NOT EXISTS purchase_order_signed_pi_sends (
-                id INT NOT NULL AUTO_INCREMENT,
-                purchase_order_signed_pi_id INT NOT NULL,
-                sent_to JSON NOT NULL,
-                subject VARCHAR(255) NULL,
-                front_message_uid VARCHAR(128) NULL,
-                front_conversation_id VARCHAR(64) NULL,
-                sent_by_email VARCHAR(255) NULL,
-                sent_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (id),
-                KEY idx_signed_pi_id (purchase_order_signed_pi_id),
-                KEY idx_sent_at (sent_at)
-            )
-        `);
-        // The buyer-side company a PO is issued by/for. Customer Details block
-        // on the PDF reads from here when the PO has a company_id set.
-        await conn.query(`
-            CREATE TABLE IF NOT EXISTS companies (
-                id INT NOT NULL AUTO_INCREMENT,
-                name VARCHAR(255) NOT NULL,
-                address_lines JSON NULL,
-                country VARCHAR(100) NULL,
-                created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                PRIMARY KEY (id),
-                UNIQUE KEY uk_name (name)
-            )
-        `);
-        // Seed JFA Medical + Hangerworld so the dropdown is non-empty on first
-        // run. Legal names + addresses sourced from Companies House. Both
-        // entities share the Cornford Road premises.
-        // INSERT IGNORE → re-running is harmless once names exist; existing
-        // rows aren't overwritten so manual UI edits are preserved.
-        await conn.query(
-            `INSERT IGNORE INTO companies (name, address_lines, country) VALUES
-                ('JFA Medical Ltd', ?, 'UNITED KINGDOM'),
-                ('Hangerworld Ltd', ?, 'UNITED KINGDOM')`,
-            [
-                JSON.stringify(['Unit B, Prestige House', 'Cornford Road', 'Blackpool', 'Lancashire', 'FY4 4QQ']),
-                JSON.stringify(['Unit B, Prestige House', 'Cornford Road', 'Blackpool', 'Lancashire', 'FY4 4QQ']),
-            ]
-        );
-        const migrations = [
-            `ALTER TABLE orders ADD COLUMN purchase_order_id INT NULL`,
-            `ALTER TABLE orders ADD KEY idx_purchase_order_id (purchase_order_id)`,
-            `ALTER TABLE orders ADD COLUMN unit_price DECIMAL(10,4) NULL`,
-            `ALTER TABLE orders ADD COLUMN actual_ready_date DATE NULL`,
-            `ALTER TABLE orders ADD COLUMN estimated_departure_date DATE NULL`,
-            // Promoted from dates JSON to flat scalar columns. Convention:
-            // flat = the date value itself; dates JSON = status-transition
-            // timestamps (manufacturing, ready, consolidated, delivered, etc).
-            `ALTER TABLE orders ADD COLUMN shipped_date DATE NULL`,
-            `ALTER TABLE orders ADD COLUMN ordered_date DATE NULL`,
-            `ALTER TABLE orders ADD COLUMN estimated_ready_date DATE NULL`,
-            `ALTER TABLE orders ADD COLUMN artwork_confirmed_date DATE NULL`,
-            // AWB (Air Waybill) number, frontend-entered. Air analog of
-            // external_container_number; joined to air_shipments by shipsgo-air.
-            `ALTER TABLE orders ADD COLUMN awb_number VARCHAR(50) NULL`,
-            `ALTER TABLE purchase_orders ADD COLUMN currency CHAR(3) NULL DEFAULT 'USD'`,
-            `ALTER TABLE purchase_orders ADD COLUMN shipping_total DECIMAL(10,2) NULL DEFAULT 0`,
-            `ALTER TABLE purchase_orders ADD COLUMN company_id INT NULL`,
-            `ALTER TABLE purchase_orders ADD KEY idx_company_id (company_id)`,
-            `ALTER TABLE purchase_orders ADD COLUMN deleted_at DATETIME NULL`,
-            `ALTER TABLE purchase_order_documents ADD COLUMN public_url VARCHAR(1000) NULL`,
-            // DELETE /purchase-orders/:id soft-deletes a PO's documents with it.
-            // The column was never created, so that route 500ed after it had
-            // already soft-deleted the PO and its orders.
-            `ALTER TABLE purchase_order_documents ADD COLUMN deleted_at DATETIME NULL`,
-            // NOTE: `allowed_emails` (joshdex's shared table) is deliberately no
-            // longer migrated from here — this app owns shipping_allowed_emails
-            // instead. See src/lib/allowed-emails.js.
-            // Widen the check status enum to include 'pending' — a row is
-            // inserted at upload time and updated in the background once
-            // Gemini settles. MODIFY is idempotent across cold starts.
-            `ALTER TABLE purchase_order_invoice_checks MODIFY COLUMN status ENUM('pending', 'succeeded', 'failed') NOT NULL`,
-            // Widen delivery_date DATE → DATETIME so it carries a time-of-day.
-            // MODIFY is idempotent; existing date-only values become midnight.
-            `ALTER TABLE orders MODIFY COLUMN delivery_date DATETIME NULL`,
-        ];
-        for (const sql of migrations) {
-            try { await conn.query(sql); } catch (e) {
-                const msg = e.message || '';
-                if (!msg.includes('Duplicate column') && !msg.includes('Duplicate key name')) throw e;
-            }
-        }
-    } finally {
-        conn.release();
-    }
-})().catch(err => log.error('[orders] purchase_orders schema migration failed', err));
+const purchaseOrdersSchemaReady = Promise.resolve();
 
-// Shipments tables + the shipment_id columns on orders, draft_containers,
-// draft_container_documents and quality_assurance_documents. The migration
-// files (src/db/migrations/2026-09-18_*) are hand-applied before each deploy;
-// this is the fallback for a fresh environment. The prerequisite schemas are
-// awaited BEFORE taking a connection: with connectionLimit 1, holding it while
-// waiting would hang every later request in this warm Lambda.
-const shipmentsSchemaReady = (async () => {
-    await draftContainerAllocationsSchemaReady;
-    await qualityAssuranceSchemaReady;
-    await purchaseOrdersSchemaReady;
-    const conn = await pool.getConnection();
-    try {
-        await shipmentSync.ensureShipmentsSchema(conn);
-    } finally {
-        conn.release();
-    }
-})().catch(err => log.error('[orders] shipments schema migration failed', err));
+const shipmentsSchemaReady = Promise.resolve();
 
 // Failure-row key for an order-membership hook: the shipment reference when the
 // orders carry one (so a bulk operation failing repeatedly is one row with a
@@ -1037,10 +313,7 @@ function patchShipmentIds(orders, byOrderId) {
 // the one-time seed in src/lib/allowed-emails.js.
 const IS_LOCAL = process.env.IS_OFFLINE || process.env.NODE_ENV === 'development';
 
-// Create + seed the table eagerly rather than on the first request, so a cold
-// start doesn't pay for it inside an auth check.
-const allowedEmailsSchemaReady = ensureAllowedEmailsSchema(pool)
-    .catch(err => log.error('[orders] shipping_allowed_emails schema migration failed', err));
+const allowedEmailsSchemaReady = Promise.resolve();
 
 app.use(async (req, res, next) => {
     if (IS_LOCAL) {
@@ -7518,51 +6791,7 @@ app.get('/api/v1/purchase-order-invoice-payments', async (req, res) => {
 const PAYMENT_RULE_DEPOSIT_TRIGGERS = ['po_sent', 'artwork_confirmed', 'pi_uploaded', 'pi_signed'];
 const PAYMENT_RULE_BALANCE_TRIGGERS = ['terms', 'before_dispatch', 'bl', 'telex_release', 'container_document', 'arrival', 'delivery', 'invoice'];
 
-const paymentRulesSchemaReady = (async () => {
-    const conn = await pool.getConnection();
-    try {
-        await conn.query(`
-            CREATE TABLE IF NOT EXISTS payment_rules (
-                id INT NOT NULL AUTO_INCREMENT,
-                scope ENUM('default', 'supplier') NOT NULL,
-                supplier_name VARCHAR(255) NOT NULL DEFAULT '',
-                supplier_label VARCHAR(255) NULL,
-                deposit_pct DECIMAL(6,3) NULL,
-                deposit_trigger VARCHAR(32) NULL,
-                deposit_grace_days INT NOT NULL DEFAULT 0,
-                balance_trigger VARCHAR(32) NULL,
-                balance_document_type VARCHAR(64) NULL,
-                balance_offset_days INT NULL,
-                balance_grace_days INT NOT NULL DEFAULT 0,
-                notes VARCHAR(500) NULL,
-                updated_by_email VARCHAR(255) NULL,
-                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                PRIMARY KEY (id),
-                UNIQUE KEY uk_scope_supplier (scope, supplier_name)
-            )
-        `);
-        // Added 2026-09-18: deposit timing relative to its trigger, and the
-        // lead-time estimates the page uses to date an event that has not
-        // happened yet ("artwork about 2 weeks after the PI", "goods ready 6
-        // weeks after the deposit is paid", transit by sea / air / road). One
-        // JSON document, validated by parsePaymentRuleEstimates. (The TEST
-        // database also carries seven est_*_days columns from an earlier cut
-        // the same day — unused, safe to drop.)
-        for (const col of [
-            'deposit_offset_days INT NULL',
-            'estimates_json TEXT NULL',
-        ]) {
-            try {
-                await conn.query(`ALTER TABLE payment_rules ADD COLUMN ${col}`);
-            } catch (e) {
-                if (!String(e.message || '').includes('Duplicate column')) throw e;
-            }
-        }
-    } finally {
-        conn.release();
-    }
-})().catch(err => log.error('[orders] payment_rules schema migration failed', err));
+const paymentRulesSchemaReady = Promise.resolve(); // schema: src/db/migrate/
 
 // Each estimate step counts from one event; the anchors allowed per step keep
 // the chain acyclic (artwork cannot count from ready, ready cannot count from
@@ -9318,73 +8547,7 @@ const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const { HeadObjectCommand } = require('@aws-sdk/client-s3');
 const { analyzeQcReport, countMatchedItems } = require('../services/qc-report-check');
 
-const qcReportsSchemaReady = (async () => {
-    const conn = await pool.getConnection();
-    try {
-        // The uploaded file + its analysis run. status:
-        // awaiting_upload -> processing -> succeeded | failed.
-        await conn.query(`
-            CREATE TABLE IF NOT EXISTS qc_reports (
-                id INT NOT NULL AUTO_INCREMENT,
-                filename VARCHAR(200) NOT NULL,
-                s3_key VARCHAR(500) NOT NULL,
-                public_url VARCHAR(1000) NULL,
-                content_type VARCHAR(100) NULL,
-                file_size INT NULL,
-                status VARCHAR(20) NOT NULL DEFAULT 'awaiting_upload',
-                supplier VARCHAR(255) NULL,
-                report_title VARCHAR(255) NULL,
-                inspection_date VARCHAR(100) NULL,
-                model_used VARCHAR(64) NULL,
-                item_count INT NULL,
-                matched_count INT NULL,
-                result_json JSON NULL,
-                error_message TEXT NULL,
-                uploaded_by_email VARCHAR(255) NULL,
-                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                analyzed_at TIMESTAMP NULL,
-                deleted_at DATETIME NULL,
-                PRIMARY KEY (id),
-                KEY idx_status (status),
-                KEY idx_created_at (created_at)
-            )
-        `);
-        // The attachment: one row per (report, matched order) with that order's
-        // pass/fail verdict. UNIQUE(report, order) keeps re-analysis idempotent.
-        await conn.query(`
-            CREATE TABLE IF NOT EXISTS order_qc_reports (
-                id INT NOT NULL AUTO_INCREMENT,
-                qc_report_id INT NOT NULL,
-                order_id INT NOT NULL,
-                jf_code VARCHAR(50) NULL,
-                lot_number VARCHAR(255) NULL,
-                qc_result VARCHAR(16) NOT NULL,
-                result_detail VARCHAR(1000) NULL,
-                match_method VARCHAR(16) NULL,
-                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (id),
-                UNIQUE KEY uk_report_order (qc_report_id, order_id),
-                KEY idx_order_id (order_id),
-                KEY idx_qc_report_id (qc_report_id)
-            )
-        `);
-        // Origin columns for reports auto-imported from Front (the email a report
-        // came from, who sent it, etc.) — see src/services/front-qc-import.js.
-        // Additive + idempotent so this never depends on the importer running.
-        for (const ddl of [
-            `ALTER TABLE qc_reports ADD COLUMN source VARCHAR(32) NULL`,
-            `ALTER TABLE qc_reports ADD COLUMN source_ref VARCHAR(255) NULL`,
-            `ALTER TABLE qc_reports ADD COLUMN source_meta JSON NULL`,
-            `ALTER TABLE qc_reports ADD COLUMN source_received_at DATETIME NULL`,
-            `ALTER TABLE qc_reports ADD UNIQUE KEY uk_source_ref (source_ref)`,
-        ]) {
-            try { await conn.query(ddl); }
-            catch (e) { if (e.errno !== 1060 && e.errno !== 1061) throw e; } // dup column / dup key
-        }
-    } finally {
-        conn.release();
-    }
-})().catch(err => log.error('[orders] qc_reports schema migration failed', err));
+const qcReportsSchemaReady = Promise.resolve(); // schema: src/db/migrate/
 
 // mysql2 returns JSON columns already parsed; tolerate a string too.
 function parseJsonColumn(v) {
@@ -10326,95 +9489,7 @@ const SHIPMENT_ALLOCATION_SOURCES = ['manual', 'share', 'extracted'];
 // float noise without letting a real penny through.
 const SHIPMENT_ALLOCATION_EPS = 0.005;
 
-const shipmentPaymentsSchemaReady = (async () => {
-    const conn = await pool.getConnection();
-    try {
-        // No FKs, no charset/engine clauses, VARCHAR enums validated in code —
-        // the conventions the rest of this schema follows.
-        await conn.query(`
-            CREATE TABLE IF NOT EXISTS shipment_payments (
-                id INT NOT NULL AUTO_INCREMENT,
-                shipment_id INT NOT NULL,
-                shipment_reference VARCHAR(100) NOT NULL,
-                supplier_name VARCHAR(255) NOT NULL,
-                supplier_key VARCHAR(255) NOT NULL,
-                kind VARCHAR(16) NOT NULL DEFAULT 'balance',
-                amount DECIMAL(14,2) NOT NULL,
-                currency CHAR(3) NOT NULL,
-                invoice_number VARCHAR(100) NULL,
-                invoice_date DATE NULL,
-                due_date DATE NULL,
-                invoice_total DECIMAL(14,2) NULL,
-                deposit_deducted DECIMAL(14,2) NULL,
-                status VARCHAR(16) NOT NULL DEFAULT 'pending',
-                paid_on DATE NULL,
-                bank_ref VARCHAR(255) NULL,
-                note VARCHAR(2000) NULL,
-                source VARCHAR(16) NOT NULL DEFAULT 'manual',
-                created_by_email VARCHAR(255) NULL,
-                updated_by_email VARCHAR(255) NULL,
-                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                deleted_at DATETIME NULL,
-                PRIMARY KEY (id),
-                KEY idx_shipment (shipment_id),
-                KEY idx_reference (shipment_reference),
-                KEY idx_supplier_key (supplier_key),
-                KEY idx_status (status)
-            )
-        `);
-        // Replaced wholesale on every write, so no updated_at: the parent's
-        // updated_at is bumped instead and drives the page's polling.
-        await conn.query(`
-            CREATE TABLE IF NOT EXISTS shipment_payment_allocations (
-                id INT NOT NULL AUTO_INCREMENT,
-                payment_id INT NOT NULL,
-                purchase_order_id INT NULL,
-                po_ref VARCHAR(100) NOT NULL,
-                amount DECIMAL(14,2) NOT NULL,
-                source VARCHAR(16) NOT NULL DEFAULT 'manual',
-                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (id),
-                KEY idx_payment (payment_id),
-                KEY idx_purchase_order (purchase_order_id)
-            )
-        `);
-        // The paper behind a record: the supplier's balance invoice, or a
-        // remittance advice proving we paid it. extract_status tracks the
-        // background read, so the page can show it without a second table.
-        await conn.query(`
-            CREATE TABLE IF NOT EXISTS shipment_payment_documents (
-                id INT NOT NULL AUTO_INCREMENT,
-                shipment_id INT NOT NULL,
-                shipment_reference VARCHAR(100) NOT NULL,
-                supplier_name VARCHAR(255) NULL,
-                supplier_key VARCHAR(255) NULL,
-                payment_id INT NULL,
-                doc_kind VARCHAR(20) NOT NULL DEFAULT 'balance_invoice',
-                filename VARCHAR(200) NOT NULL,
-                s3_key VARCHAR(500) NOT NULL,
-                public_url VARCHAR(1000) NULL,
-                content_type VARCHAR(100) NULL,
-                file_size INT NULL,
-                notes VARCHAR(2000) NULL,
-                extract_status VARCHAR(20) NOT NULL DEFAULT 'none',
-                extract_json JSON NULL,
-                model_used VARCHAR(64) NULL,
-                extract_error TEXT NULL,
-                extracted_at TIMESTAMP NULL,
-                uploaded_by_email VARCHAR(255) NULL,
-                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                deleted_at DATETIME NULL,
-                PRIMARY KEY (id),
-                KEY idx_shipment (shipment_id),
-                KEY idx_payment (payment_id),
-                KEY idx_extract_status (extract_status)
-            )
-        `);
-    } finally {
-        conn.release();
-    }
-})().catch(err => log.error('[orders] shipment_payments schema migration failed', err));
+const shipmentPaymentsSchemaReady = Promise.resolve(); // schema: src/db/migrate/
 
 function shipmentPaymentAllocationRowToJson(r) {
     return {
@@ -11561,6 +10636,19 @@ registerShipmentRoutes(app, {
     poBucket: () => PO_BUCKET,
     rowToContainer,
     rowToAirShipment,
+    log,
+});
+
+// ── Packing lists (/api/v1/packing-lists) ────────────────────────────────
+// Supplier packing list for a container, read by Gemini and compared with the
+// orders we expect from that supplier in that container.
+registerPackingListRoutes(app, {
+    pool,
+    withConnection,
+    s3,
+    poBucket: PO_BUCKET,
+    recordAudit,
+    auditLogSchemaReady,
     log,
 });
 

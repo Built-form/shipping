@@ -10,46 +10,6 @@ const log = require('../lib/logger');
 const { getPool, closePool } = require('../db');
 const { getShipmentByAwb, parseAirShipment } = require('../services/shipsgo');
 
-async function ensureAirShipmentsTable(conn) {
-    await conn.execute(`
-        CREATE TABLE IF NOT EXISTS air_shipments (
-            awb_number VARCHAR(20) NOT NULL PRIMARY KEY,
-            reference VARCHAR(128) NULL,
-            airline_name VARCHAR(255) NULL,
-            airline_iata VARCHAR(4) NULL,
-            status VARCHAR(50) NULL,
-            origin_name VARCHAR(255) NULL,
-            origin_iata VARCHAR(4) NULL,
-            origin_country VARCHAR(2) NULL,
-            destination_name VARCHAR(255) NULL,
-            destination_iata VARCHAR(4) NULL,
-            destination_country VARCHAR(2) NULL,
-            transshipments JSON NULL,
-            current_lat DECIMAL(10,6) NULL,
-            current_lng DECIMAL(10,6) NULL,
-            departure_date DATETIME NULL,
-            departure_is_actual TINYINT(1) NULL,
-            departure_initial DATETIME NULL,
-            arrival_date DATETIME NULL,
-            arrival_is_actual TINYINT(1) NULL,
-            eta DATETIME NULL,
-            ata DATETIME NULL,
-            eta_initial DATETIME NULL,
-            total_transit_time INT NULL,
-            transit_percentage INT NULL,
-            ts_count INT NULL,
-            milestones JSON NULL,
-            tags JSON NULL,
-            checked_at DATETIME NULL,
-            shipsgo_id VARCHAR(100) NULL,
-            route_geojson JSON NULL,
-            raw JSON NULL,
-            fetched_at DATETIME NULL,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-        )
-    `);
-}
-
 // Mirrors shipsgo-containers: stop re-fetching an AWB once every order on it
 // has reached the warehouse, so the shared ShipsGo rate limit is spent on
 // shipments still in transit.
@@ -119,7 +79,6 @@ exports.handler = async () => {
     const pool = getPool();
     const conn = await pool.getConnection();
     try {
-        await ensureAirShipmentsTable(conn);
         const awbNumbers = await getDistinctAwbNumbers(conn);
         log.info(`[shipsgo-air] ${awbNumbers.length} distinct AWB numbers`);
 
