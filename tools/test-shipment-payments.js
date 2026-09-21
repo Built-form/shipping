@@ -15,7 +15,7 @@
 // LOCAL_USER_TYPE=standard the suite asserts the 403s instead.
 
 const { api, check, section, guard, sql, finish, counts } = require('./shipments-test-helpers');
-const { assessFit } = require('../src/services/shipment-payment-extract');
+const { assessFit, matchLinesToPos } = require('../src/services/shipment-payment-extract');
 
 const INVOICE_TAG = `SPTEST-${Date.now()}`;
 const createdIds = [];
@@ -118,6 +118,27 @@ async function pickFixture() {
         check('more than the goods on board is a mismatch', fit({ currency: 'USD', amountDueNow: 40000 }).verdict === 'mismatch');
         const reasons = fit({ containerRefs: ['TGHU1234567'] }).checks.find(c => c.key === 'container');
         check('a mismatch says what it saw and what we hold', reasons && /TGHU1234567/.test(reasons.text) && /CSGU2205870/.test(reasons.text), reasons);
+    }
+
+    section('a deposit netted off the invoice (pure)');
+    {
+        // Suppliers bill the goods line by line, then take the deposit off the
+        // total: the lines add up to the goods, the payable is the balance.
+        const pos = [
+            { id: 1, poNumber: 'PO_00333J', valueInShipment: 23147.2, lineCount: 1 },
+            { id: 2, poNumber: 'PO_00297J', valueInShipment: 11010.8, lineCount: 1 },
+        ];
+        const lines = [{ poRef: 'PO00333J', amount: 23147.2 }, { poRef: 'PO 00297J', amount: 11010.8 }];
+        const balance = 23910.6; // 70 % of 34,158.00
+        const netted = matchLinesToPos({ lines, poRefs: [] }, pos, balance);
+        const sum = netted.allocations.reduce((a, x) => a + x.amount, 0);
+        check('a split read off line values adds up to the balance, not the goods', Math.round(sum * 100) === Math.round(balance * 100), { sum, balance });
+        const first = netted.allocations.find(a => a.purchaseOrderId === 1);
+        check('each PO keeps its share of the lines', first && Math.abs(first.amount - 23147.2 * 0.7) < 0.02, netted.allocations);
+        const whole = matchLinesToPos({ lines, poRefs: [] }, pos, 34158);
+        check('lines that already add up to the amount are left as read', whole.allocations.find(a => a.purchaseOrderId === 1).amount === 23147.2, whole.allocations);
+        const partial = matchLinesToPos({ lines: [lines[0]], poRefs: [] }, pos, 34158);
+        check('lines short of the amount are not stretched — the rest stays unallocated', partial.allocations[0].amount === 23147.2, partial.allocations);
     }
 
     section(`GET /shipment-payments/context (shipment ${fixture.id} · ${fixture.reference})`);
