@@ -10839,12 +10839,24 @@ app.get('/api/v1/shipment-payments', async (req, res) => {
                 `SELECT p.* FROM shipment_payments p WHERE ${where.join(' AND ')} ORDER BY p.id DESC`, params
             );
             const hydrated = await hydrateShipmentPayments(conn, rows);
-            // Documents that have no payment yet (extraction running or failed)
-            // still belong on the page, so the feed carries every live one.
-            if (!rows.length) {
-                const docRows = await loadShipmentPaymentDocumentRows(conn, {});
-                hydrated.documents = docRows.map(shipmentPaymentDocumentRowToJson);
+            // Every live upload on the shipments asked about, with or without a
+            // record: one still being read, one that could not be read, a
+            // remittance, one that did not look like it belonged — none has a
+            // record, and each still has to reach the page. Only the shipment
+            // and supplier filters narrow it; status and PO filters describe
+            // records, which uploads without one cannot match.
+            let docRows = await loadShipmentPaymentDocumentRows(
+                conn, req.query.shipmentId ? { shipmentIds: [Number(req.query.shipmentId)] } : {}
+            );
+            if (req.query.shipmentReference) {
+                const ref = String(req.query.shipmentReference).trim();
+                docRows = docRows.filter(d => d.shipment_reference === ref);
             }
+            if (req.query.supplier) {
+                const key = shipmentPaymentsService.supplierKey(req.query.supplier);
+                docRows = docRows.filter(d => (d.supplier_key || '').includes(key));
+            }
+            hydrated.documents = docRows.map(shipmentPaymentDocumentRowToJson);
             return hydrated;
         });
         res.json(out);
@@ -10959,6 +10971,28 @@ app.post('/api/v1/shipment-payments', async (req, res) => {
             );
             if (open.length) warnings.push(`This supplier already has an open balance on ${shipment.reference || shipment.id}.`);
 
+            // An upload the reader did not turn into a balance (it did not look
+            // like it belonged here, or showed no amount) can be recorded by
+            // hand and pinned to the balance it became.
+            let documentId = null;
+            if (body.documentId != null && body.documentId !== '') {
+                const [docs] = await conn.query(
+                    `SELECT id, shipment_id, payment_id FROM shipment_payment_documents WHERE id = ? AND deleted_at IS NULL`,
+                    [Number(body.documentId)]
+                );
+                if (!docs.length) return { fail: { status: 404, error: `Document ${body.documentId} not found.`, code: 'NOT_FOUND' } };
+                if (docs[0].shipment_id !== shipment.id) {
+                    return { fail: { status: 422, error: 'That upload belongs to a different shipment.', code: 'DOCUMENT_NOT_ON_SHIPMENT' } };
+                }
+                if (docs[0].payment_id != null) {
+                    const [linked] = await conn.query(`SELECT id FROM shipment_payments WHERE id = ? AND deleted_at IS NULL`, [docs[0].payment_id]);
+                    if (linked.length) {
+                        return { fail: { status: 409, error: 'That upload is already attached to a balance.', code: 'DOCUMENT_LINKED', payload: { paymentId: docs[0].payment_id } } };
+                    }
+                }
+                documentId = docs[0].id;
+            }
+
             await conn.beginTransaction();
             try {
                 const [ins] = await conn.query(
@@ -10979,10 +11013,13 @@ app.post('/api/v1/shipment-payments', async (req, res) => {
                     ]
                 );
                 if (allocations.length) await writeShipmentPaymentAllocations(conn, ins.insertId, allocations);
+                if (documentId) {
+                    await conn.query(`UPDATE shipment_payment_documents SET payment_id = ? WHERE id = ?`, [ins.insertId, documentId]);
+                }
                 const json = await loadShipmentPaymentById(conn, ins.insertId);
                 await recordAudit(conn, {
                     entityType: 'shipment_payment', entityId: ins.insertId, action: 'create',
-                    before: null, after: json, userEmail: req.userEmail,
+                    before: null, after: { ...json, documentId }, userEmail: req.userEmail,
                 });
                 await conn.commit();
                 return { json, warnings };
@@ -11120,9 +11157,13 @@ app.delete('/api/v1/shipment-payments/:id(\\d+)', async (req, res) => {
 // figures and the per-PO split.
 //
 // Reading a document never marks anything paid. An invoice asks for money; the
-// record it creates lands 'pending' and an operator flips it. A re-run
-// refreshes a record that is still pending and machine-written, and leaves
-// anything an operator has touched alone.
+// record it creates lands 'pending' and an operator flips it — unless the
+// invoice does not look like it belongs to this shipment and supplier
+// (extract_json.fit), in which case no record is made and the page offers to
+// record it anyway. A remittance proves a payment: the reader files it, and
+// POST /:id/mark-paid is the operator applying it. A re-run refreshes a record
+// that is still pending and machine-written, and leaves anything an operator
+// has touched alone.
 const SHIPMENT_PAYMENT_DOC_KINDS = ['balance_invoice', 'remittance', 'other'];
 
 app.post('/api/v1/shipment-payment-documents', async (req, res) => {
@@ -11199,9 +11240,9 @@ app.post('/api/v1/shipment-payment-documents', async (req, res) => {
                 ContentDisposition: `inline; filename="${safeFilename}"`,
             }));
 
-            // A remittance is filed, not read, unless asked for: it proves a
-            // payment rather than requesting one.
-            const wantExtract = b.extract === undefined ? docKind === 'balance_invoice' : b.extract === true;
+            // Invoices and remittances are read (a remittance's amount, date
+            // and bank reference are what mark-paid applies); 'other' is filed.
+            const wantExtract = b.extract === undefined ? docKind !== 'other' : b.extract === true;
             const [ins] = await conn.query(
                 `INSERT INTO shipment_payment_documents
                     (shipment_id, shipment_reference, supplier_name, supplier_key, payment_id, doc_kind,
@@ -11266,6 +11307,163 @@ app.post('/api/v1/shipment-payment-documents/:id(\\d+)/extract', async (req, res
         if (!result.alreadyRunning) startShipmentPaymentExtraction(req, id);
     } catch (error) {
         log.error('[POST /shipment-payment-documents/:id/extract]', error);
+        if (!res.headersSent) res.status(500).json({ error: 'An internal error occurred.' });
+    }
+});
+
+// POST /api/v1/shipment-payment-documents/:id/mark-paid — apply a remittance
+// advice. Reading one never marks anything paid; this is the operator saying
+// "yes, this is the proof", pre-filled from what the reader found (the amount
+// sent, the date it went, the bank's reference).
+//   paymentId         the open balance it settles (default: the one it is
+//                     already attached to)
+//   purchaseOrderIds  with no balance on file, the POs a new, already-paid one
+//                     splits across (default: the supplier's POs on board)
+//   force             settle a balance that differs by more than a bank
+//                     charge (max of 1 and 1%), or is in another currency
+const REMITTANCE_TOLERANCE = amount => Math.max(1, amount * 0.01);
+
+app.post('/api/v1/shipment-payment-documents/:id(\\d+)/mark-paid', async (req, res) => {
+    try {
+        await shipmentPaymentsSchemaReady;
+        await shipmentsSchemaReady;
+        await auditLogSchemaReady;
+        const id = Number(req.params.id);
+        const b = req.body || {};
+        const result = await withConnection(async (conn) => {
+            const [docs] = await conn.query(`SELECT * FROM shipment_payment_documents WHERE id = ? AND deleted_at IS NULL`, [id]);
+            const doc = docs[0];
+            if (!doc) return { fail: { status: 404, error: `Document ${id} not found.`, code: 'NOT_FOUND' } };
+            if (doc.extract_status !== 'succeeded') {
+                return { fail: { status: 422, error: 'That upload has not been read yet.', code: 'NOT_READ' } };
+            }
+            const read = parseJsonColumn(doc.extract_json) || {};
+            if (read.documentKind !== 'remittance') {
+                return { fail: { status: 422, error: 'Only a remittance advice — proof the money went — can mark a balance paid.', code: 'NOT_A_REMITTANCE' } };
+            }
+            const amount = [read.amountDueNow, read.totalAmount].map(Number).find(n => Number.isFinite(n) && n > 0);
+            if (!amount) return { fail: { status: 422, error: 'No amount was read from that remittance.', code: 'NO_AMOUNT' } };
+            const sent = Math.round(amount * 100) / 100;
+            const currency = read.currency ? String(read.currency).trim().toUpperCase().slice(0, 3) : null;
+            const paidOn = toDateOnlyOrNull(read.paymentDate) || toDateOnlyOrNull(read.invoiceDate)
+                || toDateOnlyOrNull(read.dueDate) || londonToday();
+            const bankRef = String(read.bank?.paymentReference || read.invoiceNumber || '').trim().slice(0, 255) || null;
+
+            // The balance it settles: the one named, else the one it is already
+            // attached to (a record deleted since counts as none).
+            let rec = null;
+            if (b.paymentId != null && b.paymentId !== '') {
+                const [recs] = await conn.query(`SELECT * FROM shipment_payments WHERE id = ? AND deleted_at IS NULL`, [Number(b.paymentId)]);
+                rec = recs[0] || null;
+                if (!rec) return { fail: { status: 404, error: `Balance ${b.paymentId} not found.`, code: 'NOT_FOUND' } };
+            } else if (doc.payment_id) {
+                const [recs] = await conn.query(`SELECT * FROM shipment_payments WHERE id = ? AND deleted_at IS NULL`, [doc.payment_id]);
+                rec = recs[0] || null;
+            }
+
+            if (rec) {
+                if (rec.shipment_id !== doc.shipment_id) {
+                    return { fail: { status: 422, error: 'That balance is on a different shipment from this remittance.', code: 'PAYMENT_NOT_ON_SHIPMENT' } };
+                }
+                if (rec.status === 'paid') {
+                    // Already settled: attach the proof and change nothing else.
+                    if (doc.payment_id !== rec.id) {
+                        await conn.query(`UPDATE shipment_payment_documents SET payment_id = ? WHERE id = ?`, [rec.id, doc.id]);
+                    }
+                    return { status: 200, json: await loadShipmentPaymentById(conn, rec.id) };
+                }
+                const balance = Number(rec.amount);
+                if (b.force !== true) {
+                    if (currency && rec.currency && currency !== rec.currency) {
+                        return { fail: { status: 409, error: `The remittance is in ${currency}; the balance is in ${rec.currency}.`, code: 'CURRENCY_DIFFERS', payload: { remittanceCurrency: currency, balanceCurrency: rec.currency } } };
+                    }
+                    if (Math.abs(sent - balance) > REMITTANCE_TOLERANCE(balance)) {
+                        return { fail: { status: 409, error: `The remittance sent ${sent}; the balance is ${balance}.`, code: 'AMOUNT_DIFFERS', payload: { remittance: sent, balance, currency: rec.currency } } };
+                    }
+                }
+                const before = await loadShipmentPaymentById(conn, rec.id);
+                if (!before.fullyAllocated) {
+                    return { fail: { status: 422, error: 'Split the whole balance across purchase orders before marking it paid.', code: 'NOT_FULLY_ALLOCATED', payload: { unallocated: before.unallocated } } };
+                }
+                await conn.beginTransaction();
+                try {
+                    await conn.query(
+                        `UPDATE shipment_payments
+                            SET status = 'paid', paid_on = ?, bank_ref = COALESCE(bank_ref, ?), updated_by_email = ?
+                          WHERE id = ?`,
+                        [paidOn, bankRef, req.userEmail || null, rec.id]
+                    );
+                    await conn.query(`UPDATE shipment_payment_documents SET payment_id = ? WHERE id = ?`, [rec.id, doc.id]);
+                    await recordAudit(conn, {
+                        entityType: 'shipment_payment', entityId: rec.id, action: 'status',
+                        before: { status: rec.status, paidOn: rec.paid_on || null },
+                        after: { status: 'paid', paidOn, via: 'remittance', documentId: doc.id, remittance: sent, forced: b.force === true },
+                        userEmail: req.userEmail,
+                    });
+                    await conn.commit();
+                } catch (e) {
+                    await conn.rollback().catch(() => {});
+                    throw e;
+                }
+                return { status: 200, json: await loadShipmentPaymentById(conn, rec.id) };
+            }
+
+            // No balance on file: the proof records one, already paid, split
+            // across the supplier's purchase orders by what each has on board.
+            const supplierName = String(doc.supplier_name || '').trim().slice(0, 255);
+            if (!supplierName) {
+                return { fail: { status: 422, error: 'That upload is not filed under a supplier.', code: 'NO_SUPPLIER' } };
+            }
+            const memberPos = await shipmentPaymentsService.loadMemberPurchaseOrders(conn, doc.shipment_id);
+            let split;
+            if (Array.isArray(b.purchaseOrderIds) && b.purchaseOrderIds.length) {
+                const byId = new Map(memberPos.map(p => [p.id, p]));
+                split = [];
+                for (const raw of b.purchaseOrderIds) {
+                    const po = byId.get(Number(raw));
+                    if (!po) {
+                        return { fail: { status: 422, error: `Purchase order ${raw} has no lines on this shipment.`, code: 'PO_NOT_IN_SHIPMENT', payload: { purchaseOrderId: Number(raw) } } };
+                    }
+                    split.push(po);
+                }
+            } else {
+                const key = shipmentPaymentsService.supplierKey(supplierName);
+                split = memberPos.filter(p => p.supplierKey === key);
+            }
+            if (!split.length) {
+                return { fail: { status: 422, error: 'No purchase orders from this supplier on this shipment to split it across.', code: 'NO_MEMBER_POS' } };
+            }
+            await conn.beginTransaction();
+            try {
+                const [ins] = await conn.query(
+                    `INSERT INTO shipment_payments
+                        (shipment_id, shipment_reference, supplier_name, supplier_key, kind, amount, currency,
+                         status, paid_on, bank_ref, note, source, created_by_email)
+                     VALUES (?, ?, ?, ?, 'balance', ?, ?, 'paid', ?, ?, ?, 'extracted', ?)`,
+                    [
+                        doc.shipment_id, doc.shipment_reference, supplierName, shipmentPaymentsService.supplierKey(supplierName),
+                        sent, currency || split[0].currency || 'USD', paidOn, bankRef,
+                        `Recorded from the remittance ${doc.filename}.`.slice(0, 2000), req.userEmail || null,
+                    ]
+                );
+                await writeShipmentPaymentAllocations(conn, ins.insertId, shipmentPaymentsService.shareAllocations(sent, split));
+                await conn.query(`UPDATE shipment_payment_documents SET payment_id = ? WHERE id = ?`, [ins.insertId, doc.id]);
+                const json = await loadShipmentPaymentById(conn, ins.insertId);
+                await recordAudit(conn, {
+                    entityType: 'shipment_payment', entityId: ins.insertId, action: 'create',
+                    before: null, after: { ...json, via: 'remittance', documentId: doc.id }, userEmail: req.userEmail,
+                });
+                await conn.commit();
+                return { status: 201, json };
+            } catch (e) {
+                await conn.rollback().catch(() => {});
+                throw e;
+            }
+        });
+        if (result.fail) return sendShipmentPaymentError(res, result.fail);
+        res.status(result.status).json(result.json);
+    } catch (error) {
+        log.error('[POST /shipment-payment-documents/:id/mark-paid]', error);
         if (!res.headersSent) res.status(500).json({ error: 'An internal error occurred.' });
     }
 });

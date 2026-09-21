@@ -45,8 +45,9 @@ Decide first what the document IS:
 - "other" — anything else.
 
 Then extract:
-- supplierName — the issuing supplier exactly as printed.
+- supplierName — the issuing supplier exactly as printed (for a remittance: the beneficiary who was paid).
 - invoiceNumber, invoiceDate (YYYY-MM-DD), dueDate (YYYY-MM-DD if stated or clearly derivable, e.g. "30 days from B/L" with the B/L date on the document).
+- paymentDate — for a remittance only: the date the money was sent (YYYY-MM-DD). Null on anything else.
 - currency — ISO code of the amounts.
 - totalAmount — the document's grand total.
 - amountDueNow — the amount actually payable against THIS document. For a balance invoice that is the balance, not the whole order value. Null if it states no payable amount.
@@ -74,6 +75,7 @@ const RESPONSE_SCHEMA = {
         invoiceNumber: { type: ['string', 'null'] },
         invoiceDate: { type: ['string', 'null'] },
         dueDate: { type: ['string', 'null'] },
+        paymentDate: { type: ['string', 'null'] },
         currency: { type: ['string', 'null'] },
         totalAmount: { type: ['number', 'null'] },
         amountDueNow: { type: ['number', 'null'] },
@@ -117,7 +119,7 @@ const RESPONSE_SCHEMA = {
         confidence: { type: 'string', enum: ['high', 'medium', 'low'] },
     },
     required: [
-        'documentKind', 'supplierName', 'invoiceNumber', 'invoiceDate', 'dueDate', 'currency',
+        'documentKind', 'supplierName', 'invoiceNumber', 'invoiceDate', 'dueDate', 'paymentDate', 'currency',
         'totalAmount', 'amountDueNow', 'depositDeducted', 'dueTerms', 'containerRefs', 'blRefs',
         'poRefs', 'lines', 'bank', 'rawText', 'confidence',
     ],
@@ -194,6 +196,122 @@ function matchLinesToPos(extract, memberPos, amount) {
         };
     }
     return { allocations: [], matchedLines: 0, unmatchedLines: 0, lineTotal: 0, needsAllocation: true };
+}
+
+// ── Does this document belong here? ──────────────────────────────────────
+// What the reader found is compared with what we hold for the shipment and
+// the supplier it was uploaded against. Each check is true (it ties the
+// document here), false (it points somewhere else) or null (the document, or
+// our records, say nothing). One false makes the document a mismatch; a
+// container or PO reference that ties it here, with no false, makes it a
+// match; anything else is unconfirmed — normal for a bank remittance, which
+// names the payee and nothing else, and worth a second look on an invoice.
+const LEGAL_WORDS = new Set([
+    'CO', 'COMPANY', 'CORP', 'CORPORATION', 'INC', 'LTD', 'LIMITED', 'LLC', 'PLC', 'GMBH', 'AG', 'SA',
+    'SAS', 'SRL', 'SPA', 'BV', 'NV', 'AB', 'AS', 'OY', 'KG', 'THE', 'AND', 'OF', 'GROUP', 'TRADING',
+    'INTERNATIONAL', 'INTL', 'IMPORT', 'EXPORT', 'SANAYI', 'TICARET', 'VE',
+]);
+const nameTokens = v => String(v ?? '').toUpperCase().split(/[^A-Z0-9]+/).filter(t => t.length >= 3 && !LEGAL_WORDS.has(t));
+
+function sameSupplier(a, b) {
+    const na = norm(a);
+    const nb = norm(b);
+    if (!na || !nb) return false;
+    if (na === nb) return true;
+    const [short, long] = na.length <= nb.length ? [na, nb] : [nb, na];
+    if (short.length >= 5 && long.includes(short)) return true;
+    const theirs = new Set(nameTokens(b));
+    return nameTokens(a).some(t => theirs.has(t));
+}
+
+// Container numbers are 11 characters and documents decorate them ("CSGU
+// 220587-0", "CSGU2205870/40HQ"); our internal references are three digits and
+// must match whole, or "312" would be found inside every other box number.
+function sameRef(printed, ours) {
+    const a = norm(printed);
+    const b = norm(ours);
+    if (!a || !b) return false;
+    return a === b || (b.length >= 7 && a.includes(b));
+}
+
+const fmtAmount = (n, currency) =>
+    `${currency ? `${currency} ` : ''}${Number(n).toLocaleString('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
+/** { verdict: 'match' | 'unconfirmed' | 'mismatch', checks: [{ key, ok, text }], onBoard, currency } */
+function assessFit({ extract, shipment, supplierName, memberPos, amount }) {
+    const checks = [];
+    const add = (key, ok, text) => checks.push({ key, ok, text });
+    const pos = memberPos || [];
+    const mine = supplierName
+        ? pos.filter(p => p.supplierKey === supplierKey(supplierName) || sameSupplier(p.supplier, supplierName))
+        : pos;
+
+    // Who issued it (for a remittance, who was paid).
+    const printed = String(extract.supplierName || extract.bank?.beneficiaryName || '').trim().replace(/[.,\s]+$/, '');
+    const names = [...new Set([supplierName, ...mine.map(p => p.supplier)].filter(Boolean))];
+    const by = extract.documentKind === 'remittance' ? 'Paid to' : 'Issued by';
+    if (!printed) add('supplier', null, 'No supplier name on it.');
+    else if (!names.length) add('supplier', null, `${by} ${printed}.`);
+    else if (names.some(n => sameSupplier(printed, n))) add('supplier', true, `${by} ${printed}.`);
+    else add('supplier', false, `${by} ${printed}, not ${supplierName || names[0]}.`);
+
+    // Which box. A container we hold no number for cannot be contradicted.
+    const docRefs = [...new Set([...(extract.containerRefs || []), ...(extract.blRefs || [])].map(r => String(r).trim()).filter(Boolean))];
+    const s = shipment || {};
+    const ours = [s.reference, s.tracking_ref, s.bl_number, s.booking_ref].filter(v => norm(v));
+    const heldNumber = [s.tracking_ref, s.bl_number, s.booking_ref].some(v => norm(v));
+    const label = s.tracking_ref ? `${s.tracking_ref} (${s.reference})` : String(s.reference ?? '');
+    if (!docRefs.length) {
+        add('container', null, 'Names no container or bill of lading.');
+    } else {
+        const hits = docRefs.filter(r => ours.some(o => sameRef(r, o)));
+        const others = docRefs.length - hits.length;
+        if (hits.length) add('container', true, `Names ${hits[0]}${others ? ` and ${others} other container${others === 1 ? '' : 's'}` : ''}.`);
+        else if (heldNumber) add('container', false, `Names ${docRefs.slice(0, 3).join(', ')} — this shipment is ${label}.`);
+        else add('container', null, `Names ${docRefs.slice(0, 3).join(', ')}; ${s.reference} has no container number on file to compare.`);
+    }
+
+    // Which purchase orders.
+    const index = buildRefIndex(pos);
+    const refs = [...new Set([...(extract.poRefs || []), ...(extract.lines || []).map(l => l && l.poRef)]
+        .map(r => String(r ?? '').trim()).filter(Boolean))];
+    if (!refs.length) {
+        add('pos', null, 'Names none of our purchase orders.');
+    } else {
+        const hits = new Map();
+        const misses = [];
+        for (const r of refs) {
+            const po = matchPoRef(r, index);
+            if (po) hits.set(po.id, po);
+            else misses.push(r);
+        }
+        const found = [...hits.values()];
+        const ownFound = found.filter(p => mine.includes(p));
+        const missNote = misses.length ? `; ${misses.slice(0, 3).join(', ')}${misses.length > 3 ? '…' : ''} ${misses.length === 1 ? 'is' : 'are'} not on this shipment` : '';
+        if (ownFound.length) add('pos', true, `Names ${ownFound.map(p => p.poNumber).join(', ')}${missNote}.`);
+        else if (found.length) add('pos', false, `Names ${found.map(p => p.poNumber).join(', ')}, filed under ${found[0].supplier || 'another supplier'}.`);
+        else add('pos', false, `Names ${misses.slice(0, 3).join(', ')}${misses.length > 3 ? '…' : ''} — not on this shipment.`);
+    }
+
+    // Money: the currency, then the amount against what is on board.
+    const currencies = [...new Set(mine.map(p => p.currency).filter(Boolean))];
+    const currency = extract.currency ? String(extract.currency).toUpperCase().slice(0, 3) : null;
+    const onBoard = Math.round(mine.reduce((a, p) => a + (Number(p.valueInShipment) || 0), 0) * 100) / 100;
+    if (currency && currencies.length && !currencies.includes(currency)) {
+        add('currency', false, `In ${currency}; the purchase orders are in ${currencies.join('/')}.`);
+    } else if (amount != null && amount > 0 && onBoard > 0) {
+        const cur = currency || currencies[0] || null;
+        if (amount > onBoard * 1.05 + 1) {
+            add('amount', false, `${fmtAmount(amount, cur)} is more than the ${fmtAmount(onBoard, cur)} of goods this supplier has on board.`);
+        } else {
+            add('amount', null, `${Math.round((amount / onBoard) * 100)}% of the ${fmtAmount(onBoard, cur)} this supplier has on board.`);
+        }
+    }
+
+    const verdict = checks.some(c => c.ok === false)
+        ? 'mismatch'
+        : checks.some(c => c.ok === true && (c.key === 'container' || c.key === 'pos')) ? 'match' : 'unconfirmed';
+    return { verdict, checks, onBoard, currency: currencies[0] ?? null };
 }
 
 // ── The model call ───────────────────────────────────────────────────────
@@ -327,11 +445,20 @@ async function runShipmentPaymentExtraction(pool, { documentId, userEmail = null
         const amount = money(extract.amountDueNow) ?? money(extract.totalAmount);
         const matched = matchLinesToPos(extract, memberPos, amount ?? 0);
         const currency = (extract.currency || context.shipmentCurrency || 'USD').toUpperCase().slice(0, 3);
-        const supplierName = (extract.supplierName || doc.supplier_name || '').trim().slice(0, 255);
-        const payable = extract.documentKind === 'balance_invoice' || extract.documentKind === 'deposit_invoice';
+        // The record is filed under the supplier the operator uploaded it
+        // against — the name the page groups by — not the spelling printed on
+        // the letterhead ("SUZHOU SUNMED CO.,LTD." would open a row of its own).
+        const supplierName = (doc.supplier_name || extract.supplierName || '').trim().slice(0, 255);
+        // Only a balance invoice becomes a balance. A deposit invoice belongs
+        // on its purchase order; a remittance proves a payment and is applied
+        // by an operator (mark-paid), never by the reader.
+        const payable = extract.documentKind === 'balance_invoice';
+        const fit = assessFit({ extract, shipment: context.shipment, supplierName: doc.supplier_name || null, memberPos, amount });
 
         const stored = {
             ...extract,
+            fit,
+            allocations: matched.allocations,
             matchedLines: matched.matchedLines,
             unmatchedLines: matched.unmatchedLines,
             lineTotal: matched.lineTotal,
@@ -354,6 +481,11 @@ async function runShipmentPaymentExtraction(pool, { documentId, userEmail = null
                 } else {
                     stored.skippedUpdate = rec ? 'operator_owned' : 'record_missing';
                 }
+            } else if (payable && amount != null && amount > 0 && fit.verdict === 'mismatch') {
+                // It names another box, another supplier or another currency:
+                // putting its figure on this balance would be wrong without a
+                // person saying so. The page offers "record it anyway".
+                stored.noPaymentCreated = 'mismatch';
             } else if (payable && amount != null && amount > 0) {
                 // A document the supplier has issued before: do not create a
                 // second record for the same invoice number.
@@ -402,7 +534,7 @@ async function runShipmentPaymentExtraction(pool, { documentId, userEmail = null
             } else {
                 // A remittance advice is evidence of payment, not a new claim:
                 // its details are stored for the operator, nothing is created.
-                stored.noPaymentCreated = extract.documentKind;
+                stored.noPaymentCreated = payable ? 'no_amount' : extract.documentKind;
             }
 
             await conn.query(
@@ -489,6 +621,8 @@ module.exports = {
     buildRefIndex,
     matchPoRef,
     matchLinesToPos,
+    sameSupplier,
+    assessFit,
     promptFor,
     readDocument,
     runShipmentPaymentExtraction,

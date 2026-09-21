@@ -79,8 +79,14 @@ key) · `purchaseOrderId` (records with an allocation to it) · `updatedSince`
 cursor). No pagination — a few hundred small rows.
 
 Returns `{ data: [record], documents: [document], shipments: { id: summary } }`.
-`documents` is **every live document**, including ones not yet attached to a
-record (extraction running or failed), so an upload is visible immediately.
+`documents` is **every live upload on the shipments asked about**, with or
+without a record — still being read, unreadable, a remittance, one that did not
+match — so an upload is visible immediately and never silently disappears.
+Only `shipmentId`, `shipmentReference` and `supplier` narrow it; the status and
+PO filters describe records, which an upload without one cannot match. (Before
+2026-09-21 the list was limited to shipments that already had a record, so an
+upload on a box with no balance yet was invisible whenever any other box had
+one.)
 
 ## `GET /api/v1/shipment-payments/context?shipmentId=|shipmentReference=`
 
@@ -121,8 +127,12 @@ split, and the number to pre-fill each allocation with. `404 NOT_FOUND` /
 - An allocation may name a `poRef` string instead of a `purchaseOrderId` (a
   reference we could not resolve); it counts as unallocated on the page.
 - The record always lands `pending`.
+- `documentId` (optional) pins an upload the reader made no record from — a
+  mismatch, or one with no amount — to the record being created ("record it
+  anyway" on the page).
 
 Refusals: `404 NOT_FOUND` · `409 MERGED { mergedIntoId }` · `422 NOT_BOOKED` ·
+`422 DOCUMENT_NOT_ON_SHIPMENT` · `409 DOCUMENT_LINKED { paymentId }` ·
 `422 PO_NOT_IN_SHIPMENT { purchaseOrderId }` · `422 OVER_ALLOCATED { allocated, amount }` ·
 `409 DUPLICATE_INVOICE { existingId }` (same supplier + invoice number; pass
 `force: true` to record it anyway) · `400 BAD_FIELD` / `BAD_ALLOCATIONS`.
@@ -160,13 +170,15 @@ advice proving we paid it. A balance invoice is **read in the background by
 Gemini**, which fills in the figures and the per-PO split.
 
 **Reading a document never marks anything paid.** An invoice asks for money;
-the record it drafts lands `pending` and an operator flips it.
+the record it drafts lands `pending` and an operator flips it. A remittance
+proves a payment; the operator applies it with `mark-paid`.
 
 ```
-POST   /api/v1/shipment-payment-documents            → 201 { document }
-POST   /api/v1/shipment-payment-documents/:id/extract → 202 { document, alreadyRunning }
-GET    /api/v1/shipment-payment-documents            → { data: [document] }
-DELETE /api/v1/shipment-payment-documents/:id        → 204   (admin only)
+POST   /api/v1/shipment-payment-documents              → 201 { document }
+POST   /api/v1/shipment-payment-documents/:id/extract   → 202 { document, alreadyRunning }
+POST   /api/v1/shipment-payment-documents/:id/mark-paid → 200 | 201 record
+GET    /api/v1/shipment-payment-documents              → { data: [document] }
+DELETE /api/v1/shipment-payment-documents/:id          → 204   (admin only)
 ```
 
 ```json
@@ -177,7 +189,7 @@ DELETE /api/v1/shipment-payment-documents/:id        → 204   (admin only)
   "dataBase64": "…",                 // the file, as the PI upload sends it
   "notes": null,
   "paymentId": 12,                   // optional: attach a remittance to a record
-  "extract": true,                   // defaults true for balance_invoice, false otherwise
+  "extract": true,                   // defaults true for balance_invoice and remittance, false for other
   "force": false }
 ```
 
@@ -192,27 +204,90 @@ The document carries its own read state, so polling the feed is enough:
 
 | `extractStatus` | meaning |
 |---|---|
-| `none` | filed, not read (a remittance, or `extract: false`) |
+| `none` | filed, not read (`docKind: other`, or `extract: false`) |
 | `processing` | being read now — poll |
 | `succeeded` | `extracted` holds the result; `paymentId` names the record |
 | `failed` | `extractError` says why; `POST …/extract` tries again |
 
 `extracted` is the model's own output plus what we did with it:
-`documentKind, supplierName, invoiceNumber, invoiceDate, dueDate, currency,
-totalAmount, amountDueNow, depositDeducted, dueTerms, containerRefs, blRefs,
-poRefs, lines[], bank{}, rawText, confidence`, then `matchedLines`,
-`unmatchedLines`, `lineTotal`, `splitByShare`, `needsAllocation`, and
-`duplicateOfPaymentId` / `skippedUpdate` when it declined to write.
+`documentKind, supplierName, invoiceNumber, invoiceDate, dueDate, paymentDate,
+currency, totalAmount, amountDueNow, depositDeducted, dueTerms, containerRefs,
+blRefs, poRefs, lines[], bank{}, rawText, confidence`, then `fit`,
+`allocations`, `matchedLines`, `unmatchedLines`, `lineTotal`, `splitByShare`,
+`needsAllocation`, and `noPaymentCreated` / `duplicateOfPaymentId` /
+`skippedUpdate` when it made or changed nothing. Reads from before 2026-09-21
+have no `fit`, `paymentDate` or `allocations` — re-run them.
 
-**What a read does.** A balance or deposit invoice with a payable amount
-creates a `pending` record (`source: "extracted"`) with allocations mapped from
-the document's own references — suppliers write `PO00333J`, `PO 00297J`,
-`PO-00299J` for the same three POs, so references match on letters+digits,
-then on the digit core when that identifies exactly one PO on the shipment.
-Anything it cannot map is kept verbatim as `poRef` with no id, and counts as
-unallocated. A document naming only PO references (no line amounts) is split by
-what each PO has on board. A remittance is filed and its bank details stored;
-no record is created.
+**Does it belong here? — `fit`.** Every read is compared with the shipment and
+the supplier it was uploaded against:
+
+```json
+{ "verdict": "mismatch",               // match | unconfirmed | mismatch
+  "checks": [
+    { "key": "supplier",  "ok": false, "text": "Issued by HANGZHOU BRIGHTSTAR HYGIENE CO.,LTD, not SUNMED." },
+    { "key": "container", "ok": null,  "text": "Names no container or bill of lading." },
+    { "key": "pos",       "ok": false, "text": "Names BSH-4471, BSH-4472 — not on this shipment." },
+    { "key": "amount",    "ok": false, "text": "USD 12,915.00 is more than the USD 10,225.36 of goods this supplier has on board." } ],
+  "onBoard": 10225.36, "currency": "USD" }
+```
+
+`ok: true` ties it here, `false` points somewhere else, `null` means nothing to
+compare. Any `false` → `mismatch`; a container/B-L or PO reference that ties it
+here with no `false` → `match`; otherwise `unconfirmed` (normal for a bank
+remittance, which names only the payee). Checks: supplier name (legal-form words
+ignored, so "MEDOFFICE SAGLIK ENDUSTRI" is MEDOFFICE); container / B/L against
+the shipment's reference, carrier ref, B/L and booking ref (an 11-character
+container number may carry a suffix; the 3-digit internal reference must match
+whole; a container cannot be contradicted when the shipment holds no number);
+PO references against the POs on board, including another supplier's PO; the
+currency; and an amount above 105 % of what this supplier has on board.
+
+**What a read does.**
+- A **balance invoice** with a payable amount creates a `pending` record
+  (`source: "extracted"`), filed under the supplier it was uploaded against
+  (not the letterhead spelling), with allocations mapped from the document's
+  own references — suppliers write `PO00333J`, `PO 00297J`, `PO-00299J` for the
+  same three POs, so references match on letters+digits, then on the digit core
+  when that identifies exactly one PO on the shipment. Anything it cannot map is
+  kept verbatim as `poRef` with no id, and counts as unallocated. A document
+  naming only PO references is split by what each PO has on board.
+  **Unless `fit.verdict` is `mismatch`**: then no record is made
+  (`noPaymentCreated: "mismatch"`) and the page offers "record it anyway"
+  (`POST /shipment-payments` with `documentId`). No amount →
+  `noPaymentCreated: "no_amount"`.
+- A **deposit invoice** makes nothing (`noPaymentCreated: "deposit_invoice"`):
+  deposits belong on the purchase order.
+- A **remittance** makes nothing on its own (`noPaymentCreated: "remittance"`);
+  its amount, `paymentDate` and `bank.paymentReference` are what `mark-paid`
+  applies. The model decides the kind — a remittance uploaded as
+  `balance_invoice` is still read as a remittance and refiled.
+
+## `POST /api/v1/shipment-payment-documents/:id/mark-paid`
+
+The operator applying a read remittance.
+
+```json
+{ "paymentId": 12,                 // the open balance it settles; default: the one it is attached to
+  "purchaseOrderIds": [299, 297],  // with no balance on file: the POs a new one splits across
+  "force": false }                 // settle despite an amount / currency difference
+```
+
+- **With a balance** (named, or already attached): marks it `paid` with
+  `paidOn` = the date the money went (`paymentDate`, else invoice/due date,
+  else today) and `bankRef` = the bank's reference (an existing one is kept);
+  attaches the remittance to it; audited as `status` with `via: "remittance"`.
+  The amount must be within a bank charge of the balance — max(1, 1 %) — and
+  in the same currency, else `409 AMOUNT_DIFFERS { remittance, balance, currency }`
+  / `409 CURRENCY_DIFFERS { remittanceCurrency, balanceCurrency }`; `force: true`
+  settles it anyway, keeping the balance's amount. A balance already `paid` just
+  gets the proof attached (`200`, idempotent).
+- **With no balance on file**: records one already `paid` for the amount sent
+  (`source: "extracted"`), split across `purchaseOrderIds` (default: the
+  supplier's POs on board, by exact supplier key) → `201`.
+
+Refusals: `404 NOT_FOUND` · `422 NOT_READ` · `422 NOT_A_REMITTANCE` ·
+`422 NO_AMOUNT` · `422 PAYMENT_NOT_ON_SHIPMENT` · `422 NOT_FULLY_ALLOCATED` ·
+`422 NO_SUPPLIER` · `422 PO_NOT_IN_SHIPMENT` · `422 NO_MEMBER_POS`.
 
 **A re-run never overwrites a person.** It refreshes a record only while that
 record is still `pending` *and* `source: "extracted"`; otherwise it stores
@@ -238,10 +313,13 @@ role is read-only in the client. Every write is recorded in `audit_log` as
 removes its own rows. Under `LOCAL_USER_TYPE=standard` it asserts the 403s
 instead.
 
-Uploads cannot be exercised locally: `PO_DOCS_BUCKET` is set by
-`serverless.yml` at deploy time, so a local `POST /shipment-payment-documents`
-answers "PO_DOCS_BUCKET env var not configured" — the same limitation the PI
-upload has. The reader itself (prompt, schema, reference matching, every DB
+Uploads need S3 locally: `PO_DOCS_BUCKET` in `.env` plus working
+`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (the default AWS credential
+chain — the `SP_AWS_*` pair is the Selling Partner API's and is never read by
+the S3 client). Without them a local `POST /shipment-payment-documents` answers
+"PO_DOCS_BUCKET env var not configured", or a 500 with `CredentialsProviderError`
+/ a signature mismatch in the server log — the same limitation the PI upload
+has. The HTTP suite inserts document rows directly, so it needs neither. The reader itself (prompt, schema, reference matching, every DB
 write and the re-run rules) is exercised against the real Gemini API and the
 TEST database by calling `runShipmentPaymentExtraction` directly with the S3
 fetch stubbed.
