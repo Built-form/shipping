@@ -429,9 +429,10 @@ function registerPackingListRoutes(app, deps) {
                 const [rows] = await conn.query(`SELECT * FROM packing_lists WHERE id = ? AND deleted_at IS NULL`, [id]);
                 const row = rows[0];
                 if (!row) return null;
-                // A Lambda killed mid-read leaves 'processing'; after ten minutes a re-run may take over.
+                // A Lambda killed mid-read leaves 'processing'; once the read
+                // is older than any real read could be, a re-run may take over.
                 const since = new Date(row.analyzed_at || row.created_at).getTime();
-                if (row.status === 'processing' && Date.now() - since < 10 * 60_000) return { row, already: true };
+                if (row.status === 'processing' && Date.now() - since < R.STUCK_AFTER_MS) return { row, already: true };
                 // Clear the previous result so a failed re-run can't sit next to
                 // an old verdict.
                 await conn.query(
@@ -504,7 +505,7 @@ function registerPackingListRoutes(app, deps) {
                        FROM packing_lists WHERE ${where.join(' AND ')} ORDER BY id DESC LIMIT 200`,
                     params
                 );
-                return r;
+                return R.reapStuckReads(conn, r);
             });
             res.json({ data: rows.map(rowToJson) });
         } catch (error) {
@@ -528,6 +529,7 @@ function registerPackingListRoutes(app, deps) {
                 const [rows] = await conn.query(`SELECT * FROM packing_lists WHERE id = ? AND deleted_at IS NULL`, [id]);
                 const row = rows[0];
                 if (!row) return null;
+                await R.reapStuckReads(conn, [row]);
                 const extracted = parseJson(row.extract_json);
                 let comparison = parseJson(row.comparison_json);
                 let live = false;

@@ -178,6 +178,34 @@ function containerColumns(container) {
 }
 
 // ── Loading ──────────────────────────────────────────────────────────────
+// A read runs in the background after the upload response. A deploy replaces
+// the Lambda while it runs, or the Lambda times out, and the row is left
+// 'processing' with nothing to retry it. Reads take 10–40 s (a couple of
+// minutes with Gemini retries), so past this age the read is dead: it is
+// marked failed with a plain reason and the "read again" path takes over.
+const STUCK_AFTER_MS = 5 * 60_000;
+const INTERRUPTED_MESSAGE = 'INTERRUPTED: the reading was cut short (a deploy or a timeout) — read it again.';
+
+async function reapStuckReads(conn, rows) {
+    const now = Date.now();
+    for (const r of rows) {
+        if (r.status !== 'processing') continue;
+        const since = new Date(r.analyzed_at || r.created_at).getTime();
+        if (!(now - since > STUCK_AFTER_MS)) continue;
+        await conn.query(
+            `UPDATE packing_lists SET status = 'failed', error_message = ? WHERE id = ? AND status = 'processing'`,
+            [INTERRUPTED_MESSAGE, r.id]
+        );
+        await recordAudit(conn, {
+            entityType: 'packing_list', entityId: r.id, action: 'read_interrupted', before: null,
+            after: { stuckForSeconds: Math.round((now - since) / 1000) }, userEmail: null,
+        });
+        r.status = 'failed';
+        r.error_message = INTERRUPTED_MESSAGE;
+    }
+    return rows;
+}
+
 async function loadPackingLists(conn, container, { supplierKey = null, includeSuperseded = true } = {}) {
     const scope = await containerScope(conn, container);
     const where = ['t.deleted_at IS NULL', scope.sql];
@@ -187,7 +215,7 @@ async function loadPackingLists(conn, container, { supplierKey = null, includeSu
     const [rows] = await conn.query(
         `SELECT t.* FROM packing_lists t WHERE ${where.join(' AND ')} ORDER BY t.id DESC`, params
     );
-    return rows;
+    return reapStuckReads(conn, rows);
 }
 
 async function loadSignOffs(conn, container, supplierKey) {
@@ -551,6 +579,8 @@ async function restorePredecessor(conn, { deletedRow, userEmail }) {
 
 module.exports = {
     ReviewError,
+    STUCK_AFTER_MS,
+    reapStuckReads,
     packingListToJson,
     signOffToJson,
     approvalToJson,
