@@ -55,7 +55,7 @@ Then extract:
 - dueTerms — the payment-timing wording, verbatim and short.
 - containerRefs, blRefs — container numbers and bill-of-lading numbers printed on the document.
 - poRefs — every purchase order reference printed anywhere on it.
-- lines — one entry per billed line: poRef (mapped to one of OUR PO numbers when you can), piRef (the supplier's own invoice/PI number if the line cites one), sku, description, qty, unitPrice, amount.
+- lines — one entry per billed line: poRef (mapped to one of OUR PO numbers when you can), jfCode (OUR product code for that line, chosen from the purchase orders you were given, when the product clearly matches; else null), piRef (the supplier's own invoice/PI number if the line cites one), sku (the supplier's own code as printed), description, qty, unitPrice, amount.
 - bank — the beneficiary and remittance details exactly as printed. Never reformat or invent account numbers.
 - rawText — the payment-terms and bank-details section copied verbatim, so a human can check the parsed figures.
 - confidence — "high" when the figures and the purchase orders are unambiguous, "low" when you are guessing.
@@ -91,6 +91,7 @@ const RESPONSE_SCHEMA = {
                 additionalProperties: false,
                 properties: {
                     poRef: { type: ['string', 'null'] },
+                    jfCode: { type: ['string', 'null'] },
                     piRef: { type: ['string', 'null'] },
                     sku: { type: ['string', 'null'] },
                     description: { type: ['string', 'null'] },
@@ -98,7 +99,7 @@ const RESPONSE_SCHEMA = {
                     unitPrice: { type: ['number', 'null'] },
                     amount: { type: ['number', 'null'] },
                 },
-                required: ['poRef', 'piRef', 'sku', 'description', 'qty', 'unitPrice', 'amount'],
+                required: ['poRef', 'jfCode', 'piRef', 'sku', 'description', 'qty', 'unitPrice', 'amount'],
             },
         },
         bank: {
@@ -247,8 +248,14 @@ function sameSupplier(a, b) {
     if (na === nb) return true;
     const [short, long] = na.length <= nb.length ? [na, nb] : [nb, na];
     if (short.length >= 5 && long.includes(short)) return true;
-    const theirs = new Set(nameTokens(b));
-    return nameTokens(a).some(t => theirs.has(t));
+    // Every distinctive word of the shorter name must be in the longer one:
+    // "SUNMED" is "Suzhou Sunmed Co., Ltd", but two suppliers in the same
+    // city share "Suzhou" and are not each other.
+    const ta = nameTokens(a);
+    const tb = nameTokens(b);
+    if (!ta.length || !tb.length) return false;
+    const [fewer, more] = ta.length <= tb.length ? [ta, new Set(tb)] : [tb, new Set(ta)];
+    return fewer.every(t => more.has(t));
 }
 
 // Container numbers are 11 characters and documents decorate them ("CSGU
@@ -341,9 +348,112 @@ function assessFit({ extract, shipment, supplierName, memberPos, amount }) {
     return { verdict, checks, onBoard, currency: currencies[0] ?? null };
 }
 
+// ── Invoice vs container ─────────────────────────────────────────────────
+// The PO-vs-PI check asks "does this invoice match the order?". This asks
+// "does this invoice match what is actually in the box?": every line the
+// supplier bills against the lines they have on board (quantity, unit price,
+// line total), and the amount they ask for against what the terms say the
+// balance should be — the goods on board less the deposit already invoiced.
+const LINE_PRICE_EPS = 0.005;
+const LINE_TOTAL_EPS = 0.5;
+const descKey = v => String(v ?? '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+
+function compareInvoiceToContainer({ extract, context, supplierName }) {
+    const key = supplierKey(supplierName);
+    const mine = (context.purchaseOrders || []).filter(p => p.supplierKey === key || sameSupplier(p.supplier, supplierName));
+    const index = buildRefIndex(mine);
+    const ours = [];
+    for (const po of mine) {
+        for (const l of po.lines || []) {
+            ours.push({
+                poId: po.id, poNumber: po.poNumber, jfCode: l.jfCode || null, productName: l.productName || null,
+                qty: l.quantity != null ? Number(l.quantity) : null, unitPrice: l.unitPrice != null ? Number(l.unitPrice) : null,
+                total: l.quantity != null && l.unitPrice != null ? Math.round(Number(l.quantity) * Number(l.unitPrice) * 100) / 100 : null,
+                matched: false,
+            });
+        }
+    }
+    const goodsOnBoard = Math.round(ours.reduce((a, l) => a + (l.total || 0), 0) * 100) / 100;
+
+    // Match each invoice line: our code first, then the PO plus the product
+    // name, then a PO that has only one line left.
+    const lines = [];
+    const extra = [];
+    for (const raw of extract.lines || []) {
+        const po = raw.poRef ? matchPoRef(raw.poRef, index) : null;
+        const code = norm(raw.jfCode || raw.sku);
+        const desc = descKey(raw.description);
+        const candidates = ours.filter(l => !l.matched && (!po || l.poId === po.id));
+        let hit = code ? candidates.find(l => norm(l.jfCode) === code) : null;
+        if (!hit && desc) hit = candidates.find(l => descKey(l.productName) === desc);
+        if (!hit && po && candidates.length === 1) hit = candidates[0];
+        if (!hit) {
+            extra.push({ poRef: raw.poRef ?? null, jfCode: raw.jfCode ?? null, sku: raw.sku ?? null, description: raw.description ?? null, qty: raw.qty ?? null, unitPrice: raw.unitPrice ?? null, amount: raw.amount ?? null });
+            continue;
+        }
+        hit.matched = true;
+        const issues = [];
+        const invQty = raw.qty != null ? Number(raw.qty) : null;
+        const invPrice = raw.unitPrice != null ? Number(raw.unitPrice) : null;
+        const invTotal = raw.amount != null ? Number(raw.amount) : null;
+        if (invQty != null && hit.qty != null && invQty !== hit.qty) issues.push(`quantity ${invQty.toLocaleString('en-GB')} on the invoice, ${hit.qty.toLocaleString('en-GB')} in the container`);
+        if (invPrice != null && hit.unitPrice != null && Math.abs(invPrice - hit.unitPrice) > LINE_PRICE_EPS) issues.push(`unit price ${invPrice} on the invoice, ${hit.unitPrice} on the PO`);
+        if (invTotal != null && hit.total != null && Math.abs(invTotal - hit.total) > LINE_TOTAL_EPS) issues.push(`line total ${invTotal.toFixed(2)} on the invoice, ${hit.total.toFixed(2)} in the container`);
+        lines.push({
+            poNumber: hit.poNumber, jfCode: hit.jfCode, productName: hit.productName,
+            ourQty: hit.qty, invoiceQty: invQty, ourUnitPrice: hit.unitPrice, invoiceUnitPrice: invPrice, ourTotal: hit.total, invoiceTotal: invTotal,
+            issues,
+        });
+    }
+    const missing = ours.filter(l => !l.matched).map(l => ({ poNumber: l.poNumber, jfCode: l.jfCode, productName: l.productName, qty: l.qty, total: l.total }));
+
+    // What the balance should be. The deposit on file (a deposit PI's
+    // percentage) beats what the invoice says it deducted; with neither, the
+    // whole goods value is expected.
+    const pcts = mine.map(p => p.deposit && p.deposit.depositPercentage != null ? Number(p.deposit.depositPercentage) : null).filter(v => v != null && v > 0);
+    let depositBasis = 'none';
+    let depositExpected = 0;
+    if (pcts.length) {
+        depositBasis = 'pi_percentage';
+        // Each PO's own percentage on its own goods.
+        depositExpected = Math.round(mine.reduce((a, p) => {
+            const pct = p.deposit && p.deposit.depositPercentage != null ? Number(p.deposit.depositPercentage) : 0;
+            const goods = ours.filter(l => l.poId === p.id).reduce((s, l) => s + (l.total || 0), 0);
+            return a + goods * pct / 100;
+        }, 0) * 100) / 100;
+    } else if (extract.depositDeducted != null && Number(extract.depositDeducted) > 0) {
+        depositBasis = 'invoice_deduction';
+        depositExpected = Math.round(Number(extract.depositDeducted) * 100) / 100;
+    }
+    const expectedBalance = Math.round((goodsOnBoard - depositExpected) * 100) / 100;
+    const invoiceBalance = extract.amountDueNow != null ? Number(extract.amountDueNow) : extract.totalAmount != null ? Number(extract.totalAmount) : null;
+    const balanceDelta = invoiceBalance == null ? 0 : Math.round((invoiceBalance - expectedBalance) * 100) / 100;
+    const balanceTolerance = Math.max(1, expectedBalance * 0.005);
+
+    const lineTrouble = lines.some(l => l.issues.length) || missing.length > 0 || extra.length > 0;
+    const balanceTrouble = invoiceBalance != null && Math.abs(balanceDelta) > balanceTolerance;
+    const verdict = !ours.length || (!lines.length && !extra.length && invoiceBalance == null)
+        ? 'unverified'
+        : !lines.length && !extra.length
+            ? (balanceTrouble ? 'differs' : 'unverified')
+            : (lineTrouble || balanceTrouble ? 'differs' : 'match');
+    return {
+        verdict,
+        matchedLines: lines.length, lines, missingOurLines: missing, extraInvoiceLines: extra,
+        goodsOnBoard, invoiceGoods: extract.totalAmount != null ? Number(extract.totalAmount) : null,
+        depositBasis, depositExpected, expectedBalance, invoiceBalance, balanceDelta, balanceTolerance,
+    };
+}
+
 // ── The model call ───────────────────────────────────────────────────────
 function promptFor(context) {
     const s = context.shipment;
+    if (!s) {
+        return [
+            '## Context',
+            'This document was uploaded against a supplier, not a shipment — most likely a bank payment confirmation or remittance advice. Read it as it is.',
+        ].join('\n');
+    }
     const lines = [
         `## Shipment`,
         `reference: ${s.reference ?? '(none)'}`,
@@ -445,8 +555,15 @@ async function runShipmentPaymentExtraction(pool, { documentId, userEmail = null
             const [rows] = await conn.query(`SELECT * FROM shipment_payment_documents WHERE id = ?`, [documentId]);
             doc = rows[0];
             if (!doc || doc.deleted_at) return { skipped: 'not_found' };
-            context = await loadShipmentContext(conn, doc.shipment_id);
-            memberPos = await loadMemberPurchaseOrders(conn, doc.shipment_id);
+            if (doc.shipment_id == null) {
+                // A proof of payment uploaded against the supplier alone: there
+                // is no box to map it to, only the transfer it will be applied with.
+                context = { shipment: null, shipmentCurrency: null, purchaseOrders: [] };
+                memberPos = [];
+            } else {
+                context = await loadShipmentContext(conn, doc.shipment_id);
+                memberPos = await loadMemberPurchaseOrders(conn, doc.shipment_id);
+            }
         } finally {
             conn.release();
         }
@@ -481,10 +598,15 @@ async function runShipmentPaymentExtraction(pool, { documentId, userEmail = null
         // by an operator (mark-paid), never by the reader.
         const payable = extract.documentKind === 'balance_invoice';
         const fit = assessFit({ extract, shipment: context.shipment, supplierName: doc.supplier_name || null, memberPos, amount });
+        // Line by line against what is in the box, for an invoice with a box.
+        const check = payable && doc.shipment_id != null
+            ? compareInvoiceToContainer({ extract, context, supplierName: supplierName || doc.supplier_name || '' })
+            : null;
 
         const stored = {
             ...extract,
             fit,
+            check,
             allocations: matched.allocations,
             matchedLines: matched.matchedLines,
             unmatchedLines: matched.unmatchedLines,
@@ -509,6 +631,10 @@ async function runShipmentPaymentExtraction(pool, { documentId, userEmail = null
                 } else {
                     stored.skippedUpdate = rec ? 'operator_owned' : 'record_missing';
                 }
+            } else if (payable && amount != null && amount > 0 && doc.shipment_id == null) {
+                // An invoice with no shipment to bill: the page says to upload
+                // it on the container.
+                stored.noPaymentCreated = 'no_shipment';
             } else if (payable && amount != null && amount > 0 && fit.verdict === 'mismatch') {
                 // It names another box, another supplier or another currency:
                 // putting its figure on this balance would be wrong without a
@@ -651,6 +777,7 @@ module.exports = {
     matchLinesToPos,
     sameSupplier,
     assessFit,
+    compareInvoiceToContainer,
     promptFor,
     readDocument,
     runShipmentPaymentExtraction,

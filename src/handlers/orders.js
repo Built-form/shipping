@@ -51,7 +51,7 @@ const { registerPackingListRoutes } = require('../services/packing-list-routes')
 const { makeSplitOrder } = require('../services/order-split');
 const shipmentsLib = require('../lib/shipments');
 const shipmentPaymentsService = require('../services/shipment-payments');
-const { runShipmentPaymentExtraction } = require('../services/shipment-payment-extract');
+const { runShipmentPaymentExtraction, sameSupplier: sameSupplierName } = require('../services/shipment-payment-extract');
 
 const app = express();
 
@@ -6641,7 +6641,7 @@ app.get('/api/v1/purchase-orders/:id/invoices', async (req, res) => {
     try {
         await purchaseOrdersSchemaReady;
         const { id } = req.params;
-        const { rows, latestByInvoiceId, paymentByInvoiceId } = await withConnection(async (conn) => {
+        const { rows, latestByInvoiceId, paymentByInvoiceId, settlements } = await withConnection(async (conn) => {
             const [invoiceRows] = await conn.query(
                 `SELECT id, purchase_order_id, filename, s3_key, public_url, content_type,
                         file_size, notes, uploaded_by_email, uploaded_at
@@ -6677,14 +6677,20 @@ app.get('/api/v1/purchase-orders/:id/invoices', async (req, res) => {
                 );
                 for (const pr of payRows) paymentByInvoiceId.set(pr.purchase_order_invoice_id, pr);
             }
-            return { rows: invoiceRows, latestByInvoiceId, paymentByInvoiceId };
+            // The transfers applied to each PI, so the PO page can show
+            // "paid 19 Sep by transfer" with the proof.
+            const settlements = await loadSettlementsByTarget(conn, 'pi', [...paymentByInvoiceId.values()].map(p => p.id));
+            return { rows: invoiceRows, latestByInvoiceId, paymentByInvoiceId, settlements };
         });
         res.json({
-            data: rows.map(r => ({
-                ...invoiceRowToJson(r),
-                latestCheck: invoiceCheckRowToJson(latestByInvoiceId.get(r.id)) || null,
-                payment: invoicePaymentRowToJson(paymentByInvoiceId.get(r.id)) || null,
-            })),
+            data: rows.map(r => {
+                const pay = paymentByInvoiceId.get(r.id);
+                return {
+                    ...invoiceRowToJson(r),
+                    latestCheck: invoiceCheckRowToJson(latestByInvoiceId.get(r.id)) || null,
+                    payment: pay ? { ...invoicePaymentRowToJson(pay), settledByPaymentId: pay.settled_by_payment_id ?? null, settlements: settlements.get(pay.id) || [] } : null,
+                };
+            }),
         });
     } catch (error) {
         log.error('[GET /purchase-orders/:id/invoices]', error);
@@ -7983,7 +7989,7 @@ app.get('/api/v1/purchase-orders/:id/payments', async (req, res) => {
     try {
         await purchaseOrdersSchemaReady;
         const { id } = req.params;
-        const rows = await withConnection(async (conn) => {
+        const { rows, transfers } = await withConnection(async (conn) => {
             const [r] = await conn.query(
                 `SELECT id, purchase_order_id, filename, s3_key, public_url, content_type,
                         file_size, notes, uploaded_by_email, uploaded_at
@@ -7992,9 +7998,24 @@ app.get('/api/v1/purchase-orders/:id/payments', async (req, res) => {
                   ORDER BY uploaded_at DESC, id DESC`,
                 [id]
             );
-            return r;
+            // Supplier payments that touched this PO: a deposit paid with no
+            // PI on file, and transfers applied to its PIs — each with its
+            // proof. The proof follows the payment to every PO it covered.
+            const transfers = [];
+            try {
+                const poId = Number(id);
+                const [piRows] = await conn.query(`SELECT id FROM purchase_order_invoice_payments WHERE purchase_order_id = ?`, [poId]);
+                const byDeposit = await loadSettlementsByTarget(conn, 'po_deposit', [poId]);
+                for (const s of byDeposit.get(poId) || []) transfers.push({ ...s, kind: 'po_deposit', invoicePaymentId: null });
+                const byPi = await loadSettlementsByTarget(conn, 'pi', piRows.map(p => p.id));
+                for (const p of piRows) for (const s of byPi.get(p.id) || []) transfers.push({ ...s, kind: 'pi', invoicePaymentId: p.id });
+                transfers.sort((a, b) => String(b.paidOn).localeCompare(String(a.paidOn)) || b.paymentId - a.paymentId);
+            } catch (e) {
+                if (e.errno !== 1146) throw e;
+            }
+            return { rows: r, transfers };
         });
-        res.json({ data: rows.map(paymentRowToJson) });
+        res.json({ data: rows.map(paymentRowToJson), transfers });
     } catch (error) {
         log.error('[GET /purchase-orders/:id/payments]', error);
         res.status(500).json({ error: 'An internal error occurred.' });
@@ -9502,10 +9523,16 @@ function shipmentPaymentAllocationRowToJson(r) {
     };
 }
 
-function shipmentPaymentRowToJson(r, { allocations = [], documents = [], link = 'ok', mergedIntoId = null } = {}) {
+function shipmentPaymentRowToJson(r, { allocations = [], documents = [], link = 'ok', mergedIntoId = null, applied = 0 } = {}) {
     const amount = r.amount != null ? Number(r.amount) : 0;
     const allocatedTotal = Math.round(allocations.reduce((a, x) => a + (x.amount || 0), 0) * 100) / 100;
+    const appliedTotal = Math.round((Number(applied) || 0) * 100) / 100;
     return {
+        // What supplier payments have been applied to it so far (a part
+        // payment leaves it pending with a remainder); which transfer settled it.
+        appliedTotal,
+        remaining: r.status === 'paid' ? 0 : Math.max(0, Math.round((amount - appliedTotal) * 100) / 100),
+        settledByPaymentId: r.settled_by_payment_id ?? null,
         id: r.id,
         shipmentId: r.shipment_id,
         shipmentReference: r.shipment_reference,
@@ -9695,11 +9722,14 @@ async function loadShipmentPaymentDocumentRows(conn, { paymentIds = null, shipme
 function shipmentPaymentDocumentRowToJson(r) {
     return {
         id: r.id,
-        shipmentId: r.shipment_id,
-        shipmentReference: r.shipment_reference,
+        // Null for a proof of payment uploaded against the supplier alone.
+        shipmentId: r.shipment_id ?? null,
+        shipmentReference: r.shipment_reference ?? null,
         supplierName: r.supplier_name || null,
         supplierKey: r.supplier_key || null,
         paymentId: r.payment_id ?? null,
+        /** The transfer a proof of payment was applied with. */
+        supplierPaymentId: r.supplier_payment_id ?? null,
         docKind: r.doc_kind || 'balance_invoice',
         filename: r.filename,
         url: r.public_url || publicS3Url(r.s3_key),
@@ -9776,12 +9806,90 @@ async function hydrateShipmentPayments(conn, rows) {
         docsByPayment.get(json.paymentId).push(json);
     }
     const { summaries, linkById } = await loadShipmentPaymentShipments(conn, shipmentIds);
-    const data = rows.map(r => shipmentPaymentRowToJson(r, {
-        allocations: allocByPayment.get(r.id) || [],
-        documents: docsByPayment.get(r.id) || [],
-        ...(linkById.get(r.shipment_id) || { link: 'missing', mergedIntoId: null }),
+    const applied = await loadAppliedByTarget(conn, 'balance', ids);
+    const settlements = await loadSettlementsByTarget(conn, 'balance', ids);
+    const data = rows.map(r => ({
+        ...shipmentPaymentRowToJson(r, {
+            allocations: allocByPayment.get(r.id) || [],
+            documents: docsByPayment.get(r.id) || [],
+            applied: applied.get(r.id) || 0,
+            ...(linkById.get(r.shipment_id) || { link: 'missing', mergedIntoId: null }),
+        }),
+        settlements: settlements.get(r.id) || [],
     }));
     return { data, documents, shipments: summaries };
+}
+
+// The transfers applied to each obligation of one kind, newest first, each
+// with its proof(s) and what else it covered — so a paid balance or PI can
+// show "paid 19 Sep by transfer, PROOF, also covered 308". Map id -> [...].
+async function loadSettlementsByTarget(conn, kind, ids) {
+    const out = new Map();
+    const want = [...new Set(ids.filter(n => Number.isInteger(n) && n > 0))];
+    if (!want.length) return out;
+    let lineRows;
+    try {
+        [lineRows] = await conn.query(
+            `SELECT l.id AS line_id, l.target_id, l.amount AS line_amount, sp.*
+               FROM supplier_payment_lines l
+               JOIN supplier_payments sp ON sp.id = l.payment_id AND sp.deleted_at IS NULL
+              WHERE l.target_kind = ? AND l.target_id IN (${want.map(() => '?').join(',')})
+              ORDER BY sp.paid_on DESC, sp.id DESC`,
+            [kind, ...want]
+        );
+    } catch (e) {
+        if (e.errno === 1146) return out;
+        throw e;
+    }
+    if (!lineRows.length) return out;
+    const paymentIds = [...new Set(lineRows.map(r => r.id))];
+    const ph = paymentIds.map(() => '?').join(',');
+    const [allLines] = await conn.query(`SELECT * FROM supplier_payment_lines WHERE payment_id IN (${ph}) ORDER BY id`, paymentIds);
+    const targets = await loadSupplierPaymentTargets(conn, allLines.map(l => ({ kind: l.target_kind, id: l.target_id })));
+    const [docRows] = await conn.query(
+        `SELECT id, supplier_payment_id, filename, s3_key, public_url, content_type FROM shipment_payment_documents
+          WHERE deleted_at IS NULL AND supplier_payment_id IN (${ph}) ORDER BY id`, paymentIds
+    );
+    const docsByPayment = new Map();
+    for (const d of docRows) {
+        if (!docsByPayment.has(d.supplier_payment_id)) docsByPayment.set(d.supplier_payment_id, []);
+        docsByPayment.get(d.supplier_payment_id).push({ id: d.id, filename: d.filename, url: d.public_url || publicS3Url(d.s3_key), contentType: d.content_type || null });
+    }
+    for (const r of lineRows) {
+        const also = allLines
+            .filter(l => l.payment_id === r.id && l.id !== r.line_id)
+            .map(l => {
+                const t = targets.get(`${l.target_kind}:${l.target_id}`);
+                return { kind: l.target_kind, targetId: l.target_id, amount: Number(l.amount), label: t ? t.label : null, paymentType: t?.paymentType ?? null };
+            });
+        if (!out.has(r.target_id)) out.set(r.target_id, []);
+        out.get(r.target_id).push({
+            paymentId: r.id, paidOn: r.paid_on || null, amount: Number(r.line_amount), paymentAmount: Number(r.amount), currency: r.currency,
+            bankRef: r.bank_ref || null, note: r.note || null, documents: docsByPayment.get(r.id) || [], also,
+        });
+    }
+    return out;
+}
+
+// What live supplier payments have applied to each obligation of one kind.
+async function loadAppliedByTarget(conn, kind, ids) {
+    const out = new Map();
+    const want = [...new Set(ids.filter(n => Number.isInteger(n) && n > 0))];
+    if (!want.length) return out;
+    try {
+        const [rows] = await conn.query(
+            `SELECT l.target_id, SUM(l.amount) AS applied
+               FROM supplier_payment_lines l
+               JOIN supplier_payments sp ON sp.id = l.payment_id AND sp.deleted_at IS NULL
+              WHERE l.target_kind = ? AND l.target_id IN (${want.map(() => '?').join(',')})
+              GROUP BY l.target_id`,
+            [kind, ...want]
+        );
+        for (const r of rows) out.set(r.target_id, Number(r.applied) || 0);
+    } catch (e) {
+        if (e.errno !== 1146) throw e;
+    }
+    return out;
 }
 
 async function loadShipmentPaymentById(conn, id) {
@@ -10236,9 +10344,9 @@ app.delete('/api/v1/shipment-payments/:id(\\d+)', async (req, res) => {
 // invoice does not look like it belongs to this shipment and supplier
 // (extract_json.fit), in which case no record is made and the page offers to
 // record it anyway. A remittance proves a payment: the reader files it, and
-// POST /:id/mark-paid is the operator applying it. A re-run refreshes a record
-// that is still pending and machine-written, and leaves anything an operator
-// has touched alone.
+// the operator applies it by recording a supplier payment (next section) with
+// the proof attached. A re-run refreshes a record that is still pending and
+// machine-written, and leaves anything an operator has touched alone.
 const SHIPMENT_PAYMENT_DOC_KINDS = ['balance_invoice', 'remittance', 'other'];
 
 app.post('/api/v1/shipment-payment-documents', async (req, res) => {
@@ -10268,12 +10376,23 @@ app.post('/api/v1/shipment-payment-documents', async (req, res) => {
         }
 
         const result = await withConnection(async (conn) => {
-            const resolved = await requireBookedShipment(conn, {
-                shipmentId: b.shipmentId ? Number(b.shipmentId) : null,
-                shipmentReference: b.shipmentReference || null,
-            });
-            if (resolved.status) return { fail: resolved };
-            const shipment = resolved.shipment;
+            // An invoice is for a shipment; a proof of payment is to a
+            // supplier and may name no shipment at all (uploaded from the
+            // Payments page while recording a transfer).
+            const supplierName = typeof b.supplierName === 'string' && b.supplierName.trim()
+                ? b.supplierName.trim().slice(0, 255) : null;
+            const hasShipment = !!(b.shipmentId || b.shipmentReference);
+            let shipment = null;
+            if (hasShipment) {
+                const resolved = await requireBookedShipment(conn, {
+                    shipmentId: b.shipmentId ? Number(b.shipmentId) : null,
+                    shipmentReference: b.shipmentReference || null,
+                });
+                if (resolved.status) return { fail: resolved };
+                shipment = resolved.shipment;
+            } else if (!supplierName) {
+                return { fail: { status: 400, error: 'A shipment or a supplier is required.', code: 'BAD_FIELD' } };
+            }
 
             // Attaching a remittance to a record it does not belong to would
             // pin the wrong payment to the wrong box.
@@ -10284,23 +10403,22 @@ app.post('/api/v1/shipment-payment-documents', async (req, res) => {
                     [Number(b.paymentId)]
                 );
                 if (!rows.length) return { fail: { status: 404, error: `Shipment payment ${b.paymentId} not found.`, code: 'NOT_FOUND' } };
-                if (rows[0].shipment_id !== shipment.id) {
+                if (!shipment || rows[0].shipment_id !== shipment.id) {
                     return { fail: { status: 422, error: 'That balance record belongs to a different shipment.', code: 'PAYMENT_NOT_ON_SHIPMENT' } };
                 }
                 paymentId = rows[0].id;
             }
 
-            const supplierName = typeof b.supplierName === 'string' && b.supplierName.trim()
-                ? b.supplierName.trim().slice(0, 255) : null;
             if (b.force !== true) {
                 const [dupes] = await conn.query(
                     `SELECT id FROM shipment_payment_documents
-                      WHERE deleted_at IS NULL AND shipment_id = ? AND filename = ? AND file_size = ?
+                      WHERE deleted_at IS NULL AND filename = ? AND file_size = ?
+                        AND ${shipment ? 'shipment_id = ?' : 'shipment_id IS NULL AND supplier_key = ?'}
                       LIMIT 1`,
-                    [shipment.id, filename.slice(0, 200), buffer.length]
+                    [filename.slice(0, 200), buffer.length, shipment ? shipment.id : shipmentPaymentsService.supplierKey(supplierName)]
                 );
                 if (dupes.length) {
-                    return { fail: { status: 409, error: `${filename} is already on this shipment.`, code: 'DUPLICATE_DOCUMENT', payload: { existingId: dupes[0].id } } };
+                    return { fail: { status: 409, error: `${filename} is already on ${shipment ? 'this shipment' : 'this supplier'}.`, code: 'DUPLICATE_DOCUMENT', payload: { existingId: dupes[0].id } } };
                 }
             }
 
@@ -10316,7 +10434,8 @@ app.post('/api/v1/shipment-payment-documents', async (req, res) => {
             }));
 
             // Invoices and remittances are read (a remittance's amount, date
-            // and bank reference are what mark-paid applies); 'other' is filed.
+            // and bank reference pre-fill the transfer it is applied with);
+            // 'other' is filed.
             const wantExtract = b.extract === undefined ? docKind !== 'other' : b.extract === true;
             const [ins] = await conn.query(
                 `INSERT INTO shipment_payment_documents
@@ -10324,7 +10443,7 @@ app.post('/api/v1/shipment-payment-documents', async (req, res) => {
                      filename, s3_key, public_url, content_type, file_size, notes, extract_status, uploaded_by_email)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
                 [
-                    shipment.id, shipment.reference || String(shipment.id),
+                    shipment ? shipment.id : null, shipment ? (shipment.reference || String(shipment.id)) : null,
                     supplierName, supplierName ? shipmentPaymentsService.supplierKey(supplierName) : null,
                     paymentId, docKind,
                     filename.slice(0, 200), s3Key, publicS3Url(s3Key), contentType, buffer.length,
@@ -10337,7 +10456,7 @@ app.post('/api/v1/shipment-payment-documents', async (req, res) => {
             await recordAudit(conn, {
                 entityType: 'shipment_payment_document', entityId: ins.insertId, action: 'create',
                 before: null,
-                after: { shipmentId: shipment.id, filename: filename.slice(0, 200), docKind, fileSize: buffer.length },
+                after: { shipmentId: shipment ? shipment.id : null, supplierName, filename: filename.slice(0, 200), docKind, fileSize: buffer.length },
                 userEmail: req.userEmail,
             });
             return { document: shipmentPaymentDocumentRowToJson(readback[0]), wantExtract, documentId: ins.insertId };
@@ -10382,163 +10501,6 @@ app.post('/api/v1/shipment-payment-documents/:id(\\d+)/extract', async (req, res
         if (!result.alreadyRunning) startShipmentPaymentExtraction(req, id);
     } catch (error) {
         log.error('[POST /shipment-payment-documents/:id/extract]', error);
-        if (!res.headersSent) res.status(500).json({ error: 'An internal error occurred.' });
-    }
-});
-
-// POST /api/v1/shipment-payment-documents/:id/mark-paid — apply a remittance
-// advice. Reading one never marks anything paid; this is the operator saying
-// "yes, this is the proof", pre-filled from what the reader found (the amount
-// sent, the date it went, the bank's reference).
-//   paymentId         the open balance it settles (default: the one it is
-//                     already attached to)
-//   purchaseOrderIds  with no balance on file, the POs a new, already-paid one
-//                     splits across (default: the supplier's POs on board)
-//   force             settle a balance that differs by more than a bank
-//                     charge (max of 1 and 1%), or is in another currency
-const REMITTANCE_TOLERANCE = amount => Math.max(1, amount * 0.01);
-
-app.post('/api/v1/shipment-payment-documents/:id(\\d+)/mark-paid', async (req, res) => {
-    try {
-        await shipmentPaymentsSchemaReady;
-        await shipmentsSchemaReady;
-        await auditLogSchemaReady;
-        const id = Number(req.params.id);
-        const b = req.body || {};
-        const result = await withConnection(async (conn) => {
-            const [docs] = await conn.query(`SELECT * FROM shipment_payment_documents WHERE id = ? AND deleted_at IS NULL`, [id]);
-            const doc = docs[0];
-            if (!doc) return { fail: { status: 404, error: `Document ${id} not found.`, code: 'NOT_FOUND' } };
-            if (doc.extract_status !== 'succeeded') {
-                return { fail: { status: 422, error: 'That upload has not been read yet.', code: 'NOT_READ' } };
-            }
-            const read = parseJsonColumn(doc.extract_json) || {};
-            if (read.documentKind !== 'remittance') {
-                return { fail: { status: 422, error: 'Only a remittance advice — proof the money went — can mark a balance paid.', code: 'NOT_A_REMITTANCE' } };
-            }
-            const amount = [read.amountDueNow, read.totalAmount].map(Number).find(n => Number.isFinite(n) && n > 0);
-            if (!amount) return { fail: { status: 422, error: 'No amount was read from that remittance.', code: 'NO_AMOUNT' } };
-            const sent = Math.round(amount * 100) / 100;
-            const currency = read.currency ? String(read.currency).trim().toUpperCase().slice(0, 3) : null;
-            const paidOn = toDateOnlyOrNull(read.paymentDate) || toDateOnlyOrNull(read.invoiceDate)
-                || toDateOnlyOrNull(read.dueDate) || londonToday();
-            const bankRef = String(read.bank?.paymentReference || read.invoiceNumber || '').trim().slice(0, 255) || null;
-
-            // The balance it settles: the one named, else the one it is already
-            // attached to (a record deleted since counts as none).
-            let rec = null;
-            if (b.paymentId != null && b.paymentId !== '') {
-                const [recs] = await conn.query(`SELECT * FROM shipment_payments WHERE id = ? AND deleted_at IS NULL`, [Number(b.paymentId)]);
-                rec = recs[0] || null;
-                if (!rec) return { fail: { status: 404, error: `Balance ${b.paymentId} not found.`, code: 'NOT_FOUND' } };
-            } else if (doc.payment_id) {
-                const [recs] = await conn.query(`SELECT * FROM shipment_payments WHERE id = ? AND deleted_at IS NULL`, [doc.payment_id]);
-                rec = recs[0] || null;
-            }
-
-            if (rec) {
-                if (rec.shipment_id !== doc.shipment_id) {
-                    return { fail: { status: 422, error: 'That balance is on a different shipment from this remittance.', code: 'PAYMENT_NOT_ON_SHIPMENT' } };
-                }
-                if (rec.status === 'paid') {
-                    // Already settled: attach the proof and change nothing else.
-                    if (doc.payment_id !== rec.id) {
-                        await conn.query(`UPDATE shipment_payment_documents SET payment_id = ? WHERE id = ?`, [rec.id, doc.id]);
-                    }
-                    return { status: 200, json: await loadShipmentPaymentById(conn, rec.id) };
-                }
-                const balance = Number(rec.amount);
-                if (b.force !== true) {
-                    if (currency && rec.currency && currency !== rec.currency) {
-                        return { fail: { status: 409, error: `The remittance is in ${currency}; the balance is in ${rec.currency}.`, code: 'CURRENCY_DIFFERS', payload: { remittanceCurrency: currency, balanceCurrency: rec.currency } } };
-                    }
-                    if (Math.abs(sent - balance) > REMITTANCE_TOLERANCE(balance)) {
-                        return { fail: { status: 409, error: `The remittance sent ${sent}; the balance is ${balance}.`, code: 'AMOUNT_DIFFERS', payload: { remittance: sent, balance, currency: rec.currency } } };
-                    }
-                }
-                const before = await loadShipmentPaymentById(conn, rec.id);
-                if (!before.fullyAllocated) {
-                    return { fail: { status: 422, error: 'Split the whole balance across purchase orders before marking it paid.', code: 'NOT_FULLY_ALLOCATED', payload: { unallocated: before.unallocated } } };
-                }
-                await conn.beginTransaction();
-                try {
-                    await conn.query(
-                        `UPDATE shipment_payments
-                            SET status = 'paid', paid_on = ?, bank_ref = COALESCE(bank_ref, ?), updated_by_email = ?
-                          WHERE id = ?`,
-                        [paidOn, bankRef, req.userEmail || null, rec.id]
-                    );
-                    await conn.query(`UPDATE shipment_payment_documents SET payment_id = ? WHERE id = ?`, [rec.id, doc.id]);
-                    await recordAudit(conn, {
-                        entityType: 'shipment_payment', entityId: rec.id, action: 'status',
-                        before: { status: rec.status, paidOn: rec.paid_on || null },
-                        after: { status: 'paid', paidOn, via: 'remittance', documentId: doc.id, remittance: sent, forced: b.force === true },
-                        userEmail: req.userEmail,
-                    });
-                    await conn.commit();
-                } catch (e) {
-                    await conn.rollback().catch(() => {});
-                    throw e;
-                }
-                return { status: 200, json: await loadShipmentPaymentById(conn, rec.id) };
-            }
-
-            // No balance on file: the proof records one, already paid, split
-            // across the supplier's purchase orders by what each has on board.
-            const supplierName = String(doc.supplier_name || '').trim().slice(0, 255);
-            if (!supplierName) {
-                return { fail: { status: 422, error: 'That upload is not filed under a supplier.', code: 'NO_SUPPLIER' } };
-            }
-            const memberPos = await shipmentPaymentsService.loadMemberPurchaseOrders(conn, doc.shipment_id);
-            let split;
-            if (Array.isArray(b.purchaseOrderIds) && b.purchaseOrderIds.length) {
-                const byId = new Map(memberPos.map(p => [p.id, p]));
-                split = [];
-                for (const raw of b.purchaseOrderIds) {
-                    const po = byId.get(Number(raw));
-                    if (!po) {
-                        return { fail: { status: 422, error: `Purchase order ${raw} has no lines on this shipment.`, code: 'PO_NOT_IN_SHIPMENT', payload: { purchaseOrderId: Number(raw) } } };
-                    }
-                    split.push(po);
-                }
-            } else {
-                const key = shipmentPaymentsService.supplierKey(supplierName);
-                split = memberPos.filter(p => p.supplierKey === key);
-            }
-            if (!split.length) {
-                return { fail: { status: 422, error: 'No purchase orders from this supplier on this shipment to split it across.', code: 'NO_MEMBER_POS' } };
-            }
-            await conn.beginTransaction();
-            try {
-                const [ins] = await conn.query(
-                    `INSERT INTO shipment_payments
-                        (shipment_id, shipment_reference, supplier_name, supplier_key, kind, amount, currency,
-                         status, paid_on, bank_ref, note, source, created_by_email)
-                     VALUES (?, ?, ?, ?, 'balance', ?, ?, 'paid', ?, ?, ?, 'extracted', ?)`,
-                    [
-                        doc.shipment_id, doc.shipment_reference, supplierName, shipmentPaymentsService.supplierKey(supplierName),
-                        sent, currency || split[0].currency || 'USD', paidOn, bankRef,
-                        `Recorded from the remittance ${doc.filename}.`.slice(0, 2000), req.userEmail || null,
-                    ]
-                );
-                await writeShipmentPaymentAllocations(conn, ins.insertId, shipmentPaymentsService.shareAllocations(sent, split));
-                await conn.query(`UPDATE shipment_payment_documents SET payment_id = ? WHERE id = ?`, [ins.insertId, doc.id]);
-                const json = await loadShipmentPaymentById(conn, ins.insertId);
-                await recordAudit(conn, {
-                    entityType: 'shipment_payment', entityId: ins.insertId, action: 'create',
-                    before: null, after: { ...json, via: 'remittance', documentId: doc.id }, userEmail: req.userEmail,
-                });
-                await conn.commit();
-                return { status: 201, json };
-            } catch (e) {
-                await conn.rollback().catch(() => {});
-                throw e;
-            }
-        });
-        if (result.fail) return sendShipmentPaymentError(res, result.fail);
-        res.status(result.status).json(result.json);
-    } catch (error) {
-        log.error('[POST /shipment-payment-documents/:id/mark-paid]', error);
         if (!res.headersSent) res.status(500).json({ error: 'An internal error occurred.' });
     }
 });
@@ -10611,6 +10573,789 @@ function startShipmentPaymentExtraction(req, documentId) {
         }
     })();
 }
+
+// ── Supplier payments (/api/v1/supplier-payments) ────────────────────────
+// One bank transfer to a supplier, applied to the obligations it settled:
+// balances on several shipments, a deposit PI, a deposit on a PO that has no
+// PI yet. Each line carries the amount applied, so one transfer can cover
+// four things and a part payment leaves an obligation pending with a
+// remainder. An obligation is paid once the live lines applied to it cover
+// its amount within a bank charge (max of 1 and 1 %); the transfer that
+// completed it is remembered, so deleting or editing the transfer puts that
+// obligation back to pending and touches nothing else — a balance or PI
+// someone marked paid by hand stays paid.
+//
+// Reading a proof of payment never records a transfer: the operator does,
+// with the proof attached (documentId). Schema: src/db/migrate/*_supplier_payments.sql.
+const SUPPLIER_PAYMENT_LINE_KINDS = ['balance', 'pi', 'po_deposit'];
+// A fourth kind exists on the way in only: 'container_balance' names a
+// shipment whose balance nobody has recorded yet (the page projects it from
+// the goods on board). Saving records that balance — split across the
+// supplier's POs in the box — and the line becomes an ordinary 'balance'.
+const SUPPLIER_PAYMENT_INPUT_KINDS = [...SUPPLIER_PAYMENT_LINE_KINDS, 'container_balance'];
+const settleTolerance = amount => Math.max(1, amount * 0.01);
+
+function supplierPaymentLineToJson(l, target) {
+    return {
+        id: l.id,
+        kind: l.target_kind,
+        targetId: l.target_id,
+        amount: Number(l.amount),
+        // What the line points at, resolved for display; null when it has
+        // since been deleted.
+        label: target ? target.label : null,
+        shipmentId: target?.shipmentId ?? null,
+        shipmentReference: target?.shipmentReference ?? null,
+        purchaseOrderId: target?.purchaseOrderId ?? null,
+        poNumber: target?.poNumber ?? null,
+        paymentType: target?.paymentType ?? null,
+        invoiceNumber: target?.invoiceNumber ?? null,
+        targetAmount: target?.amount ?? null,
+        targetStatus: target?.status ?? null,
+        targetMissing: !target,
+    };
+}
+
+function supplierPaymentRowToJson(r, { lines = [], documents = [] } = {}) {
+    const amount = Number(r.amount) || 0;
+    const linesTotal = Math.round(lines.reduce((a, l) => a + (l.amount || 0), 0) * 100) / 100;
+    return {
+        id: r.id,
+        supplierName: r.supplier_name,
+        supplierKey: r.supplier_key,
+        amount,
+        currency: r.currency,
+        paidOn: r.paid_on || null,
+        bankRef: r.bank_ref || null,
+        note: r.note || null,
+        source: r.source || 'manual',
+        lines,
+        linesTotal,
+        // Money sent that no line explains — a bank charge, or something not
+        // on our books yet.
+        unexplained: Math.max(0, Math.round((amount - linesTotal) * 100) / 100),
+        documents,
+        createdByEmail: r.created_by_email || null,
+        updatedByEmail: r.updated_by_email || null,
+        createdAt: r.created_at?.toISOString?.() ?? r.created_at,
+        updatedAt: r.updated_at?.toISOString?.() ?? r.updated_at,
+    };
+}
+
+// Resolve what each line points at. Keyed `${kind}:${id}`; a missing entry is
+// a target that no longer exists.
+async function loadSupplierPaymentTargets(conn, lines) {
+    const out = new Map();
+    const idsOf = kind => [...new Set(lines.filter(l => l.kind === kind).map(l => l.id))];
+    const balIds = idsOf('balance');
+    if (balIds.length) {
+        const ph = balIds.map(() => '?').join(',');
+        const [rows] = await conn.query(
+            `SELECT p.*, (SELECT COALESCE(SUM(a.amount), 0) FROM shipment_payment_allocations a WHERE a.payment_id = p.id) AS allocated
+               FROM shipment_payments p WHERE p.id IN (${ph}) AND p.deleted_at IS NULL`, balIds
+        );
+        for (const r of rows) {
+            out.set(`balance:${r.id}`, {
+                kind: 'balance', id: r.id, amount: Number(r.amount), currency: r.currency, status: r.status,
+                supplier: r.supplier_name, supplierKey: r.supplier_key, settledBy: r.settled_by_payment_id ?? null,
+                allocated: Number(r.allocated) || 0, label: r.shipment_reference || String(r.shipment_id),
+                shipmentId: r.shipment_id, shipmentReference: r.shipment_reference, invoiceNumber: r.invoice_number || null,
+                purchaseOrderId: null, poNumber: null, paymentType: null,
+            });
+        }
+    }
+    const piIds = idsOf('pi');
+    if (piIds.length) {
+        const ph = piIds.map(() => '?').join(',');
+        const [rows] = await conn.query(
+            `SELECT p.*, po.po_number, po.supplier AS po_supplier
+               FROM purchase_order_invoice_payments p
+               JOIN purchase_orders po ON po.id = p.purchase_order_id AND po.deleted_at IS NULL
+               JOIN purchase_order_invoices i ON i.id = p.purchase_order_invoice_id AND i.deleted_at IS NULL
+              WHERE p.id IN (${ph})`, piIds
+        );
+        for (const r of rows) {
+            out.set(`pi:${r.id}`, {
+                kind: 'pi', id: r.id, amount: r.amount_due != null ? Number(r.amount_due) : null,
+                currency: (r.currency || '').toUpperCase() || null, status: r.payment_status,
+                supplier: r.po_supplier, supplierKey: shipmentPaymentsService.supplierKey(r.po_supplier), settledBy: r.settled_by_payment_id ?? null,
+                label: r.po_number, purchaseOrderId: r.purchase_order_id, poNumber: r.po_number,
+                paymentType: r.payment_type || null, invoiceId: r.purchase_order_invoice_id,
+                shipmentId: null, shipmentReference: null, invoiceNumber: null,
+            });
+        }
+    }
+    const poIds = idsOf('po_deposit');
+    if (poIds.length) {
+        const ph = poIds.map(() => '?').join(',');
+        const [rows] = await conn.query(
+            `SELECT po.id, po.po_number, po.supplier, po.currency,
+                    (SELECT COUNT(*) FROM purchase_order_invoice_payments q
+                       JOIN purchase_order_invoices i ON i.id = q.purchase_order_invoice_id AND i.deleted_at IS NULL
+                      WHERE q.purchase_order_id = po.id AND q.payment_type IN ('deposit', 'full')) AS deposit_pis
+               FROM purchase_orders po WHERE po.id IN (${ph}) AND po.deleted_at IS NULL`, poIds
+        );
+        for (const r of rows) {
+            out.set(`po_deposit:${r.id}`, {
+                kind: 'po_deposit', id: r.id, amount: null, currency: (r.currency || '').toUpperCase() || null, status: null,
+                supplier: r.supplier, supplierKey: shipmentPaymentsService.supplierKey(r.supplier), settledBy: null,
+                label: r.po_number, purchaseOrderId: r.id, poNumber: r.po_number, paymentType: 'deposit',
+                depositPis: Number(r.deposit_pis) || 0, shipmentId: null, shipmentReference: null, invoiceNumber: null,
+            });
+        }
+    }
+    return out;
+}
+
+// What OTHER live transfers have applied to these targets.
+async function loadSupplierPaymentApplied(conn, lines, { excludePaymentId = null } = {}) {
+    const out = new Map();
+    for (const kind of SUPPLIER_PAYMENT_LINE_KINDS) {
+        const ids = [...new Set(lines.filter(l => l.kind === kind).map(l => l.id))];
+        if (!ids.length) continue;
+        const [rows] = await conn.query(
+            `SELECT l.target_id, SUM(l.amount) AS applied
+               FROM supplier_payment_lines l
+               JOIN supplier_payments sp ON sp.id = l.payment_id AND sp.deleted_at IS NULL
+              WHERE l.target_kind = ? AND l.target_id IN (${ids.map(() => '?').join(',')})
+                ${excludePaymentId ? 'AND l.payment_id <> ?' : ''}
+              GROUP BY l.target_id`,
+            [kind, ...ids, ...(excludePaymentId ? [excludePaymentId] : [])]
+        );
+        for (const r of rows) out.set(`${kind}:${r.target_id}`, Number(r.applied) || 0);
+    }
+    return out;
+}
+
+async function hydrateSupplierPayments(conn, rows) {
+    if (!rows.length) return [];
+    const ids = rows.map(r => r.id);
+    const ph = ids.map(() => '?').join(',');
+    const [lineRows] = await conn.query(
+        `SELECT * FROM supplier_payment_lines WHERE payment_id IN (${ph}) ORDER BY id`, ids
+    );
+    const targets = await loadSupplierPaymentTargets(conn, lineRows.map(l => ({ kind: l.target_kind, id: l.target_id })));
+    const linesByPayment = new Map();
+    for (const l of lineRows) {
+        if (!linesByPayment.has(l.payment_id)) linesByPayment.set(l.payment_id, []);
+        linesByPayment.get(l.payment_id).push(supplierPaymentLineToJson(l, targets.get(`${l.target_kind}:${l.target_id}`) || null));
+    }
+    const [docRows] = await conn.query(
+        `SELECT * FROM shipment_payment_documents WHERE deleted_at IS NULL AND supplier_payment_id IN (${ph}) ORDER BY id DESC`, ids
+    );
+    const docsByPayment = new Map();
+    for (const d of docRows) {
+        if (!docsByPayment.has(d.supplier_payment_id)) docsByPayment.set(d.supplier_payment_id, []);
+        docsByPayment.get(d.supplier_payment_id).push(shipmentPaymentDocumentRowToJson(d));
+    }
+    return rows.map(r => supplierPaymentRowToJson(r, {
+        lines: linesByPayment.get(r.id) || [],
+        documents: docsByPayment.get(r.id) || [],
+    }));
+}
+
+async function loadSupplierPaymentById(conn, id) {
+    const [rows] = await conn.query(`SELECT * FROM supplier_payments WHERE id = ? AND deleted_at IS NULL`, [id]);
+    if (!rows.length) return null;
+    return (await hydrateSupplierPayments(conn, rows))[0] || null;
+}
+
+// Validates a transfer body. `partial` (PUT) checks only what was sent.
+function parseSupplierPaymentBody(body, { partial = false } = {}) {
+    const b = body && typeof body === 'object' ? body : {};
+    const has = k => Object.prototype.hasOwnProperty.call(b, k) && b[k] !== undefined;
+    const row = {};
+    if (has('supplierName') || !partial) {
+        const name = typeof b.supplierName === 'string' ? b.supplierName.trim().slice(0, 255) : '';
+        if (!name) return { error: 'supplierName is required.', code: 'BAD_FIELD' };
+        row.supplier_name = name;
+        row.supplier_key = shipmentPaymentsService.supplierKey(name);
+    }
+    if (has('amount') || !partial) {
+        const amount = Number(b.amount);
+        if (!Number.isFinite(amount) || amount <= 0) return { error: 'amount must be a number above 0.', code: 'BAD_FIELD' };
+        row.amount = Math.round(amount * 100) / 100;
+    }
+    if (has('currency') || !partial) {
+        const cur = typeof b.currency === 'string' ? b.currency.trim().toUpperCase() : '';
+        if (!/^[A-Z]{3}$/.test(cur)) return { error: 'currency must be a 3-letter code.', code: 'BAD_FIELD' };
+        row.currency = cur;
+    }
+    if (has('paidOn') || !partial) {
+        const d = toDateOnlyOrNull(b.paidOn);
+        if (!d) return { error: 'paidOn (the date the money was sent) is required, as YYYY-MM-DD.', code: 'BAD_FIELD' };
+        row.paid_on = d;
+    }
+    if (has('bankRef')) row.bank_ref = b.bankRef == null ? null : String(b.bankRef).trim().slice(0, 255) || null;
+    if (has('note')) row.note = b.note == null ? null : String(b.note).trim().slice(0, 2000) || null;
+
+    let lines = null;
+    if (has('lines') || !partial) {
+        if (!Array.isArray(b.lines) || !b.lines.length) return { error: 'lines must name at least one thing this transfer paid.', code: 'BAD_LINES' };
+        lines = [];
+        const seen = new Set();
+        for (const entry of b.lines) {
+            if (!entry || typeof entry !== 'object') return { error: 'each line must be an object.', code: 'BAD_LINES' };
+            const kind = String(entry.kind || '');
+            if (!SUPPLIER_PAYMENT_INPUT_KINDS.includes(kind)) return { error: `lines[].kind must be one of: ${SUPPLIER_PAYMENT_INPUT_KINDS.join(', ')}.`, code: 'BAD_LINES' };
+            const id = Number(entry.id);
+            if (!Number.isInteger(id) || id <= 0) return { error: 'lines[].id must be an id.', code: 'BAD_LINES' };
+            const amount = Number(entry.amount);
+            if (!Number.isFinite(amount) || amount <= 0) return { error: 'lines[].amount must be a number above 0.', code: 'BAD_LINES' };
+            const key = `${kind}:${id}`;
+            if (seen.has(key)) return { error: `lines name ${key} twice.`, code: 'BAD_LINES' };
+            seen.add(key);
+            const line = { kind, id, amount: Math.round(amount * 100) / 100 };
+            if (kind === 'container_balance') {
+                // The balance to record: the projected figure (default: what
+                // is being paid), optionally already split by the page.
+                if (entry.balanceAmount != null && entry.balanceAmount !== '') {
+                    const ba = Number(entry.balanceAmount);
+                    if (!Number.isFinite(ba) || ba <= 0) return { error: 'lines[].balanceAmount must be a number above 0.', code: 'BAD_LINES' };
+                    line.balanceAmount = Math.round(ba * 100) / 100;
+                }
+                if (entry.allocations != null) {
+                    const parsedAlloc = parseShipmentPaymentAllocations(entry.allocations);
+                    if (parsedAlloc.error) return { error: `lines[].allocations: ${parsedAlloc.error}`, code: 'BAD_LINES' };
+                    line.allocations = parsedAlloc.allocations;
+                }
+            }
+            lines.push(line);
+        }
+    }
+    return { row, lines };
+}
+
+// Record the balance a 'container_balance' line pays for — one balance per
+// shipment x supplier, split across the supplier's POs on board — and turn
+// the line into an ordinary 'balance' line. Runs inside the caller's
+// transaction. { fail } or { lines, created: [balanceId] }.
+async function materialiseContainerBalances(conn, { lines, supplierName, supplierKeyValue, currency, userEmail }) {
+    const out = [];
+    const created = [];
+    for (const l of lines) {
+        if (l.kind !== 'container_balance') { out.push(l); continue; }
+        const resolved = await requireBookedShipment(conn, { shipmentId: l.id, shipmentReference: null });
+        if (resolved.status) return { fail: resolved };
+        const shipment = resolved.shipment;
+        const [open] = await conn.query(
+            `SELECT id FROM shipment_payments
+              WHERE deleted_at IS NULL AND shipment_id = ? AND supplier_key = ? AND status IN ('pending', 'arranged')
+              ORDER BY id LIMIT 1`,
+            [shipment.id, supplierKeyValue]
+        );
+        if (open.length) {
+            return { fail: { status: 409, error: `${shipment.reference || shipment.id} already has an open balance for ${supplierName} — apply the payment to that.`, code: 'BALANCE_EXISTS', payload: { balanceId: open[0].id, shipmentId: shipment.id } } };
+        }
+        const memberPos = await shipmentPaymentsService.loadMemberPurchaseOrders(conn, shipment.id);
+        const mine = memberPos.filter(p => p.supplierKey === supplierKeyValue || sameSupplierName(p.supplier, supplierName));
+        const balanceAmount = l.balanceAmount ?? l.amount;
+        const alloc = resolveShipmentPaymentAllocations({
+            allocations: l.allocations ?? null,
+            allocate: l.allocations ? null : { mode: 'share', purchaseOrderIds: mine.map(p => p.id) },
+            amount: balanceAmount, memberPos, supplierKeyValue,
+        });
+        if (alloc.error) return { fail: { status: 422, ...alloc } };
+        const allocations = alloc.allocations || [];
+        const allocated = allocations.reduce((a, x) => a + x.amount, 0);
+        if (allocated > balanceAmount + SHIPMENT_ALLOCATION_EPS) {
+            return { fail: { status: 422, error: 'The balance split adds up to more than the balance.', code: 'OVER_ALLOCATED', payload: { allocated: Math.round(allocated * 100) / 100, amount: balanceAmount } } };
+        }
+        const [ins] = await conn.query(
+            `INSERT INTO shipment_payments
+                (shipment_id, shipment_reference, supplier_name, supplier_key, kind, amount, currency, status, note, source, created_by_email)
+             VALUES (?, ?, ?, ?, 'balance', ?, ?, 'pending', ?, 'manual', ?)`,
+            [
+                shipment.id, shipment.reference || String(shipment.id), supplierName, supplierKeyValue, balanceAmount, currency,
+                'Recorded while applying a payment — the projected balance for the goods on board.', userEmail || null,
+            ]
+        );
+        if (allocations.length) await writeShipmentPaymentAllocations(conn, ins.insertId, allocations);
+        await recordAudit(conn, {
+            entityType: 'shipment_payment', entityId: ins.insertId, action: 'create',
+            before: null, after: await loadShipmentPaymentById(conn, ins.insertId), userEmail,
+        });
+        created.push(ins.insertId);
+        out.push({ kind: 'balance', id: ins.insertId, amount: l.amount });
+    }
+    return { lines: out, created };
+}
+
+// Check every line against what it points at and what is still owed on it.
+// Returns { fail } or { warnings, targets, applied }.
+async function checkSupplierPaymentLines(conn, { lines, currency, amount, supplierKeyValue, excludePaymentId = null }) {
+    const warnings = [];
+    const targets = await loadSupplierPaymentTargets(conn, lines);
+    const applied = await loadSupplierPaymentApplied(conn, lines, { excludePaymentId });
+    let linesTotal = 0;
+    for (const l of lines) {
+        linesTotal += l.amount;
+        const t = targets.get(`${l.kind}:${l.id}`);
+        if (!t) return { fail: { status: 404, error: `${l.kind} ${l.id} does not exist.`, code: 'TARGET_NOT_FOUND', payload: { kind: l.kind, id: l.id } } };
+        if (t.currency && currency && t.currency !== currency) {
+            return { fail: { status: 422, error: `${t.label} is in ${t.currency}; this transfer is in ${currency}.`, code: 'CURRENCY_MISMATCH', payload: { kind: l.kind, id: l.id, targetCurrency: t.currency } } };
+        }
+        if (t.status === 'skipped') {
+            return { fail: { status: 422, error: `${t.label} is marked skipped — nothing is owed on it.`, code: 'TARGET_NOT_OPEN', payload: { kind: l.kind, id: l.id } } };
+        }
+        if (t.supplierKey && supplierKeyValue && t.supplierKey !== supplierKeyValue && !sameSupplierName(t.supplier, supplierKeyValue)) {
+            warnings.push(`${t.label} is filed under "${t.supplier}".`);
+        }
+        if (t.amount != null) {
+            const before = applied.get(`${l.kind}:${l.id}`) || 0;
+            const remaining = Math.round((t.amount - before) * 100) / 100;
+            if (l.amount > remaining + SHIPMENT_ALLOCATION_EPS) {
+                return { fail: { status: 422, error: `${t.label}: ${l.amount} applied, but only ${remaining} is still owed on it.`, code: 'OVER_APPLIED', payload: { kind: l.kind, id: l.id, remaining, applied: before } } };
+            }
+            const settles = before + l.amount >= t.amount - settleTolerance(t.amount);
+            if (settles && t.kind === 'balance' && t.allocated < t.amount - SHIPMENT_ALLOCATION_EPS) {
+                return { fail: { status: 422, error: `Split balance ${t.label} across its purchase orders before settling it.`, code: 'NOT_FULLY_ALLOCATED', payload: { kind: 'balance', id: t.id, unallocated: Math.round((t.amount - t.allocated) * 100) / 100 } } };
+            }
+        } else if (t.kind === 'po_deposit' && t.depositPis > 0) {
+            warnings.push(`${t.label} has a deposit PI on file — apply the payment to that PI instead.`);
+        }
+    }
+    linesTotal = Math.round(linesTotal * 100) / 100;
+    if (linesTotal > amount + SHIPMENT_ALLOCATION_EPS) {
+        return { fail: { status: 422, error: 'The lines add up to more than was sent.', code: 'OVER_ALLOCATED', payload: { linesTotal, amount } } };
+    }
+    return { warnings, targets, applied };
+}
+
+// Flip the obligations this transfer now covers. Runs inside the caller's
+// transaction, after the lines are written.
+async function settleSupplierPaymentTargets(conn, { payment, lines, targets, applied, userEmail }) {
+    for (const l of lines) {
+        const t = targets.get(`${l.kind}:${l.id}`);
+        if (!t || t.amount == null) continue;
+        const total = (applied.get(`${l.kind}:${l.id}`) || 0) + l.amount;
+        if (total < t.amount - settleTolerance(t.amount)) continue;
+        if (t.kind === 'balance') {
+            await conn.query(
+                `UPDATE shipment_payments
+                    SET status = 'paid', paid_on = ?, bank_ref = COALESCE(bank_ref, ?), settled_by_payment_id = ?, updated_by_email = ?
+                  WHERE id = ?`,
+                [payment.paid_on, payment.bank_ref ?? null, payment.id, userEmail, t.id]
+            );
+            await recordAudit(conn, {
+                entityType: 'shipment_payment', entityId: t.id, action: 'status',
+                before: { status: t.status },
+                after: { status: 'paid', paidOn: payment.paid_on, via: 'payment', paymentId: payment.id, applied: Math.round(total * 100) / 100 },
+                userEmail,
+            });
+        } else if (t.kind === 'pi') {
+            await conn.query(
+                `UPDATE purchase_order_invoice_payments SET payment_status = 'paid', settled_by_payment_id = ? WHERE id = ?`,
+                [payment.id, t.id]
+            );
+            await recordAudit(conn, {
+                entityType: 'purchase_order', entityId: t.purchaseOrderId, action: 'invoice_payment_status',
+                before: { invoiceId: t.invoiceId, paymentStatus: t.status },
+                after: { invoiceId: t.invoiceId, paymentStatus: 'paid', via: 'payment', paymentId: payment.id, applied: Math.round(total * 100) / 100 },
+                userEmail,
+            });
+        }
+    }
+}
+
+// Put back to pending whatever THIS transfer settled — and only that.
+async function unsettleSupplierPaymentTargets(conn, { paymentId, userEmail }) {
+    const [bals] = await conn.query(`SELECT id, status, paid_on FROM shipment_payments WHERE settled_by_payment_id = ? AND deleted_at IS NULL`, [paymentId]);
+    for (const b of bals) {
+        await conn.query(
+            `UPDATE shipment_payments SET status = 'pending', paid_on = NULL, settled_by_payment_id = NULL, updated_by_email = ? WHERE id = ?`,
+            [userEmail, b.id]
+        );
+        await recordAudit(conn, {
+            entityType: 'shipment_payment', entityId: b.id, action: 'status',
+            before: { status: b.status, paidOn: b.paid_on || null },
+            after: { status: 'pending', paidOn: null, via: 'payment_reverted', paymentId },
+            userEmail,
+        });
+    }
+    const [pis] = await conn.query(`SELECT id, purchase_order_id, purchase_order_invoice_id, payment_status FROM purchase_order_invoice_payments WHERE settled_by_payment_id = ?`, [paymentId]);
+    for (const p of pis) {
+        await conn.query(`UPDATE purchase_order_invoice_payments SET payment_status = 'pending', settled_by_payment_id = NULL WHERE id = ?`, [p.id]);
+        await recordAudit(conn, {
+            entityType: 'purchase_order', entityId: p.purchase_order_id, action: 'invoice_payment_status',
+            before: { invoiceId: p.purchase_order_invoice_id, paymentStatus: p.payment_status },
+            after: { invoiceId: p.purchase_order_invoice_id, paymentStatus: 'pending', via: 'payment_reverted', paymentId },
+            userEmail,
+        });
+    }
+}
+
+// Attach a proof of payment to a transfer. { fail } or { documentId }.
+async function claimSupplierPaymentDocument(conn, { documentId, paymentId, supplierKeyValue, warnings }) {
+    const [docs] = await conn.query(`SELECT id, supplier_key, supplier_payment_id FROM shipment_payment_documents WHERE id = ? AND deleted_at IS NULL`, [documentId]);
+    if (!docs.length) return { fail: { status: 404, error: `Document ${documentId} not found.`, code: 'NOT_FOUND' } };
+    const d = docs[0];
+    if (d.supplier_payment_id != null && d.supplier_payment_id !== paymentId) {
+        const [live] = await conn.query(`SELECT id FROM supplier_payments WHERE id = ? AND deleted_at IS NULL`, [d.supplier_payment_id]);
+        if (live.length) return { fail: { status: 409, error: 'That proof is already on another transfer.', code: 'DOCUMENT_LINKED', payload: { paymentId: d.supplier_payment_id } } };
+    }
+    if (d.supplier_key && supplierKeyValue && d.supplier_key !== supplierKeyValue) warnings.push('The proof was uploaded under a different supplier.');
+    await conn.query(`UPDATE shipment_payment_documents SET supplier_payment_id = ? WHERE id = ?`, [paymentId, d.id]);
+    return { documentId: d.id };
+}
+
+// GET /api/v1/supplier-payments?supplier=&shipmentId=&updatedSince=
+// The transfers, each with its lines resolved, plus every unapplied proof of
+// payment (a remittance, or anything uploaded against a supplier alone).
+app.get('/api/v1/supplier-payments', async (req, res) => {
+    try {
+        await shipmentPaymentsSchemaReady;
+        const where = ['sp.deleted_at IS NULL'];
+        const params = [];
+        const supplierKeyValue = req.query.supplier ? shipmentPaymentsService.supplierKey(req.query.supplier) : null;
+        if (supplierKeyValue) { where.push('sp.supplier_key = ?'); params.push(supplierKeyValue); }
+        if (req.query.shipmentId) {
+            where.push(`EXISTS (SELECT 1 FROM supplier_payment_lines l JOIN shipment_payments b ON b.id = l.target_id
+                          WHERE l.payment_id = sp.id AND l.target_kind = 'balance' AND b.shipment_id = ?)`);
+            params.push(Number(req.query.shipmentId));
+        }
+        if (req.query.updatedSince) {
+            const since = new Date(String(req.query.updatedSince));
+            if (Number.isNaN(since.getTime())) return res.status(400).json({ error: 'updatedSince must be a date.', code: 'BAD_FIELD' });
+            where.push('sp.updated_at >= ?'); params.push(since);
+        }
+        const out = await withConnection(async (conn) => {
+            const [rows] = await conn.query(`SELECT sp.* FROM supplier_payments sp WHERE ${where.join(' AND ')} ORDER BY sp.paid_on DESC, sp.id DESC`, params);
+            const data = await hydrateSupplierPayments(conn, rows);
+            const docWhere = [
+                'd.deleted_at IS NULL', 'd.supplier_payment_id IS NULL', 'd.payment_id IS NULL',
+                `(d.doc_kind = 'remittance' OR d.shipment_id IS NULL OR JSON_UNQUOTE(JSON_EXTRACT(d.extract_json, '$.documentKind')) = 'remittance')`,
+            ];
+            const docParams = [];
+            if (supplierKeyValue) { docWhere.push('d.supplier_key = ?'); docParams.push(supplierKeyValue); }
+            const [docRows] = await conn.query(`SELECT d.* FROM shipment_payment_documents d WHERE ${docWhere.join(' AND ')} ORDER BY d.id DESC`, docParams);
+            // A supplier's proofs may be filed under another spelling of its name.
+            const docs = docRows.map(shipmentPaymentDocumentRowToJson);
+            return { data, documents: docs };
+        });
+        res.json(out);
+    } catch (error) {
+        log.error('[GET /supplier-payments]', error);
+        res.status(500).json({ error: 'An internal error occurred.' });
+    }
+});
+
+// GET /api/v1/supplier-payments/open-items?supplier=&currency=
+// What a transfer to this supplier could be applied to: open balances and
+// open PIs, each with what is still owed after earlier transfers. Deposits on
+// POs with no PI are the page's to offer — only it knows the projected
+// amount — so they are not listed here.
+app.get('/api/v1/supplier-payments/open-items', async (req, res) => {
+    try {
+        await shipmentPaymentsSchemaReady;
+        await purchaseOrdersSchemaReady;
+        const supplier = typeof req.query.supplier === 'string' ? req.query.supplier.trim() : '';
+        if (!supplier) return res.status(400).json({ error: 'supplier is required.', code: 'BAD_FIELD' });
+        const currency = req.query.currency ? String(req.query.currency).trim().toUpperCase() : null;
+        const key = shipmentPaymentsService.supplierKey(supplier);
+        const out = await withConnection(async (conn) => {
+            // Open AND settled: what a transfer can be applied to, plus what is
+            // already paid so the operator sees it while ticking (a deposit
+            // paid in June, last month's container balance).
+            const [bals] = await conn.query(
+                `SELECT * FROM shipment_payments WHERE deleted_at IS NULL AND status <> 'skipped' ORDER BY shipment_reference, id`
+            );
+            const [pis] = await conn.query(
+                `SELECT p.*, po.po_number, po.supplier AS po_supplier
+                   FROM purchase_order_invoice_payments p
+                   JOIN purchase_orders po ON po.id = p.purchase_order_id AND po.deleted_at IS NULL
+                   JOIN purchase_order_invoices i ON i.id = p.purchase_order_invoice_id AND i.deleted_at IS NULL
+                  WHERE p.payment_status <> 'skipped' AND p.amount_due > 0
+                  ORDER BY po.po_number, p.id`
+            );
+            const mine = {
+                balances: bals.filter(b => b.supplier_key === key || sameSupplierName(b.supplier_name, supplier)),
+                pis: pis.filter(p => shipmentPaymentsService.supplierKey(p.po_supplier) === key || sameSupplierName(p.po_supplier, supplier)),
+            };
+            const applied = await loadSupplierPaymentApplied(conn, [
+                ...mine.balances.map(b => ({ kind: 'balance', id: b.id })),
+                ...mine.pis.map(p => ({ kind: 'pi', id: p.id })),
+            ]);
+
+            // What each balance is made of: its per-PO split, how much of each
+            // PO is in that box, and whether that PO's deposit has gone.
+            const balIds = mine.balances.map(b => b.id);
+            const allocByBalance = new Map();
+            const poIds = new Set(mine.pis.map(p => p.purchase_order_id));
+            if (balIds.length) {
+                const [allocRows] = await conn.query(
+                    `SELECT a.payment_id, a.purchase_order_id, a.po_ref, a.amount, po.po_number
+                       FROM shipment_payment_allocations a
+                       LEFT JOIN purchase_orders po ON po.id = a.purchase_order_id
+                      WHERE a.payment_id IN (${balIds.map(() => '?').join(',')})
+                      ORDER BY a.id`,
+                    balIds
+                );
+                for (const r of allocRows) {
+                    if (!allocByBalance.has(r.payment_id)) allocByBalance.set(r.payment_id, []);
+                    allocByBalance.get(r.payment_id).push(r);
+                    if (r.purchase_order_id) poIds.add(r.purchase_order_id);
+                }
+            }
+            const shipmentIds = [...new Set(mine.balances.map(b => b.shipment_id).filter(Boolean))];
+            const onBoard = new Map(); // `${shipmentId}:${poId}` -> { lines, units, value }
+            for (const sid of shipmentIds) {
+                for (const m of await shipmentPaymentsService.loadMemberPurchaseOrders(conn, sid)) {
+                    onBoard.set(`${sid}:${m.id}`, { lines: m.lineCount, units: m.unitsInShipment, value: m.valueInShipment });
+                    poIds.add(m.id);
+                }
+            }
+            const poTotals = new Map();
+            const depositByPo = new Map();
+            if (poIds.size) {
+                const ids = [...poIds];
+                const [tot] = await conn.query(
+                    // Lines that are goods: destroyed samples are not part of what is owed.
+                    `SELECT purchase_order_id, COUNT(*) AS line_count, SUM(quantity) AS units
+                       FROM orders WHERE deleted_at IS NULL AND status <> 'DESTROYED' AND purchase_order_id IN (${ids.map(() => '?').join(',')})
+                      GROUP BY purchase_order_id`, ids
+                );
+                for (const r of tot) poTotals.set(r.purchase_order_id, { lines: Number(r.line_count) || 0, units: Number(r.units) || 0 });
+                const deposits = await shipmentPaymentsService.loadDepositsFor(conn, ids);
+                for (const [poId, d] of deposits) depositByPo.set(poId, { source: 'pi', status: d.paymentStatus, amount: d.amountDue, paidOn: null });
+                // A deposit paid by transfer with no PI on file.
+                const [depLines] = await conn.query(
+                    `SELECT l.target_id AS po_id, SUM(l.amount) AS amount, MIN(sp.paid_on) AS paid_on
+                       FROM supplier_payment_lines l JOIN supplier_payments sp ON sp.id = l.payment_id AND sp.deleted_at IS NULL
+                      WHERE l.target_kind = 'po_deposit' AND l.target_id IN (${ids.map(() => '?').join(',')})
+                      GROUP BY l.target_id`, ids
+                );
+                for (const r of depLines) depositByPo.set(r.po_id, { source: 'payment', status: 'paid', amount: Number(r.amount), paidOn: r.paid_on || null });
+            }
+            const allocationsOf = (b) => (allocByBalance.get(b.id) || []).map(a => {
+                const ob = a.purchase_order_id ? onBoard.get(`${b.shipment_id}:${a.purchase_order_id}`) : null;
+                const tot = a.purchase_order_id ? poTotals.get(a.purchase_order_id) : null;
+                return {
+                    purchaseOrderId: a.purchase_order_id ?? null, poNumber: a.po_number || a.po_ref || null, amount: Number(a.amount),
+                    linesOnBoard: ob ? ob.lines : null, linesTotal: tot ? tot.lines : null,
+                    unitsOnBoard: ob ? ob.units : null, unitsTotal: tot ? tot.units : null,
+                    deposit: (a.purchase_order_id && depositByPo.get(a.purchase_order_id)) || null,
+                };
+            });
+
+            const items = [];
+            for (const b of mine.balances) {
+                const cur = (b.currency || '').toUpperCase();
+                if (currency && cur !== currency) continue;
+                const amount = Number(b.amount);
+                const done = applied.get(`balance:${b.id}`) || 0;
+                const open = b.status !== 'paid';
+                const remaining = open ? Math.round((amount - done) * 100) / 100 : 0;
+                if (open && remaining <= SHIPMENT_ALLOCATION_EPS) continue;
+                items.push({
+                    kind: 'balance', id: b.id, label: b.shipment_reference || String(b.shipment_id), amount, applied: Math.round(done * 100) / 100, remaining,
+                    open, paidOn: b.paid_on || null,
+                    currency: cur, status: b.status, dueDate: b.due_date || null, invoiceNumber: b.invoice_number || null,
+                    shipmentId: b.shipment_id, shipmentReference: b.shipment_reference, purchaseOrderId: null, poNumber: null, paymentType: null,
+                    supplierName: b.supplier_name, allocations: allocationsOf(b),
+                });
+            }
+            for (const p of mine.pis) {
+                const cur = (p.currency || '').toUpperCase();
+                if (currency && cur && cur !== currency) continue;
+                const amount = Number(p.amount_due);
+                const done = applied.get(`pi:${p.id}`) || 0;
+                const open = p.payment_status !== 'paid';
+                const remaining = open ? Math.round((amount - done) * 100) / 100 : 0;
+                if (open && remaining <= SHIPMENT_ALLOCATION_EPS) continue;
+                const tot = poTotals.get(p.purchase_order_id);
+                items.push({
+                    kind: 'pi', id: p.id, label: p.po_number, amount, applied: Math.round(done * 100) / 100, remaining,
+                    open, paidOn: open ? null : (p.updated_at ? new Date(p.updated_at).toISOString().slice(0, 10) : null),
+                    currency: cur || null, status: p.payment_status, dueDate: p.due_date || null, invoiceNumber: null,
+                    shipmentId: null, shipmentReference: null, purchaseOrderId: p.purchase_order_id, poNumber: p.po_number, paymentType: p.payment_type || null,
+                    supplierName: p.po_supplier,
+                    // A balance PI is worth showing next to its PO's deposit;
+                    // a deposit or 100 % PI IS the deposit, so nothing to add.
+                    allocations: p.payment_type === 'balance' ? [{
+                        purchaseOrderId: p.purchase_order_id, poNumber: p.po_number, amount,
+                        linesOnBoard: null, linesTotal: tot ? tot.lines : null, unitsOnBoard: null, unitsTotal: tot ? tot.units : null,
+                        deposit: depositByPo.get(p.purchase_order_id) || null,
+                    }] : [],
+                });
+            }
+            return { supplier, currency, items };
+        });
+        res.json(out);
+    } catch (error) {
+        log.error('[GET /supplier-payments/open-items]', error);
+        res.status(500).json({ error: 'An internal error occurred.' });
+    }
+});
+
+// POST /api/v1/supplier-payments — record a transfer and what it paid.
+app.post('/api/v1/supplier-payments', async (req, res) => {
+    try {
+        await shipmentPaymentsSchemaReady;
+        await purchaseOrdersSchemaReady;
+        await auditLogSchemaReady;
+        const parsed = parseSupplierPaymentBody(req.body, { partial: false });
+        if (parsed.error) return res.status(400).json({ error: parsed.error, code: parsed.code });
+        const b = req.body || {};
+        const result = await withConnection(async (conn) => {
+            await conn.beginTransaction();
+            try {
+                // Balances paid for before anyone recorded them are recorded
+                // now, so the checks below see them like any other target.
+                const mat = await materialiseContainerBalances(conn, {
+                    lines: parsed.lines, supplierName: parsed.row.supplier_name, supplierKeyValue: parsed.row.supplier_key,
+                    currency: parsed.row.currency, userEmail: req.userEmail,
+                });
+                if (mat.fail) { await conn.rollback(); return { fail: mat.fail }; }
+                const lines = mat.lines;
+                const checked = await checkSupplierPaymentLines(conn, {
+                    lines, currency: parsed.row.currency, amount: parsed.row.amount, supplierKeyValue: parsed.row.supplier_key,
+                });
+                if (checked.fail) { await conn.rollback(); return { fail: checked.fail }; }
+                const warnings = [...checked.warnings];
+                const [ins] = await conn.query(
+                    `INSERT INTO supplier_payments (supplier_name, supplier_key, amount, currency, paid_on, bank_ref, note, source, created_by_email)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                    [
+                        parsed.row.supplier_name, parsed.row.supplier_key, parsed.row.amount, parsed.row.currency, parsed.row.paid_on,
+                        parsed.row.bank_ref ?? null, parsed.row.note ?? null, b.source === 'extracted' ? 'extracted' : 'manual', req.userEmail || null,
+                    ]
+                );
+                const paymentId = ins.insertId;
+                for (const l of lines) {
+                    await conn.query(`INSERT INTO supplier_payment_lines (payment_id, target_kind, target_id, amount) VALUES (?, ?, ?, ?)`, [paymentId, l.kind, l.id, l.amount]);
+                }
+                await settleSupplierPaymentTargets(conn, {
+                    payment: { id: paymentId, paid_on: parsed.row.paid_on, bank_ref: parsed.row.bank_ref ?? null },
+                    lines, targets: checked.targets, applied: checked.applied, userEmail: req.userEmail,
+                });
+                if (b.documentId != null && b.documentId !== '') {
+                    const claimed = await claimSupplierPaymentDocument(conn, { documentId: Number(b.documentId), paymentId, supplierKeyValue: parsed.row.supplier_key, warnings });
+                    if (claimed.fail) { await conn.rollback(); return { fail: claimed.fail }; }
+                }
+                const json = await loadSupplierPaymentById(conn, paymentId);
+                await recordAudit(conn, { entityType: 'supplier_payment', entityId: paymentId, action: 'create', before: null, after: json, userEmail: req.userEmail });
+                await conn.commit();
+                return { json, warnings };
+            } catch (e) {
+                await conn.rollback().catch(() => {});
+                throw e;
+            }
+        });
+        if (result.fail) return sendShipmentPaymentError(res, result.fail);
+        res.status(201).json({ ...result.json, warnings: result.warnings });
+    } catch (error) {
+        log.error('[POST /supplier-payments]', error);
+        res.status(500).json({ error: 'An internal error occurred.' });
+    }
+});
+
+// PUT /api/v1/supplier-payments/:id — edit the header or replace the lines.
+// Replacing the lines first reverts everything this transfer had settled,
+// then applies the new set, so a dropped line puts its obligation back.
+app.put('/api/v1/supplier-payments/:id(\\d+)', async (req, res) => {
+    try {
+        await shipmentPaymentsSchemaReady;
+        await purchaseOrdersSchemaReady;
+        await auditLogSchemaReady;
+        const id = Number(req.params.id);
+        const parsed = parseSupplierPaymentBody(req.body, { partial: true });
+        if (parsed.error) return res.status(400).json({ error: parsed.error, code: parsed.code });
+        const b = req.body || {};
+        const result = await withConnection(async (conn) => {
+            const before = await loadSupplierPaymentById(conn, id);
+            if (!before) return { notFound: true };
+            const [rows] = await conn.query(`SELECT * FROM supplier_payments WHERE id = ?`, [id]);
+            const cur = rows[0];
+            const next = {
+                supplier_name: parsed.row.supplier_name ?? cur.supplier_name,
+                supplier_key: parsed.row.supplier_key ?? cur.supplier_key,
+                amount: parsed.row.amount ?? Number(cur.amount),
+                currency: parsed.row.currency ?? cur.currency,
+                paid_on: parsed.row.paid_on ?? cur.paid_on,
+                bank_ref: Object.prototype.hasOwnProperty.call(parsed.row, 'bank_ref') ? parsed.row.bank_ref : cur.bank_ref,
+                note: Object.prototype.hasOwnProperty.call(parsed.row, 'note') ? parsed.row.note : cur.note,
+            };
+            const inputLines = parsed.lines ?? before.lines.map(l => ({ kind: l.kind, id: l.targetId, amount: l.amount }));
+            await conn.beginTransaction();
+            try {
+                const mat = await materialiseContainerBalances(conn, {
+                    lines: inputLines, supplierName: next.supplier_name, supplierKeyValue: next.supplier_key,
+                    currency: next.currency, userEmail: req.userEmail,
+                });
+                if (mat.fail) { await conn.rollback(); return { fail: mat.fail }; }
+                const lines = mat.lines;
+                const checked = await checkSupplierPaymentLines(conn, {
+                    lines, currency: next.currency, amount: next.amount, supplierKeyValue: next.supplier_key, excludePaymentId: id,
+                });
+                if (checked.fail) { await conn.rollback(); return { fail: checked.fail }; }
+                const warnings = [...checked.warnings];
+                await unsettleSupplierPaymentTargets(conn, { paymentId: id, userEmail: req.userEmail });
+                await conn.query(`DELETE FROM supplier_payment_lines WHERE payment_id = ?`, [id]);
+                await conn.query(
+                    `UPDATE supplier_payments SET supplier_name = ?, supplier_key = ?, amount = ?, currency = ?, paid_on = ?, bank_ref = ?, note = ?, updated_by_email = ? WHERE id = ?`,
+                    [next.supplier_name, next.supplier_key, next.amount, next.currency, next.paid_on, next.bank_ref, next.note, req.userEmail || null, id]
+                );
+                for (const l of lines) {
+                    await conn.query(`INSERT INTO supplier_payment_lines (payment_id, target_kind, target_id, amount) VALUES (?, ?, ?, ?)`, [id, l.kind, l.id, l.amount]);
+                }
+                await settleSupplierPaymentTargets(conn, {
+                    payment: { id, paid_on: next.paid_on, bank_ref: next.bank_ref },
+                    lines, targets: checked.targets, applied: checked.applied, userEmail: req.userEmail,
+                });
+                if (b.documentId != null && b.documentId !== '') {
+                    const claimed = await claimSupplierPaymentDocument(conn, { documentId: Number(b.documentId), paymentId: id, supplierKeyValue: next.supplier_key, warnings });
+                    if (claimed.fail) { await conn.rollback(); return { fail: claimed.fail }; }
+                }
+                const json = await loadSupplierPaymentById(conn, id);
+                await recordAudit(conn, { entityType: 'supplier_payment', entityId: id, action: 'update', before, after: json, userEmail: req.userEmail });
+                await conn.commit();
+                return { json, warnings };
+            } catch (e) {
+                await conn.rollback().catch(() => {});
+                throw e;
+            }
+        });
+        if (result.notFound) return res.status(404).json({ error: `Supplier payment ${id} not found.`, code: 'NOT_FOUND' });
+        if (result.fail) return sendShipmentPaymentError(res, result.fail);
+        res.json({ ...result.json, warnings: result.warnings });
+    } catch (error) {
+        log.error('[PUT /supplier-payments/:id]', error);
+        res.status(500).json({ error: 'An internal error occurred.' });
+    }
+});
+
+// DELETE /api/v1/supplier-payments/:id — admin only, soft. Reverts what it
+// settled; its proof becomes loose again so it can be applied afresh.
+app.delete('/api/v1/supplier-payments/:id(\\d+)', async (req, res) => {
+    try {
+        if (req.userType !== 'admin') return res.status(403).json({ error: 'Admin access required.', code: 'ADMIN_ONLY' });
+        await shipmentPaymentsSchemaReady;
+        await auditLogSchemaReady;
+        const id = Number(req.params.id);
+        const result = await withConnection(async (conn) => {
+            const before = await loadSupplierPaymentById(conn, id);
+            if (!before) return { notFound: true };
+            await conn.beginTransaction();
+            try {
+                await unsettleSupplierPaymentTargets(conn, { paymentId: id, userEmail: req.userEmail });
+                await conn.query(`UPDATE supplier_payments SET deleted_at = NOW(), updated_by_email = ? WHERE id = ?`, [req.userEmail || null, id]);
+                await conn.query(`UPDATE shipment_payment_documents SET supplier_payment_id = NULL WHERE supplier_payment_id = ?`, [id]);
+                await recordAudit(conn, { entityType: 'supplier_payment', entityId: id, action: 'delete', before, after: null, userEmail: req.userEmail });
+                await conn.commit();
+            } catch (e) {
+                await conn.rollback().catch(() => {});
+                throw e;
+            }
+            return { ok: true };
+        });
+        if (result.notFound) return res.status(404).json({ error: `Supplier payment ${id} not found.`, code: 'NOT_FOUND' });
+        res.status(204).end();
+    } catch (error) {
+        log.error('[DELETE /supplier-payments/:id]', error);
+        res.status(500).json({ error: 'An internal error occurred.' });
+    }
+});
 
 // ── Shipments (/api/v1/shipments) ────────────────────────────────────────
 // Registered last: the handlers close over UPDATABLE_FIELDS, ORDER_INSERT_COLS
