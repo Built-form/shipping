@@ -48,6 +48,7 @@ const T = require('../lib/order-transitions');
 const shipmentSync = require('../services/shipment-sync');
 const { registerShipmentRoutes } = require('../services/shipment-routes');
 const { registerPackingListRoutes } = require('../services/packing-list-routes');
+const { registerContainerPhotoRoutes } = require('../services/container-photo-routes');
 const { makeSplitOrder } = require('../services/order-split');
 const shipmentsLib = require('../lib/shipments');
 const shipmentPaymentsService = require('../services/shipment-payments');
@@ -11389,6 +11390,18 @@ registerShipmentRoutes(app, {
 // orders we expect from that supplier in that container.
 registerPackingListRoutes(app, {
     pool,
+    withConnection,
+    s3,
+    poBucket: PO_BUCKET,
+    recordAudit,
+    auditLogSchemaReady,
+    log,
+});
+
+// ── Container photos (/api/v1/container-photos) ──────────────────────────
+// Photos per container (booked or draft) with a description, picked from a
+// list of options ("Proof of cleaning", …) or typed.
+registerContainerPhotoRoutes(app, {
     withConnection,
     s3,
     poBucket: PO_BUCKET,
