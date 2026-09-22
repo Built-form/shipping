@@ -31,6 +31,7 @@
 // The pool has a single connection, so the model call happens with none held:
 // load, release, call Gemini, reacquire, write (same as shipment-payment-extract).
 
+const crypto = require('crypto');
 const { GoogleGenAI } = require('@google/genai');
 const log = require('../lib/logger');
 const { fetchInvoicePdf } = require('./po-invoice-check');
@@ -647,6 +648,13 @@ function compareGroup(orders, packed, matchMethod) {
             ? `PO ${packPos.join(', ')} on the packing list; the order${expPos.length > 1 ? 's are' : ' is'} on ${expPos.join(', ')}.`
             : `No PO on the packing list row; matched on product code to ${expPos.join(', ')}.`);
     }
+    if (matchMethod === 'no_code') {
+        const jf = baseJf(orders[0].jf_code) || orders[0].jf_code;
+        const byPo = packed.some(p => norm(p.poNumber) && orders.some(o => norm(o.po_number) === norm(p.poNumber)));
+        const desc = packed[0].description ? ` ("${String(packed[0].description).slice(0, 60)}")` : '';
+        add('productCode', 'warning', jf, null,
+            `No product code on the packing-list row${desc}; matched to ${jf} by ${byPo ? 'PO' : 'quantity'} — check it is the same product.`);
+    }
 
     return { expQty, packQty, expCtn, packCtn, differences };
 }
@@ -674,6 +682,7 @@ function orderSummary(o) {
 function packedSummary(p) {
     return {
         index: p.index,
+        packingListId: p.packingListId ?? null,
         jfCode: p.jfCode || null,
         poNumber: p.poNumber || null,
         lotNumber: p.lotNumber || null,
@@ -694,16 +703,41 @@ function worstSeverity(diffs) {
     return worst;
 }
 
+// A line's identity across recomputes: base product code + the PO(s) it was
+// matched under. Sign-offs are keyed by it, so they survive a re-read, a
+// replaced packing list and a changed quantity alike.
+const lineKeyFor = (jf, pos) => `${baseJf(jf)}|${uniq(pos.map(norm)).sort().join('+')}`;
+
+// What a sign-off vouches for: the line's status and every difference that
+// isn't informational. If any of that changes, the sign-off no longer applies.
+function lineFingerprint(line) {
+    const parts = (line.differences || [])
+        .filter(d => d.severity !== 'info')
+        .map(d => `${d.field}=${JSON.stringify(d.expected ?? null)}>${JSON.stringify(d.actual ?? null)}`)
+        .sort();
+    return crypto.createHash('sha1').update(`${line.status}|${parts.join('|')}`).digest('hex');
+}
+
 /**
- * Pure: expected order rows (EXPECTED_SELECT shape) × extracted packing list →
- * { summary, lines, extractionCheck }.
+ * Pure: expected order rows (LINE_COLS shape) × the documents on file for the
+ * supplier → { summary, lines, documents, extractionCheck }.
+ *
+ * `documents` is [{ packingListId, filename, extracted }]. A supplier who ships
+ * one container under two invoices sends two packing lists; their rows are
+ * pooled and compared together, so neither shows the other's lines as
+ * missing. Each packed row remembers which document it came from.
  *
  * Grouping is by (base product code, PO). A row that finds no group with its
  * PO falls back to the same product code on any PO still unmatched, with a PO
  * warning — so a packing list that omits or misprints PO numbers still lines up.
  */
-function comparePackingList(expectedOrders, extracted) {
-    const packedRows = (extracted?.lines || []).map((l, index) => ({ ...l, index }));
+function compareDocuments(expectedOrders, documents) {
+    const docs = (documents || []).map((d, docIndex) => ({ ...d, docIndex }));
+    const packedRows = docs.flatMap(d =>
+        ((d.extracted && d.extracted.lines) || []).map((l, index) => ({
+            ...l, index, packingListId: d.packingListId ?? null, filename: d.filename ?? null, docIndex: d.docIndex,
+        }))
+    );
 
     const groupBy = (items, keyFn) => {
         const m = new Map();
@@ -722,6 +756,7 @@ function comparePackingList(expectedOrders, extracted) {
         const c = compareGroup(orders, packed, matchMethod);
         const severity = worstSeverity(c.differences);
         lines.push({
+            lineKey: lineKeyFor(orders[0].jf_code, orders.map(o => o.po_number)),
             status: c.differences.some(d => d.severity !== 'info') ? 'mismatch' : 'match',
             severity,
             matchMethod,
@@ -758,11 +793,35 @@ function comparePackingList(expectedOrders, extracted) {
         }
     }
 
-    // Expected but not on the packing list.
+    // Pass 3 — rows with no product code. A supplier that prints only its own
+    // description ("Tape", 10,000 SET) still lines up when the row's PO, or
+    // failing that its quantity, points at exactly one expected line.
+    const dropPacked = (p) => {
+        const k = `${baseJf(p.jfCode)}|${norm(p.poNumber)}`;
+        const rest = (packGroups.get(k) || []).filter(x => x !== p);
+        if (rest.length) packGroups.set(k, rest); else packGroups.delete(k);
+    };
+    for (const p of [...packGroups.values()].flat().filter(x => !baseJf(x.jfCode))) {
+        const left = [...leftoverOrdersByJf.entries()];
+        const po = norm(p.poNumber);
+        let candidates = po ? left.filter(([, orders]) => orders.some(o => norm(o.po_number) === po)) : [];
+        if (candidates.length !== 1) {
+            const q = Number(p.quantity);
+            candidates = q > 0 ? left.filter(([, orders]) => orders.reduce((s, o) => s + (Number(o.quantity) || 0), 0) === q) : [];
+        }
+        if (candidates.length !== 1) continue;
+        const [jf, orders] = candidates[0];
+        pushMatched(orders, [p], 'no_code');
+        leftoverOrdersByJf.delete(jf);
+        dropPacked(p);
+    }
+
+    // Expected but not on any packing list.
     for (const orders of leftoverOrdersByJf.values()) {
         for (const group of groupBy(orders, o => norm(o.po_number)).values()) {
             const qty = group.reduce((s, o) => s + (Number(o.quantity) || 0), 0);
             lines.push({
+                lineKey: lineKeyFor(group[0].jf_code, [group[0].po_number]),
                 status: 'missing',
                 severity: 'error',
                 matchMethod: null,
@@ -779,11 +838,12 @@ function comparePackingList(expectedOrders, extracted) {
         }
     }
 
-    // On the packing list but not expected (from this supplier, in this container).
+    // On a packing list but not expected (from this supplier, in this container).
     for (const packed of packGroups.values()) {
         const qty = packed.reduce((s, p) => s + (Number(p.quantity) || 0), 0);
         const ctn = packed.reduce((s, p) => s + (Number(p.cartons) || 0), 0);
         lines.push({
+            lineKey: lineKeyFor(packed[0].jfCode || '', [packed[0].poNumber]),
             status: 'unexpected',
             severity: 'error',
             matchMethod: null,
@@ -804,39 +864,99 @@ function comparePackingList(expectedOrders, extracted) {
 
     const ORDER = { missing: 0, unexpected: 1, mismatch: 2, match: 3 };
     lines.sort((a, b) => ORDER[a.status] - ORDER[b.status] || String(a.jfCode).localeCompare(String(b.jfCode)));
+    for (const l of lines) l.fingerprint = lineFingerprint(l);
 
-    // Does the model's reading add up to the document's own printed totals? If
-    // not, a row was probably missed or misread — say so before anyone trusts
-    // the differences.
+    // Does the model's reading of each document add up to that document's own
+    // printed totals? If not, a row was probably missed or misread — say so
+    // before anyone trusts the differences.
+    const docChecks = docs.map(d => {
+        const rows = packedRows.filter(p => p.docIndex === d.docIndex);
+        const sumQty = rows.reduce((s, p) => s + (Number(p.quantity) || 0), 0);
+        const sumCtn = rows.reduce((s, p) => s + (Number(p.cartons) || 0), 0);
+        const printedQty = d.extracted?.totalQuantity ?? null;
+        const printedCtn = d.extracted?.totalCartons ?? null;
+        return {
+            packingListId: d.packingListId ?? null,
+            filename: d.filename ?? null,
+            invoiceNumber: d.extracted?.invoiceNumber ?? null,
+            rows: rows.length,
+            printedTotalQuantity: printedQty,
+            sumOfRowsQuantity: sumQty,
+            printedTotalCartons: printedCtn,
+            sumOfRowsCartons: sumCtn,
+            ok: (printedQty == null || printedQty === sumQty) && (printedCtn == null || printedCtn === sumCtn),
+        };
+    });
     const sumQty = packedRows.reduce((s, p) => s + (Number(p.quantity) || 0), 0);
     const sumCtn = packedRows.reduce((s, p) => s + (Number(p.cartons) || 0), 0);
-    const printedQty = extracted?.totalQuantity ?? null;
-    const printedCtn = extracted?.totalCartons ?? null;
+    const printedOr = (k, sumK) => (docChecks.every(c => c[k] == null) ? null : docChecks.reduce((s, c) => s + (c[k] ?? c[sumK]), 0));
     const extractionCheck = {
-        printedTotalQuantity: printedQty,
+        printedTotalQuantity: printedOr('printedTotalQuantity', 'sumOfRowsQuantity'),
         sumOfRowsQuantity: sumQty,
-        printedTotalCartons: printedCtn,
+        printedTotalCartons: printedOr('printedTotalCartons', 'sumOfRowsCartons'),
         sumOfRowsCartons: sumCtn,
-        ok: (printedQty == null || printedQty === sumQty) && (printedCtn == null || printedCtn === sumCtn),
+        ok: docChecks.every(c => c.ok),
     };
 
     const count = s => lines.filter(l => l.status === s).length;
     const expectedUnits = expectedOrders.reduce((s, o) => s + (Number(o.quantity) || 0), 0);
+    const discrepancyCount = lines.filter(l => l.status !== 'match').length;
     const summary = {
-        verdict: lines.some(l => l.status !== 'match') || !extractionCheck.ok ? 'differences' : 'match',
+        verdict: discrepancyCount > 0 || !extractionCheck.ok ? 'differences' : 'match',
         lines: lines.length,
         matched: count('match'),
         mismatched: count('mismatch'),
         missingFromPackingList: count('missing'),
         notExpected: count('unexpected'),
-        discrepancyCount: lines.filter(l => l.status !== 'match').length,
+        discrepancyCount,
+        signedOff: 0,
+        outstanding: discrepancyCount,
         expectedUnits,
         packedUnits: sumQty,
         expectedOrders: expectedOrders.length,
         packingListRows: packedRows.length,
+        documents: docs.length,
     };
 
-    return { summary, lines, extractionCheck };
+    return { summary, lines, documents: docChecks, extractionCheck };
+}
+
+/** One document (the original shape); see compareDocuments. */
+function comparePackingList(expectedOrders, extracted) {
+    return compareDocuments(expectedOrders, [{ packingListId: null, filename: null, extracted }]);
+}
+
+/**
+ * Pure: lay the sign-offs over a comparison. A sign-off is a person saying
+ * "this difference is fine" for one line — it holds only while the line's
+ * status and differences are exactly what was signed (its fingerprint). A
+ * line that has since changed keeps its sign-off as `stale`, and counts as
+ * outstanding again. The verdict becomes 'accepted' once every difference is
+ * signed off (the reading check must be clean too).
+ */
+function applySignOffs(comparison, signOffs) {
+    const byKey = new Map();
+    for (const s of signOffs || []) if (s && s.lineKey) byKey.set(s.lineKey, s);
+    let signedOff = 0;
+    for (const line of comparison.lines) {
+        const s = byKey.get(line.lineKey);
+        if (line.status === 'match') {
+            // Nothing to accept; a leftover sign-off is history, not a state.
+            if (s) line.signOff = { ...s, stale: false, moot: true };
+            continue;
+        }
+        if (!s) continue;
+        const stale = s.fingerprint !== line.fingerprint;
+        line.signOff = { ...s, stale };
+        if (!stale) { line.accepted = true; signedOff += 1; }
+    }
+    const summary = comparison.summary;
+    summary.signedOff = signedOff;
+    summary.outstanding = summary.discrepancyCount - signedOff;
+    summary.verdict = summary.outstanding > 0 || !comparison.extractionCheck.ok
+        ? (summary.discrepancyCount > 0 || !comparison.extractionCheck.ok ? 'differences' : 'match')
+        : (summary.discrepancyCount > 0 ? 'accepted' : 'match');
+    return comparison;
 }
 
 // Adds `elsewhere` — where else that product/PO sits — to every line whose
@@ -869,10 +989,16 @@ function describeContainer(c) {
     };
 }
 
-/** Compare an extracted packing list with this supplier's lines in the container. */
-async function buildComparison(conn, { container, supplierKey, extracted }) {
+/**
+ * Compare the supplier's documents ([{ packingListId, filename, extracted }],
+ * or one `extracted`) with its lines in the container. Sign-offs, if given,
+ * are laid over the result (see applySignOffs).
+ */
+async function buildComparison(conn, { container, supplierKey, documents, extracted, signOffs }) {
     const { rows, skipped } = await loadExpectedLines(conn, container, supplierKey);
-    const comparison = comparePackingList(rows, extracted);
+    const docs = documents || [{ packingListId: null, filename: null, extracted }];
+    const comparison = compareDocuments(rows, docs);
+    applySignOffs(comparison, signOffs || []);
     comparison.container = describeContainer(container);
     // Draft lines whose order is already booked elsewhere were left out rather
     // than double-counted; say so, since the packing list may well include them.
@@ -987,8 +1113,12 @@ async function runPackingListCheck(pool, { id, userEmail = null, model = null } 
         if (container.kind === 'draft' && !container.lineCount) {
             throw Object.assign(new Error(`Draft ${container.draftName} has no lines and no booked container was found for it.`), { code: 'CONTAINER_EMPTY' });
         }
+        // The row's snapshot is what THIS document alone says at reading time;
+        // the live view (packing-review.js) pools every active document for
+        // the supplier and lays the sign-offs over it.
         const comparison = await buildComparison(conn, {
-            container, supplierKey: row.supplier_key, extracted: read.parsed,
+            container, supplierKey: row.supplier_key,
+            documents: [{ packingListId: id, filename: row.filename, extracted: read.parsed }],
         });
         const p = read.parsed;
         await conn.query(
@@ -1029,7 +1159,11 @@ module.exports = {
     toMonth,
     parseDims,
     baseJf,
+    norm,
     comparePackingList,
+    compareDocuments,
+    applySignOffs,
+    lineFingerprint,
     buildComparison,
     describeContainer,
     parseTypedReference,

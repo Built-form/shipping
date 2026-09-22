@@ -18,6 +18,7 @@ const { PutObjectCommand, GetObjectCommand, HeadObjectCommand } = require('@aws-
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const { v4: uuidv4 } = require('uuid');
 const P = require('./packing-list-check');
+const R = require('./packing-review');
 
 // Two ways in. dataBase64 in the JSON body is capped at 4 MB: base64 grows it
 // by a third and the HTTP API / Lambda request cap is 6 MB, beyond which the
@@ -41,36 +42,13 @@ function registerPackingListRoutes(app, deps) {
         if (typeof v === 'object') return v;
         try { return JSON.parse(v); } catch { return null; }
     };
-    const iso = v => v?.toISOString?.() ?? v ?? null;
+    const rowToJson = R.packingListToJson;
 
-    function rowToJson(r) {
-        return {
-            id: r.id,
-            // As uploaded. A draft's lines are followed live (renames, booking)
-            // — the detail route's `comparison.container` says where they are now.
-            containerKind: r.container_kind,
-            containerNumber: r.container_number || null,
-            draftContainerId: r.draft_container_id != null ? Number(r.draft_container_id) : null,
-            containerName: r.container_name || null,
-            supplierKey: r.supplier_key,
-            supplierName: r.supplier_name || null,
-            filename: r.filename,
-            downloadPath: `/api/v1/packing-lists/${r.id}/download`,
-            contentType: r.content_type || null,
-            fileSize: r.file_size != null ? Number(r.file_size) : null,
-            status: r.status,
-            verdict: r.verdict || null,
-            discrepancyCount: r.discrepancy_count != null ? Number(r.discrepancy_count) : null,
-            rowCount: r.row_count != null ? Number(r.row_count) : null,
-            invoiceNumber: r.invoice_number || null,
-            documentDate: r.document_date || null,
-            supplierPrinted: r.supplier_printed || null,
-            modelUsed: r.model_used || null,
-            error: r.error_message || null,
-            uploadedByEmail: r.uploaded_by_email || null,
-            createdAt: iso(r.created_at),
-            analyzedAt: iso(r.analyzed_at),
-        };
+    // A refusal from the review service, or a 500.
+    function sendReviewError(res, e, label) {
+        if (e instanceof R.ReviewError) return res.status(e.status).json({ error: e.message, code: e.code, ...(e.payload || {}) });
+        log.error(label, e);
+        return res.status(500).json({ error: 'An internal error occurred.' });
     }
 
     // Background read on its own connections (pool of one — the service never
@@ -163,8 +141,10 @@ function registerPackingListRoutes(app, deps) {
 
     // POST /api/v1/packing-lists
     // Body: { containerNumber | draftContainerId, supplierKey | supplierId | supplierName,
-    //         filename, contentType?, dataBase64 | s3Key, force?, model? }
-    // 201 { packingList } with status 'processing'; poll GET /:id.
+    //         filename, contentType?, dataBase64 | s3Key, force?, model?, replacesId? }
+    // 201 { packingList } with status 'processing'; poll GET /:id. With
+    // replacesId the new document is a corrected version of that one, which
+    // drops out of the live check (see packing-review.js).
     app.post('/api/v1/packing-lists', async (req, res) => {
         try {
             await schemaReady;
@@ -197,6 +177,13 @@ function registerPackingListRoutes(app, deps) {
                 return res.status(400).json({ error: 'dataBase64, or an s3Key from /upload-url, is required.', code: 'BAD_FIELD' });
             }
             const model = typeof b.model === 'string' && b.model.trim() ? b.model.trim() : null;
+            let replacesId = null;
+            if (b.replacesId != null && b.replacesId !== '') {
+                replacesId = Number(b.replacesId);
+                if (!Number.isInteger(replacesId) || replacesId <= 0) {
+                    return res.status(400).json({ error: 'replacesId must be a packing list id.', code: 'BAD_FIELD' });
+                }
+            }
 
             const result = await withConnection(async (conn) => {
                 const resolved = await resolveForRequest(conn, {
@@ -264,18 +251,170 @@ function registerPackingListRoutes(app, deps) {
                 );
                 await recordAudit(conn, {
                     entityType: 'packing_list', entityId: ins.insertId, action: 'create', before: null,
-                    after: { container: P.describeContainer(container), supplierKey, supplierName, filename, fileSize },
+                    after: { container: P.describeContainer(container), supplierKey, supplierName, filename, fileSize, replacesId },
                     userEmail: req.userEmail,
                 });
+                if (replacesId != null) {
+                    try {
+                        await R.supersede(conn, { container, supplierKey, oldId: replacesId, newId: ins.insertId, userEmail: req.userEmail });
+                    } catch (e) {
+                        if (!(e instanceof R.ReviewError)) throw e;
+                        // The file is in S3 and the row exists; keep it as an
+                        // extra document rather than lose the upload, but say so.
+                        log.warn('[POST /packing-lists] replace refused, kept as a new document', { id: ins.insertId, replacesId, code: e.code });
+                        const [rows] = await conn.query(`SELECT * FROM packing_lists WHERE id = ?`, [ins.insertId]);
+                        return { row: rows[0], replaceRefused: { code: e.code, error: e.message } };
+                    }
+                }
                 const [rows] = await conn.query(`SELECT * FROM packing_lists WHERE id = ?`, [ins.insertId]);
                 return { row: rows[0] };
             });
             if (result.fail) return sendFail(res, result.fail);
-            res.status(201).json({ packingList: rowToJson(result.row) });
+            res.status(201).json({ packingList: rowToJson(result.row), ...(result.replaceRefused ? { replaceRefused: result.replaceRefused } : {}) });
             startCheck(req, result.row.id, model);
         } catch (error) {
             log.error('[POST /packing-lists]', error);
             if (!res.headersSent) res.status(500).json({ error: 'An internal error occurred.' });
+        }
+    });
+
+    // ── The review: status, check, sign-offs, approval ─────────────────────
+
+    // GET /api/v1/packing-lists/status?containerNumber=324 | ?draftContainerId=129
+    // The container's packing review at a glance: every supplier with lines in
+    // it, that supplier's documents and live check, the approval, and one
+    // overall verdict. Computed from the lines as they are now.
+    app.get('/api/v1/packing-lists/status', async (req, res) => {
+        try {
+            const out = await withConnection(async (conn) => {
+                const r = await resolveForRequest(conn, { containerNumber: req.query.containerNumber, draftContainerId: req.query.draftContainerId });
+                if (r.fail) return r;
+                return R.buildContainerStatus(conn, r.container);
+            });
+            if (out.fail) return sendFail(res, out.fail);
+            res.json(out);
+        } catch (error) {
+            log.error('[GET /packing-lists/status]', error);
+            res.status(500).json({ error: 'An internal error occurred.' });
+        }
+    });
+
+    // GET /api/v1/packing-lists/check?containerNumber=324&supplierKey=s:2
+    // One supplier's full check: its active documents pooled and compared
+    // with its lines in the container, sign-offs applied, older versions listed.
+    app.get('/api/v1/packing-lists/check', async (req, res) => {
+        try {
+            const supplierKey = String(req.query.supplierKey || '').trim();
+            if (!supplierKey) return res.status(400).json({ error: 'supplierKey is required.', code: 'BAD_FIELD' });
+            const out = await withConnection(async (conn) => {
+                const r = await resolveForRequest(conn, { containerNumber: req.query.containerNumber, draftContainerId: req.query.draftContainerId });
+                if (r.fail) return r;
+                const check = await R.buildSupplierCheck(conn, r.container, supplierKey);
+                const suppliers = await P.loadContainerSuppliers(conn, r.container);
+                const onBoard = suppliers.find(s => s.supplierKey === supplierKey) || null;
+                const approvalRow = await R.loadActiveApproval(conn, r.container);
+                return {
+                    container: P.describeContainer(r.container),
+                    supplier: {
+                        supplierKey,
+                        supplierName: onBoard?.supplierName ?? check.packingLists[0]?.supplierName ?? check.superseded[0]?.supplierName ?? supplierKey,
+                        units: onBoard?.units ?? 0, orderCount: onBoard?.orderCount ?? 0, onBoard: !!onBoard,
+                    },
+                    packingLists: check.packingLists,
+                    superseded: check.superseded,
+                    processing: check.processing,
+                    failed: check.failed,
+                    signOffs: check.signOffs,
+                    comparison: check.comparison,
+                    approval: approvalRow ? R.approvalToJson(approvalRow) : null,
+                };
+            });
+            if (out.fail) return sendFail(res, out.fail);
+            res.json(out);
+        } catch (error) {
+            log.error('[GET /packing-lists/check]', error);
+            res.status(500).json({ error: 'An internal error occurred.' });
+        }
+    });
+
+    // POST /api/v1/packing-lists/sign-offs
+    // Body: { containerNumber | draftContainerId, supplierKey, lineKey, note? }
+    // Accept one line's difference. 201 { signOff, check } — the check is the
+    // supplier's comparison after the sign-off.
+    app.post('/api/v1/packing-lists/sign-offs', async (req, res) => {
+        try {
+            await auditLogSchemaReady;
+            const b = req.body || {};
+            const supplierKey = String(b.supplierKey || '').trim();
+            const lineKey = String(b.lineKey || '').trim();
+            if (!supplierKey || !lineKey) return res.status(400).json({ error: 'supplierKey and lineKey are required.', code: 'BAD_FIELD' });
+            const out = await withConnection(async (conn) => {
+                const r = await resolveForRequest(conn, { containerNumber: b.containerNumber, draftContainerId: b.draftContainerId });
+                if (r.fail) return r;
+                const result = await R.signOffLine(conn, { container: r.container, supplierKey, lineKey, note: b.note, userEmail: req.userEmail });
+                const check = await R.buildSupplierCheck(conn, r.container, supplierKey);
+                return { ...result, comparison: check.comparison, signOffs: check.signOffs };
+            });
+            if (out.fail) return sendFail(res, out.fail);
+            res.status(out.created ? 201 : 200).json(out);
+        } catch (error) {
+            sendReviewError(res, error, '[POST /packing-lists/sign-offs]');
+        }
+    });
+
+    // DELETE /api/v1/packing-lists/sign-offs/:id — take a sign-off back.
+    app.delete('/api/v1/packing-lists/sign-offs/:id(\\d+)', async (req, res) => {
+        try {
+            await auditLogSchemaReady;
+            const id = Number(req.params.id);
+            await withConnection(conn => R.revokeSignOff(conn, { id, reason: 'revoked', userEmail: req.userEmail }));
+            res.status(204).end();
+        } catch (error) {
+            sendReviewError(res, error, '[DELETE /packing-lists/sign-offs/:id]');
+        }
+    });
+
+    // GET /api/v1/packing-lists/approvals — every container currently approved
+    // (for badges); each says what it was approved as.
+    app.get('/api/v1/packing-lists/approvals', async (req, res) => {
+        try {
+            const data = await withConnection(conn => R.listActiveApprovals(conn));
+            res.json({ data });
+        } catch (error) {
+            log.error('[GET /packing-lists/approvals]', error);
+            res.status(500).json({ error: 'An internal error occurred.' });
+        }
+    });
+
+    // POST /api/v1/packing-lists/approvals
+    // Body: { containerNumber | draftContainerId, note? }
+    // Approve the container's packing as it stands, whatever the checks say.
+    // 201 { approval }; 409 ALREADY_APPROVED while one is active.
+    app.post('/api/v1/packing-lists/approvals', async (req, res) => {
+        try {
+            await auditLogSchemaReady;
+            const b = req.body || {};
+            const out = await withConnection(async (conn) => {
+                const r = await resolveForRequest(conn, { containerNumber: b.containerNumber, draftContainerId: b.draftContainerId });
+                if (r.fail) return r;
+                return { approval: await R.approveContainer(conn, { container: r.container, note: b.note, userEmail: req.userEmail }) };
+            });
+            if (out.fail) return sendFail(res, out.fail);
+            res.status(201).json(out);
+        } catch (error) {
+            sendReviewError(res, error, '[POST /packing-lists/approvals]');
+        }
+    });
+
+    // POST /api/v1/packing-lists/approvals/:id/withdraw  Body: { note? }
+    app.post('/api/v1/packing-lists/approvals/:id(\\d+)/withdraw', async (req, res) => {
+        try {
+            await auditLogSchemaReady;
+            const id = Number(req.params.id);
+            const out = await withConnection(conn => R.withdrawApproval(conn, { id, note: req.body?.note, userEmail: req.userEmail }));
+            res.json(out);
+        } catch (error) {
+            sendReviewError(res, error, '[POST /packing-lists/approvals/:id/withdraw]');
         }
     });
 
@@ -360,7 +499,8 @@ function registerPackingListRoutes(app, deps) {
                     `SELECT id, container_kind, container_number, draft_container_id, container_name,
                             supplier_key, supplier_name, filename, content_type, file_size, status,
                             verdict, discrepancy_count, row_count, invoice_number, document_date, supplier_printed,
-                            model_used, error_message, uploaded_by_email, created_at, analyzed_at
+                            model_used, error_message, version, replaces_id, superseded_by_id, superseded_at,
+                            uploaded_by_email, created_at, analyzed_at
                        FROM packing_lists WHERE ${where.join(' AND ')} ORDER BY id DESC LIMIT 200`,
                     params
                 );
@@ -373,12 +513,13 @@ function registerPackingListRoutes(app, deps) {
         }
     });
 
-    // GET /api/v1/packing-lists/:id — the row, what was read, and the
-    // comparison recomputed against the container's lines as they are now. A
-    // draft is followed through renames and, once booked, to its container
-    // (comparison.container.followedFrom says so). ?snapshot=1 returns the
-    // comparison as stored at analysis time instead; so does a draft whose
-    // lines can no longer be found (liveUnavailableReason says why).
+    // GET /api/v1/packing-lists/:id — the document, what was read from it, and
+    // its supplier's live check: every active document for that supplier in
+    // the container pooled and compared with the lines as they are now, with
+    // sign-offs applied. A draft is followed through renames and, once booked,
+    // to its container (comparison.container.followedFrom says so).
+    // ?snapshot=1 returns what THIS document alone said when it was read; so
+    // does a draft whose lines can no longer be found (liveUnavailableReason).
     app.get('/api/v1/packing-lists/:id(\\d+)', async (req, res) => {
         try {
             await schemaReady;
@@ -391,16 +532,20 @@ function registerPackingListRoutes(app, deps) {
                 let comparison = parseJson(row.comparison_json);
                 let live = false;
                 let liveUnavailableReason = null;
-                if (row.status === 'succeeded' && extracted && req.query.snapshot !== '1') {
+                let check = null;
+                let approval = null;
+                if (req.query.snapshot !== '1') {
                     const container = await P.resolveStoredContainer(conn, row);
                     if (container.kind === 'draft' && !container.lineCount) {
                         liveUnavailableReason = `Draft ${container.draftName} has no lines any more and no booked container was found for it.`;
                     } else {
-                        comparison = await P.buildComparison(conn, { container, supplierKey: row.supplier_key, extracted });
-                        live = true;
+                        check = await R.buildSupplierCheck(conn, container, row.supplier_key);
+                        const approvalRow = await R.loadActiveApproval(conn, container);
+                        approval = approvalRow ? R.approvalToJson(approvalRow) : null;
+                        if (check.comparison) { comparison = check.comparison; live = true; }
                     }
                 }
-                return { row, extracted, comparison, live, liveUnavailableReason };
+                return { row, extracted, comparison, live, liveUnavailableReason, check, approval };
             });
             if (!out) return res.status(404).json({ error: `Packing list ${id} not found.`, code: 'NOT_FOUND' });
             res.json({
@@ -409,6 +554,10 @@ function registerPackingListRoutes(app, deps) {
                 comparison: out.comparison,
                 comparisonIsLive: out.live,
                 ...(out.liveUnavailableReason ? { liveUnavailableReason: out.liveUnavailableReason } : {}),
+                packingLists: out.check ? out.check.packingLists : [],
+                superseded: out.check ? out.check.superseded : [],
+                signOffs: out.check ? out.check.signOffs : [],
+                approval: out.approval,
             });
         } catch (error) {
             log.error('[GET /packing-lists/:id]', error);
@@ -447,7 +596,8 @@ function registerPackingListRoutes(app, deps) {
         }
     });
 
-    // DELETE /api/v1/packing-lists/:id — soft delete; the S3 object stays.
+    // DELETE /api/v1/packing-lists/:id — soft delete; the S3 object stays. A
+    // deleted replacement puts the version it replaced back into the check.
     app.delete('/api/v1/packing-lists/:id(\\d+)', async (req, res) => {
         try {
             await schemaReady;
@@ -461,6 +611,7 @@ function registerPackingListRoutes(app, deps) {
                     entityType: 'packing_list', entityId: id, action: 'delete',
                     before: rowToJson(rows[0]), after: null, userEmail: req.userEmail,
                 });
+                await R.restorePredecessor(conn, { deletedRow: rows[0], userEmail: req.userEmail });
                 return true;
             });
             if (!ok) return res.status(404).json({ error: `Packing list ${id} not found.`, code: 'NOT_FOUND' });
