@@ -6795,143 +6795,9 @@ app.get('/api/v1/purchase-order-invoice-payments', async (req, res) => {
 // 'po_sent' (with the PO) and balance trigger 'terms' (as the supplier's terms
 // say) override the default with nothing. Read by everyone, written by admins.
 // The Payments flow page (ShipLine) is the only consumer.
-const PAYMENT_RULE_DEPOSIT_TRIGGERS = ['po_sent', 'artwork_confirmed', 'pi_uploaded', 'pi_signed'];
-const PAYMENT_RULE_BALANCE_TRIGGERS = ['terms', 'before_dispatch', 'bl', 'telex_release', 'container_document', 'arrival', 'delivery', 'invoice'];
+const { parsePaymentRuleBody, paymentRuleRowToJson } = require('../lib/payment-rules');
 
 const paymentRulesSchemaReady = Promise.resolve(); // schema: src/db/migrate/
-
-// Each estimate step counts from one event; the anchors allowed per step keep
-// the chain acyclic (artwork cannot count from ready, ready cannot count from
-// arrival…). Transit is per mode from the ETD.
-const PAYMENT_RULE_ESTIMATE_STEPS = {
-    artwork: ['po', 'pi', 'pi_signed'],
-    pi: ['po', 'artwork'],
-    piSigned: ['pi', 'po', 'artwork'],
-    ready: ['po', 'pi', 'pi_signed', 'artwork', 'deposit_paid'],
-    telex: ['bl', 'etd', 'arrival'],
-    document: ['bl', 'etd', 'arrival'],
-};
-const PAYMENT_RULE_FREIGHT_MODES = ['sea', 'air', 'road'];
-const EMPTY_PAYMENT_RULE_ESTIMATES = () => ({
-    artwork: null, pi: null, piSigned: null, ready: null, telex: null, document: null,
-    transit: { sea: null, air: null, road: null },
-});
-
-// { error } or { value: estimates } — always the full shape, nulls for unset.
-function parsePaymentRuleEstimates(input) {
-    const out = EMPTY_PAYMENT_RULE_ESTIMATES();
-    if (input == null) return { value: out };
-    if (typeof input !== 'object') return { error: 'estimates must be an object.' };
-    const days = (v, name) => {
-        const n = Number(v);
-        return Number.isInteger(n) && n >= 0 && n <= 365 ? { value: n } : { error: `${name} must be a whole number of days between 0 and 365.` };
-    };
-    for (const [key, anchors] of Object.entries(PAYMENT_RULE_ESTIMATE_STEPS)) {
-        const step = input[key];
-        if (step == null || step === '') continue;
-        if (typeof step !== 'object') return { error: `estimates.${key} must be { from, days }.` };
-        if (!anchors.includes(step.from)) return { error: `estimates.${key}.from must be one of: ${anchors.join(', ')}.` };
-        const d = days(step.days, `estimates.${key}.days`);
-        if (d.error) return { error: d.error };
-        out[key] = { from: step.from, days: d.value };
-    }
-    const transit = input.transit;
-    if (transit != null) {
-        if (typeof transit !== 'object') return { error: 'estimates.transit must be { sea, air, road }.' };
-        for (const mode of PAYMENT_RULE_FREIGHT_MODES) {
-            const v = transit[mode];
-            if (v == null || v === '') continue;
-            const d = days(v, `estimates.transit.${mode}`);
-            if (d.error) return { error: d.error };
-            out.transit[mode] = d.value;
-        }
-    }
-    return { value: out };
-}
-
-function parseStoredEstimates(raw) {
-    if (!raw) return EMPTY_PAYMENT_RULE_ESTIMATES();
-    try {
-        const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
-        return parsePaymentRuleEstimates(parsed).value ?? EMPTY_PAYMENT_RULE_ESTIMATES();
-    } catch {
-        return EMPTY_PAYMENT_RULE_ESTIMATES();
-    }
-}
-
-function paymentRuleRowToJson(r) {
-    if (!r) return null;
-    return {
-        id: r.id,
-        scope: r.scope,
-        supplierName: r.scope === 'supplier' ? r.supplier_name : null,
-        supplierLabel: r.supplier_label || null,
-        depositPct: r.deposit_pct != null ? Number(r.deposit_pct) : null,
-        depositTrigger: r.deposit_trigger || null,
-        depositGraceDays: Number(r.deposit_grace_days) || 0,
-        balanceTrigger: r.balance_trigger || null,
-        balanceDocumentType: r.balance_document_type || null,
-        balanceOffsetDays: r.balance_offset_days != null ? Number(r.balance_offset_days) : null,
-        balanceGraceDays: Number(r.balance_grace_days) || 0,
-        depositOffsetDays: r.deposit_offset_days != null ? Number(r.deposit_offset_days) : null,
-        estimates: parseStoredEstimates(r.estimates_json),
-        notes: r.notes || null,
-        updatedByEmail: r.updated_by_email || null,
-        createdAt: r.created_at?.toISOString?.() ?? r.created_at,
-        updatedAt: r.updated_at?.toISOString?.() ?? r.updated_at,
-    };
-}
-
-// Validates and normalises a rule body. Returns { error } or { row }.
-function parsePaymentRuleBody(body) {
-    const b = body && typeof body === 'object' ? body : {};
-    const scope = b.scope === 'supplier' ? 'supplier' : b.scope === 'default' ? 'default' : null;
-    if (!scope) return { error: 'scope must be "default" or "supplier".' };
-    const label = typeof b.supplierName === 'string' ? b.supplierName.trim() : '';
-    if (scope === 'supplier' && !label) return { error: 'supplierName is required for a supplier rule.' };
-    const intOrNull = (v, name, min, max) => {
-        if (v == null || v === '') return { value: null };
-        const n = Number(v);
-        if (!Number.isInteger(n) || n < min || n > max) return { error: `${name} must be a whole number between ${min} and ${max}.` };
-        return { value: n };
-    };
-    const pct = b.depositPct == null || b.depositPct === '' ? { value: null } : (() => {
-        const n = Number(b.depositPct);
-        return Number.isFinite(n) && n >= 0 && n <= 100 ? { value: n } : { error: 'depositPct must be between 0 and 100.' };
-    })();
-    if (pct.error) return { error: pct.error };
-    const depositTrigger = b.depositTrigger == null || b.depositTrigger === '' ? null : String(b.depositTrigger);
-    if (depositTrigger && !PAYMENT_RULE_DEPOSIT_TRIGGERS.includes(depositTrigger)) return { error: `depositTrigger must be one of: ${PAYMENT_RULE_DEPOSIT_TRIGGERS.join(', ')}.` };
-    const balanceTrigger = b.balanceTrigger == null || b.balanceTrigger === '' ? null : String(b.balanceTrigger);
-    if (balanceTrigger && !PAYMENT_RULE_BALANCE_TRIGGERS.includes(balanceTrigger)) return { error: `balanceTrigger must be one of: ${PAYMENT_RULE_BALANCE_TRIGGERS.join(', ')}.` };
-    const docType = typeof b.balanceDocumentType === 'string' && b.balanceDocumentType.trim() ? b.balanceDocumentType.trim().slice(0, 64) : null;
-    if (balanceTrigger === 'container_document' && !docType) return { error: 'balanceDocumentType is required when the balance is due on a container document.' };
-    const depGrace = intOrNull(b.depositGraceDays, 'depositGraceDays', 0, 90);
-    const balGrace = intOrNull(b.balanceGraceDays, 'balanceGraceDays', 0, 90);
-    const offset = intOrNull(b.balanceOffsetDays, 'balanceOffsetDays', -180, 365);
-    const depOffset = intOrNull(b.depositOffsetDays, 'depositOffsetDays', -180, 365);
-    for (const r of [depGrace, balGrace, offset, depOffset]) if (r.error) return { error: r.error };
-    const est = parsePaymentRuleEstimates(b.estimates);
-    if (est.error) return { error: est.error };
-    const hasEstimate = Object.entries(est.value).some(([k, v]) => (k === 'transit' ? Object.values(v).some(x => x != null) : v != null));
-    return {
-        row: {
-            scope,
-            supplier_name: scope === 'supplier' ? label.toLowerCase() : '',
-            supplier_label: scope === 'supplier' ? label : null,
-            deposit_pct: pct.value,
-            deposit_trigger: depositTrigger,
-            deposit_grace_days: depGrace.value ?? 0,
-            balance_trigger: balanceTrigger,
-            balance_document_type: balanceTrigger === 'container_document' ? docType : null,
-            balance_offset_days: offset.value,
-            balance_grace_days: balGrace.value ?? 0,
-            deposit_offset_days: depOffset.value,
-            estimates_json: hasEstimate ? JSON.stringify(est.value) : null,
-            notes: typeof b.notes === 'string' && b.notes.trim() ? b.notes.trim().slice(0, 500) : null,
-        },
-    };
-}
 
 // GET /api/v1/payment-rules — every rule, default first.
 app.get('/api/v1/payment-rules', async (req, res) => {
@@ -6951,7 +6817,8 @@ app.get('/api/v1/payment-rules', async (req, res) => {
 // PUT /api/v1/payment-rules — upsert by (scope, supplierName). Admin only.
 // Body: { scope, supplierName?, depositPct?, depositTrigger?, depositOffsetDays?, depositGraceDays?,
 //         balanceTrigger?, balanceDocumentType?, balanceOffsetDays?, balanceGraceDays?,
-//         estimates?: { artwork?, pi?, piSigned?, ready?, telex?, document?: { from, days }, transit?: { sea?, air?, road? } }, notes? }
+//         estimates?: { artwork?, pi?, piSigned?, ready?, telex?, document?: { from, days }, transit?: { sea?, air?, road? } },
+//         airOwedFrom? (default rule only, YYYY-MM-DD), airLimitDays?, notes? }
 app.put('/api/v1/payment-rules', async (req, res) => {
     try {
         if (req.userType !== 'admin') return res.status(403).json({ error: 'Admin access required.' });
@@ -6970,18 +6837,19 @@ app.put('/api/v1/payment-rules', async (req, res) => {
                 `INSERT INTO payment_rules
                     (scope, supplier_name, supplier_label, deposit_pct, deposit_trigger, deposit_grace_days,
                      balance_trigger, balance_document_type, balance_offset_days, balance_grace_days, deposit_offset_days,
-                     estimates_json, notes, updated_by_email)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     estimates_json, air_owed_from, air_limit_days, notes, updated_by_email)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                  ON DUPLICATE KEY UPDATE
                     supplier_label = VALUES(supplier_label), deposit_pct = VALUES(deposit_pct),
                     deposit_trigger = VALUES(deposit_trigger), deposit_grace_days = VALUES(deposit_grace_days),
                     balance_trigger = VALUES(balance_trigger), balance_document_type = VALUES(balance_document_type),
                     balance_offset_days = VALUES(balance_offset_days), balance_grace_days = VALUES(balance_grace_days),
                     deposit_offset_days = VALUES(deposit_offset_days), estimates_json = VALUES(estimates_json),
+                    air_owed_from = VALUES(air_owed_from), air_limit_days = VALUES(air_limit_days),
                     notes = VALUES(notes), updated_by_email = VALUES(updated_by_email)`,
                 [row.scope, row.supplier_name, row.supplier_label, row.deposit_pct, row.deposit_trigger, row.deposit_grace_days,
                  row.balance_trigger, row.balance_document_type, row.balance_offset_days, row.balance_grace_days, row.deposit_offset_days,
-                 row.estimates_json, row.notes, req.userEmail || null]
+                 row.estimates_json, row.air_owed_from, row.air_limit_days, row.notes, req.userEmail || null]
             );
             const [rb] = await conn.query(`SELECT * FROM payment_rules WHERE scope = ? AND supplier_name = ?`, [row.scope, row.supplier_name]);
             const after = paymentRuleRowToJson(rb[0]);
@@ -10588,6 +10456,7 @@ function startShipmentPaymentExtraction(req, documentId) {
 //
 // Reading a proof of payment never records a transfer: the operator does,
 // with the proof attached (documentId). Schema: src/db/migrate/*_supplier_payments.sql.
+const { groupDeliveredAir, attachBalances, findPaidClash } = require('../lib/delivered-air');
 const SUPPLIER_PAYMENT_LINE_KINDS = ['balance', 'pi', 'po_deposit'];
 // A fourth kind exists on the way in only: 'container_balance' names a
 // shipment whose balance nobody has recorded yet (the page projects it from
@@ -10861,6 +10730,22 @@ async function materialiseContainerBalances(conn, { lines, supplierName, supplie
         const allocated = allocations.reduce((a, x) => a + x.amount, 0);
         if (allocated > balanceAmount + SHIPMENT_ALLOCATION_EPS) {
             return { fail: { status: 422, error: 'The balance split adds up to more than the balance.', code: 'OVER_ALLOCATED', payload: { allocated: Math.round(allocated * 100) / 100, amount: balanceAmount } } };
+        }
+        // A balance already PAID for these goods: recording another would pay
+        // them twice. Another PO in the same box is fine — its part of the
+        // balance was never recorded (air freight is often paid PO by PO).
+        const [paidRows] = await conn.query(
+            `SELECT sp.id, sp.paid_on, a.purchase_order_id
+               FROM shipment_payments sp
+               LEFT JOIN shipment_payment_allocations a ON a.payment_id = sp.id
+              WHERE sp.deleted_at IS NULL AND sp.shipment_id = ? AND sp.supplier_key = ? AND sp.status = 'paid'`,
+            [shipment.id, supplierKeyValue]
+        );
+        const coveredPoIds = allocations.length ? allocations.map(a => a.purchaseOrderId).filter(id => id != null) : mine.map(p => p.id);
+        const clash = findPaidClash(paidRows, coveredPoIds);
+        if (clash) {
+            const poNumber = clash.purchase_order_id != null ? (memberPos.find(p => p.id === clash.purchase_order_id)?.poNumber ?? null) : null;
+            return { fail: { status: 409, error: `${shipment.reference || shipment.id} already has a paid balance for ${poNumber ?? supplierName}${clash.paid_on ? ` (paid ${String(clash.paid_on).slice(0, 10)})` : ''} — it would be paid twice.`, code: 'BALANCE_PAID', payload: { balanceId: clash.id, paidOn: clash.paid_on || null, purchaseOrderId: clash.purchase_order_id ?? null, shipmentId: shipment.id } } };
         }
         const [ins] = await conn.query(
             `INSERT INTO shipment_payments
@@ -11185,6 +11070,100 @@ app.get('/api/v1/supplier-payments/open-items', async (req, res) => {
         res.json(out);
     } catch (error) {
         log.error('[GET /supplier-payments/open-items]', error);
+        res.status(500).json({ error: 'An internal error occurred.' });
+    }
+});
+
+// GET /api/v1/supplier-payments/delivered-air?supplier=&currency=
+// A supplier's air shipments that have landed, with what each of its POs has
+// on board: air balances go with a later transfer, and air delivered before
+// the Payments page's start date is not in its forecast, so Record payment
+// searches here. Each PO carries what says it may already be paid another
+// way — its deposit, PIs marked paid, proof files, and any balance recorded
+// for it on that shipment — so the operator can judge before paying.
+app.get('/api/v1/supplier-payments/delivered-air', async (req, res) => {
+    try {
+        await shipmentPaymentsSchemaReady;
+        await purchaseOrdersSchemaReady;
+        const supplier = typeof req.query.supplier === 'string' ? req.query.supplier.trim() : '';
+        if (!supplier) return res.status(400).json({ error: 'supplier is required.', code: 'BAD_FIELD' });
+        const currency = req.query.currency ? String(req.query.currency).trim().toUpperCase() : null;
+        const key = shipmentPaymentsService.supplierKey(supplier);
+        const isSupplier = (name) => shipmentPaymentsService.supplierKey(name) === key || sameSupplierName(name, supplier);
+        const out = await withConnection(async (conn) => {
+            const [rows] = await conn.query(
+                `SELECT s.id AS shipment_id, s.reference, s.stage, s.arrived_at AS shipment_arrived_at,
+                        o.purchase_order_id, po.po_number, po.supplier AS po_supplier, po.currency,
+                        o.jf_code, o.quantity, o.unit_price, o.status, o.arrived_date, o.delivery_date, o.awb_number
+                   FROM shipments s
+                   JOIN orders o ON o.shipment_id = s.id AND o.deleted_at IS NULL AND o.status <> 'DESTROYED'
+                   JOIN purchase_orders po ON po.id = o.purchase_order_id AND po.deleted_at IS NULL
+                  WHERE s.deleted_at IS NULL AND s.merged_into_id IS NULL AND UPPER(s.mode) = 'AIR'
+                  ORDER BY s.id, o.id`
+            );
+            const shipments = groupDeliveredAir(rows, { isSupplier, currency });
+            if (!shipments.length) return { supplier, currency, shipments };
+
+            const ids = shipments.map(s => s.shipmentId);
+            const [bal] = await conn.query(
+                `SELECT sp.id, sp.shipment_id, sp.amount, sp.status, sp.paid_on, sp.supplier_key, sp.supplier_name, a.purchase_order_id
+                   FROM shipment_payments sp
+                   LEFT JOIN shipment_payment_allocations a ON a.payment_id = sp.id
+                  WHERE sp.deleted_at IS NULL AND sp.shipment_id IN (${ids.map(() => '?').join(',')})`,
+                ids
+            );
+            attachBalances(shipments, bal.filter(b => b.supplier_key === key || sameSupplierName(b.supplier_name, supplier)));
+
+            const poIds = [...new Set(shipments.flatMap(s => s.purchaseOrders.map(p => p.purchaseOrderId)))];
+            const ph = poIds.map(() => '?').join(',');
+            const [tot] = await conn.query(
+                `SELECT purchase_order_id, COUNT(*) AS line_count, SUM(quantity) AS units
+                   FROM orders WHERE deleted_at IS NULL AND status <> 'DESTROYED' AND purchase_order_id IN (${ph})
+                  GROUP BY purchase_order_id`, poIds
+            );
+            const totals = new Map(tot.map(r => [r.purchase_order_id, { lines: Number(r.line_count) || 0, units: Number(r.units) || 0 }]));
+            const deposits = await shipmentPaymentsService.loadDepositsFor(conn, poIds);
+            const [depLines] = await conn.query(
+                `SELECT l.target_id AS po_id, SUM(l.amount) AS amount, MIN(sp.paid_on) AS paid_on
+                   FROM supplier_payment_lines l JOIN supplier_payments sp ON sp.id = l.payment_id AND sp.deleted_at IS NULL
+                  WHERE l.target_kind = 'po_deposit' AND l.target_id IN (${ph})
+                  GROUP BY l.target_id`, poIds
+            );
+            const depositByTransfer = new Map(depLines.map(r => [r.po_id, { amount: Number(r.amount), paidOn: r.paid_on || null }]));
+            const [pisPaid] = await conn.query(
+                `SELECT p.purchase_order_id, SUM(p.amount_due) AS paid
+                   FROM purchase_order_invoice_payments p
+                   JOIN purchase_order_invoices i ON i.id = p.purchase_order_invoice_id AND i.deleted_at IS NULL
+                  WHERE p.purchase_order_id IN (${ph}) AND p.payment_status = 'paid'
+                  GROUP BY p.purchase_order_id`, poIds
+            );
+            const piPaidBy = new Map(pisPaid.map(r => [r.purchase_order_id, Number(r.paid) || 0]));
+            const [proofs] = await conn.query(
+                `SELECT purchase_order_id, COUNT(*) AS n FROM purchase_order_payments
+                  WHERE deleted_at IS NULL AND purchase_order_id IN (${ph}) GROUP BY purchase_order_id`, poIds
+            );
+            const proofsBy = new Map(proofs.map(r => [r.purchase_order_id, Number(r.n) || 0]));
+
+            for (const s of shipments) {
+                for (const p of s.purchaseOrders) {
+                    const t = totals.get(p.purchaseOrderId);
+                    const d = deposits.get(p.purchaseOrderId);
+                    const byTransfer = depositByTransfer.get(p.purchaseOrderId);
+                    p.linesTotal = t ? t.lines : null;
+                    p.unitsTotal = t ? t.units : null;
+                    // type 'full' = a 100% PI covers the whole PO, air goods included.
+                    p.deposit = byTransfer
+                        ? { source: 'payment', type: 'deposit', status: 'paid', amount: byTransfer.amount, percentage: null, paidOn: byTransfer.paidOn }
+                        : d ? { source: 'pi', type: d.paymentType, status: d.paymentStatus, amount: d.amountDue, percentage: d.depositPercentage, paidOn: null } : null;
+                    p.pisPaid = Math.round((piPaidBy.get(p.purchaseOrderId) || 0) * 100) / 100;
+                    p.proofCount = proofsBy.get(p.purchaseOrderId) || 0;
+                }
+            }
+            return { supplier, currency, shipments };
+        });
+        res.json(out);
+    } catch (error) {
+        log.error('[GET /supplier-payments/delivered-air]', error);
         res.status(500).json({ error: 'An internal error occurred.' });
     }
 });

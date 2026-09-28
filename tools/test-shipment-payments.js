@@ -493,14 +493,106 @@ async function pickFixture() {
         });
         check('paying the rest against that balance settles it', restCb.status === 201 && (await api.get(`/api/v1/shipment-payments?shipmentId=${noBalanceShipment.id}`)).data.data.find(b => b.id === madeLine.targetId).status === 'paid', restCb.data);
         if (restCb.data && restCb.data.id) paymentIds.push(restCb.data.id);
-        const full = await pay({
+        // The box's balance is now PAID for every PO of this supplier on board:
+        // recording another one would pay the same goods twice.
+        const twice = await pay({
             supplierName: noBalanceShipment.supplier, amount: 50, currency: 'USD', paidOn: '2026-09-20',
             lines: [{ kind: 'container_balance', id: noBalanceShipment.id, amount: 50 }],
         });
-        check('with no projected amount the balance is what was paid, and paid', full.status === 201 && full.data.lines[0].targetAmount === 50 && full.data.lines[0].targetStatus === 'paid', full.data && full.data.lines);
-        if (full.data && full.data.id) { paymentIds.push(full.data.id); if (full.data.lines[0]) createdIds.push(full.data.lines[0].targetId); }
+        check('another balance for goods whose balance is paid → 409 BALANCE_PAID naming it', twice.status === 409 && twice.data.code === 'BALANCE_PAID' && twice.data.balanceId === madeLine.targetId, twice.data);
+        if (twice.status === 201 && twice.data.id) { paymentIds.push(twice.data.id); if (twice.data.lines[0]) createdIds.push(twice.data.lines[0].targetId); }
     } else {
         console.log('  (no booked shipment without a balance — container_balance not exercised)');
+    }
+    const [freshBox] = await sql(
+        `SELECT s.id, s.reference, po.supplier
+           FROM shipments s
+           JOIN orders o ON o.shipment_id = s.id AND o.deleted_at IS NULL
+           JOIN purchase_orders po ON po.id = o.purchase_order_id AND po.deleted_at IS NULL
+          WHERE s.deleted_at IS NULL AND s.merged_into_id IS NULL AND s.reference IS NOT NULL
+            AND s.stage IN ('BOOKED', 'IN_TRANSIT', 'ARRIVED') AND s.id NOT IN (?, ?)
+            AND NOT EXISTS (SELECT 1 FROM shipment_payments b WHERE b.shipment_id = s.id AND b.deleted_at IS NULL)
+          GROUP BY s.id, po.supplier
+          ORDER BY s.id LIMIT 1`,
+        [fixture.id, noBalanceShipment ? noBalanceShipment.id : 0]
+    );
+    if (freshBox) {
+        const full = await pay({
+            supplierName: freshBox.supplier, amount: 50, currency: 'USD', paidOn: '2026-09-20',
+            lines: [{ kind: 'container_balance', id: freshBox.id, amount: 50 }],
+        });
+        check('with no projected amount the balance is what was paid, and paid', full.status === 201 && full.data.lines[0].targetAmount === 50 && full.data.lines[0].targetStatus === 'paid', full.data && full.data.lines);
+        if (full.data && full.data.id) { paymentIds.push(full.data.id); if (full.data.lines[0]) createdIds.push(full.data.lines[0].targetId); }
+    }
+
+    section('air freight paid PO by PO — a paid balance only blocks the POs it covers');
+    const [twoPoBox] = await sql(
+        `SELECT s.id, s.reference, po.supplier, GROUP_CONCAT(DISTINCT po.id ORDER BY po.id) AS po_ids
+           FROM shipments s
+           JOIN orders o ON o.shipment_id = s.id AND o.deleted_at IS NULL AND o.status <> 'DESTROYED'
+           JOIN purchase_orders po ON po.id = o.purchase_order_id AND po.deleted_at IS NULL
+          WHERE s.deleted_at IS NULL AND s.merged_into_id IS NULL AND s.reference IS NOT NULL
+            AND s.stage IN ('BOOKED', 'IN_TRANSIT', 'ARRIVED', 'CLOSED')
+            AND NOT EXISTS (SELECT 1 FROM shipment_payments b WHERE b.shipment_id = s.id AND b.deleted_at IS NULL)
+          GROUP BY s.id, po.supplier
+         HAVING COUNT(DISTINCT po.id) >= 2
+          ORDER BY s.id LIMIT 1`
+    );
+    if (twoPoBox) {
+        const [poA, poB] = String(twoPoBox.po_ids).split(',').map(Number);
+        const payA = await pay({
+            supplierName: twoPoBox.supplier, amount: 40, currency: 'USD', paidOn: '2026-09-21',
+            lines: [{ kind: 'container_balance', id: twoPoBox.id, amount: 40, allocations: [{ purchaseOrderId: poA, amount: 40 }] }],
+        });
+        check('one PO\'s part of a box → 201, paid', payA.status === 201 && payA.data.lines[0].targetStatus === 'paid', payA.data);
+        if (payA.data && payA.data.id) { paymentIds.push(payA.data.id); if (payA.data.lines[0]) createdIds.push(payA.data.lines[0].targetId); }
+        const payB = await pay({
+            supplierName: twoPoBox.supplier, amount: 30, currency: 'USD', paidOn: '2026-09-22',
+            lines: [{ kind: 'container_balance', id: twoPoBox.id, amount: 30, allocations: [{ purchaseOrderId: poB, amount: 30 }] }],
+        });
+        check('another PO in the same box → 201 (its part was never recorded)', payB.status === 201, payB.data);
+        if (payB.data && payB.data.id) { paymentIds.push(payB.data.id); if (payB.data.lines[0]) createdIds.push(payB.data.lines[0].targetId); }
+        const payA2 = await pay({
+            supplierName: twoPoBox.supplier, amount: 40, currency: 'USD', paidOn: '2026-09-23',
+            lines: [{ kind: 'container_balance', id: twoPoBox.id, amount: 40, allocations: [{ purchaseOrderId: poA, amount: 40 }] }],
+        });
+        check('the first PO again → 409 BALANCE_PAID', payA2.status === 409 && payA2.data.code === 'BALANCE_PAID' && payA2.data.purchaseOrderId === poA, payA2.data);
+        if (payA2.status === 201 && payA2.data.id) { paymentIds.push(payA2.data.id); if (payA2.data.lines[0]) createdIds.push(payA2.data.lines[0].targetId); }
+    } else {
+        console.log('  (no booked box with two POs from one supplier and no balance — per-PO guard not exercised)');
+    }
+
+    section('GET /supplier-payments/delivered-air');
+    const noSupplier = await api.get('/api/v1/supplier-payments/delivered-air');
+    check('supplier is required → 400', noSupplier.status === 400, noSupplier.data);
+    const [airSupplier] = await sql(
+        `SELECT po.supplier, COUNT(DISTINCT s.id) AS n
+           FROM shipments s
+           JOIN orders o ON o.shipment_id = s.id AND o.deleted_at IS NULL AND o.status <> 'DESTROYED'
+           JOIN purchase_orders po ON po.id = o.purchase_order_id AND po.deleted_at IS NULL
+          WHERE s.deleted_at IS NULL AND s.merged_into_id IS NULL AND UPPER(s.mode) = 'AIR'
+            AND (s.stage IN ('ARRIVED', 'CLOSED') OR o.status = 'RECEIVED') -- the stage often lags the goods
+          GROUP BY po.supplier ORDER BY n DESC LIMIT 1`
+    );
+    if (airSupplier) {
+        const da = await api.get(`/api/v1/supplier-payments/delivered-air?supplier=${encodeURIComponent(airSupplier.supplier)}`);
+        check('200 with shipments', da.status === 200 && Array.isArray(da.data.shipments) && da.data.shipments.length > 0, da.data);
+        const ids = (da.data.shipments || []).map(s => s.shipmentId);
+        const modes = ids.length ? await sql(`SELECT DISTINCT UPPER(mode) AS m FROM shipments WHERE id IN (${ids.map(() => '?').join(',')})`, ids) : [];
+        check('every shipment is air', modes.length === 1 && modes[0].m === 'AIR', modes);
+        const s0 = da.data.shipments && da.data.shipments[0];
+        const p0 = s0 && s0.purchaseOrders[0];
+        const [expect] = p0 ? await sql(
+            `SELECT COUNT(*) AS n, SUM(quantity) AS units, ROUND(SUM(CASE WHEN unit_price > 0 THEN quantity * unit_price ELSE 0 END), 2) AS value
+               FROM orders WHERE deleted_at IS NULL AND status <> 'DESTROYED' AND shipment_id = ? AND purchase_order_id = ?`,
+            [s0.shipmentId, p0.purchaseOrderId]
+        ) : [null];
+        check('a PO\'s lines / units / value on board match the orders', p0 && expect && p0.lines === Number(expect.n) && p0.units === Number(expect.units) && p0.value === Number(expect.value), { p0, expect });
+        check('each PO says what may already be paid', p0 && 'deposit' in p0 && 'pisPaid' in p0 && 'proofCount' in p0 && 'balance' in p0 && 'linesTotal' in p0, p0);
+        const newestFirst = (da.data.shipments || []).map(s => s.deliveredOn || '').every((d, i, a) => i === 0 || a[i - 1] >= d);
+        check('newest delivery first', newestFirst, (da.data.shipments || []).map(s => s.deliveredOn));
+    } else {
+        console.log('  (no delivered air shipment — delivered-air not exercised)');
     }
     const draftForCb = await sql(`SELECT id FROM shipments WHERE stage IN ('DRAFT','PLANNED') AND deleted_at IS NULL AND merged_into_id IS NULL LIMIT 1`);
     if (draftForCb[0]) {

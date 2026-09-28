@@ -19,6 +19,7 @@ POST   /api/v1/shipment-payments/relink      → repair pointers after a re-seed
 
 GET    /api/v1/supplier-payments             → { data, documents }   transfers + proofs waiting to be applied
 GET    /api/v1/supplier-payments/open-items  → what a transfer to a supplier can be applied to
+GET    /api/v1/supplier-payments/delivered-air → a supplier's landed air shipments, per PO on board
 POST   /api/v1/supplier-payments             → 201 transfer  (marks what its lines cover paid)
 PUT    /api/v1/supplier-payments/:id         → 200 transfer
 DELETE /api/v1/supplier-payments/:id         → 204                              (admin only)
@@ -262,6 +263,17 @@ Tolerances as the PI check: 0.005 on a unit price, 0.50 on a line total,
 max(1, 0.5 %) on the balance. `fit` and `check` are different questions: an
 invoice can belong here (`fit: match`) and still not agree with the box.
 
+**Goods-value (commercial) invoices** — `invoiceBasis: "goods"`. An invoice
+that states no amount payable (`amountDueNow` null) and deducts no deposit
+prices the goods at full value: its total is compared with the goods on board
+(`goodsDelta`, tolerance max(1, 0.5 %)), `invoiceBalance` is null, and
+`payable` = its goods at the balance share of the goods on board (goods less
+the deposit). The record made from it takes `payable`, with a note saying so;
+the read carries `recordAmount` and `balanceFrom` (`stated` |
+`goods_less_deposit` | `total`). An invoice that states an amount due is
+compared as before (`invoiceBasis: "balance"`), so a supplier asking for the
+full value with a deposit on file is still flagged.
+
 **Does it belong here? — `fit`.** Every read is compared with the shipment and
 the supplier it was uploaded against:
 
@@ -276,7 +288,9 @@ the supplier it was uploaded against:
 ```
 
 `ok: true` ties it here, `false` points somewhere else, `null` means nothing to
-compare. Any `false` → `mismatch`; a container/B-L or PO reference that ties it
+compare (or a warning: an invoice issued under another company name that cites
+this supplier's own PO — the factory invoicing for the trading house — has its
+supplier check downgraded to `null`, never for a remittance). Any `false` → `mismatch`; a container/B-L or PO reference that ties it
 here with no `false` → `match`; otherwise `unconfirmed` (normal for a bank
 remittance, which names only the payee). Checks: supplier name (legal-form words
 ignored, so "MEDOFFICE SAGLIK ENDUSTRI" is MEDOFFICE); container / B/L against
@@ -286,30 +300,36 @@ whole; a container cannot be contradicted when the shipment holds no number);
 PO references against the POs on board, including another supplier's PO; the
 currency; and an amount above 105 % of what this supplier has on board.
 
-**What a read does.**
-- A **balance invoice** with a payable amount creates a `pending` record
-  (`source: "extracted"`), filed under the supplier it was uploaded against
-  (not the letterhead spelling), with allocations mapped from the document's
-  own references — suppliers write `PO00333J`, `PO 00297J`, `PO-00299J` for the
-  same three POs, so references match on letters+digits, then on the digit core
-  when that identifies exactly one PO on the shipment. Anything it cannot map is
-  kept verbatim as `poRef` with no id, and counts as unallocated. A document
-  naming only PO references is split by what each PO has on board. Lines bill
-  the goods while the payable is often the goods less the deposit, so when the
-  lines add up to MORE than the amount due the split is scaled to it, each PO
-  keeping its share of the lines, in whole cents (`scaledToAmount: true`);
-  lines adding up to LESS are left as read and the gap stays unallocated.
-  **Unless `fit.verdict` is `mismatch`**: then no record is made
-  (`noPaymentCreated: "mismatch"`) and the page offers "record it anyway"
-  (`POST /shipment-payments` with `documentId`). No amount →
-  `noPaymentCreated: "no_amount"`.
-- A **deposit invoice** makes nothing (`noPaymentCreated: "deposit_invoice"`):
-  deposits belong on the purchase order.
+**What a read does (since 2026-09-28).** The reader makes **no balance record
+and never changes one**. What is owed for a box is the supplier's terms × the
+goods on board, less what has been paid — the Payments page works it out (it
+knows the JFPRO terms; this service does not) and an uploaded document is only
+checked against it. A balance record is made when the box is PAID (Record
+payment's `container_balance` line, at the page's figure).
+- A **balance invoice** on a shipment: `noPaymentCreated: "checked"` — `fit`
+  (does it belong here) and `check` (its lines against the box; for a
+  goods-value invoice its total against the goods on board). `check.verdict`
+  judges lines and goods only: what the invoice asks against what is owed is the
+  page's comparison (`compareInvoiceToOwed` in ShipLine), which knows the
+  deposit %. `check.expectedBalance` / `balanceDelta` use deposit PIs only and
+  are information, not a verdict. `allocations` (the document's own split,
+  mapped as below) are still stored.
+- A **deposit invoice / proforma** on a shipment ("PI & PL", "30 % deposit, 70 %
+  balance") prices the same goods: it gets the same `check`
+  (`noPaymentCreated: "deposit_invoice"`).
 - A **remittance** makes nothing on its own (`noPaymentCreated: "remittance"`);
   its amount, `paymentDate` and `bank.paymentReference` pre-fill the transfer
   it is applied with. The model decides the kind — a remittance uploaded as
   `balance_invoice` is still read as a remittance and refiled. An invoice
-  uploaded with no shipment makes nothing (`noPaymentCreated: "no_shipment"`).
+  uploaded with no shipment: `noPaymentCreated: "no_shipment"`.
+- Mapping a document's references: suppliers write `PO00333J`, `PO 00297J`,
+  `PO-00299J` for the same POs, so references match on letters+digits, then on
+  the digit core when that identifies exactly one PO on the shipment; anything
+  unmapped is kept verbatim as `poRef`. Line splits that add up to MORE than the
+  document's figure are scaled to it (`scaledToAmount`).
+- Model: `gemini-3.8-flash`, `gemini-3.1-pro-preview` as fallback. Reads made
+  before 2026-09-28 may have linked a record (`paymentId`); those links are left
+  as they are, and the page never lets an open record change what is owed.
 
 ## Supplier payments — `/api/v1/supplier-payments`
 
@@ -342,8 +362,30 @@ balance (`balanceAmount`, default the amount paid; split by `allocations`
 `[{ purchaseOrderId, amount }]`, default by what each of the supplier's POs has
 on board) and the line becomes an ordinary `balance`. `409 BALANCE_EXISTS
 { balanceId, shipmentId }` when that shipment × supplier already has an open
-balance — apply to it instead; `422 NOT_BOOKED` / `NO_MEMBER_POS` /
-`PO_NOT_IN_SHIPMENT` as for a balance.
+balance — apply to it instead; `409 BALANCE_PAID { balanceId, paidOn,
+purchaseOrderId, shipmentId }` when a PAID balance on that shipment × supplier
+already covers any of the POs being paid (or was recorded with no split, so
+covers the whole box) — it would pay the same goods twice. Another PO in the
+same box is allowed: air freight is often paid PO by PO. `422 NOT_BOOKED` /
+`NO_MEMBER_POS` / `PO_NOT_IN_SHIPMENT` as for a balance.
+
+### `GET /api/v1/supplier-payments/delivered-air?supplier=&currency=`
+
+Air balances go with a later transfer, and air delivered before the Payments
+page's start date (`payment_rules.air_owed_from`) is not in its forecast, so
+Record payment searches here. `{ supplier, currency, shipments: [{ shipmentId,
+reference, stage, deliveredOn, awbNumbers, purchaseOrders: [{ purchaseOrderId,
+poNumber, supplier, currency, lines, linesTotal, units, unitsTotal, value,
+unpricedLines, jfCodes, deposit: { source: pi|payment, type: deposit|full,
+status, amount, percentage, paidOn } | null, pisPaid, proofCount, balance: {
+id, status, paidOn, amount } | null }] }] }`, newest delivery first. Air =
+shipment `mode` AIR; landed = stage ARRIVED / CLOSED, or every one of the
+supplier's lines received (the stage often lags). `value` counts priced lines
+only (`unpricedLines` says how many are not). `deliveredOn` = earliest line
+arrived / delivery date, else the shipment's arrival, else null. `balance` =
+the record already covering that PO on that shipment (paid wins over open).
+Paying one: a `container_balance` line with `allocations` for the ticked POs.
+Pure logic in `src/lib/delivered-air.js`.
 
 **Where it shows.** The proof follows the payment to everything it covered: a
 balance carries `settlements[]` (`GET /shipment-payments`), a PI carries

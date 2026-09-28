@@ -113,9 +113,22 @@ DELETE /api/v1/payment-rules/:id      → 204                       (admin only;
     "document": null,                                  // from: bl | etd | arrival
     "transit":  { "sea": 35, "air": 5, "road": 14 }    // ETD → arrival by mode, days; null = none
   },
+  "airOwedFrom": null,                 // default rule ONLY (400 on a supplier rule): YYYY-MM-DD; null = air counts as paid once delivered
+  "airLimitDays": 30,                  // 1–365; null = inherit the default's, then 60
   "notes": "..."
 }
 ```
+
+Delivered air freight: air goods are released before their balance is paid,
+which goes with a later transfer. With `airOwedFrom` set on the default rule,
+the page keeps air delivered on or after that date (line arrived date, else
+delivery date, else the shipment's) as owed until a recorded payment settles
+it. It is dated to the supplier's next payment in the same currency, never
+later than `airLimitDays` after delivery; a transfer to that supplier after
+the delivery that left it out marks it missed (due that day). Air delivered
+before the date, or with no date on file, stays treated as paid. Sea is
+unchanged. Columns `air_owed_from`, `air_limit_days` (migration
+`2026-09-28_10_payment_rules_air.sql`).
 
 Estimates never make anything payable: an item whose trigger has not happened
 stays "not payable yet"; the estimate only gives it a forecast date (flagged

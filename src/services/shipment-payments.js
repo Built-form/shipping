@@ -132,7 +132,7 @@ async function loadDepositsFor(conn, poIds) {
     if (!poIds.length) return out;
     const ph = poIds.map(() => '?').join(',');
     const [rows] = await conn.query(
-        `SELECT p.purchase_order_id, p.amount_due, p.currency, p.payment_status, p.due_date, p.deposit_percentage
+        `SELECT p.purchase_order_id, p.amount_due, p.currency, p.payment_status, p.due_date, p.deposit_percentage, p.payment_type
            FROM purchase_order_invoice_payments p
            JOIN purchase_order_invoices i ON i.id = p.purchase_order_invoice_id AND i.deleted_at IS NULL
           WHERE p.purchase_order_id IN (${ph}) AND p.payment_type IN ('deposit', 'full')
@@ -147,6 +147,8 @@ async function loadDepositsFor(conn, poIds) {
             paymentStatus: r.payment_status || null,
             dueDate: r.due_date || null,
             depositPercentage: r.deposit_percentage != null ? Number(r.deposit_percentage) : null,
+            // 'full' = a 100% PI: it covers the whole PO, balance included.
+            paymentType: r.payment_type || null,
         });
     }
     return out;

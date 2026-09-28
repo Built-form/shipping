@@ -29,9 +29,14 @@ const {
     supplierKey, loadShipmentContext, loadMemberPurchaseOrders, shareAllocations,
 } = require('./shipment-payments');
 
-// Same tiering as the QC reader: Flash does this comfortably, Pro is the
-// fallback when Flash refuses a scan.
-const GEMINI_MODEL_DEFAULT = 'gemini-3-flash-preview';
+// Flash reads the figures; the judging (lines vs the box, invoice vs what is
+// owed) is ours, not the model's. gemini-3.8-flash (not a preview) read the
+// real uploads field-for-field the same as 3-flash-preview and 3.1-pro, in
+// about half the time (2026-09-28). Pro is the fallback when Flash refuses a
+// scan. NB the PO/PI check (po-invoice-check.js) stays on 3-flash-preview:
+// there the MODEL judges, and 3.8-flash passed three PIs that preview and pro
+// both flagged (one a _FQC code difference).
+const GEMINI_MODEL_DEFAULT = 'gemini-3.8-flash';
 const FALLBACK_MODEL = 'gemini-3.1-pro-preview';
 
 const SYSTEM_INSTRUCTION = `You read supplier payment documents for a UK medical-supplies importer and return structured JSON.
@@ -50,7 +55,7 @@ Then extract:
 - paymentDate — for a remittance only: the date the money was sent (YYYY-MM-DD). Null on anything else.
 - currency — ISO code of the amounts.
 - totalAmount — the document's grand total.
-- amountDueNow — the amount actually payable against THIS document. For a balance invoice that is the balance, not the whole order value. Null if it states no payable amount.
+- amountDueNow — the amount actually payable against THIS document. For a balance invoice that is the balance, not the whole order value. Null if it states no payable amount. A commercial invoice that only prices the goods (line values and a grand total, no "amount due", "balance" or deposit wording) is a balance_invoice with amountDueNow null — never copy its grand total into amountDueNow.
 - depositDeducted — any deposit or advance the document nets off (often "less 30% deposit"), as a positive number; null if none.
 - dueTerms — the payment-timing wording, verbatim and short.
 - containerRefs, blRefs — container numbers and bill-of-lading numbers printed on the document.
@@ -325,6 +330,17 @@ function assessFit({ extract, shipment, supplierName, memberPos, amount }) {
         if (ownFound.length) add('pos', true, `Names ${ownFound.map(p => p.poNumber).join(', ')}${missNote}.`);
         else if (found.length) add('pos', false, `Names ${found.map(p => p.poNumber).join(', ')}, filed under ${found[0].supplier || 'another supplier'}.`);
         else add('pos', false, `Names ${misses.slice(0, 3).join(', ')}${misses.length > 3 ? '…' : ''} — not on this shipment.`);
+
+        // Suppliers often invoice through another company (the factory for
+        // the trading house, or the reverse). An invoice that cites this
+        // supplier's own PO is theirs whatever the letterhead says — a
+        // warning, not a mismatch. Never for a remittance: money paid to
+        // another beneficiary is exactly what must stop someone.
+        const supplierCheck = checks.find(c => c.key === 'supplier' && c.ok === false);
+        if (supplierCheck && ownFound.length && extract.documentKind !== 'remittance') {
+            supplierCheck.ok = null;
+            supplierCheck.text = `${by} ${printed} — not the name on file (${supplierName || names[0]}), but it names ${ownFound.map(p => p.poNumber).join(', ')}.`;
+        }
     }
 
     // Money: the currency, then the amount against what is on board.
@@ -426,13 +442,25 @@ function compareInvoiceToContainer({ extract, context, supplierName }) {
         depositExpected = Math.round(Number(extract.depositDeducted) * 100) / 100;
     }
     const expectedBalance = Math.round((goodsOnBoard - depositExpected) * 100) / 100;
-    const invoiceBalance = extract.amountDueNow != null ? Number(extract.amountDueNow) : extract.totalAmount != null ? Number(extract.totalAmount) : null;
+    const invoiceTotal = money(extract.totalAmount);
+    const statedDue = money(extract.amountDueNow);
+    // A commercial invoice prices the goods at full value and states nothing
+    // payable: its total is the GOODS, not what the supplier asks for now, and
+    // it is checked against the goods on board.
+    const invoiceBasis = statedDue == null && !(money(extract.depositDeducted) > 0) && invoiceTotal != null ? 'goods' : 'balance';
+    const goodsTolerance = Math.max(1, goodsOnBoard * 0.005);
+    const goodsDelta = invoiceBasis === 'goods' ? Math.round((invoiceTotal - goodsOnBoard) * 100) / 100 : 0;
+    const invoiceBalance = invoiceBasis === 'goods' ? null : statedDue ?? invoiceTotal;
     const balanceDelta = invoiceBalance == null ? 0 : Math.round((invoiceBalance - expectedBalance) * 100) / 100;
     const balanceTolerance = Math.max(1, expectedBalance * 0.005);
-
     const lineTrouble = lines.some(l => l.issues.length) || missing.length > 0 || extra.length > 0;
-    const balanceTrouble = invoiceBalance != null && Math.abs(balanceDelta) > balanceTolerance;
-    const verdict = !ours.length || (!lines.length && !extra.length && invoiceBalance == null)
+    // The goods on a goods invoice are judged here — they do not depend on the
+    // terms. What an invoice ASKS is not: the balance owed comes from the
+    // supplier's terms, which only the page knows (JFPRO), so the page compares
+    // it (expectedBalance/balanceDelta here use deposit PIs only — information).
+    const balanceTrouble = invoiceBasis === 'goods' && Math.abs(goodsDelta) > goodsTolerance;
+    const nothingToWeigh = invoiceBasis === 'balance' && invoiceBalance == null;
+    const verdict = !ours.length || (!lines.length && !extra.length && nothingToWeigh)
         ? 'unverified'
         : !lines.length && !extra.length
             ? (balanceTrouble ? 'differs' : 'unverified')
@@ -440,8 +468,9 @@ function compareInvoiceToContainer({ extract, context, supplierName }) {
     return {
         verdict,
         matchedLines: lines.length, lines, missingOurLines: missing, extraInvoiceLines: extra,
-        goodsOnBoard, invoiceGoods: extract.totalAmount != null ? Number(extract.totalAmount) : null,
+        goodsOnBoard, invoiceGoods: invoiceTotal,
         depositBasis, depositExpected, expectedBalance, invoiceBalance, balanceDelta, balanceTolerance,
+        invoiceBasis, goodsDelta, goodsTolerance,
     };
 }
 
@@ -536,10 +565,19 @@ async function readDocument({ s3Key, contentType, context, model }) {
 }
 
 // ── Orchestration ────────────────────────────────────────────────────────
+// Nothing stays nothing: Number(null) is 0, which would turn "the document
+// states no amount" into "the amount is 0".
 const money = v => {
+    if (v == null || v === '') return null;
     const n = Number(v);
     return Number.isFinite(n) ? Math.round(n * 100) / 100 : null;
 };
+
+// The figure a document shows: what it states payable, else its total. It is
+// never what is owed — that is the terms × the goods on board (the page's).
+function documentAmountOf(extract) {
+    return money(extract.amountDueNow) ?? money(extract.totalAmount);
+}
 
 /** Read one uploaded document and write what it says. Owns its own
  *  connections: the pool has a single one, so none is held across the model
@@ -586,22 +624,28 @@ async function runShipmentPaymentExtraction(pool, { documentId, userEmail = null
     const conn = await pool.getConnection();
     try {
         const extract = read.parsed;
-        const amount = money(extract.amountDueNow) ?? money(extract.totalAmount);
-        const matched = matchLinesToPos(extract, memberPos, amount ?? 0);
         const currency = (extract.currency || context.shipmentCurrency || 'USD').toUpperCase().slice(0, 3);
         // The record is filed under the supplier the operator uploaded it
         // against — the name the page groups by — not the spelling printed on
         // the letterhead ("SUZHOU SUNMED CO.,LTD." would open a row of its own).
         const supplierName = (doc.supplier_name || extract.supplierName || '').trim().slice(0, 255);
-        // Only a balance invoice becomes a balance. A deposit invoice belongs
-        // on its purchase order; a remittance proves a payment and is applied
-        // by an operator (mark-paid), never by the reader.
+        // Only a balance invoice is checked against the box. A deposit invoice
+        // belongs on its purchase order; a remittance proves a payment and is
+        // applied by an operator (Record payment), never by the reader.
         const payable = extract.documentKind === 'balance_invoice';
-        const fit = assessFit({ extract, shipment: context.shipment, supplierName: doc.supplier_name || null, memberPos, amount });
-        // Line by line against what is in the box, for an invoice with a box.
-        const check = payable && doc.shipment_id != null
+        // Line by line against what is in the box, for an invoice with a box —
+        // a proforma (read as a deposit invoice: "PI & PL", "30 % deposit, 70 %
+        // balance") uploaded on a container prices the same goods, so it is
+        // checked too.
+        const checkable = payable || extract.documentKind === 'deposit_invoice';
+        const check = checkable && doc.shipment_id != null
             ? compareInvoiceToContainer({ extract, context, supplierName: supplierName || doc.supplier_name || '' })
             : null;
+        // The figure it shows (what it states payable, else its total) — for the
+        // line split and the "does it belong here" check only.
+        const amount = documentAmountOf(extract);
+        const matched = matchLinesToPos(extract, memberPos, amount ?? 0);
+        const fit = assessFit({ extract, shipment: context.shipment, supplierName: doc.supplier_name || null, memberPos, amount });
 
         const stored = {
             ...extract,
@@ -618,78 +662,14 @@ async function runShipmentPaymentExtraction(pool, { documentId, userEmail = null
 
         await conn.beginTransaction();
         try {
-            let paymentId = doc.payment_id ?? null;
-
-            if (paymentId) {
-                // Refresh a record this reader wrote and nobody has touched.
-                const [existing] = await conn.query(`SELECT * FROM shipment_payments WHERE id = ? AND deleted_at IS NULL`, [paymentId]);
-                const rec = existing[0];
-                if (rec && rec.status === 'pending' && rec.source === 'extracted' && payable && amount != null) {
-                    await writeExtractedPayment(conn, paymentId, {
-                        amount, currency, extract, supplierName, allocations: matched.allocations,
-                    });
-                } else {
-                    stored.skippedUpdate = rec ? 'operator_owned' : 'record_missing';
-                }
-            } else if (payable && amount != null && amount > 0 && doc.shipment_id == null) {
-                // An invoice with no shipment to bill: the page says to upload
-                // it on the container.
-                stored.noPaymentCreated = 'no_shipment';
-            } else if (payable && amount != null && amount > 0 && fit.verdict === 'mismatch') {
-                // It names another box, another supplier or another currency:
-                // putting its figure on this balance would be wrong without a
-                // person saying so. The page offers "record it anyway".
-                stored.noPaymentCreated = 'mismatch';
-            } else if (payable && amount != null && amount > 0) {
-                // A document the supplier has issued before: do not create a
-                // second record for the same invoice number.
-                const [dupes] = await conn.query(
-                    `SELECT id FROM shipment_payments
-                      WHERE deleted_at IS NULL AND supplier_key = ? AND invoice_number = ? AND invoice_number IS NOT NULL
-                      LIMIT 1`,
-                    [supplierKey(supplierName), extract.invoiceNumber ? String(extract.invoiceNumber).trim().slice(0, 100) : null]
-                );
-                if (dupes.length) {
-                    stored.duplicateOfPaymentId = dupes[0].id;
-                    paymentId = dupes[0].id;
-                } else {
-                    const [ins] = await conn.query(
-                        `INSERT INTO shipment_payments
-                            (shipment_id, shipment_reference, supplier_name, supplier_key, kind, amount, currency,
-                             invoice_number, invoice_date, due_date, invoice_total, deposit_deducted,
-                             status, note, source, created_by_email)
-                         VALUES (?, ?, ?, ?, 'balance', ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 'extracted', ?)`,
-                        [
-                            doc.shipment_id, doc.shipment_reference,
-                            supplierName || doc.supplier_name || 'Unknown supplier', supplierKey(supplierName || doc.supplier_name || ''),
-                            amount, currency,
-                            extract.invoiceNumber ? String(extract.invoiceNumber).trim().slice(0, 100) : null,
-                            toDateOnlyOrNull(extract.invoiceDate), toDateOnlyOrNull(extract.dueDate),
-                            money(extract.totalAmount), money(extract.depositDeducted),
-                            extract.dueTerms ? String(extract.dueTerms).slice(0, 2000) : null,
-                            userEmail,
-                        ]
-                    );
-                    paymentId = ins.insertId;
-                    for (const a of matched.allocations) {
-                        await conn.query(
-                            `INSERT INTO shipment_payment_allocations (payment_id, purchase_order_id, po_ref, amount, source)
-                             VALUES (?, ?, ?, ?, 'extracted')`,
-                            [paymentId, a.purchaseOrderId, a.poRef || '', a.amount]
-                        );
-                    }
-                    await recordAudit(conn, {
-                        entityType: 'shipment_payment', entityId: paymentId, action: 'create',
-                        before: null,
-                        after: { source: 'extracted', amount, currency, documentId, status: 'pending' },
-                        userEmail,
-                    });
-                }
-            } else {
-                // A remittance advice is evidence of payment, not a new claim:
-                // its details are stored for the operator, nothing is created.
-                stored.noPaymentCreated = payable ? 'no_amount' : extract.documentKind;
-            }
+            // The reader makes no balance and never changes one (user rule,
+            // 2026-09-28): what is owed is the terms × the goods on board, and
+            // this document is only checked against it. A balance is recorded
+            // when it is paid (Record payment). A link an older read made stays.
+            const paymentId = doc.payment_id ?? null;
+            stored.noPaymentCreated = !payable ? extract.documentKind
+                : doc.shipment_id == null ? 'no_shipment'
+                : 'checked';
 
             await conn.query(
                 `UPDATE shipment_payment_documents
@@ -716,32 +696,6 @@ async function runShipmentPaymentExtraction(pool, { documentId, userEmail = null
         return { failed: 'WRITE_FAILED' };
     } finally {
         conn.release();
-    }
-}
-
-async function writeExtractedPayment(conn, paymentId, { amount, currency, extract, supplierName, allocations }) {
-    await conn.query(
-        `UPDATE shipment_payments
-            SET amount = ?, currency = ?, invoice_number = ?, invoice_date = ?, due_date = ?,
-                invoice_total = ?, deposit_deducted = ?, note = COALESCE(note, ?),
-                supplier_name = COALESCE(NULLIF(?, ''), supplier_name)
-          WHERE id = ?`,
-        [
-            amount, currency,
-            extract.invoiceNumber ? String(extract.invoiceNumber).trim().slice(0, 100) : null,
-            toDateOnlyOrNull(extract.invoiceDate), toDateOnlyOrNull(extract.dueDate),
-            money(extract.totalAmount), money(extract.depositDeducted),
-            extract.dueTerms ? String(extract.dueTerms).slice(0, 2000) : null,
-            supplierName || '', paymentId,
-        ]
-    );
-    await conn.query(`DELETE FROM shipment_payment_allocations WHERE payment_id = ?`, [paymentId]);
-    for (const a of allocations) {
-        await conn.query(
-            `INSERT INTO shipment_payment_allocations (payment_id, purchase_order_id, po_ref, amount, source)
-             VALUES (?, ?, ?, ?, 'extracted')`,
-            [paymentId, a.purchaseOrderId, a.poRef || '', a.amount]
-        );
     }
 }
 
@@ -778,6 +732,8 @@ module.exports = {
     sameSupplier,
     assessFit,
     compareInvoiceToContainer,
+    documentAmountOf,
+    money,
     promptFor,
     readDocument,
     runShipmentPaymentExtraction,
