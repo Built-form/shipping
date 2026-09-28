@@ -49,6 +49,7 @@ const shipmentSync = require('../services/shipment-sync');
 const { registerShipmentRoutes } = require('../services/shipment-routes');
 const { registerPackingListRoutes } = require('../services/packing-list-routes');
 const { registerContainerPhotoRoutes } = require('../services/container-photo-routes');
+const { registerPaymentReviewRoutes } = require('../services/payment-review-routes');
 const { makeSplitOrder } = require('../services/order-split');
 const shipmentsLib = require('../lib/shipments');
 const shipmentPaymentsService = require('../services/shipment-payments');
@@ -11384,6 +11385,16 @@ registerContainerPhotoRoutes(app, {
     withConnection,
     s3,
     poBucket: PO_BUCKET,
+    recordAudit,
+    auditLogSchemaReady,
+    log,
+});
+
+// ── Payment sign-offs (/api/v1/payment-reviews, /api/v1/payment-assignees) ─
+// Two people sign off each payment on ShipLine's Payments flow page; one
+// accountant is its assignee.
+registerPaymentReviewRoutes(app, {
+    withConnection,
     recordAudit,
     auditLogSchemaReady,
     log,
