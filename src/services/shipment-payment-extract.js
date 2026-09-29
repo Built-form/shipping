@@ -577,9 +577,40 @@ function compareInvoiceToContainer({ extract, context, supplierName }) {
 }
 
 // ── The model call ───────────────────────────────────────────────────────
+// The supplier's QC sample units — never on board, often billed on their own
+// invoice for several POs. Newest POs first, capped.
+function qcSectionOf(context) {
+    const qc = [...(context.qcLines || [])].sort((a, b) => b.poId - a.poId).slice(0, 80);
+    if (!qc.length) return [];
+    const lines = [
+        '## QC sample units on this supplier\'s purchase orders',
+        'They never travel in a container. If the document bills them, list each as a line with its _FQC code as jfCode and its PO as poRef.',
+    ];
+    const byPo = new Map();
+    for (const l of qc) {
+        if (!byPo.has(l.poNumber)) byPo.set(l.poNumber, []);
+        byPo.get(l.poNumber).push(l);
+    }
+    for (const [poNumber, list] of byPo) {
+        lines.push(`- ${poNumber}: ${list.map(l => `${l.jfCode} ${l.productName ?? ''} × ${l.quantity ?? '?'} @ ${l.unitPrice ?? '?'}`).join('; ')}`);
+    }
+    lines.push('');
+    return lines;
+}
+
 function promptFor(context) {
     const s = context.shipment;
     if (!s) {
+        // An invoice on the supplier alone bills QC units (they belong to no
+        // container, user 2026-09-29); anything else there is a proof of payment.
+        if ((context.qcLines || []).length) {
+            return [
+                '## Context',
+                'This document was uploaded against a supplier as an invoice for QC sample units — extra units bought for QC, our codes ending _FQC. Read it as it is.',
+                '',
+                ...qcSectionOf(context),
+            ].join('\n');
+        }
         return [
             '## Context',
             'This document was uploaded against a supplier, not a shipment — most likely a bank payment confirmation or remittance advice. Read it as it is.',
@@ -611,23 +642,24 @@ function promptFor(context) {
         }
         lines.push('');
     }
-    // The supplier's QC sample units — never on board, often billed on their
-    // own invoice for several POs. Newest POs first, capped.
-    const qc = [...(context.qcLines || [])].sort((a, b) => b.poId - a.poId).slice(0, 80);
-    if (qc.length) {
-        lines.push('## QC sample units on this supplier\'s purchase orders');
-        lines.push('They never travel in a container. If the document bills them, list each as a line with its _FQC code as jfCode and its PO as poRef.');
-        const byPo = new Map();
-        for (const l of qc) {
-            if (!byPo.has(l.poNumber)) byPo.set(l.poNumber, []);
-            byPo.get(l.poNumber).push(l);
-        }
-        for (const [poNumber, list] of byPo) {
-            lines.push(`- ${poNumber}: ${list.map(l => `${l.jfCode} ${l.productName ?? ''} × ${l.quantity ?? '?'} @ ${l.unitPrice ?? '?'}`).join('; ')}`);
-        }
-        lines.push('');
-    }
+    lines.push(...qcSectionOf(context));
     return lines.join('\n');
+}
+
+/** Whether a read is checked line by line: any invoice on a container; on
+ *  the supplier alone, a balance invoice when the supplier has QC units (a QC
+ *  invoice — they belong to no container). A proof of payment never is. */
+function shouldCheck({ documentKind, hasShipment, hasQcLines }) {
+    if (documentKind !== 'balance_invoice' && documentKind !== 'deposit_invoice') return false;
+    return hasShipment || (documentKind === 'balance_invoice' && hasQcLines);
+}
+
+/** What a read says it made (it never makes a balance): a balance invoice with
+ *  no container is "no_shipment" — unless it bills QC units, which need none. */
+function noPaymentReason({ documentKind, hasShipment, invoiceKind }) {
+    if (documentKind !== 'balance_invoice') return documentKind;
+    if (!hasShipment && invoiceKind !== 'qc') return 'no_shipment';
+    return 'checked';
 }
 
 /** Runs the model over one document. Returns { parsed, modelUsed, usage }. */
@@ -712,10 +744,16 @@ async function runShipmentPaymentExtraction(pool, { documentId, userEmail = null
             doc = rows[0];
             if (!doc || doc.deleted_at) return { skipped: 'not_found' };
             if (doc.shipment_id == null) {
-                // A proof of payment uploaded against the supplier alone: there
-                // is no box to map it to, only the transfer it will be applied with.
+                // Uploaded against the supplier alone: a proof of payment (no
+                // box to map it to, only the transfer it will be applied with) —
+                // or, uploaded as an invoice, one billing QC units, which belong
+                // to no container: read with the supplier's QC units.
                 context = { shipment: null, shipmentCurrency: null, purchaseOrders: [] };
                 memberPos = [];
+                if (doc.doc_kind === 'balance_invoice' && doc.supplier_name) {
+                    const key = supplierKey(doc.supplier_name);
+                    context.qcLines = (await loadQcLines(conn)).filter(l => l.supplierKey === key || sameSupplier(l.supplier, doc.supplier_name));
+                }
             } else {
                 context = await loadShipmentContext(conn, doc.shipment_id);
                 memberPos = await loadMemberPurchaseOrders(conn, doc.shipment_id);
@@ -752,16 +790,13 @@ async function runShipmentPaymentExtraction(pool, { documentId, userEmail = null
         // against — the name the page groups by — not the spelling printed on
         // the letterhead ("SUZHOU SUNMED CO.,LTD." would open a row of its own).
         const supplierName = (doc.supplier_name || extract.supplierName || '').trim().slice(0, 255);
-        // Only a balance invoice is checked against the box. A deposit invoice
-        // belongs on its purchase order; a remittance proves a payment and is
-        // applied by an operator (Record payment), never by the reader.
-        const payable = extract.documentKind === 'balance_invoice';
         // Line by line against what is in the box, for an invoice with a box —
         // a proforma (read as a deposit invoice: "PI & PL", "30 % deposit, 70 %
         // balance") uploaded on a container prices the same goods, so it is
-        // checked too.
-        const checkable = payable || extract.documentKind === 'deposit_invoice';
-        const check = checkable && doc.shipment_id != null
+        // checked too — and against the supplier's QC units for a QC invoice
+        // on the supplier alone. A remittance proves a payment and is applied
+        // by an operator (Record payment), never by the reader.
+        const check = shouldCheck({ documentKind: extract.documentKind, hasShipment: doc.shipment_id != null, hasQcLines: (context.qcLines || []).length > 0 })
             ? compareInvoiceToContainer({ extract, context, supplierName: supplierName || doc.supplier_name || '' })
             : null;
         // The figure it shows (what it states payable, else its total) — for the
@@ -793,9 +828,7 @@ async function runShipmentPaymentExtraction(pool, { documentId, userEmail = null
             // this document is only checked against it. A balance is recorded
             // when it is paid (Record payment). A link an older read made stays.
             const paymentId = doc.payment_id ?? null;
-            stored.noPaymentCreated = !payable ? extract.documentKind
-                : doc.shipment_id == null ? 'no_shipment'
-                : 'checked';
+            stored.noPaymentCreated = noPaymentReason({ documentKind: extract.documentKind, hasShipment: doc.shipment_id != null, invoiceKind: check?.invoiceKind ?? null });
 
             await conn.query(
                 `UPDATE shipment_payment_documents
@@ -862,6 +895,8 @@ module.exports = {
     chargesOf,
     money,
     promptFor,
+    shouldCheck,
+    noPaymentReason,
     readDocument,
     runShipmentPaymentExtraction,
 };

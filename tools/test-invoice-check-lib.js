@@ -8,7 +8,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { compareInvoiceToContainer, assessFit, documentAmountOf, money, RESPONSE_SCHEMA, promptFor } = require('../src/services/shipment-payment-extract');
+const { compareInvoiceToContainer, assessFit, documentAmountOf, money, RESPONSE_SCHEMA, promptFor, shouldCheck, noPaymentReason } = require('../src/services/shipment-payment-extract');
 const piCheck = require('../src/services/po-invoice-check');
 const { EXTRA_KINDS } = require('../src/lib/payment-extras');
 
@@ -319,4 +319,33 @@ test('the reader is told the supplier\'s QC units, newest PO first; no section w
     assert.ok(p.includes('- PO_00306J: JF1001_FQC JF1001 × 10 @ 2.5; JF1002_FQC JF1002 × 20 @ 1.2'));
     assert.ok(p.indexOf('- PO_00311J') < p.indexOf('- PO_00306J'));
     assert.doesNotMatch(promptFor(CONTEXT), /QC sample units/);
+});
+
+// ── A QC invoice uploaded against the supplier, no container ─────────────
+// QC units belong to no container (user, 2026-09-29): their invoice is
+// uploaded on the supplier (the Payments page's QC tab) and read and checked
+// all the same. A proof of payment on the supplier stays as it was.
+test('which reads are checked line by line: any invoice on a container; on the supplier alone, one when the supplier has QC units', () => {
+    assert.equal(shouldCheck({ documentKind: 'balance_invoice', hasShipment: true, hasQcLines: false }), true);
+    assert.equal(shouldCheck({ documentKind: 'deposit_invoice', hasShipment: true, hasQcLines: false }), true);
+    assert.equal(shouldCheck({ documentKind: 'balance_invoice', hasShipment: false, hasQcLines: true }), true);
+    assert.equal(shouldCheck({ documentKind: 'balance_invoice', hasShipment: false, hasQcLines: false }), false);
+    assert.equal(shouldCheck({ documentKind: 'remittance', hasShipment: false, hasQcLines: true }), false);
+    assert.equal(shouldCheck({ documentKind: 'other', hasShipment: true, hasQcLines: true }), false);
+});
+
+test('what a read says it made: a QC invoice on the supplier is checked, never "needs its container"', () => {
+    assert.equal(noPaymentReason({ documentKind: 'remittance', hasShipment: false, invoiceKind: null }), 'remittance');
+    assert.equal(noPaymentReason({ documentKind: 'balance_invoice', hasShipment: false, invoiceKind: 'qc' }), 'checked');
+    assert.equal(noPaymentReason({ documentKind: 'balance_invoice', hasShipment: false, invoiceKind: 'goods' }), 'no_shipment');
+    assert.equal(noPaymentReason({ documentKind: 'balance_invoice', hasShipment: false, invoiceKind: null }), 'no_shipment');
+    assert.equal(noPaymentReason({ documentKind: 'balance_invoice', hasShipment: true, invoiceKind: 'goods' }), 'checked');
+});
+
+test('the reader is told a supplier upload is a QC invoice, with the supplier\'s QC units — not "most likely a remittance"', () => {
+    const p = promptFor({ shipment: null, shipmentCurrency: null, purchaseOrders: [], qcLines: QC_LINES.slice(0, 2) });
+    assert.match(p, /uploaded against a supplier as an invoice for QC sample units/);
+    assert.match(p, /- PO_00306J: JF1001_FQC/);
+    assert.doesNotMatch(p, /remittance advice/);
+    assert.match(promptFor({ shipment: null, shipmentCurrency: null, purchaseOrders: [] }), /remittance advice/);
 });

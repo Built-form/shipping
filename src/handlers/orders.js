@@ -10462,7 +10462,12 @@ function startShipmentPaymentExtraction(req, documentId) {
 const { groupDeliveredAir, attachBalances, findPaidClash } = require('../lib/delivered-air');
 // 'extra' = a charge or credit added on the Payments page (payment_extras,
 // src/lib/payment-extras.js). A credit is applied as a NEGATIVE line.
-const SUPPLIER_PAYMENT_LINE_KINDS = ['balance', 'pi', 'po_deposit', 'extra'];
+// 'qc' = one QC unit — an _FQC order line (orders.id). QC units belong to no
+// container (user, 2026-09-29): the page lists them and the user ticks the
+// ones a transfer pays. What is owed on one is the page's (it knows the
+// terms); the server only caps the money at the line's value. Nothing is
+// flipped: paid is what the lines add up to.
+const SUPPLIER_PAYMENT_LINE_KINDS = ['balance', 'pi', 'po_deposit', 'extra', 'qc'];
 // A fourth kind exists on the way in only: 'container_balance' names a
 // shipment whose balance nobody has recorded yet (the page projects it from
 // the goods on board). Saving records that balance — split across the
@@ -10595,6 +10600,27 @@ async function loadSupplierPaymentTargets(conn, lines) {
                 label: extrasLib.lineLabel(r), purchaseOrderId: r.purchase_order_id ?? null, poNumber: r.po_number || null,
                 paymentType: null, shipmentId: r.shipment_id ?? null, shipmentReference: r.shipment_reference || null, invoiceNumber: null,
                 extraKind: r.kind, ridesWith: r.rides_with,
+            });
+        }
+    }
+    const qcIds = idsOf('qc');
+    if (qcIds.length) {
+        const [rows] = await conn.query(
+            `SELECT o.id, o.jf_code, o.asin, o.quantity, o.unit_price, o.purchase_order_id, po.po_number, po.supplier, po.currency
+               FROM orders o JOIN purchase_orders po ON po.id = o.purchase_order_id AND po.deleted_at IS NULL
+              WHERE o.id IN (${qcIds.map(() => '?').join(',')}) AND o.deleted_at IS NULL`, qcIds
+        );
+        for (const r of rows) {
+            const code = [r.jf_code, r.asin].find(v => /_FQC$/i.test(String(v || '').trim())) || null;
+            const value = r.quantity != null && r.unit_price != null ? Math.round(Number(r.quantity) * Number(r.unit_price) * 100) / 100 : null;
+            out.set(`qc:${r.id}`, {
+                // amount: the line's value — the most any transfers can put on it.
+                kind: 'qc', id: r.id, amount: code ? value : null, currency: (r.currency || '').toUpperCase() || null, status: null,
+                supplier: r.supplier, supplierKey: shipmentPaymentsService.supplierKey(r.supplier), settledBy: null,
+                label: `${r.po_number} QC units ${String(code || r.jf_code || r.asin || '').trim().replace(/_FQC$/i, '')}`,
+                purchaseOrderId: r.purchase_order_id, poNumber: r.po_number, paymentType: null,
+                shipmentId: null, shipmentReference: null, invoiceNumber: null,
+                isQcUnit: !!code,
             });
         }
     }
@@ -10805,6 +10831,9 @@ async function checkSupplierPaymentLines(conn, { lines, currency, amount, suppli
         linesTotal += l.amount;
         const t = targets.get(`${l.kind}:${l.id}`);
         if (!t) return { fail: { status: 404, error: `${l.kind} ${l.id} does not exist.`, code: 'TARGET_NOT_FOUND', payload: { kind: l.kind, id: l.id } } };
+        if (t.kind === 'qc' && !t.isQcUnit) {
+            return { fail: { status: 422, error: `Order line ${l.id} on ${t.poNumber} is goods, not a QC unit — pay it with its container or PI.`, code: 'NOT_QC_UNIT', payload: { kind: 'qc', id: l.id } } };
+        }
         if (t.currency && currency && t.currency !== currency) {
             return { fail: { status: 422, error: `${t.label} is in ${t.currency}; this transfer is in ${currency}.`, code: 'CURRENCY_MISMATCH', payload: { kind: l.kind, id: l.id, targetCurrency: t.currency } } };
         }
@@ -10974,7 +11003,10 @@ app.get('/api/v1/supplier-payments', async (req, res) => {
             const data = await hydrateSupplierPayments(conn, rows);
             const docWhere = [
                 'd.deleted_at IS NULL', 'd.supplier_payment_id IS NULL', 'd.payment_id IS NULL',
-                `(d.doc_kind = 'remittance' OR d.shipment_id IS NULL OR JSON_UNQUOTE(JSON_EXTRACT(d.extract_json, '$.documentKind')) = 'remittance')`,
+                // A proof: a remittance, or anything on the supplier alone — except
+                // an invoice uploaded there, which bills QC units (they belong to no
+                // container), unless the reader found it is a remittance after all.
+                `(d.doc_kind = 'remittance' OR (d.shipment_id IS NULL AND COALESCE(d.doc_kind, '') <> 'balance_invoice') OR JSON_UNQUOTE(JSON_EXTRACT(d.extract_json, '$.documentKind')) = 'remittance')`,
             ];
             const docParams = [];
             if (supplierKeyValue) { docWhere.push('d.supplier_key = ?'); docParams.push(supplierKeyValue); }

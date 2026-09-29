@@ -392,6 +392,25 @@ as the extra, and never more than is left on it (`422 SIGN_MISMATCH`,
 is used against something being paid. The line carries `extraKind` and
 `ridesWith` (`deposit` | `balance`) besides the usual fields.
 
+**`qc` lines.** A `qc` line points at `orders.id` of one `_FQC` line: one QC
+unit. QC units never travel, so they belong to no container (user,
+2026-09-29). The page lists them (`CurrencyFlow.qcItems`), and the user ticks
+the ones each transfer pays.
+- **What is owed is the page's.** It knows the terms: balance % × value, less
+  what the `qc` lines already apply.
+- **The server does no more than this:**
+  - the line must be an `_FQC` code (jf_code or asin), else `422 NOT_QC_UNIT`;
+  - its PO must be in the transfer's currency, else `422 CURRENCY_MISMATCH`;
+  - the amount must be above 0;
+  - `qc` lines across live transfers never add up to more than the line's
+    value (qty × unit price), else `422 OVER_APPLIED`. There is no cap when the
+    line has no price.
+- **Nothing is flipped.** Paid is what the lines add up to, so deleting or
+  editing a transfer frees its amounts.
+- **The line's fields:** `label` is "PO_X QC units JF0208" (no `_FQC`),
+  `poNumber`, `purchaseOrderId`, and `targetAmount` (the value).
+- **open-items does not list QC units.** The page passes its own.
+
 A fourth kind exists **on the way in only**: `container_balance` → a shipment
 id, for a box nobody has recorded a balance for yet. Saving records that
 balance (`balanceAmount`, default the amount paid; split by `allocations`
