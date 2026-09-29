@@ -196,6 +196,32 @@ async function loadShipmentContext(conn, shipmentId) {
     };
 }
 
+// The QC sample units still unshipped on any purchase order: lines whose code
+// ends _FQC and that are in no shipment (they never travel). A supplier bills
+// them on their own invoice or beside the goods, often for several POs at
+// once, so the reader matches them across the supplier's POs. Every live one
+// comes back; the caller keeps the supplier's (spellings vary).
+async function loadQcLines(conn) {
+    const [rows] = await conn.query(
+        `SELECT o.purchase_order_id, po.po_number, po.supplier, o.jf_code, o.asin, o.product_name, o.quantity, o.unit_price
+           FROM orders o
+           JOIN purchase_orders po ON po.id = o.purchase_order_id AND po.deleted_at IS NULL
+          WHERE o.deleted_at IS NULL AND o.shipment_id IS NULL
+            AND (UPPER(o.jf_code) LIKE '%\\_FQC' OR UPPER(o.asin) LIKE '%\\_FQC')
+          ORDER BY o.purchase_order_id, o.id`
+    );
+    return rows.map(r => ({
+        poId: r.purchase_order_id,
+        poNumber: r.po_number,
+        supplier: r.supplier || null,
+        supplierKey: supplierKey(r.supplier),
+        jfCode: /_FQC$/i.test(String(r.jf_code || '')) ? r.jf_code : r.asin,
+        productName: r.product_name || null,
+        quantity: r.quantity != null ? Number(r.quantity) : null,
+        unitPrice: r.unit_price != null ? Number(r.unit_price) : null,
+    }));
+}
+
 // What the record form needs: the shipment, its member POs with the share
 // basis, and the deposit already on file for each.
 async function loadRecordContext(conn, shipmentRow) {
@@ -319,6 +345,7 @@ module.exports = {
     loadMemberPurchaseOrders,
     loadDepositsFor,
     loadShipmentContext,
+    loadQcLines,
     loadRecordContext,
     shareAllocations,
     relinkShipmentPayments,

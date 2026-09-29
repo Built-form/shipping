@@ -274,6 +274,35 @@ the read carries `recordAmount` and `balanceFrom` (`stated` |
 compared as before (`invoiceBasis: "balance"`), so a supplier asking for the
 full value with a deposit on file is still flagged.
 
+**QC units** (our `_FQC` lines, which never travel). A supplier bills them on
+their own invoice, or beside the goods, often for several of its POs at once:
+some with goods in this box, some elsewhere or not shipped. The user's rule
+(2026-09-29) is that they are paid with the box the invoice is uploaded on.
+The reader is given the supplier's QC lines on all its POs (`loadQcLines`,
+newest 80 in the prompt) and gives each billed one its `_FQC` code. Then:
+
+- `invoiceKind` is `goods` | `qc` | `goods_and_qc`; it is absent on older
+  reads, meaning goods.
+- `qcLines[]` holds `{ poId, poNumber, jfCode, ourQty, invoiceQty,
+  ourUnitPrice, invoiceUnitPrice, ourTotal, invoiceTotal, issues }`, checked
+  against the PO, never the box.
+  - A line matches on the PO it names. With no PO named, the one with goods in
+    this box wins, else the newest.
+  - Another supplier's POs never match.
+  - An `_FQC` line that is in the box is goods.
+- `qcOurTotal`, `qcInvoiceTotal`, `qcBilled` give the invoice's QC lines as
+  it prices them.
+- A QC-only invoice lists no box goods as missing. `invoiceGoods` and
+  `goodsDelta` leave out `qcBilled`.
+- `fit` counts one of the supplier's other POs as "Names PO_X (QC units)".
+- The page moves those QC units into this box's payment.
+  - Units already paid with their own box stay where they are.
+  - Nothing moves onto a box whose balance for the supplier is already paid.
+  - The newest upload wins a unit billed twice.
+
+Re-read an older QC invoice to get these fields; a re-read never changes a
+balance.
+
 **Does it belong here? — `fit`.** Every read is compared with the shipment and
 the supplier it was uploaded against:
 
@@ -354,7 +383,14 @@ Line kinds: `balance` → `shipment_payments.id` · `pi` →
 `purchase_order_invoice_payments.id` (a deposit, balance or full PI) ·
 `po_deposit` → `purchase_orders.id`, a deposit paid before any PI was filed;
 the line itself is the record of it (the page treats it as a stated paid
-deposit and shrinks the projected one).
+deposit and shrinks the projected one) · `extra` → `payment_extras.id`, a
+charge or credit added on the Payments page (mould, handling, a discount…;
+see `docs/payment-extras-frontend.md`). An `extra` line is the only line that
+may be **negative**: a credit is used as a negative amount, with the same sign
+as the extra, and never more than is left on it (`422 SIGN_MISMATCH`,
+`422 OVER_APPLIED`). A credit on its own is refused (`422 CREDIT_ALONE`) — it
+is used against something being paid. The line carries `extraKind` and
+`ridesWith` (`deposit` | `balance`) besides the usual fields.
 
 A fourth kind exists **on the way in only**: `container_balance` → a shipment
 id, for a box nobody has recorded a balance for yet. Saving records that
@@ -397,7 +433,8 @@ settlement: `{ paymentId, paidOn, amount (applied here), paymentAmount,
 currency, bankRef, note, documents: [{ id, filename, url }], also: [the
 transfer's other lines] }`.
 
-**Settling.** An obligation (`balance`, `pi`) is marked paid once the live
+**Settling.** An obligation (`balance`, `pi`, `extra` — on absolute amounts,
+so a credit settles when it is used up) is marked paid once the live
 lines applied to it cover its amount within a bank charge — max(1, 1 %) — with
 `paidOn` = the transfer's date and (for a balance) `bankRef` kept if already
 set; `settled_by_payment_id` remembers which transfer completed it. Less than
@@ -425,7 +462,9 @@ ticking. A balance carries `allocations[]`: each PO's part, `linesOnBoard` /
 `linesTotal` and `unitsOnBoard` / `unitsTotal` (destroyed samples excluded),
 and that PO's `deposit` (`{ source: "pi" | "payment", status, amount, paidOn }`,
 null when nothing is on file). A balance-type PI carries the same for its PO;
-a deposit or 100 % PI is the deposit and carries none.
+a deposit or 100 % PI is the deposit and carries none. Extra charges and
+credits for the supplier are listed too (`kind: "extra"`, a credit's
+`remaining` negative, with `extraKind`, `ridesWith`, `description`).
 
 ```json
 { "supplier": "SUNMED", "currency": "USD", "items": [

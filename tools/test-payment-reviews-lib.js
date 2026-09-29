@@ -141,6 +141,21 @@ test('review decision: the assignee is never one of the reviewers', () => {
     assert.equal(d.refuse.code, 'ASSIGNEE_CANNOT_REVIEW');
 });
 
+test('refusals are plain text: no mangled characters reach the page', () => {
+    assert.equal(
+        L.decideReview({ active: [], userEmail: 'acc@x.com', assigneeEmail: 'acc@x.com', amount: 100, currency: 'USD' }).refuse.error,
+        'You are this payment’s assignee — two other people sign it off.',
+    );
+    assert.equal(
+        L.decideAssignment({ email: 'nobody@x.com', candidate: null, activeReviews: [] }).refuse.error,
+        'nobody@x.com is not an accountant on ShipLine — only accountants can be assigned a payment.',
+    );
+    assert.equal(L.parseReviewBody({ paymentKey: 'deposit:1', currency: 'USD', amount: 0 }).error, 'amount must be more than 0 — the figure being signed off.');
+    // UTF-8 read back as Latin-1 — how the damage looked (Ã¢â‚¬â€ for —).
+    const source = require('node:fs').readFileSync(require.resolve('../src/lib/payment-reviews'), 'utf8');
+    assert.doesNotMatch(source, /Ã|â€/);
+});
+
 test('withdrawing: your own review, or anyone\'s as an admin', () => {
     const row = { reviewed_by_email: 'ann@x.com' };
     assert.equal(L.canWithdraw({ row, userEmail: 'ANN@x.com', userType: 'standard' }), true);

@@ -26,8 +26,9 @@ const { fetchInvoicePdf, toDateOnlyOrNull } = require('./po-invoice-check');
 const { withGeminiRetry } = require('./supplier-email-check');
 const { recordAudit } = require('../lib/audit');
 const {
-    supplierKey, loadShipmentContext, loadMemberPurchaseOrders, shareAllocations,
+    supplierKey, loadShipmentContext, loadMemberPurchaseOrders, loadQcLines, shareAllocations,
 } = require('./shipment-payments');
+const { EXTRA_KINDS, OTHER_CHARGES_SCHEMA } = require('../lib/payment-extras');
 
 // Flash reads the figures; the judging (lines vs the box, invoice vs what is
 // owed) is ours, not the model's. gemini-3.8-flash (not a preview) read the
@@ -44,7 +45,7 @@ const SYSTEM_INSTRUCTION = `You read supplier payment documents for a UK medical
 You are given ONE document (a PDF or image) and the shipment it was filed against, including every purchase order travelling in that shipment with its PO number, the supplier's own spelling of its name, its line items and the value it has on board.
 
 Decide first what the document IS:
-- "balance_invoice" — the supplier billing for goods being shipped (often "balance", "final payment", "70% against B/L"). This is the common case.
+- "balance_invoice" — the supplier billing for goods being shipped (often "balance", "final payment", "70% against B/L"). This is the common case. A supplier's invoice for QC sample units (our codes ending "_FQC"; often "FQC" or "QC samples"), alone or beside the goods, is one too.
 - "deposit_invoice" — an upfront/proforma asking for a deposit before production.
 - "remittance" — evidence that a payment was MADE (a bank transfer advice, SWIFT copy, payment receipt).
 - "other" — anything else.
@@ -60,7 +61,8 @@ Then extract:
 - dueTerms — the payment-timing wording, verbatim and short.
 - containerRefs, blRefs — container numbers and bill-of-lading numbers printed on the document.
 - poRefs — every purchase order reference printed anywhere on it.
-- lines — one entry per billed line: poRef (mapped to one of OUR PO numbers when you can), jfCode (OUR product code for that line, chosen from the purchase orders you were given, when the product clearly matches; else null), piRef (the supplier's own invoice/PI number if the line cites one), sku (the supplier's own code as printed), description, qty, unitPrice, amount.
+- lines — the GOODS only, one entry per product billed: poRef (mapped to one of OUR PO numbers when you can), jfCode (OUR product code for that line, chosen from the purchase orders you were given, when the product clearly matches; else null), piRef (the supplier's own invoice/PI number if the line cites one), sku (the supplier's own code as printed), description, qty, unitPrice, amount. QC sample units are lines too, with their _FQC code as jfCode. Never put a charge in lines.
+- otherCharges — every amount billed that is NOT goods: mould or tooling, handling, freight, samples, testing, packaging, bank charges, surcharges — and any discount or credit, as a NEGATIVE amount. One entry each: description (as printed), amount, kind (one of: ${EXTRA_KINDS.join(', ')}). A deposit the document nets off is depositDeducted, not a charge. Empty when there are none.
 - bank — the beneficiary and remittance details exactly as printed. Never reformat or invent account numbers.
 - rawText — the payment-terms and bank-details section copied verbatim, so a human can check the parsed figures.
 - confidence — "high" when the figures and the purchase orders are unambiguous, "low" when you are guessing.
@@ -68,7 +70,7 @@ Then extract:
 Rules:
 - Map references to the PO numbers you were given whenever the digits match, even if the document writes them differently (PO00299, PO_00299J, 299). If you cannot map a reference, return it verbatim in poRef and leave the mapping to a human.
 - NEVER invent an amount. If a figure is not on the document, return null.
-- The sum of the line amounts should reconcile to totalAmount; if it does not, still report both faithfully.
+- The line amounts plus otherCharges should reconcile to totalAmount; if they do not, still report them faithfully.
 - Amounts are numbers, not strings, with no currency symbols or thousands separators.`;
 
 const RESPONSE_SCHEMA = {
@@ -107,6 +109,7 @@ const RESPONSE_SCHEMA = {
                 required: ['poRef', 'jfCode', 'piRef', 'sku', 'description', 'qty', 'unitPrice', 'amount'],
             },
         },
+        otherCharges: OTHER_CHARGES_SCHEMA,
         bank: {
             type: 'object',
             additionalProperties: false,
@@ -127,9 +130,22 @@ const RESPONSE_SCHEMA = {
     required: [
         'documentKind', 'supplierName', 'invoiceNumber', 'invoiceDate', 'dueDate', 'paymentDate', 'currency',
         'totalAmount', 'amountDueNow', 'depositDeducted', 'dueTerms', 'containerRefs', 'blRefs',
-        'poRefs', 'lines', 'bank', 'rawText', 'confidence',
+        'poRefs', 'lines', 'otherCharges', 'bank', 'rawText', 'confidence',
     ],
 };
+
+// Charges read off a document, cleaned: numbers only, known kinds. Reads made
+// before the field existed have none.
+function chargesOf(extract) {
+    return (Array.isArray(extract && extract.otherCharges) ? extract.otherCharges : [])
+        .filter(c => c && typeof c === 'object' && Number.isFinite(Number(c.amount)) && c.amount !== null && Number(c.amount) !== 0)
+        .map(c => ({
+            description: typeof c.description === 'string' && c.description.trim() ? c.description.trim() : null,
+            amount: Math.round(Number(c.amount) * 100) / 100,
+            kind: EXTRA_KINDS.includes(c.kind) ? c.kind : 'other',
+        }));
+}
+const chargesTotalOf = charges => Math.round(charges.reduce((a, c) => a + c.amount, 0) * 100) / 100;
 
 // ── Reference matching ───────────────────────────────────────────────────
 // Suppliers write our PO numbers every way imaginable: "PO_00299J", "PO 299",
@@ -277,13 +293,14 @@ const fmtAmount = (n, currency) =>
     `${currency ? `${currency} ` : ''}${Number(n).toLocaleString('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 
 /** { verdict: 'match' | 'unconfirmed' | 'mismatch', checks: [{ key, ok, text }], onBoard, currency } */
-function assessFit({ extract, shipment, supplierName, memberPos, amount }) {
+function assessFit({ extract, shipment, supplierName, memberPos, qcPos = [], amount }) {
     const checks = [];
     const add = (key, ok, text) => checks.push({ key, ok, text });
     const pos = memberPos || [];
-    const mine = supplierName
-        ? pos.filter(p => p.supplierKey === supplierKey(supplierName) || sameSupplier(p.supplier, supplierName))
-        : pos;
+    const isMine = p => p.supplierKey === supplierKey(supplierName) || sameSupplier(p.supplier, supplierName);
+    const mine = supplierName ? pos.filter(isMine) : pos;
+    // This supplier's other POs whose QC units a document here may bill.
+    const qcOnly = supplierName ? (qcPos || []).filter(p => isMine(p) && !pos.some(m => m.id === p.id)) : [];
 
     // Who issued it (for a remittance, who was paid).
     const printed = String(extract.supplierName || extract.bank?.beneficiaryName || '').trim().replace(/[.,\s]+$/, '');
@@ -310,24 +327,31 @@ function assessFit({ extract, shipment, supplierName, memberPos, amount }) {
         else add('container', null, `Names ${docRefs.slice(0, 3).join(', ')}; ${s.reference} has no container number on file to compare.`);
     }
 
-    // Which purchase orders.
+    // Which purchase orders. One of this supplier's other POs counts too when
+    // the document bills its QC units (they are paid with this box).
     const index = buildRefIndex(pos);
+    const qcIndex = buildRefIndex(qcOnly);
     const refs = [...new Set([...(extract.poRefs || []), ...(extract.lines || []).map(l => l && l.poRef)]
         .map(r => String(r ?? '').trim()).filter(Boolean))];
     if (!refs.length) {
         add('pos', null, 'Names none of our purchase orders.');
     } else {
         const hits = new Map();
+        const qcHits = new Map();
         const misses = [];
         for (const r of refs) {
             const po = matchPoRef(r, index);
+            const qc = po ? null : matchPoRef(r, qcIndex);
             if (po) hits.set(po.id, po);
+            else if (qc) qcHits.set(qc.id, qc);
             else misses.push(r);
         }
         const found = [...hits.values()];
         const ownFound = found.filter(p => mine.includes(p));
+        const qcFound = [...qcHits.values()];
+        const named = [...ownFound.map(p => p.poNumber), ...qcFound.map(p => `${p.poNumber} (QC units)`)];
         const missNote = misses.length ? `; ${misses.slice(0, 3).join(', ')}${misses.length > 3 ? '…' : ''} ${misses.length === 1 ? 'is' : 'are'} not on this shipment` : '';
-        if (ownFound.length) add('pos', true, `Names ${ownFound.map(p => p.poNumber).join(', ')}${missNote}.`);
+        if (named.length) add('pos', true, `Names ${named.join(', ')}${missNote}.`);
         else if (found.length) add('pos', false, `Names ${found.map(p => p.poNumber).join(', ')}, filed under ${found[0].supplier || 'another supplier'}.`);
         else add('pos', false, `Names ${misses.slice(0, 3).join(', ')}${misses.length > 3 ? '…' : ''} — not on this shipment.`);
 
@@ -337,24 +361,28 @@ function assessFit({ extract, shipment, supplierName, memberPos, amount }) {
         // warning, not a mismatch. Never for a remittance: money paid to
         // another beneficiary is exactly what must stop someone.
         const supplierCheck = checks.find(c => c.key === 'supplier' && c.ok === false);
-        if (supplierCheck && ownFound.length && extract.documentKind !== 'remittance') {
+        if (supplierCheck && named.length && extract.documentKind !== 'remittance') {
             supplierCheck.ok = null;
-            supplierCheck.text = `${by} ${printed} — not the name on file (${supplierName || names[0]}), but it names ${ownFound.map(p => p.poNumber).join(', ')}.`;
+            supplierCheck.text = `${by} ${printed} — not the name on file (${supplierName || names[0]}), but it names ${[...ownFound, ...qcFound].map(p => p.poNumber).join(', ')}.`;
         }
     }
 
-    // Money: the currency, then the amount against what is on board.
+    // Money: the currency, then the amount against what is on board — the
+    // goods part of it: a mould fee or a handling charge is not goods.
     const currencies = [...new Set(mine.map(p => p.currency).filter(Boolean))];
     const currency = extract.currency ? String(extract.currency).toUpperCase().slice(0, 3) : null;
     const onBoard = Math.round(mine.reduce((a, p) => a + (Number(p.valueInShipment) || 0), 0) * 100) / 100;
+    const charges = chargesTotalOf(chargesOf(extract));
+    const goods = amount == null ? null : Math.round((amount - charges) * 100) / 100;
     if (currency && currencies.length && !currencies.includes(currency)) {
         add('currency', false, `In ${currency}; the purchase orders are in ${currencies.join('/')}.`);
-    } else if (amount != null && amount > 0 && onBoard > 0) {
+    } else if (goods != null && goods > 0 && onBoard > 0) {
         const cur = currency || currencies[0] || null;
-        if (amount > onBoard * 1.05 + 1) {
-            add('amount', false, `${fmtAmount(amount, cur)} is more than the ${fmtAmount(onBoard, cur)} of goods this supplier has on board.`);
+        const less = charges ? ` (after ${fmtAmount(charges, cur)} of other charges)` : '';
+        if (goods > onBoard * 1.05 + 1) {
+            add('amount', false, `${fmtAmount(goods, cur)}${less} is more than the ${fmtAmount(onBoard, cur)} of goods this supplier has on board.`);
         } else {
-            add('amount', null, `${Math.round((amount / onBoard) * 100)}% of the ${fmtAmount(onBoard, cur)} this supplier has on board.`);
+            add('amount', null, `${Math.round((goods / onBoard) * 100)}% of the ${fmtAmount(onBoard, cur)} this supplier has on board${less}.`);
         }
     }
 
@@ -374,10 +402,35 @@ const LINE_PRICE_EPS = 0.005;
 const LINE_TOTAL_EPS = 0.5;
 const descKey = v => String(v ?? '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
 
+// QC sample units — our codes ending _FQC — never travel. The supplier bills
+// them on their own invoice or beside the goods, often for several POs at once
+// (user, 2026-09-29: they are paid with the box the invoice is uploaded on).
+const isQcCode = v => /FQC$/.test(norm(v));
+const lineAmountOf = raw => {
+    const amount = Number(raw.amount);
+    if (raw.amount != null && Number.isFinite(amount)) return amount;
+    const q = Number(raw.qty);
+    const p = Number(raw.unitPrice);
+    return raw.qty != null && raw.unitPrice != null && Number.isFinite(q) && Number.isFinite(p) ? Math.round(q * p * 100) / 100 : 0;
+};
+const poOfLine = l => ({ id: l.poId, poNumber: l.poNumber, supplier: l.supplier || null, supplierKey: l.supplierKey || supplierKey(l.supplier) });
+const uniquePos = pos => [...new Map(pos.map(p => [p.id, p])).values()];
+
 function compareInvoiceToContainer({ extract, context, supplierName }) {
     const key = supplierKey(supplierName);
     const mine = (context.purchaseOrders || []).filter(p => p.supplierKey === key || sameSupplier(p.supplier, supplierName));
     const index = buildRefIndex(mine);
+    const onBoardPoIds = new Set(mine.map(p => p.id));
+    // The supplier's QC units on any of its POs, never another supplier's.
+    const qcOurs = (context.qcLines || [])
+        .filter(l => (l.supplierKey || supplierKey(l.supplier)) === key || sameSupplier(l.supplier, supplierName))
+        .map(l => ({
+            poId: l.poId, poNumber: l.poNumber, jfCode: l.jfCode || null, productName: l.productName || null,
+            qty: l.quantity != null ? Number(l.quantity) : null, unitPrice: l.unitPrice != null ? Number(l.unitPrice) : null,
+            total: l.quantity != null && l.unitPrice != null ? Math.round(Number(l.quantity) * Number(l.unitPrice) * 100) / 100 : null,
+            matched: false,
+        }));
+    const qcIndex = buildRefIndex(uniquePos(qcOurs.map(poOfLine)));
     const ours = [];
     for (const po of mine) {
         for (const l of po.lines || []) {
@@ -394,34 +447,71 @@ function compareInvoiceToContainer({ extract, context, supplierName }) {
     // Match each invoice line: our code first, then the PO plus the product
     // name, then a PO that has only one line left.
     const lines = [];
+    const qcLines = [];
     const extra = [];
+    // Quantity, unit price and line total against ours, in the words the page shows.
+    const issuesOf = (raw, hit, where) => {
+        const issues = [];
+        const invQty = raw.qty != null ? Number(raw.qty) : null;
+        const invPrice = raw.unitPrice != null ? Number(raw.unitPrice) : null;
+        const invTotal = raw.amount != null ? Number(raw.amount) : null;
+        if (invQty != null && hit.qty != null && invQty !== hit.qty) issues.push(`quantity ${invQty.toLocaleString('en-GB')} on the invoice, ${hit.qty.toLocaleString('en-GB')} ${where}`);
+        if (invPrice != null && hit.unitPrice != null && Math.abs(invPrice - hit.unitPrice) > LINE_PRICE_EPS) issues.push(`unit price ${invPrice} on the invoice, ${hit.unitPrice} on the PO`);
+        if (invTotal != null && hit.total != null && Math.abs(invTotal - hit.total) > LINE_TOTAL_EPS) issues.push(`line total ${invTotal.toFixed(2)} on the invoice, ${hit.total.toFixed(2)} ${where}`);
+        return { issues, invQty, invPrice, invTotal };
+    };
     for (const raw of extract.lines || []) {
         const po = raw.poRef ? matchPoRef(raw.poRef, index) : null;
         const code = norm(raw.jfCode || raw.sku);
+        const qcCode = isQcCode(code);
         const desc = descKey(raw.description);
         const candidates = ours.filter(l => !l.matched && (!po || l.poId === po.id));
+        // An _FQC line on board is goods, found by its code only: a QC unit
+        // is never taken for the goods it samples by name.
         let hit = code ? candidates.find(l => norm(l.jfCode) === code) : null;
-        if (!hit && desc) hit = candidates.find(l => descKey(l.productName) === desc);
-        if (!hit && po && candidates.length === 1) hit = candidates[0];
+        if (!hit && desc && !qcCode) hit = candidates.find(l => descKey(l.productName) === desc);
+        if (!hit && po && candidates.length === 1 && !qcCode) hit = candidates[0];
+        if (!hit && qcCode) {
+            // A QC unit: on the PO it names (any of this supplier's), else the
+            // one with goods in this box, else the newest.
+            const named = raw.poRef ? matchPoRef(raw.poRef, qcIndex) : null;
+            const found = qcOurs.filter(l => !l.matched && norm(l.jfCode) === code && (!raw.poRef || (named && l.poId === named.id)));
+            const qhit = found.find(l => onBoardPoIds.has(l.poId)) ?? found.sort((a, b) => b.poId - a.poId)[0];
+            if (qhit) {
+                qhit.matched = true;
+                const { issues, invQty, invPrice, invTotal } = issuesOf(raw, qhit, 'on the PO');
+                qcLines.push({
+                    poId: qhit.poId, poNumber: qhit.poNumber, jfCode: qhit.jfCode, productName: qhit.productName,
+                    ourQty: qhit.qty, invoiceQty: invQty, ourUnitPrice: qhit.unitPrice, invoiceUnitPrice: invPrice, ourTotal: qhit.total, invoiceTotal: invTotal,
+                    issues,
+                });
+                continue;
+            }
+        }
         if (!hit) {
             extra.push({ poRef: raw.poRef ?? null, jfCode: raw.jfCode ?? null, sku: raw.sku ?? null, description: raw.description ?? null, qty: raw.qty ?? null, unitPrice: raw.unitPrice ?? null, amount: raw.amount ?? null });
             continue;
         }
         hit.matched = true;
-        const issues = [];
-        const invQty = raw.qty != null ? Number(raw.qty) : null;
-        const invPrice = raw.unitPrice != null ? Number(raw.unitPrice) : null;
-        const invTotal = raw.amount != null ? Number(raw.amount) : null;
-        if (invQty != null && hit.qty != null && invQty !== hit.qty) issues.push(`quantity ${invQty.toLocaleString('en-GB')} on the invoice, ${hit.qty.toLocaleString('en-GB')} in the container`);
-        if (invPrice != null && hit.unitPrice != null && Math.abs(invPrice - hit.unitPrice) > LINE_PRICE_EPS) issues.push(`unit price ${invPrice} on the invoice, ${hit.unitPrice} on the PO`);
-        if (invTotal != null && hit.total != null && Math.abs(invTotal - hit.total) > LINE_TOTAL_EPS) issues.push(`line total ${invTotal.toFixed(2)} on the invoice, ${hit.total.toFixed(2)} in the container`);
+        const { issues, invQty, invPrice, invTotal } = issuesOf(raw, hit, 'in the container');
         lines.push({
             poNumber: hit.poNumber, jfCode: hit.jfCode, productName: hit.productName,
             ourQty: hit.qty, invoiceQty: invQty, ourUnitPrice: hit.unitPrice, invoiceUnitPrice: invPrice, ourTotal: hit.total, invoiceTotal: invTotal,
             issues,
         });
     }
-    const missing = ours.filter(l => !l.matched).map(l => ({ poNumber: l.poNumber, jfCode: l.jfCode, productName: l.productName, qty: l.qty, total: l.total }));
+    // What it bills: goods (matched, or strangers that are not QC units), QC units, or both.
+    const extraQc = extra.filter(l => isQcCode(l.jfCode || l.sku));
+    const billsGoods = lines.length > 0 || extra.length > extraQc.length;
+    const billsQc = qcLines.length > 0 || extraQc.length > 0;
+    const invoiceKind = billsGoods && billsQc ? 'goods_and_qc' : billsQc ? 'qc' : 'goods';
+    const qcOurTotal = Math.round(qcLines.reduce((a, l) => a + (l.ourTotal || 0), 0) * 100) / 100;
+    const qcInvoiceTotal = Math.round(qcLines.reduce((a, l) => a + (l.invoiceTotal ?? 0), 0) * 100) / 100;
+    const qcBilled = Math.round([...(extract.lines || [])].filter(raw => isQcCode(raw.jfCode || raw.sku)).reduce((a, raw) => a + lineAmountOf(raw), 0) * 100) / 100;
+    // A QC units invoice does not bill the goods: none of them is missing.
+    const missing = billsGoods
+        ? ours.filter(l => !l.matched).map(l => ({ poNumber: l.poNumber, jfCode: l.jfCode, productName: l.productName, qty: l.qty, total: l.total }))
+        : [];
 
     // What the balance should be. The deposit on file (a deposit PI's
     // percentage) beats what the invoice says it deducted; with neither, the
@@ -444,33 +534,45 @@ function compareInvoiceToContainer({ extract, context, supplierName }) {
     const expectedBalance = Math.round((goodsOnBoard - depositExpected) * 100) / 100;
     const invoiceTotal = money(extract.totalAmount);
     const statedDue = money(extract.amountDueNow);
+    // Charges that are not goods (handling, mould, bank charges, credits) are
+    // the page's to add as extras; the goods are checked without them.
+    const otherCharges = chargesOf(extract);
+    const chargesTotal = chargesTotalOf(otherCharges);
+    const net = v => (v == null ? null : Math.round((v - chargesTotal) * 100) / 100);
     // A commercial invoice prices the goods at full value and states nothing
     // payable: its total is the GOODS, not what the supplier asks for now, and
     // it is checked against the goods on board.
     const invoiceBasis = statedDue == null && !(money(extract.depositDeducted) > 0) && invoiceTotal != null ? 'goods' : 'balance';
     const goodsTolerance = Math.max(1, goodsOnBoard * 0.005);
-    const goodsDelta = invoiceBasis === 'goods' ? Math.round((invoiceTotal - goodsOnBoard) * 100) / 100 : 0;
-    const invoiceBalance = invoiceBasis === 'goods' ? null : statedDue ?? invoiceTotal;
+    // The goods it prices: its total less the charges and the QC units it bills.
+    const invoiceGoods = invoiceTotal == null ? null : Math.round((net(invoiceTotal) - qcBilled) * 100) / 100;
+    const goodsDelta = invoiceBasis === 'goods' && billsGoods ? Math.round((invoiceGoods - goodsOnBoard) * 100) / 100 : 0;
+    // What it asks for, QC units included (qcBilled says how much of it they are).
+    const invoiceBalance = invoiceBasis === 'goods' ? null : net(statedDue ?? invoiceTotal);
     const balanceDelta = invoiceBalance == null ? 0 : Math.round((invoiceBalance - expectedBalance) * 100) / 100;
     const balanceTolerance = Math.max(1, expectedBalance * 0.005);
-    const lineTrouble = lines.some(l => l.issues.length) || missing.length > 0 || extra.length > 0;
+    const lineTrouble = lines.some(l => l.issues.length) || qcLines.some(l => l.issues.length) || missing.length > 0 || extra.length > 0;
     // The goods on a goods invoice are judged here — they do not depend on the
     // terms. What an invoice ASKS is not: the balance owed comes from the
     // supplier's terms, which only the page knows (JFPRO), so the page compares
     // it (expectedBalance/balanceDelta here use deposit PIs only — information).
-    const balanceTrouble = invoiceBasis === 'goods' && Math.abs(goodsDelta) > goodsTolerance;
+    const balanceTrouble = invoiceBasis === 'goods' && billsGoods && Math.abs(goodsDelta) > goodsTolerance;
     const nothingToWeigh = invoiceBasis === 'balance' && invoiceBalance == null;
-    const verdict = !ours.length || (!lines.length && !extra.length && nothingToWeigh)
+    const noLines = !lines.length && !qcLines.length && !extra.length;
+    const verdict = (!ours.length && !qcLines.length) || (noLines && nothingToWeigh)
         ? 'unverified'
-        : !lines.length && !extra.length
+        : noLines
             ? (balanceTrouble ? 'differs' : 'unverified')
             : (lineTrouble || balanceTrouble ? 'differs' : 'match');
     return {
         verdict,
+        invoiceKind,
         matchedLines: lines.length, lines, missingOurLines: missing, extraInvoiceLines: extra,
-        goodsOnBoard, invoiceGoods: invoiceTotal,
+        qcLines, qcOurTotal, qcInvoiceTotal, qcBilled,
+        goodsOnBoard, invoiceGoods,
         depositBasis, depositExpected, expectedBalance, invoiceBalance, balanceDelta, balanceTolerance,
         invoiceBasis, goodsDelta, goodsTolerance,
+        otherCharges, chargesTotal,
     };
 }
 
@@ -506,6 +608,22 @@ function promptFor(context) {
         }
         for (const l of po.lines.slice(0, 40)) {
             lines.push(`- ${l.jfCode ?? ''} ${l.productName ?? ''} · qty ${l.quantity ?? '?'} @ ${l.unitPrice ?? '?'}`);
+        }
+        lines.push('');
+    }
+    // The supplier's QC sample units — never on board, often billed on their
+    // own invoice for several POs. Newest POs first, capped.
+    const qc = [...(context.qcLines || [])].sort((a, b) => b.poId - a.poId).slice(0, 80);
+    if (qc.length) {
+        lines.push('## QC sample units on this supplier\'s purchase orders');
+        lines.push('They never travel in a container. If the document bills them, list each as a line with its _FQC code as jfCode and its PO as poRef.');
+        const byPo = new Map();
+        for (const l of qc) {
+            if (!byPo.has(l.poNumber)) byPo.set(l.poNumber, []);
+            byPo.get(l.poNumber).push(l);
+        }
+        for (const [poNumber, list] of byPo) {
+            lines.push(`- ${poNumber}: ${list.map(l => `${l.jfCode} ${l.productName ?? ''} × ${l.quantity ?? '?'} @ ${l.unitPrice ?? '?'}`).join('; ')}`);
         }
         lines.push('');
     }
@@ -601,6 +719,11 @@ async function runShipmentPaymentExtraction(pool, { documentId, userEmail = null
             } else {
                 context = await loadShipmentContext(conn, doc.shipment_id);
                 memberPos = await loadMemberPurchaseOrders(conn, doc.shipment_id);
+                // The supplier's QC units on any of its POs: an invoice here may bill them.
+                if (context && doc.supplier_name) {
+                    const key = supplierKey(doc.supplier_name);
+                    context.qcLines = (await loadQcLines(conn)).filter(l => l.supplierKey === key || sameSupplier(l.supplier, doc.supplier_name));
+                }
             }
         } finally {
             conn.release();
@@ -642,10 +765,13 @@ async function runShipmentPaymentExtraction(pool, { documentId, userEmail = null
             ? compareInvoiceToContainer({ extract, context, supplierName: supplierName || doc.supplier_name || '' })
             : null;
         // The figure it shows (what it states payable, else its total) — for the
-        // line split and the "does it belong here" check only.
+        // line split (goods only: charges are not split across POs) and the
+        // "does it belong here" check only.
         const amount = documentAmountOf(extract);
-        const matched = matchLinesToPos(extract, memberPos, amount ?? 0);
-        const fit = assessFit({ extract, shipment: context.shipment, supplierName: doc.supplier_name || null, memberPos, amount });
+        const goodsAmount = amount == null ? 0 : Math.round((amount - chargesTotalOf(chargesOf(extract))) * 100) / 100;
+        const matched = matchLinesToPos(extract, memberPos, goodsAmount);
+        const qcPos = [...new Map((context.qcLines || []).map(l => [l.poId, { id: l.poId, poNumber: l.poNumber, supplier: l.supplier, supplierKey: l.supplierKey }])).values()];
+        const fit = assessFit({ extract, shipment: context.shipment, supplierName: doc.supplier_name || null, memberPos, qcPos, amount });
 
         const stored = {
             ...extract,
@@ -733,6 +859,7 @@ module.exports = {
     assessFit,
     compareInvoiceToContainer,
     documentAmountOf,
+    chargesOf,
     money,
     promptFor,
     readDocument,

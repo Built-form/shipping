@@ -16,6 +16,9 @@
 const { GoogleGenAI } = require('@google/genai');
 const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
 const log = require('../lib/logger');
+// Charges a PI bills that are not goods (mould, handling, …) come back as
+// otherCharges. The page shows them as already inside the PI's own figures.
+const { EXTRA_KINDS, OTHER_CHARGES_SCHEMA } = require('../lib/payment-extras');
 
 const PO_BUCKET = process.env.PO_DOCS_BUCKET;
 const REGION = process.env.AWS_REGION || 'eu-north-1';
@@ -36,7 +39,7 @@ Compare these dimensions:
 
 1. Line items — match each PI line to a PO line by SKU/jf_code first, then by product description if SKU is absent on the PI. For each pair, compare quantity, unit price, and line total. Flag mismatches even if small (these are commercial contracts). Currency amounts are equal when they round to the same 2dp value.
 
-2. Header totals — subtotal, shipping, grand total. Compute the PO grand total yourself from line_total values plus shipping. Flag any delta > 0.50 currency units between PO and PI.
+2. Header totals — subtotal, shipping, grand total. Compute the PO grand total yourself from line_total values plus shipping. Flag any delta > 0.50 currency units between PO and PI. Charges the PI bills that are not goods and not the shipping the PO carries — mould or tooling, handling, freight, samples, testing, packaging, bank charges — and any discount or credit are NOT discrepancies: list them in otherCharges and compare the totals without them.
 
 3. Supplier identity — does the invoice come from the same supplier named on the PO? Does it reference the PO number anywhere?
 
@@ -53,6 +56,8 @@ Separately, EXTRACT the payment instructions from the PI so a downstream payment
 - beneficiaryName, bankName, bankAddress, accountNumber, iban, swiftBic, intermediaryBank, paymentReference — the supplier's remittance/bank details exactly as printed (do not invent or reformat account numbers; copy digits/letters verbatim). Null any field not present.
 - rawText — the full payment-terms + bank-details section copied verbatim from the PI, so a human can sanity-check the parsed fields.
 Extraction is best-effort and independent of the verdict: a clean invoice with clear bank details still fills paymentTerms; never fail the comparison because a payment field is missing — just null it.
+
+Also EXTRACT \`otherCharges\` — every amount the PI bills that is not a PO line item and not the shipping the PO carries: mould or tooling, handling, freight, samples, testing, packaging, bank charges, surcharges — and any discount or credit, as a NEGATIVE amount. One entry each: description (as printed), amount, kind (one of: ${EXTRA_KINDS.join(', ')}). Empty when there are none.
 
 For every discrepancy:
 - Give the exact PO value and the exact PI value so the operator can verify quickly.
@@ -165,13 +170,14 @@ const RESPONSE_SCHEMA = {
                 'accountNumber', 'iban', 'swiftBic', 'intermediaryBank', 'paymentReference', 'rawText',
             ],
         },
+        otherCharges: OTHER_CHARGES_SCHEMA,
         overallVerdict: {
             type: 'string',
             enum: ['pass', 'minor_discrepancies', 'major_discrepancies'],
         },
         verdictExplanation: { type: 'string' },
     },
-    required: ['summary', 'header', 'totals', 'discrepancies', 'paymentTerms', 'overallVerdict', 'verdictExplanation'],
+    required: ['summary', 'header', 'totals', 'discrepancies', 'paymentTerms', 'otherCharges', 'overallVerdict', 'verdictExplanation'],
 };
 
 // ── DB loading ───────────────────────────────────────────────────────────
@@ -405,4 +411,5 @@ async function upsertInvoicePaymentTerms(conn, { invoiceId, purchaseOrderId, che
 module.exports = {
     compare, loadPoForCheck, fetchInvoicePdf,
     toDateOnlyOrNull, upsertInvoicePaymentTerms,
+    RESPONSE_SCHEMA,
 };

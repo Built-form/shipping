@@ -1,6 +1,6 @@
 'use strict';
 
-// Payment sign-offs Ã¢â‚¬â€ pure rules behind /api/v1/payment-reviews and
+// Payment sign-offs — pure rules behind /api/v1/payment-reviews and
 // /api/v1/payment-assignees (routes: src/services/payment-review-routes.js).
 //
 // ShipLine's Payments flow page works out what is owed on the client, from the
@@ -47,7 +47,7 @@ function parsePaymentKey(raw) {
     return { error: 'paymentKey must be "deposit:<purchase order id>" or "balance:<currency>:<container>|<supplier>".' };
 }
 
-// { value } or { error } Ã¢â‚¬â€ a sign-off as the page sends it.
+// { value } or { error } — a sign-off as the page sends it.
 function parseReviewBody(body) {
     const b = body || {};
     const k = parsePaymentKey(b.paymentKey);
@@ -56,7 +56,7 @@ function parseReviewBody(body) {
     if (!/^[A-Z]{3}$/.test(currency)) return { error: 'currency must be a three-letter code.' };
     if (k.currency && k.currency !== currency) return { error: `currency ${currency} does not match the payment (${k.currency}).` };
     const amount = Math.round(Number(b.amount) * 100) / 100;
-    if (!Number.isFinite(amount) || amount <= 0) return { error: 'amount must be more than 0 Ã¢â‚¬â€ the figure being signed off.' };
+    if (!Number.isFinite(amount) || amount <= 0) return { error: 'amount must be more than 0 — the figure being signed off.' };
     let dueDate = null;
     if (b.dueDate != null && b.dueDate !== '') {
         if (typeof b.dueDate !== 'string' || !DATE_RE.test(b.dueDate)) return { error: 'dueDate must be YYYY-MM-DD.' };
@@ -94,14 +94,14 @@ function parseAssigneeBody(body) {
 
 /**
  * Whether a reviewer's sign-off is written, given the key's ACTIVE reviews.
- * Ã¢â€ â€™ { action: 'create', supersede: [ids of the reviewer's older reviews] }
+ * → { action: 'create', supersede: [ids of the reviewer's older reviews] }
  *   or { refuse: { status, code, error } }.
  * The assignee pays; two other people sign off. A reviewer has one active
  * review per payment: reviewing a changed figure replaces their old one.
  */
 function decideReview({ active, userEmail, assigneeEmail, amount, currency }) {
     if (sameEmail(userEmail, assigneeEmail)) {
-        return { refuse: { status: 409, code: 'ASSIGNEE_CANNOT_REVIEW', error: 'You are this paymentÃ¢â‚¬â„¢s assignee Ã¢â‚¬â€ two other people sign it off.' } };
+        return { refuse: { status: 409, code: 'ASSIGNEE_CANNOT_REVIEW', error: 'You are this payment’s assignee — two other people sign it off.' } };
     }
     const mine = (active || []).filter(r => sameEmail(r.reviewed_by_email, userEmail));
     if (mine.some(r => r.currency === currency && sameFigure(r.amount, amount))) {
@@ -113,12 +113,12 @@ function decideReview({ active, userEmail, assigneeEmail, amount, currency }) {
 /**
  * Setting a payment's assignee. `candidate` is the allowlist row for `email`
  * (null when not on it); `activeReviews` are the key's active reviews.
- * Ã¢â€ â€™ { action: 'clear' } | { action: 'set', email } | { refuse }.
+ * → { action: 'clear' } | { action: 'set', email } | { refuse }.
  */
 function decideAssignment({ email, candidate, activeReviews }) {
     if (email == null) return { action: 'clear' };
     if (!candidate || String(candidate.type) !== ASSIGNEE_ROLE) {
-        return { refuse: { status: 422, code: 'NOT_ACCOUNTANT', error: `${email} is not an accountant on ShipLine Ã¢â‚¬â€ only accountants can be assigned a payment.` } };
+        return { refuse: { status: 422, code: 'NOT_ACCOUNTANT', error: `${email} is not an accountant on ShipLine — only accountants can be assigned a payment.` } };
     }
     if ((activeReviews || []).some(r => sameEmail(r.reviewed_by_email, email))) {
         return { refuse: { status: 409, code: 'ASSIGNEE_HAS_REVIEWED', error: `${email} has signed this payment off, so cannot also be its assignee.` } };

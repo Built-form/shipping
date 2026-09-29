@@ -50,6 +50,8 @@ const { registerShipmentRoutes } = require('../services/shipment-routes');
 const { registerPackingListRoutes } = require('../services/packing-list-routes');
 const { registerContainerPhotoRoutes } = require('../services/container-photo-routes');
 const { registerPaymentReviewRoutes } = require('../services/payment-review-routes');
+const { registerPaymentExtraRoutes } = require('../services/payment-extra-routes');
+const extrasLib = require('../lib/payment-extras');
 const { makeSplitOrder } = require('../services/order-split');
 const shipmentsLib = require('../lib/shipments');
 const shipmentPaymentsService = require('../services/shipment-payments');
@@ -10458,7 +10460,9 @@ function startShipmentPaymentExtraction(req, documentId) {
 // Reading a proof of payment never records a transfer: the operator does,
 // with the proof attached (documentId). Schema: src/db/migrate/*_supplier_payments.sql.
 const { groupDeliveredAir, attachBalances, findPaidClash } = require('../lib/delivered-air');
-const SUPPLIER_PAYMENT_LINE_KINDS = ['balance', 'pi', 'po_deposit'];
+// 'extra' = a charge or credit added on the Payments page (payment_extras,
+// src/lib/payment-extras.js). A credit is applied as a NEGATIVE line.
+const SUPPLIER_PAYMENT_LINE_KINDS = ['balance', 'pi', 'po_deposit', 'extra'];
 // A fourth kind exists on the way in only: 'container_balance' names a
 // shipment whose balance nobody has recorded yet (the page projects it from
 // the goods on board). Saving records that balance — split across the
@@ -10484,6 +10488,9 @@ function supplierPaymentLineToJson(l, target) {
         targetAmount: target?.amount ?? null,
         targetStatus: target?.status ?? null,
         targetMissing: !target,
+        // An extra only: what kind of charge, and which payment it rode with.
+        extraKind: target?.extraKind ?? null,
+        ridesWith: target?.ridesWith ?? null,
     };
 }
 
@@ -10572,6 +10579,22 @@ async function loadSupplierPaymentTargets(conn, lines) {
                 supplier: r.supplier, supplierKey: shipmentPaymentsService.supplierKey(r.supplier), settledBy: null,
                 label: r.po_number, purchaseOrderId: r.id, poNumber: r.po_number, paymentType: 'deposit',
                 depositPis: Number(r.deposit_pis) || 0, shipmentId: null, shipmentReference: null, invoiceNumber: null,
+            });
+        }
+    }
+    const extraIds = idsOf('extra');
+    if (extraIds.length) {
+        const [rows] = await conn.query(
+            `SELECT e.*, po.po_number FROM payment_extras e LEFT JOIN purchase_orders po ON po.id = e.purchase_order_id
+              WHERE e.id IN (${extraIds.map(() => '?').join(',')}) AND e.deleted_at IS NULL`, extraIds
+        );
+        for (const r of rows) {
+            out.set(`extra:${r.id}`, {
+                kind: 'extra', id: r.id, amount: Number(r.amount), currency: r.currency, status: r.status,
+                supplier: r.supplier_name, supplierKey: r.supplier_key, settledBy: r.settled_by_payment_id ?? null,
+                label: extrasLib.lineLabel(r), purchaseOrderId: r.purchase_order_id ?? null, poNumber: r.po_number || null,
+                paymentType: null, shipmentId: r.shipment_id ?? null, shipmentReference: r.shipment_reference || null, invoiceNumber: null,
+                extraKind: r.kind, ridesWith: r.rides_with,
             });
         }
     }
@@ -10672,7 +10695,10 @@ function parseSupplierPaymentBody(body, { partial = false } = {}) {
             const id = Number(entry.id);
             if (!Number.isInteger(id) || id <= 0) return { error: 'lines[].id must be an id.', code: 'BAD_LINES' };
             const amount = Number(entry.amount);
-            if (!Number.isFinite(amount) || amount <= 0) return { error: 'lines[].amount must be a number above 0.', code: 'BAD_LINES' };
+            // Only an extra's line can be negative: a credit, used against what is paid.
+            if (!Number.isFinite(amount) || amount === 0 || (amount < 0 && kind !== 'extra')) {
+                return { error: kind === 'extra' ? 'lines[].amount must be a number other than 0 (negative for a credit).' : 'lines[].amount must be a number above 0.', code: 'BAD_LINES' };
+            }
             const key = `${kind}:${id}`;
             if (seen.has(key)) return { error: `lines name ${key} twice.`, code: 'BAD_LINES' };
             seen.add(key);
@@ -10788,7 +10814,11 @@ async function checkSupplierPaymentLines(conn, { lines, currency, amount, suppli
         if (t.supplierKey && supplierKeyValue && t.supplierKey !== supplierKeyValue && !sameSupplierName(t.supplier, supplierKeyValue)) {
             warnings.push(`${t.label} is filed under "${t.supplier}".`);
         }
-        if (t.amount != null) {
+        if (t.kind === 'extra') {
+            // Signed: a credit takes a negative line, never more than is left on it.
+            const bad = extrasLib.checkLine({ lineAmount: l.amount, extraAmount: t.amount, appliedBefore: applied.get(`extra:${l.id}`) || 0 });
+            if (bad) return { fail: { status: 422, error: `${t.label}: ${bad.error}`, code: bad.code, payload: { kind: 'extra', id: l.id, ...(bad.remaining != null ? { remaining: bad.remaining } : {}) } } };
+        } else if (t.amount != null) {
             const before = applied.get(`${l.kind}:${l.id}`) || 0;
             const remaining = Math.round((t.amount - before) * 100) / 100;
             if (l.amount > remaining + SHIPMENT_ALLOCATION_EPS) {
@@ -10806,6 +10836,9 @@ async function checkSupplierPaymentLines(conn, { lines, currency, amount, suppli
     if (linesTotal > amount + SHIPMENT_ALLOCATION_EPS) {
         return { fail: { status: 422, error: 'The lines add up to more than was sent.', code: 'OVER_ALLOCATED', payload: { linesTotal, amount } } };
     }
+    if (lines.some(l => l.amount < 0) && linesTotal <= SHIPMENT_ALLOCATION_EPS) {
+        return { fail: { status: 422, error: 'A credit is used against something being paid — tick what the transfer paid as well.', code: 'CREDIT_ALONE', payload: { linesTotal } } };
+    }
     return { warnings, targets, applied };
 }
 
@@ -10816,8 +10849,23 @@ async function settleSupplierPaymentTargets(conn, { payment, lines, targets, app
         const t = targets.get(`${l.kind}:${l.id}`);
         if (!t || t.amount == null) continue;
         const total = (applied.get(`${l.kind}:${l.id}`) || 0) + l.amount;
-        if (total < t.amount - settleTolerance(t.amount)) continue;
-        if (t.kind === 'balance') {
+        // An extra is signed (a credit is negative): its own rule, on absolute amounts.
+        const settled = t.kind === 'extra' ? extrasLib.settles(total, t.amount) : total >= t.amount - settleTolerance(t.amount);
+        if (!settled) continue;
+        if (t.kind === 'extra') {
+            // Already paid (by hand): it stays as the operator left it.
+            if (t.status === 'paid') continue;
+            await conn.query(
+                `UPDATE payment_extras SET status = 'paid', paid_on = ?, settled_by_payment_id = ?, updated_by_email = ? WHERE id = ?`,
+                [payment.paid_on, payment.id, userEmail, t.id]
+            );
+            await recordAudit(conn, {
+                entityType: 'payment_extra', entityId: t.id, action: 'status',
+                before: { status: t.status },
+                after: { status: 'paid', paidOn: payment.paid_on, via: 'payment', paymentId: payment.id, applied: Math.round(total * 100) / 100 },
+                userEmail,
+            });
+        } else if (t.kind === 'balance') {
             await conn.query(
                 `UPDATE shipment_payments
                     SET status = 'paid', paid_on = ?, bank_ref = COALESCE(bank_ref, ?), settled_by_payment_id = ?, updated_by_email = ?
@@ -10867,6 +10915,21 @@ async function unsettleSupplierPaymentTargets(conn, { paymentId, userEmail }) {
             entityType: 'purchase_order', entityId: p.purchase_order_id, action: 'invoice_payment_status',
             before: { invoiceId: p.purchase_order_invoice_id, paymentStatus: p.payment_status },
             after: { invoiceId: p.purchase_order_invoice_id, paymentStatus: 'pending', via: 'payment_reverted', paymentId },
+            userEmail,
+        });
+    }
+    let extras = [];
+    try {
+        [extras] = await conn.query(`SELECT id, status, paid_on FROM payment_extras WHERE settled_by_payment_id = ? AND deleted_at IS NULL`, [paymentId]);
+    } catch (e) {
+        if (e.errno !== 1146) throw e; // table not migrated yet: nothing to revert
+    }
+    for (const x of extras) {
+        await conn.query(`UPDATE payment_extras SET status = 'open', paid_on = NULL, settled_by_payment_id = NULL, updated_by_email = ? WHERE id = ?`, [userEmail, x.id]);
+        await recordAudit(conn, {
+            entityType: 'payment_extra', entityId: x.id, action: 'status',
+            before: { status: x.status, paidOn: x.paid_on || null },
+            after: { status: 'open', paidOn: null, via: 'payment_reverted', paymentId },
             userEmail,
         });
     }
@@ -10955,13 +11018,25 @@ app.get('/api/v1/supplier-payments/open-items', async (req, res) => {
                   WHERE p.payment_status <> 'skipped' AND p.amount_due > 0
                   ORDER BY po.po_number, p.id`
             );
+            // Extra charges and credits added on the Payments page.
+            let extras = [];
+            try {
+                [extras] = await conn.query(
+                    `SELECT e.*, po.po_number FROM payment_extras e LEFT JOIN purchase_orders po ON po.id = e.purchase_order_id
+                      WHERE e.deleted_at IS NULL ORDER BY e.id`
+                );
+            } catch (e) {
+                if (e.errno !== 1146) throw e; // table not migrated yet
+            }
             const mine = {
                 balances: bals.filter(b => b.supplier_key === key || sameSupplierName(b.supplier_name, supplier)),
                 pis: pis.filter(p => shipmentPaymentsService.supplierKey(p.po_supplier) === key || sameSupplierName(p.po_supplier, supplier)),
+                extras: extras.filter(x => x.supplier_key === key || sameSupplierName(x.supplier_name, supplier)),
             };
             const applied = await loadSupplierPaymentApplied(conn, [
                 ...mine.balances.map(b => ({ kind: 'balance', id: b.id })),
                 ...mine.pis.map(p => ({ kind: 'pi', id: p.id })),
+                ...mine.extras.map(x => ({ kind: 'extra', id: x.id })),
             ]);
 
             // What each balance is made of: its per-PO split, how much of each
@@ -11064,6 +11139,23 @@ app.get('/api/v1/supplier-payments/open-items', async (req, res) => {
                         linesOnBoard: null, linesTotal: tot ? tot.lines : null, unitsOnBoard: null, unitsTotal: tot ? tot.units : null,
                         deposit: depositByPo.get(p.purchase_order_id) || null,
                     }] : [],
+                });
+            }
+            for (const x of mine.extras) {
+                if (currency && x.currency !== currency) continue;
+                const amount = Number(x.amount);
+                const done = applied.get(`extra:${x.id}`) || 0;
+                const open = x.status !== 'paid';
+                // Signed: a credit's remaining is negative.
+                const remaining = open ? Math.round((amount - done) * 100) / 100 : 0;
+                if (open && Math.abs(remaining) <= SHIPMENT_ALLOCATION_EPS) continue;
+                items.push({
+                    kind: 'extra', id: x.id, label: extrasLib.lineLabel(x), amount, applied: Math.round(done * 100) / 100, remaining,
+                    open, paidOn: x.paid_on || null,
+                    currency: x.currency, status: x.status, dueDate: x.due_date || null, invoiceNumber: null,
+                    shipmentId: x.shipment_id ?? null, shipmentReference: x.shipment_reference || null,
+                    purchaseOrderId: x.purchase_order_id ?? null, poNumber: x.po_number || null, paymentType: null,
+                    supplierName: x.supplier_name, extraKind: x.kind, ridesWith: x.rides_with, description: x.description || null,
                 });
             }
             return { supplier, currency, items };
@@ -11398,6 +11490,19 @@ registerPaymentReviewRoutes(app, {
     recordAudit,
     auditLogSchemaReady,
     log,
+});
+
+// ── Extra charges and credits (/api/v1/payment-extras) ────────────────────
+// Mould, handling, samples, credits… added to a payment on the Payments flow
+// page; paid through a supplier-payments line of kind 'extra' (above).
+registerPaymentExtraRoutes(app, {
+    withConnection,
+    recordAudit,
+    auditLogSchemaReady,
+    log,
+    loadAppliedByTarget,
+    loadSettlementsByTarget,
+    sameSupplierName,
 });
 
 // ── Serverless export ────────────────────────────────────────────────────
