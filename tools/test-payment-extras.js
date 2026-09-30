@@ -23,6 +23,8 @@ const { app } = require('../src/handlers/orders');
 
 const STAMP = Date.now();
 const SUP = `PX Test Supplier ${STAMP}`;
+// A forwarder paid for a container (ridesWith 'shipment'): its own payee.
+const FWD = `PX Test Forwarder ${STAMP}`;
 const PO_NUMBER = `PXTEST-${STAMP}`;
 const BOX = `PXBOX-${STAMP}`;
 const TODAY = new Date().toISOString().slice(0, 10);
@@ -60,8 +62,8 @@ const pay = async (amount, lines) => {
 async function cleanup() {
     // The PO goes whatever else fails (e.g. the table not migrated yet).
     let extras = [];
-    try { extras = await sql(`SELECT id FROM payment_extras WHERE supplier_name = ?`, [SUP]); } catch (e) { if (e.errno !== 1146) throw e; }
-    const payments = await sql(`SELECT id FROM supplier_payments WHERE supplier_name = ?`, [SUP]);
+    try { extras = await sql(`SELECT id FROM payment_extras WHERE supplier_name IN (?, ?)`, [SUP, FWD]); } catch (e) { if (e.errno !== 1146) throw e; }
+    const payments = await sql(`SELECT id FROM supplier_payments WHERE supplier_name IN (?, ?)`, [SUP, FWD]);
     const pids = [...new Set([...payments.map(p => p.id), ...paymentIds])];
     const xids = extras.map(x => x.id);
     if (xids.length) await sql(`DELETE FROM audit_log WHERE entity_type = 'payment_extra' AND entity_id IN (?)`, [xids]);
@@ -173,6 +175,28 @@ async function cleanup() {
         as('warehouse');
         const whStatus = await call('POST', `/api/v1/payment-extras/${freight.body.id}/status`, { status: 'paid' });
         check('warehouse cannot mark paid → 403', whStatus.status === 403, whStatus);
+
+        console.log('\nA forwarder paid for a container (ridesWith shipment)');
+        as('standard');
+        const fwdBody = { supplierName: FWD, currency: 'GBP', amount: 1850, kind: 'freight', description: 'INV-5521', ridesWith: 'shipment', shipmentReference: BOX };
+        const withPo = await call('POST', '/api/v1/payment-extras', { ...fwdBody, purchaseOrderId: poId });
+        check('naming a PO → 400', withPo.status === 400 && /purchase order/i.test(withPo.body.error || ''), withPo);
+        const fwd = await call('POST', '/api/v1/payment-extras', fwdBody);
+        check('POST → 201, the container kept, no PO, GBP', fwd.status === 201 && fwd.body.ridesWith === 'shipment' && fwd.body.shipmentReference === BOX
+            && fwd.body.purchaseOrderId === null && fwd.body.currency === 'GBP' && fwd.body.label === `${BOX} freight`, fwd);
+        const customs = await call('POST', '/api/v1/payment-extras', { ...fwdBody, amount: 240, kind: 'customs', description: null });
+        check('customs clearance → 201', customs.status === 201 && customs.body.kind === 'customs', customs);
+        const fwdPay = await call('POST', '/api/v1/supplier-payments', {
+            supplierName: FWD, amount: 2090, currency: 'GBP', paidOn: TODAY,
+            lines: [{ kind: 'extra', id: fwd.body.id, amount: 1850 }, { kind: 'extra', id: customs.body.id, amount: 240 }],
+        });
+        if (fwdPay.status === 201) paymentIds.add(fwdPay.body.id);
+        check('one transfer to the forwarder pays both → 201', fwdPay.status === 201, fwdPay);
+        const fwdAfter = (await call('GET', `/api/v1/payment-extras?supplier=${encodeURIComponent(FWD)}`)).body.data || [];
+        check('both paid by that transfer', fwdAfter.length === 2 && fwdAfter.every(x => x.status === 'paid' && x.settledByPaymentId === fwdPay.body.id), fwdAfter);
+        const wrongPayee = await call('POST', '/api/v1/supplier-payments', { supplierName: SUP, amount: 1850, currency: 'GBP', paidOn: TODAY, lines: [{ kind: 'extra', id: fwd.body.id, amount: 1850 }] });
+        if (wrongPayee.status === 201) paymentIds.add(wrongPayee.body.id);
+        check('a transfer to someone else cannot pay the forwarder\'s cost', wrongPayee.status >= 400, wrongPayee);
 
         console.log('\nDeleting the transfer puts them back');
         as('admin');

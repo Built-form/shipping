@@ -66,7 +66,7 @@ function registerPaymentExtraRoutes(app, {
         }
         let shipmentId = null;
         let shipmentReference = v.shipmentReference;
-        if (v.ridesWith === 'balance' && v.shipmentId != null) {
+        if ((v.ridesWith === 'balance' || v.ridesWith === 'shipment') && v.shipmentId != null) {
             const resolved = await resolveShipment(conn, { id: v.shipmentId });
             if (resolved.notFound || !resolved.row) return { fail: { status: 404, code: 'NOT_FOUND', error: `Shipment ${v.shipmentId} not found.` } };
             shipmentId = resolved.row.id;

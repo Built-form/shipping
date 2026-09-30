@@ -142,3 +142,27 @@ test('labels and JSON', () => {
     // Paid: nothing left, whatever was applied.
     assert.equal(L.extraRowToJson({ id: 8, amount: '-50', status: 'paid', kind: 'discount' }, { applied: 0 }).remaining, 0);
 });
+
+// Forwarder / freight payments (user, 2026-09-30): a cost of the shipment
+// itself, paid to its own payee (the forwarder) — rides with the container,
+// names no PO, in its own currency.
+test('a shipment cost: payee, container, no PO; freight/customs/duty/delivery kinds', () => {
+    const v = L.parseExtraBody({
+        supplierName: ' DCG Logistics ', currency: 'gbp', amount: '1850', kind: 'freight', ridesWith: 'shipment',
+        shipmentId: 62, shipmentReference: ' 301 ', description: ' INV-5521 ', dueDate: '2026-10-10',
+    }).value;
+    assert.deepEqual(v, {
+        supplierName: 'DCG Logistics', currency: 'GBP', amount: 1850, kind: 'freight', description: 'INV-5521',
+        ridesWith: 'shipment', purchaseOrderId: null, shipmentId: 62, shipmentReference: '301', dueDate: '2026-10-10',
+        sourceKind: null, sourceId: null, note: null,
+    });
+    for (const kind of ['customs', 'duty', 'delivery']) assert.equal(L.parseExtraBody({ supplierName: 'DCG', currency: 'GBP', amount: 10, kind, ridesWith: 'shipment', shipmentReference: '301' }).value.kind, kind);
+    assert.deepEqual(L.RIDES_WITH, ['deposit', 'balance', 'shipment']);
+    assert.equal(L.lineLabel({ kind: 'customs', shipment_reference: '301' }), '301 customs clearance');
+});
+
+test('a shipment cost may not name a PO, and must name its container', () => {
+    const cost = (over = {}) => ({ supplierName: 'DCG', currency: 'GBP', amount: 10, kind: 'freight', ridesWith: 'shipment', shipmentReference: '301', ...over });
+    assert.match(L.parseExtraBody(cost({ purchaseOrderId: 395 })).error || '', /shipment.*purchase order/i);
+    assert.match(L.parseExtraBody(cost({ shipmentReference: null })).error || '', /shipment.*container/i);
+});

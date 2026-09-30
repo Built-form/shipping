@@ -18,12 +18,16 @@
 // the way it settles a balance or a PI: once the money applied covers it
 // within a bank charge (max of 1 and 1 %), on the absolute amounts.
 
-const EXTRA_KINDS = ['mould', 'tooling', 'handling', 'samples', 'testing', 'freight', 'packaging', 'bank_charge', 'discount', 'other'];
+const EXTRA_KINDS = ['mould', 'tooling', 'handling', 'samples', 'testing', 'freight', 'packaging', 'bank_charge', 'discount', 'customs', 'duty', 'delivery', 'other'];
 const EXTRA_LABEL = {
     mould: 'Mould cost', tooling: 'Tooling', handling: 'Handling fee', samples: 'Samples', testing: 'Testing',
-    freight: 'Freight', packaging: 'Packaging', bank_charge: 'Bank charge', discount: 'Discount', other: 'Other charge',
+    freight: 'Freight', packaging: 'Packaging', bank_charge: 'Bank charge', discount: 'Discount',
+    customs: 'Customs clearance', duty: 'Import duty', delivery: 'Delivery', other: 'Other charge',
 };
-const RIDES_WITH = ['deposit', 'balance'];
+// 'shipment' (user, 2026-09-30): a cost of the shipment itself — freight,
+// customs, delivery — paid to its own payee (the forwarder, in supplierName),
+// with the container and in its own currency; it names no PO.
+const RIDES_WITH = ['deposit', 'balance', 'shipment'];
 const EDITOR_ROLES = ['admin', 'standard', 'accountant'];
 // Where a suggested extra was read from: a supplier's invoice on a container.
 const SOURCE_KINDS = ['shipment_document'];
@@ -73,7 +77,7 @@ function parseExtraBody(body) {
         return { error: 'description cannot exceed 255 characters.' };
     }
     const ridesWith = String(b.ridesWith || '');
-    if (!RIDES_WITH.includes(ridesWith)) return { error: 'ridesWith must be "deposit" or "balance".' };
+    if (!RIDES_WITH.includes(ridesWith)) return { error: 'ridesWith must be "deposit", "balance" or "shipment".' };
     const purchaseOrderId = positiveId(b.purchaseOrderId);
     const shipmentId = positiveId(b.shipmentId);
     if (Number.isNaN(purchaseOrderId)) return { error: 'purchaseOrderId must be an id.' };
@@ -82,6 +86,9 @@ function parseExtraBody(body) {
     if (ridesWith === 'deposit') {
         if (purchaseOrderId == null) return { error: 'An extra riding with a deposit names its purchase order (purchaseOrderId).' };
         if (shipmentId != null || shipmentReference) return { error: 'An extra riding with a deposit belongs to the PO, not a container — leave the shipment out.' };
+    } else if (ridesWith === 'shipment') {
+        if (purchaseOrderId != null) return { error: 'A shipment cost belongs to the container, not a purchase order — leave the PO out.' };
+        if (shipmentId == null && !shipmentReference) return { error: 'A shipment cost names its container (shipmentId or shipmentReference).' };
     } else if (shipmentId == null && !shipmentReference) {
         return { error: 'An extra riding with a balance names its container (shipmentId or shipmentReference).' };
     }

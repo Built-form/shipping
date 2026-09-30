@@ -19,6 +19,16 @@ Rules and shapes: `src/lib/payment-extras.js`. Routes:
     `shipmentReference` required, `purchaseOrderId` optional).
   It is due, signed off and paid with that payment. When that payment is
   already paid, the extra's own `dueDate` applies (else it is due now).
+  - `shipment` (2026-09-30) — a **forwarder payment**: a cost of the shipment
+    itself (freight, customs, duty, delivery), paid to its own payee — the
+    forwarder, in `supplierName` — in its own currency. `shipmentId` and/or
+    `shipmentReference` required, `purchaseOrderId` refused (400). On the page
+    it is its own payable (container × forwarder: its own sign-off key) in its
+    currency's tab; its `dueDate` if given, else the container's goods balances'
+    date (any currency), else now. A transfer to the forwarder pays it with an
+    ordinary `extra` line; a transfer to anyone else is refused.
+- Kinds: `mould`, `tooling`, `handling`, `samples`, `testing`, `freight`,
+  `packaging`, `bank_charge`, `discount`, `customs`, `duty`, `delivery`, `other`.
 - `amount` is **signed**: a credit is negative. `kind: "discount"` must be negative.
 - Never part of the PO value: not split by the deposit %, never moves a
   container share. The page adds it on top.
