@@ -349,3 +349,36 @@ test('the reader is told a supplier upload is a QC invoice, with the supplier\'s
     assert.doesNotMatch(p, /remittance advice/);
     assert.match(promptFor({ shipment: null, shipmentCurrency: null, purchaseOrders: [] }), /remittance advice/);
 });
+
+// A QC code on two of the supplier's POs with no poRef read (user, 2026-09-30:
+// invoice 26/89132 bills JF0938_FQC × 62 for SUNMED-93; the read ticked
+// PO_00333J's 50). The PO printed in the line's text counts as its reference;
+// failing that, the PO whose quantity is the invoice's — "newest" is last.
+const TWO_POS = { ...CONTEXT, qcLines: [
+    qc(94, 'SUNMED-93', 'JF0938_FQC', 62, null),
+    qc(333, 'PO_00333J', 'JF0938_FQC', 50, 2.27),
+] };
+test('no poRef, but the PO number is printed in the line: that PO', () => {
+    const c = compareInvoiceToContainer({ extract: { ...QC_INVOICE, lines: [{ ...qcLine(null, 'JF0938_FQC', 62, 2.27), description: 'BY INSPECTION CUTIDERM BUTTERFLY SUNMED-93 LOT 0938009' }] }, context: TWO_POS, supplierName: SUPPLIER });
+    assert.deepEqual(c.qcLines.map(l => [l.poNumber, l.ourQty, l.invoiceQty, l.issues]), [['SUNMED-93', 62, 62, []]]);
+});
+test('no poRef and no PO in the text: the PO whose quantity is the invoice\'s, before the newest', () => {
+    const c = compareInvoiceToContainer({ extract: { ...QC_INVOICE, lines: [qcLine(null, 'JF0938_FQC', 62, 2.27)] }, context: TWO_POS, supplierName: SUPPLIER });
+    assert.deepEqual(c.qcLines.map(l => [l.poNumber, l.ourQty, l.invoiceQty, l.issues]), [['SUNMED-93', 62, 62, []]]);
+    const fifty = compareInvoiceToContainer({ extract: { ...QC_INVOICE, lines: [qcLine(null, 'JF0938_FQC', 50, 2.27)] }, context: TWO_POS, supplierName: SUPPLIER });
+    assert.deepEqual(fifty.qcLines.map(l => l.poNumber), ['PO_00333J']);
+});
+test('a number in the text that is not a PO of this supplier changes nothing', () => {
+    const c = compareInvoiceToContainer({ extract: { ...QC_INVOICE, lines: [{ ...qcLine(null, 'JF0938_FQC', 7, 2.27), description: 'LOT 0938009 MFG 05.2026 BOX OF 100' }] }, context: TWO_POS, supplierName: SUPPLIER });
+    assert.deepEqual(c.qcLines.map(l => l.poNumber), ['PO_00333J']);
+});
+test('a PO printed in the line outranks the quantity: 62 units with "PO_00333J" in the text go to PO_00333J, mismatch and all', () => {
+    const c = compareInvoiceToContainer({ extract: { ...QC_INVOICE, lines: [{ ...qcLine(null, 'JF0938_FQC', 62, 2.27), description: 'BY INSPECTION PO_00333J LOT 0938009' }] }, context: TWO_POS, supplierName: SUPPLIER });
+    assert.deepEqual(c.qcLines.map(l => [l.poNumber, l.ourQty, l.invoiceQty]), [['PO_00333J', 50, 62]]);
+    assert.equal(c.qcLines[0].issues.length, 2);
+});
+test('a digits-only token in the text never names a PO, even one numbered with digits alone', () => {
+    const numeric = { ...CONTEXT, qcLines: [qc(500, '100', 'JF0938_FQC', 50, 2.27), qc(94, 'SUNMED-93', 'JF0938_FQC', 62, null)] };
+    const c = compareInvoiceToContainer({ extract: { ...QC_INVOICE, lines: [{ ...qcLine(null, 'JF0938_FQC', 62, 2.27), description: 'BOX OF 100' }] }, context: numeric, supplierName: SUPPLIER });
+    assert.deepEqual(c.qcLines.map(l => l.poNumber), ['SUNMED-93']);
+});

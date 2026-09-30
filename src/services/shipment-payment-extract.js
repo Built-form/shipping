@@ -180,6 +180,18 @@ function matchPoRef(ref, index) {
     return hits && hits.length === 1 ? hits[0] : null;
 }
 
+// A PO number printed inside free text (a line's description): a token that
+// is one of ours, spelt out. Only whole tokens with letters and digits, and
+// only an exact spelling — a lot number or a pack size is never a PO.
+function poRefInText(text, index) {
+    for (const token of String(text ?? '').split(/[\s,;:()（）]+/)) {
+        const n = norm(token);
+        if (!/[A-Z]/.test(n) || !/\d/.test(n)) continue;
+        if (index.byExact.has(n)) return token;
+    }
+    return null;
+}
+
 /** Allocations read off line values, scaled so they cover `amount` in the same
  *  proportion the lines covered `lineTotal` — in whole cents, remainder to the
  *  largest, so a full set of lines sums to `amount` exactly. */
@@ -472,11 +484,18 @@ function compareInvoiceToContainer({ extract, context, supplierName }) {
         if (!hit && desc && !qcCode) hit = candidates.find(l => descKey(l.productName) === desc);
         if (!hit && po && candidates.length === 1 && !qcCode) hit = candidates[0];
         if (!hit && qcCode) {
-            // A QC unit: on the PO it names (any of this supplier's), else the
-            // one with goods in this box, else the newest.
-            const named = raw.poRef ? matchPoRef(raw.poRef, qcIndex) : null;
-            const found = qcOurs.filter(l => !l.matched && norm(l.jfCode) === code && (!raw.poRef || (named && l.poId === named.id)));
-            const qhit = found.find(l => onBoardPoIds.has(l.poId)) ?? found.sort((a, b) => b.poId - a.poId)[0];
+            // A QC unit: on the PO it names — as poRef, else printed in the
+            // line's text (user, 2026-09-30: "SUNMED-93" sat in the description
+            // and the read ticked another PO's units) — else, with the same
+            // code on several of this supplier's POs, the one whose quantity
+            // is the invoice's, else the one with goods in this box, else the newest.
+            const poRef = raw.poRef || poRefInText(`${raw.description ?? ''} ${raw.sku ?? ''}`, qcIndex);
+            const named = poRef ? matchPoRef(poRef, qcIndex) : null;
+            const found = qcOurs.filter(l => !l.matched && norm(l.jfCode) === code && (!poRef || (named && l.poId === named.id)));
+            const invQty = raw.qty != null ? Number(raw.qty) : null;
+            const byQty = invQty != null ? found.filter(l => l.qty === invQty) : [];
+            const pool = byQty.length ? byQty : found;
+            const qhit = pool.find(l => onBoardPoIds.has(l.poId)) ?? pool.sort((a, b) => b.poId - a.poId)[0];
             if (qhit) {
                 qhit.matched = true;
                 const { issues, invQty, invPrice, invTotal } = issuesOf(raw, qhit, 'on the PO');
