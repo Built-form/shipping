@@ -484,15 +484,24 @@ function compareInvoiceToContainer({ extract, context, supplierName }) {
         if (!hit && desc && !qcCode) hit = candidates.find(l => descKey(l.productName) === desc);
         if (!hit && po && candidates.length === 1 && !qcCode) hit = candidates[0];
         if (!hit && qcCode) {
-            // A QC unit: on the PO it names — as poRef, else printed in the
-            // line's text (user, 2026-09-30: "SUNMED-93" sat in the description
-            // and the read ticked another PO's units) — else, with the same
-            // code on several of this supplier's POs, the one whose quantity
-            // is the invoice's, else the one with goods in this box, else the newest.
-            const poRef = raw.poRef || poRefInText(`${raw.description ?? ''} ${raw.sku ?? ''}`, qcIndex);
-            const named = poRef ? matchPoRef(poRef, qcIndex) : null;
-            const found = qcOurs.filter(l => !l.matched && norm(l.jfCode) === code && (!poRef || (named && l.poId === named.id)));
+            // A QC unit: on the PO printed on the line — the document's own
+            // word, which outranks the model's poRef (2026-10-01: the model set
+            // every line of invoice 26/89132 to PO_00333J while the lines print
+            // SUNMED-93 and SUNMED-96) — else the model's poRef; else, with the
+            // same code on several of this supplier's POs, the one whose
+            // quantity is the invoice's, else the one with goods in this box,
+            // else the newest. A model-named PO whose quantity differs gives way
+            // to the one other PO carrying exactly the invoice's quantity.
+            const printed = poRefInText(`${raw.description ?? ''} ${raw.sku ?? ''}`, qcIndex);
+            const named = printed ? matchPoRef(printed, qcIndex) : raw.poRef ? matchPoRef(raw.poRef, qcIndex) : null;
+            const withCode = qcOurs.filter(l => !l.matched && norm(l.jfCode) === code);
             const invQty = raw.qty != null ? Number(raw.qty) : null;
+            let found = withCode;
+            if (printed || raw.poRef) {
+                const onNamed = named ? withCode.filter(l => l.poId === named.id) : [];
+                const exact = invQty != null ? withCode.filter(l => l.qty === invQty) : [];
+                found = !printed && onNamed.length && !onNamed.some(l => l.qty === invQty) && exact.length === 1 ? exact : onNamed;
+            }
             const byQty = invQty != null ? found.filter(l => l.qty === invQty) : [];
             const pool = byQty.length ? byQty : found;
             const qhit = pool.find(l => onBoardPoIds.has(l.poId)) ?? pool.sort((a, b) => b.poId - a.poId)[0];
@@ -604,6 +613,7 @@ function qcSectionOf(context) {
     const lines = [
         '## QC sample units on this supplier\'s purchase orders',
         'They never travel in a container. If the document bills them, list each as a line with its _FQC code as jfCode and its PO as poRef.',
+        'poRef is the purchase order number printed on that line (often inside its description, e.g. "SUNMED-93" or "PO_00299J"), copied exactly as printed when it is one of the purchase orders below — never a different one, even if another lists the same product.',
     ];
     const byPo = new Map();
     for (const l of qc) {

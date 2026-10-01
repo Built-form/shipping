@@ -382,3 +382,43 @@ test('a digits-only token in the text never names a PO, even one numbered with d
     const c = compareInvoiceToContainer({ extract: { ...QC_INVOICE, lines: [{ ...qcLine(null, 'JF0938_FQC', 62, 2.27), description: 'BOX OF 100' }] }, context: numeric, supplierName: SUPPLIER });
     assert.deepEqual(c.qcLines.map(l => l.poNumber), ['SUNMED-93']);
 });
+
+// The model maps a line's PO to one of ours and can map it wrong (2026-10-01,
+// invoice 26/89132: every line set to PO_00333J, though the lines print
+// SUNMED-93 and SUNMED-96). The PO printed on the line is the document's own
+// word and outranks the model's poRef.
+const THREE_POS = { ...CONTEXT, qcLines: [
+    qc(94, 'SUNMED-93', 'JF0938_FQC', 62, null),
+    qc(97, 'SUNMED-96', 'JF0993_FQC', 40, null),
+    qc(333, 'PO_00333J', 'JF0938_FQC', 50, 2.27),
+    qc(333, 'PO_00333J', 'JF0993_FQC', 40, 1.83),
+    qc(298, 'PO_00298J', 'JF1168_FQC', 20, 0.95),
+    qc(393, 'PO_00393J', 'JF1168_FQC', 23, 1),
+    qc(95, 'SUNMED-95', 'JF1168_FQC', 26, null),
+] };
+test('the model names PO_00333J but the line prints SUNMED-93: SUNMED-93, no issues', () => {
+    const c = compareInvoiceToContainer({ extract: { ...QC_INVOICE, lines: [{ ...qcLine('PO_00333J', 'JF0938_FQC', 62, 2.27), description: 'BY INSPECTION CUTIDERM BUTTERFLY SUNMED-93 LOT 0938009' }] }, context: THREE_POS, supplierName: SUPPLIER });
+    assert.deepEqual(c.qcLines.map(l => [l.poNumber, l.ourQty, l.invoiceQty, l.issues]), [['SUNMED-93', 62, 62, []]]);
+});
+test('the model names PO_00333J, the line prints SUNMED-96 and the quantities agree on both: SUNMED-96 still', () => {
+    const c = compareInvoiceToContainer({ extract: { ...QC_INVOICE, lines: [{ ...qcLine('PO_00333J', 'JF0993_FQC', 40, 1.83), description: 'CUTI-ADH-10X10-50 SUNMED-96 LOT 0993015' }] }, context: THREE_POS, supplierName: SUPPLIER });
+    assert.deepEqual(c.qcLines.map(l => l.poNumber), ['SUNMED-96']);
+});
+test('the model names a PO whose quantity differs, nothing printed, and exactly one other PO has the invoice\'s quantity: that one', () => {
+    const c = compareInvoiceToContainer({ extract: { ...QC_INVOICE, lines: [qcLine('PO_00393J', 'JF1168_FQC', 26, 0.95)] }, context: THREE_POS, supplierName: SUPPLIER });
+    assert.deepEqual(c.qcLines.map(l => [l.poNumber, l.ourQty, l.invoiceQty]), [['SUNMED-95', 26, 26]]);
+    // Two other POs with that quantity: the model's PO stands, mismatch and all.
+    const two = { ...THREE_POS, qcLines: [...THREE_POS.qcLines, qc(86, 'SUNMED-86', 'JF1168_FQC', 26, null)] };
+    const c2 = compareInvoiceToContainer({ extract: { ...QC_INVOICE, lines: [qcLine('PO_00393J', 'JF1168_FQC', 26, 0.95)] }, context: two, supplierName: SUPPLIER });
+    assert.deepEqual(c2.qcLines.map(l => [l.poNumber, l.issues.length > 0]), [['PO_00393J', true]]);
+});
+test('the model names the right PO and it matches: unchanged', () => {
+    const c = compareInvoiceToContainer({ extract: { ...QC_INVOICE, lines: [qcLine('PO_00298J', 'JF1168_FQC', 20, 0.95)] }, context: THREE_POS, supplierName: SUPPLIER });
+    assert.deepEqual(c.qcLines.map(l => [l.poNumber, l.issues]), [['PO_00298J', []]]);
+});
+test('two POs printed on one line: the first printed wins; goods lines are untouched by the rule', () => {
+    const c = compareInvoiceToContainer({ extract: { ...QC_INVOICE, lines: [{ ...qcLine(null, 'JF0938_FQC', 62, 2.27), description: 'SUNMED-93 (replaces PO_00333J) LOT 0938009' }] }, context: THREE_POS, supplierName: SUPPLIER });
+    assert.deepEqual(c.qcLines.map(l => l.poNumber), ['SUNMED-93']);
+    const swapped = compareInvoiceToContainer({ extract: { ...QC_INVOICE, lines: [{ ...qcLine(null, 'JF0938_FQC', 62, 2.27), description: 'PO_00333J (was SUNMED-93)' }] }, context: THREE_POS, supplierName: SUPPLIER });
+    assert.deepEqual(swapped.qcLines.map(l => [l.poNumber, l.issues.length > 0]), [['PO_00333J', true]]);
+});
