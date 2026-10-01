@@ -10693,7 +10693,8 @@ function parseSupplierPaymentBody(body, { partial = false } = {}) {
     }
     if (has('amount') || !partial) {
         const amount = Number(b.amount);
-        if (!Number.isFinite(amount) || amount <= 0) return { error: 'amount must be a number above 0.', code: 'BAD_FIELD' };
+        // 0 is a payment made wholly by credit (checkCreditUse): no money sent.
+        if (!Number.isFinite(amount) || amount < 0) return { error: 'amount must be a number of 0 or more.', code: 'BAD_FIELD' };
         row.amount = Math.round(amount * 100) / 100;
     }
     if (has('currency') || !partial) {
@@ -10862,11 +10863,12 @@ async function checkSupplierPaymentLines(conn, { lines, currency, amount, suppli
         }
     }
     linesTotal = Math.round(linesTotal * 100) / 100;
+    // Credits taken together: against something paid, never more than it; they
+    // may cover everything ticked, and then nothing is sent (amount 0).
+    const creditRefusal = extrasLib.checkCreditUse({ lines, amount });
+    if (creditRefusal) return { fail: { status: 422, ...creditRefusal, payload: { linesTotal } } };
     if (linesTotal > amount + SHIPMENT_ALLOCATION_EPS) {
         return { fail: { status: 422, error: 'The lines add up to more than was sent.', code: 'OVER_ALLOCATED', payload: { linesTotal, amount } } };
-    }
-    if (lines.some(l => l.amount < 0) && linesTotal <= SHIPMENT_ALLOCATION_EPS) {
-        return { fail: { status: 422, error: 'A credit is used against something being paid — tick what the transfer paid as well.', code: 'CREDIT_ALONE', payload: { linesTotal } } };
     }
     return { warnings, targets, applied };
 }

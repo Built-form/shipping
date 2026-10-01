@@ -157,7 +157,7 @@ test('a shipment cost: payee, container, no PO; freight/customs/duty/delivery ki
         sourceKind: null, sourceId: null, note: null,
     });
     for (const kind of ['customs', 'duty', 'delivery']) assert.equal(L.parseExtraBody({ supplierName: 'DCG', currency: 'GBP', amount: 10, kind, ridesWith: 'shipment', shipmentReference: '301' }).value.kind, kind);
-    assert.deepEqual(L.RIDES_WITH, ['deposit', 'balance', 'shipment']);
+    assert.ok(L.RIDES_WITH.includes('shipment')); // the full list is pinned by the credit-note test below
     assert.equal(L.lineLabel({ kind: 'customs', shipment_reference: '301' }), '301 customs clearance');
 });
 
@@ -165,4 +165,43 @@ test('a shipment cost may not name a PO, and must name its container', () => {
     const cost = (over = {}) => ({ supplierName: 'DCG', currency: 'GBP', amount: 10, kind: 'freight', ridesWith: 'shipment', shipmentReference: '301', ...over });
     assert.match(L.parseExtraBody(cost({ purchaseOrderId: 395 })).error || '', /shipment.*purchase order/i);
     assert.match(L.parseExtraBody(cost({ shipmentReference: null })).error || '', /shipment.*container/i);
+});
+
+// Supplier credit notes (user, 2026-10-01): a credit held with a supplier,
+// tied to no PO and no container — "on account" until a transfer uses it.
+// It may cover what a transfer pays in full: then no money is sent.
+test('a supplier credit note: on account, negative, no PO, no container', () => {
+    const v = L.parseExtraBody({ supplierName: ' Sunmed ', currency: 'usd', amount: -4500, kind: 'credit_note', ridesWith: 'account', description: ' CN-2026-014 ' }).value;
+    assert.deepEqual(v, {
+        supplierName: 'Sunmed', currency: 'USD', amount: -4500, kind: 'credit_note', description: 'CN-2026-014',
+        ridesWith: 'account', purchaseOrderId: null, shipmentId: null, shipmentReference: null, dueDate: null,
+        sourceKind: null, sourceId: null, note: null,
+    });
+    assert.deepEqual(L.RIDES_WITH, ['deposit', 'balance', 'shipment', 'account']);
+    assert.equal(L.lineLabel({ kind: 'credit_note', rides_with: 'account' }), 'Credit note');
+});
+test('a credit note is a credit, and belongs to the supplier alone', () => {
+    const note = (over = {}) => ({ supplierName: 'Sunmed', currency: 'USD', amount: -100, kind: 'credit_note', ridesWith: 'account', ...over });
+    assert.match(L.parseExtraBody(note({ amount: 100 })).error || '', /credit note.*negative/i);
+    assert.match(L.parseExtraBody(note({ purchaseOrderId: 395 })).error || '', /credit note.*purchase order|container/i);
+    assert.match(L.parseExtraBody(note({ shipmentReference: '301' })).error || '', /credit note.*purchase order|container/i);
+});
+test('credits in a transfer: against something paid, never more than it, and they may cover it all with no money sent', () => {
+    const lines = (...amounts) => amounts.map(amount => ({ amount }));
+    // Money sent, credits take part of it off: fine.
+    assert.equal(L.checkCreditUse({ lines: lines(5000, -500), amount: 4500 }), null);
+    // Credits cover everything ticked, nothing sent: settled by credit.
+    assert.equal(L.checkCreditUse({ lines: lines(4000, -4000), amount: 0 }), null);
+    assert.equal(L.checkCreditUse({ lines: lines(300, 700, -450, -550), amount: 0 }), null);
+    // Nothing sent and no credit: not a payment.
+    assert.equal(L.checkCreditUse({ lines: lines(300), amount: 0 }).code, 'NOTHING_SENT');
+    // A credit with nothing paid.
+    assert.equal(L.checkCreditUse({ lines: lines(-120), amount: 1 }).code, 'CREDIT_ALONE');
+    assert.equal(L.checkCreditUse({ lines: lines(-120), amount: 0 }).code, 'CREDIT_ALONE');
+    // More credit than what is paid.
+    assert.equal(L.checkCreditUse({ lines: lines(300, -450), amount: 0 }).code, 'CREDIT_EXCEEDS');
+    // Money sent although the credits already cover everything: refused as before.
+    assert.equal(L.checkCreditUse({ lines: lines(300, -300), amount: 50 }).code, 'CREDIT_ALONE');
+    // No credits: nothing to say.
+    assert.equal(L.checkCreditUse({ lines: lines(300, 200), amount: 500 }), null);
 });

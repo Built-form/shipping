@@ -18,16 +18,19 @@
 // the way it settles a balance or a PI: once the money applied covers it
 // within a bank charge (max of 1 and 1 %), on the absolute amounts.
 
-const EXTRA_KINDS = ['mould', 'tooling', 'handling', 'samples', 'testing', 'freight', 'packaging', 'bank_charge', 'discount', 'customs', 'duty', 'delivery', 'other'];
+const EXTRA_KINDS = ['mould', 'tooling', 'handling', 'samples', 'testing', 'freight', 'packaging', 'bank_charge', 'discount', 'customs', 'duty', 'delivery', 'credit_note', 'other'];
 const EXTRA_LABEL = {
     mould: 'Mould cost', tooling: 'Tooling', handling: 'Handling fee', samples: 'Samples', testing: 'Testing',
     freight: 'Freight', packaging: 'Packaging', bank_charge: 'Bank charge', discount: 'Discount',
-    customs: 'Customs clearance', duty: 'Import duty', delivery: 'Delivery', other: 'Other charge',
+    customs: 'Customs clearance', duty: 'Import duty', delivery: 'Delivery', credit_note: 'Credit note', other: 'Other charge',
 };
 // 'shipment' (user, 2026-09-30): a cost of the shipment itself — freight,
 // customs, delivery — paid to its own payee (the forwarder, in supplierName),
 // with the container and in its own currency; it names no PO.
-const RIDES_WITH = ['deposit', 'balance', 'shipment'];
+// 'account' (user, 2026-10-01): a supplier credit note — a credit held with
+// the supplier, tied to no PO and no container. It is in no payment's figure
+// until a person uses it in a transfer (Record payment), in whole or in part.
+const RIDES_WITH = ['deposit', 'balance', 'shipment', 'account'];
 const EDITOR_ROLES = ['admin', 'standard', 'accountant'];
 // Where a suggested extra was read from: a supplier's invoice on a container.
 const SOURCE_KINDS = ['shipment_document'];
@@ -77,7 +80,7 @@ function parseExtraBody(body) {
         return { error: 'description cannot exceed 255 characters.' };
     }
     const ridesWith = String(b.ridesWith || '');
-    if (!RIDES_WITH.includes(ridesWith)) return { error: 'ridesWith must be "deposit", "balance" or "shipment".' };
+    if (!RIDES_WITH.includes(ridesWith)) return { error: 'ridesWith must be "deposit", "balance", "shipment" or "account".' };
     const purchaseOrderId = positiveId(b.purchaseOrderId);
     const shipmentId = positiveId(b.shipmentId);
     if (Number.isNaN(purchaseOrderId)) return { error: 'purchaseOrderId must be an id.' };
@@ -86,6 +89,11 @@ function parseExtraBody(body) {
     if (ridesWith === 'deposit') {
         if (purchaseOrderId == null) return { error: 'An extra riding with a deposit names its purchase order (purchaseOrderId).' };
         if (shipmentId != null || shipmentReference) return { error: 'An extra riding with a deposit belongs to the PO, not a container — leave the shipment out.' };
+    } else if (ridesWith === 'account') {
+        if (amount > 0) return { error: 'A credit note is a credit — enter it as a negative amount.' };
+        if (purchaseOrderId != null || shipmentId != null || shipmentReference) {
+            return { error: 'A credit note belongs to the supplier alone — leave the purchase order and the container out.' };
+        }
     } else if (ridesWith === 'shipment') {
         if (purchaseOrderId != null) return { error: 'A shipment cost belongs to the container, not a purchase order — leave the PO out.' };
         if (shipmentId == null && !shipmentReference) return { error: 'A shipment cost names its container (shipmentId or shipmentReference).' };
@@ -123,6 +131,26 @@ function checkLine({ lineAmount, extraAmount, appliedBefore }) {
     const remaining = money(extraAmount - appliedBefore);
     if (Math.abs(lineAmount) > Math.abs(remaining) + EPS) {
         return { code: 'OVER_APPLIED', error: `${Math.abs(lineAmount)} applied, but only ${Math.abs(remaining)} is left on it.`, remaining };
+    }
+    return null;
+}
+
+// Credits in one transfer, taken together: a credit is used against something
+// being paid, never for more than it — and credits may cover everything paid,
+// in which case no money is sent (user, 2026-10-01: "4,000 deposit, 4,500 of
+// credit: 0 due"). null, or { code, error }. `lines`: [{ amount }], credits negative.
+function checkCreditUse({ lines, amount }) {
+    const total = money(lines.reduce((a, l) => a + l.amount, 0));
+    const credits = lines.some(l => l.amount < 0);
+    const paid = lines.some(l => l.amount > 0);
+    const nothingSent = !(Number(amount) > EPS);
+    if (!credits) {
+        return nothingSent ? { code: 'NOTHING_SENT', error: 'amount must be above 0 — only credits can cover a payment with no money sent.' } : null;
+    }
+    if (!paid) return { code: 'CREDIT_ALONE', error: 'A credit is used against something being paid — tick what the transfer paid as well.' };
+    if (total < -EPS) return { code: 'CREDIT_EXCEEDS', error: 'The credits used come to more than what is being paid — use less of the credit.' };
+    if (!nothingSent && total <= EPS) {
+        return { code: 'CREDIT_ALONE', error: 'The credits already cover everything ticked — record it with nothing sent, or tick what the money paid as well.' };
     }
     return null;
 }
@@ -211,6 +239,7 @@ module.exports = {
     canEdit,
     parseExtraBody,
     checkLine,
+    checkCreditUse,
     settles,
     decideEdit,
     decideDelete,

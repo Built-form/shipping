@@ -198,6 +198,34 @@ async function cleanup() {
         if (wrongPayee.status === 201) paymentIds.add(wrongPayee.body.id);
         check('a transfer to someone else cannot pay the forwarder\'s cost', wrongPayee.status >= 400, wrongPayee);
 
+        console.log('\nA supplier credit note (ridesWith account)');
+        as('standard');
+        const noteBody = { supplierName: SUP, currency: 'USD', amount: -450, kind: 'credit_note', description: 'CN-TEST-1', ridesWith: 'account' };
+        const notePos = await call('POST', '/api/v1/payment-extras', { ...noteBody, amount: 450 });
+        check('a positive credit note → 400', notePos.status === 400 && /negative/i.test(notePos.body.error || ''), notePos);
+        const noteWithPo = await call('POST', '/api/v1/payment-extras', { ...noteBody, purchaseOrderId: poId });
+        check('a credit note naming a PO → 400', noteWithPo.status === 400, noteWithPo);
+        const note = await call('POST', '/api/v1/payment-extras', noteBody);
+        check('POST → 201, on account: no PO, no container, 450 of credit left', note.status === 201 && note.body.ridesWith === 'account' && note.body.purchaseOrderId === null
+            && note.body.shipmentReference === null && note.body.remaining === -450 && note.body.label === 'Credit note', note);
+        const owed = await call('POST', '/api/v1/payment-extras', { ...mould, amount: 300, kind: 'handling', description: 'Handling for the credit test' });
+        const tooMuchCredit = await pay(0, [{ kind: 'extra', id: owed.body.id, amount: 300 }, { kind: 'extra', id: note.body.id, amount: -450 }]);
+        check('more credit than what is paid → 422 CREDIT_EXCEEDS', tooMuchCredit.status === 422 && tooMuchCredit.body.code === 'CREDIT_EXCEEDS', tooMuchCredit);
+        const nothingSent = await pay(0, [{ kind: 'extra', id: owed.body.id, amount: 300 }]);
+        check('nothing sent and no credit → 422 NOTHING_SENT', nothingSent.status === 422 && nothingSent.body.code === 'NOTHING_SENT', nothingSent);
+        const byCredit = await pay(0, [{ kind: 'extra', id: owed.body.id, amount: 300 }, { kind: 'extra', id: note.body.id, amount: -300 }]);
+        check('300 owed, 300 of the credit, nothing sent → 201', byCredit.status === 201 && Number(byCredit.body.amount) === 0, byCredit);
+        const afterCredit = await extrasOf();
+        const owedAfter = afterCredit.find(x => x.id === owed.body.id);
+        const noteAfter = afterCredit.find(x => x.id === note.body.id);
+        check('the charge is paid by it; the credit note has 150 left and stays open',
+            !!owedAfter && !!noteAfter && owedAfter.status === 'paid' && owedAfter.settledByPaymentId === byCredit.body.id
+            && noteAfter.status === 'open' && noteAfter.remaining === -150 && noteAfter.applied === -300, { owedAfter, noteAfter });
+        as('admin');
+        const delByCredit = await call('DELETE', `/api/v1/supplier-payments/${byCredit.body.id}`);
+        const noteBack = (await extrasOf()).find(x => x.id === note.body.id);
+        check('deleting that record gives the credit back in full', delByCredit.status === 204 && !!noteBack && noteBack.remaining === -450 && noteBack.applied === 0, { delByCredit, noteBack });
+
         console.log('\nDeleting the transfer puts them back');
         as('admin');
         const delPay = await call('DELETE', `/api/v1/supplier-payments/${paid.body.id}`);

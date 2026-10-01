@@ -27,8 +27,21 @@ Rules and shapes: `src/lib/payment-extras.js`. Routes:
     currency's tab; its `dueDate` if given, else the container's goods balances'
     date (any currency), else now. A transfer to the forwarder pays it with an
     ordinary `extra` line; a transfer to anyone else is refused.
+  - `account` (2026-10-01) — a **supplier credit note**: a credit held with the
+    supplier, tied to no PO and no container (`purchaseOrderId` and the shipment
+    fields refused, 400). `amount` must be negative; `kind` is normally
+    `credit_note`; `description` carries the credit note number. It is in no
+    payment figure. A transfer uses it, in whole or in part, with an ordinary
+    negative `extra` line against anything paid to that supplier in that currency.
+- **Credits in a transfer** (`POST`/`PUT /supplier-payments`, rule `checkCreditUse`):
+  a credit is used against something being paid (`422 CREDIT_ALONE` otherwise),
+  never for more than what is paid (`422 CREDIT_EXCEEDS`), and credits may cover
+  everything the lines pay — then `amount` is `0`, nothing was sent, and the
+  record is the credit being used. `amount: 0` with no credit line is refused
+  (`422 NOTHING_SENT`); money sent although credits already cover everything
+  ticked is refused (`422 CREDIT_ALONE`).
 - Kinds: `mould`, `tooling`, `handling`, `samples`, `testing`, `freight`,
-  `packaging`, `bank_charge`, `discount`, `customs`, `duty`, `delivery`, `other`.
+  `packaging`, `bank_charge`, `discount`, `customs`, `duty`, `delivery`, `credit_note`, `other`.
 - `amount` is **signed**: a credit is negative. `kind: "discount"` must be negative.
 - Never part of the PO value: not split by the deposit %, never moves a
   container share. The page adds it on top.
