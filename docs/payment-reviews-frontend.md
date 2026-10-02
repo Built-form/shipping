@@ -41,7 +41,13 @@ deposit:<purchase order id>                     every deposit due on that PO
 balance:<CUR>:<container>|<supplier>            one supplier's balance in one container
                                                 (container upper-cased, '-' for none;
                                                  supplier lower-cased, spaces collapsed)
+qc:<QC invoice document id>                     the QC units one uploaded QC invoice bills
+                                                (shipment_payment_documents.id) — 2026-10-02
 ```
+
+A QC invoice's figure is what is still owed on the QC units it bills, so paying
+one of them changes the figure and the invoice is signed off again. `kind` is
+`'qc'`, `currency` and `containerRef` come back null from the key.
 
 Anything else is `400 BAD_FIELD`. At most 255 characters.
 
@@ -98,7 +104,7 @@ every accountant; any allowlisted user).
 
 ```ts
 interface PaymentReview {
-  id: number; paymentKey: string; kind: 'deposit' | 'balance';
+  id: number; paymentKey: string; kind: 'deposit' | 'balance' | 'qc';
   supplierName: string | null; poNumbers: string | null; containerRef: string | null;
   currency: string; amount: number; dueDate: string | null;
   reviewedByEmail: string; reviewedByName: string | null;   // name from shipping_allowed_emails.display_name
@@ -118,11 +124,23 @@ replace) and `payment_assignee` (create / update / delete).
 
 ## Not enforced here
 
-- **Recording a payment is never blocked** by missing sign-offs: a transfer is
-  recorded after the money has left the bank. The Payments page names what is
-  short of two sign-offs in the Record payment form and relabels its button
-  ("Record without sign-off"). The PO page and the container/shipment balance
-  tabs do not have the payments model, so they do not warn.
+- **The API never refuses a payment for missing sign-offs.** Since 2026-10-02
+  ShipLine's Record payment FORM does (user's rule; before that it only
+  warned): every new line needs an uploaded invoice and two sign-offs at
+  today's figure, and a new payment needs its proof document. It is a rule of
+  that form only — `POST /supplier-payments` still accepts anything, and the
+  status chips ("mark paid") on a balance record are not covered.
+  - Going forward only: lines already on a recorded payment are not checked
+    again, and an edit asks for no proof. A line added in an edit is checked.
+  - A top-up (`source: 'top_up'`) needs no invoice; a credit being used needs
+    nothing; a payment made wholly by credit needs no proof.
+  - An admin may record anyway with a typed reason. The form writes it as the
+    last line of the payment's `note`:
+    `[OVERRIDE] Recorded without: <what was missing>. Reason: <text>`.
+  - The PO page and the container/shipment balance tabs open the same form
+    without the payments model, so they cannot check anything: a new line
+    cannot be recorded from them, and the form says to use the Payments page.
+  - Rules and wording: `ShipLine/src/components/payments/payRules.ts`.
 - The accountant's view-only status is still enforced in ShipLine's browser
   code only; the API does not refuse other writes from an accountant token.
   (Pre-existing; unchanged by this feature.)

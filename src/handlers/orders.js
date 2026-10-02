@@ -51,6 +51,7 @@ const { registerPackingListRoutes } = require('../services/packing-list-routes')
 const { registerContainerPhotoRoutes } = require('../services/container-photo-routes');
 const { registerPaymentReviewRoutes } = require('../services/payment-review-routes');
 const { registerPaymentExtraRoutes } = require('../services/payment-extra-routes');
+const { registerPaymentAlertRoutes } = require('../services/payment-alert-routes');
 const extrasLib = require('../lib/payment-extras');
 const paymentDocumentsLib = require('../lib/payment-documents');
 const { makeSplitOrder } = require('../services/order-split');
@@ -10064,7 +10065,9 @@ app.post('/api/v1/shipment-payments', async (req, res) => {
                         parsed.row.invoice_number ?? null, parsed.row.invoice_date ?? null, parsed.row.due_date ?? null,
                         parsed.row.invoice_total ?? null, parsed.row.deposit_deducted ?? null,
                         parsed.row.status || 'pending', parsed.row.bank_ref ?? null, parsed.row.note ?? null,
-                        typeof body.source === 'string' && body.source === 'extracted' ? 'extracted' : 'manual',
+                        // 'top_up': a balance for goods added after the container was paid
+                        // (over-production). Pending = to pay; skipped = not owed.
+                        body.source === 'extracted' ? 'extracted' : body.source === 'top_up' ? 'top_up' : 'manual',
                         req.userEmail || null,
                     ]
                 );
@@ -10498,6 +10501,8 @@ function supplierPaymentLineToJson(l, target) {
         targetAmount: target?.amount ?? null,
         targetStatus: target?.status ?? null,
         targetMissing: !target,
+        // A balance only: 'top_up' when it pays for goods added after the container was paid.
+        targetSource: target?.source ?? null,
         // An extra only: what kind of charge, and which payment it rode with.
         extraKind: target?.extraKind ?? null,
         ridesWith: target?.ridesWith ?? null,
@@ -10546,7 +10551,7 @@ async function loadSupplierPaymentTargets(conn, lines) {
             out.set(`balance:${r.id}`, {
                 kind: 'balance', id: r.id, amount: Number(r.amount), currency: r.currency, status: r.status,
                 supplier: r.supplier_name, supplierKey: r.supplier_key, settledBy: r.settled_by_payment_id ?? null,
-                allocated: Number(r.allocated) || 0, label: r.shipment_reference || String(r.shipment_id),
+                allocated: Number(r.allocated) || 0, label: r.shipment_reference || String(r.shipment_id), source: r.source || 'manual',
                 shipmentId: r.shipment_id, shipmentReference: r.shipment_reference, invoiceNumber: r.invoice_number || null,
                 purchaseOrderId: null, poNumber: null, paymentType: null,
             });
@@ -11153,7 +11158,7 @@ app.get('/api/v1/supplier-payments/open-items', async (req, res) => {
                     open, paidOn: b.paid_on || null,
                     currency: cur, status: b.status, dueDate: b.due_date || null, invoiceNumber: b.invoice_number || null,
                     shipmentId: b.shipment_id, shipmentReference: b.shipment_reference, purchaseOrderId: null, poNumber: null, paymentType: null,
-                    supplierName: b.supplier_name, allocations: allocationsOf(b),
+                    supplierName: b.supplier_name, allocations: allocationsOf(b), source: b.source || 'manual',
                 });
             }
             for (const p of mine.pis) {
@@ -11525,6 +11530,15 @@ registerContainerPhotoRoutes(app, {
 // Two people sign off each payment on ShipLine's Payments flow page; one
 // accountant is its assignee.
 registerPaymentReviewRoutes(app, {
+    withConnection,
+    recordAudit,
+    auditLogSchemaReady,
+    log,
+});
+
+// ── Dismissed "Needs attention" lines (/api/v1/payment-alert-dismissals) ──
+// The Payments flow page works its alerts out itself; an admin can dismiss one.
+registerPaymentAlertRoutes(app, {
     withConnection,
     recordAudit,
     auditLogSchemaReady,

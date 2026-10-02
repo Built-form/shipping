@@ -10,6 +10,8 @@
 //   deposit:<purchase order id>                     every deposit due on that PO
 //   balance:<currency>:<container>|<supplier key>   a supplier's balance in one
 //                                                   container ('-' = no container)
+//   qc:<QC invoice document id>                     the QC units one uploaded
+//                                                   QC invoice bills (2026-10-02)
 // Whether a review still stands is the page's call: only it knows today's
 // figure, and a review of any other figure does not count. The server owns
 // who reviewed, when, and what they saw.
@@ -44,7 +46,10 @@ function parsePaymentKey(raw) {
     if (bal && bal[2].trim() && bal[3].trim()) {
         return { key, kind: 'balance', currency: bal[1], containerRef: bal[2] === '-' ? null : bal[2] };
     }
-    return { error: 'paymentKey must be "deposit:<purchase order id>" or "balance:<currency>:<container>|<supplier>".' };
+    // A QC invoice (shipment_payment_documents.id): the QC units it bills are signed off as one payment.
+    const qc = /^qc:([1-9]\d{0,9})$/.exec(key);
+    if (qc) return { key, kind: 'qc', currency: null, containerRef: null };
+    return { error: 'paymentKey must be "deposit:<purchase order id>", "balance:<currency>:<container>|<supplier>" or "qc:<QC invoice document id>".' };
 }
 
 // { value } or { error } — a sign-off as the page sends it.

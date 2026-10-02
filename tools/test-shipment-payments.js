@@ -705,6 +705,30 @@ async function pickFixture() {
         check('deleting an upload is admin-only → 403', delDoc.status === 403, delDoc.data);
     }
 
+    // A top-up (2026-10-02): goods added after the container was paid — the
+    // supplier made more than was ordered and no new PI comes. A balance of its
+    // own on the shipment: pending to pay, skipped when it is not owed.
+    section('POST /shipment-payments — a top-up');
+    {
+        const base = { shipmentId: fixture.id, supplierName: fixture.supplier, currency: 'USD', allocations: [{ purchaseOrderId: pos[0].id, amount: 90 }] };
+        const top = await post({ ...base, amount: 90, source: 'top_up', invoiceNumber: `${INVOICE_TAG}-TOPUP`, note: 'Top-up test' });
+        check('a top-up is recorded → 201', top.status === 201, top.data);
+        if (top.data && top.data.id) createdIds.push(top.data.id);
+        check('it is filed as a top-up, pending', top.data && top.data.source === 'top_up' && top.data.status === 'pending', top.data && [top.data.source, top.data.status]);
+        const waived = await post({ ...base, amount: 90, source: 'top_up', status: 'skipped', invoiceNumber: `${INVOICE_TAG}-TOPUP-NO` });
+        if (waived.data && waived.data.id) createdIds.push(waived.data.id);
+        check('"not owed" is the same record, skipped', waived.status === 201 && waived.data.source === 'top_up' && waived.data.status === 'skipped', waived.data && [waived.status, waived.data.source, waived.data.status]);
+        const other = await post({ ...base, amount: 5, allocations: [{ purchaseOrderId: pos[0].id, amount: 5 }], source: 'anything-else', invoiceNumber: `${INVOICE_TAG}-TOPUP-X` });
+        if (other.data && other.data.id) createdIds.push(other.data.id);
+        check('any other source asked for is filed as manual', other.status === 201 && other.data.source === 'manual', other.data);
+        const open = await api.get(`/api/v1/supplier-payments/open-items?supplier=${encodeURIComponent(fixture.supplier)}&currency=USD`);
+        const items = (open.data && (open.data.items || open.data.data)) || [];
+        const mine = items.find(i => i.kind === 'balance' && top.data && i.id === top.data.id);
+        check('Record payment is offered the pending top-up, marked as one', !!mine && mine.source === 'top_up' && mine.remaining === 90, mine);
+        check('…and never the one marked not owed', !items.some(i => i.kind === 'balance' && waived.data && i.id === waived.data.id));
+        check('an ordinary balance says manual', items.some(i => i.kind === 'balance' && i.id === rec.id && i.source === 'manual') || !items.some(i => i.id === rec.id), items.find(i => i.id === rec.id));
+    }
+
     section('DELETE /shipment-payments/:id');
     const del = await api.delete(`/api/v1/shipment-payments/${rec.id}`);
     if (isAdmin) {

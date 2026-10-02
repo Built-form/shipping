@@ -29,6 +29,11 @@ test('balance key: balance:<currency>:<container>|<supplier>, "-" = no container
     );
     // A container number with spaces ("104. Air Freight") is a container number.
     assert.equal(L.parsePaymentKey('balance:USD:104. AIR FREIGHT|kingphar').containerRef, '104. AIR FREIGHT');
+    // A QC invoice: the QC units one uploaded invoice bills (2026-10-02).
+    assert.deepEqual(L.parsePaymentKey('qc:412'), { key: 'qc:412', kind: 'qc', currency: null, containerRef: null });
+    for (const bad of ['qc:', 'qc:0', 'qc:abc', 'qc:12|x', 'qc:-4', 'QC:12']) {
+        assert.ok(L.parsePaymentKey(bad).error, `expected an error for ${JSON.stringify(bad)}`);
+    }
 });
 
 test('malformed keys are refused', () => {
