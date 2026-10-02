@@ -52,6 +52,7 @@ const { registerContainerPhotoRoutes } = require('../services/container-photo-ro
 const { registerPaymentReviewRoutes } = require('../services/payment-review-routes');
 const { registerPaymentExtraRoutes } = require('../services/payment-extra-routes');
 const extrasLib = require('../lib/payment-extras');
+const paymentDocumentsLib = require('../lib/payment-documents');
 const { makeSplitOrder } = require('../services/order-split');
 const shipmentsLib = require('../lib/shipments');
 const shipmentPaymentsService = require('../services/shipment-payments');
@@ -10404,17 +10405,20 @@ app.get('/api/v1/shipment-payment-documents', async (req, res) => {
     }
 });
 
-// DELETE /api/v1/shipment-payment-documents/:id — admin only, soft. The
-// record it produced stays: the figures were checked by a person.
+// DELETE /api/v1/shipment-payment-documents/:id — soft. Admin only, except
+// that whoever uploaded a proof of payment no payment uses may take it back
+// (lib/payment-documents). The record it produced stays: the figures were
+// checked by a person.
 app.delete('/api/v1/shipment-payment-documents/:id(\\d+)', async (req, res) => {
     try {
-        if (req.userType !== 'admin') return res.status(403).json({ error: 'Admin access required.', code: 'ADMIN_ONLY' });
         await shipmentPaymentsSchemaReady;
         await auditLogSchemaReady;
         const id = Number(req.params.id);
         const result = await withConnection(async (conn) => {
             const [rows] = await conn.query(`SELECT * FROM shipment_payment_documents WHERE id = ? AND deleted_at IS NULL`, [id]);
             if (!rows.length) return { notFound: true };
+            const refusal = paymentDocumentsLib.deleteRefusal({ userType: req.userType, userEmail: req.userEmail, doc: rows[0] });
+            if (refusal) return { refusal };
             await conn.query(`UPDATE shipment_payment_documents SET deleted_at = NOW() WHERE id = ?`, [id]);
             await recordAudit(conn, {
                 entityType: 'shipment_payment_document', entityId: id, action: 'delete',
@@ -10423,6 +10427,7 @@ app.delete('/api/v1/shipment-payment-documents/:id(\\d+)', async (req, res) => {
             return { ok: true };
         });
         if (result.notFound) return res.status(404).json({ error: `Document ${id} not found.`, code: 'NOT_FOUND' });
+        if (result.refusal) return res.status(result.refusal.status).json({ error: result.refusal.error, code: result.refusal.code });
         res.status(204).end();
     } catch (error) {
         log.error('[DELETE /shipment-payment-documents/:id]', error);
