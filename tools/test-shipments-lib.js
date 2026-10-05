@@ -188,6 +188,49 @@ test('rowToShipment: booked shipments read etd / eta / vessel / carrier ref from
     assert.equal(d.etd, '2026-10-01', 'a draft keeps its own etd');
 });
 
+test('rowToShipment: an open shipment reports the number its name reserves; a booked one reports none', () => {
+    const sea = S.rowToShipment({ id: 7, stage: 'DRAFT', mode: 'SEA', name: 'DRAFT-SEA-260917-173825 - 328 Ningbo mix' });
+    assert.equal(sea.reservedReference, '328');
+    assert.equal(sea.reservedSeq, 328);
+    const air = S.rowToShipment({ id: 8, stage: 'DRAFT', mode: 'AIR', name: 'DRAFT-AIR-260917-173825 - 104' });
+    assert.equal(air.reservedReference, '104. Air Freight');
+    assert.equal(air.reservedSeq, 104);
+    const planned = S.rowToShipment({ id: 9, stage: 'PLANNED', mode: 'SEA', name: 'PLANNED-SEA-260917-173825 - 330' });
+    assert.equal(planned.reservedReference, '330');
+    const none = S.rowToShipment({ id: 10, stage: 'DRAFT', mode: 'SEA', name: 'DRAFT-SEA-260917-173825 - TAM Container 2' });
+    assert.equal(none.reservedReference, null);
+    assert.equal(none.reservedSeq, null);
+    // The rule booking applies: a hint of the other sequence reserves nothing.
+    const mismatch = S.rowToShipment({ id: 11, stage: 'DRAFT', mode: 'AIR', name: 'DRAFT-SEA-260917-173825 - 328' });
+    assert.equal(mismatch.reservedReference, null);
+    const booked = S.rowToShipment({ id: 12, stage: 'BOOKED', mode: 'SEA', reference: '328', name: 'DRAFT-SEA-260917-173825 - 328' });
+    assert.equal(booked.reservedReference, null);
+    assert.equal(booked.reference, '328');
+});
+
+test('nextReference: a number reserved by an open shipment with no lines still counts', async () => {
+    const conn = fakeConn((sql) => {
+        if (sql.includes('FROM orders')) return [[{ ref: '327' }, { ref: '103. Air Freight' }]];
+        if (sql.includes('draft_container_allocations')) return [[{ name: 'DRAFT-SEA-260917-173825 - 328' }]];
+        if (sql.includes('FROM shipments')) return [[
+            { id: 41, name: 'DRAFT-SEA-260918-090000 - 329' },      // saved with no lines
+            { id: 40, name: 'DRAFT-SEA-260917-173825 - 328' },      // also in the allocations
+            { id: 42, name: 'DRAFT-AIR-260918-090500 - 104' },
+        ]];
+        return [[]];
+    });
+    const sea = await sync.nextReference(conn, 'SEA');
+    assert.equal(sea.maxBooked, 327);
+    assert.equal(sea.maxReserved, 329);
+    assert.equal(sea.seq, 330);
+    assert.equal(sea.reference, '330');
+    assert.deepEqual(sea.reservedBy.map(r => [r.seq, r.shipmentId]), [[329, 41], [328, 40]]);
+    const air = await sync.nextReference(conn, 'AIR');
+    assert.equal(air.seq, 105);
+    assert.equal(air.reference, '105. Air Freight');
+    assert.deepEqual(air.reservedBy.map(r => [r.seq, r.shipmentId]), [[104, 42]]);
+});
+
 // ── shadow(): arming, kill switch, both transaction modes ─────────────────
 test('shadow: inert without the marker, and a negative answer is never cached', async () => {
     sync.resetFlagCache();

@@ -18,6 +18,7 @@ const S = require('../lib/shipments');
 const sync = require('./shipment-sync');
 const { makeBookShipment } = require('./shipment-book');
 const { makeTransitionShipment } = require('./shipment-stage');
+const rename = require('./shipment-rename');
 const { SplitError } = require('./order-split');
 
 const { ShipmentError } = S;
@@ -238,7 +239,12 @@ function registerShipmentRoutes(app, deps) {
     });
 
     // ── POST /shipments ───────────────────────────────────────────────────
-    // { mode, stage?: 'DRAFT' | 'PLANNED', name?, reference?, originPort?, notes?, lines? }
+    // { mode, stage?: 'DRAFT' | 'PLANNED', name?, reference?, reserve?, label?,
+    //   originPort?, notes?, etd?, eta?, vesselName?, forwarder?, bookingRef?, blNumber?, lines? }
+    // `reserve: true` (DRAFT, SEA / AIR) has the server take the next number in
+    // the mode's sequence and name the draft '<stamp> - <number> <label>': one
+    // reserver at a time per mode, so two drafts never hold the same number.
+    const CREATE_HEADER = ['etd', 'eta', 'vesselName', 'forwarder', 'bookingRef', 'blNumber'];
     app.post('/api/v1/shipments', async (req, res) => {
         try {
             await ready();
@@ -250,6 +256,24 @@ function registerShipmentRoutes(app, deps) {
             const lines = parseLines(b.lines);
             if (stage === 'PLANNED' && !lines.length) {
                 return res.status(422).json({ error: 'A planned shipment needs at least one line (a planned container is its lines).', code: 'LINES_REQUIRED' });
+            }
+            const reserve = b.reserve === true;
+            const label = S.clean(b.label);
+            if (reserve) {
+                if (S.clean(b.name) || S.clean(b.reference)) {
+                    return res.status(400).json({ error: 'With reserve the server names the draft: send label, not name or reference.', code: 'RESERVE_CONFLICT' });
+                }
+                if (stage !== 'DRAFT') return res.status(400).json({ error: 'Only a draft reserves a number.', code: 'RESERVE_CONFLICT' });
+                if (mode === 'ROAD') {
+                    return res.status(422).json({ error: 'ROAD shipments have no reference sequence to reserve from.', code: 'NO_SEQUENCE' });
+                }
+            }
+            const header = {};
+            for (const key of CREATE_HEADER) {
+                if (b[key] === undefined) continue;
+                const spec = HEADER_FIELDS[key] || WRITE_THROUGH[key];
+                const v = fieldValue(key, spec, b[key]);
+                if (v != null) header[spec.col] = v;
             }
             let name = S.clean(b.name) || stampName(stage, mode);
             const reference = S.clean(b.reference);
@@ -265,7 +289,16 @@ function registerShipmentRoutes(app, deps) {
             const originPort = S.clean(b.originPort) ? S.clean(b.originPort).slice(0, 255) : null;
             const notes = S.clean(b.notes);
 
-            const result = await withConnection(conn => inTransaction(conn, async () => {
+            const create = async (conn) => inTransaction(conn, async () => {
+                if (reserve) {
+                    // Under the per-mode lock taken below: the next number past
+                    // every booked and held one, skipping any a stale shadow
+                    // row still sits on.
+                    let seq = (await sync.nextReference(conn, mode)).seq;
+                    for (let i = 0; i < 25 && !(await sync.referenceIsFree(conn, S.formatReference(mode, seq))); i++) seq++;
+                    name = `${stampName(stage, mode)} - ${seq}${label ? ` ${label}` : ''}`;
+                    if (name.length > 100) throw new ShipmentError(400, 'BAD_NAME', 'name must be 100 characters or fewer: shorten the label.');
+                }
                 const kind = stage === 'PLANNED' ? 'P' : 'D';
                 if (await sync.lockOpenShipment(conn, `${kind}:${name}`)) {
                     throw new ShipmentError(409, 'NAME_IN_USE', `An open ${stage.toLowerCase()} named "${name}" already exists.`);
@@ -278,6 +311,11 @@ function registerShipmentRoutes(app, deps) {
                 }
                 if (reference) {
                     const parsed = S.parseReference(reference);
+                    const holder = await sync.reservedHolder(conn, parsed.reference);
+                    if (holder) {
+                        throw new ShipmentError(409, 'REFERENCE_IN_USE', `Reference "${parsed.reference}" is held by the open draft "${holder.name}".`,
+                            { reference: parsed.reference, reservedBy: holder.name, reservedByShipmentId: holder.id });
+                    }
                     if (!(await sync.referenceIsFree(conn, parsed.reference))) {
                         throw new ShipmentError(409, 'REFERENCE_IN_USE', `Reference "${parsed.reference}" is already in use.`);
                     }
@@ -303,15 +341,33 @@ function registerShipmentRoutes(app, deps) {
                     synced = await sync.syncPlanned(conn, name, { origin: 'api', userEmail: req.userEmail, createIfMissing: true });
                 }
                 if (!synced || !synced.shipmentId || synced.stampedOnly) throw new Error('shipment not created');
+                const headerCols = Object.keys(header);
                 await conn.query(
                     `UPDATE shipments
                         SET mode = ?, mode_source = 'user', origin_port = COALESCE(?, origin_port), notes = COALESCE(?, notes),
-                            created_by_email = COALESCE(created_by_email, ?)
+                            created_by_email = COALESCE(created_by_email, ?)${headerCols.map(c => `, ${c} = ?`).join('')}
                       WHERE id = ?`,
-                    [mode, originPort, notes, req.userEmail || null, synced.shipmentId]
+                    [mode, originPort, notes, req.userEmail || null, ...headerCols.map(c => header[c]), synced.shipmentId]
                 );
                 return { id: synced.shipmentId, warnings };
-            }));
+            });
+            const result = await withConnection(async (conn) => {
+                if (!reserve) return create(conn);
+                // A named lock, not a row lock: there is no row to lock before
+                // the first draft of a number exists. Taken before the
+                // transaction starts and released after it ends, so the next
+                // reserver reads this one's committed name.
+                const lock = `shipments:reserve:${mode}`;
+                const [[held]] = await conn.query('SELECT GET_LOCK(?, 10) AS got', [lock]);
+                if (Number(held.got) !== 1) {
+                    throw new ShipmentError(503, 'RESERVE_BUSY', 'Another draft is being numbered right now. Try again.');
+                }
+                try {
+                    return await create(conn);
+                } finally {
+                    try { await conn.query('SELECT RELEASE_LOCK(?)', [lock]); } catch (_) { /* the connection is gone, and its lock with it */ }
+                }
+            });
             const detail = await withConnection(conn => shipmentDetail(conn, result.id));
             res.status(201).json({ ...detail, ...(result.warnings.length ? { warnings: result.warnings } : {}) });
         } catch (error) {
@@ -333,9 +389,8 @@ function registerShipmentRoutes(app, deps) {
 
     // ── PATCH /shipments/:id ──────────────────────────────────────────────
     // Header fields. On a booked shipment reference / trackingRef / vesselName
-    // / eta / etd write through to every member order (with per-order audit).
+    // / eta / etd / ata write through to every member order (with per-order audit).
     const HEADER_FIELDS = {
-        ata: { col: 'ata', type: 'date' },
         originPort: { col: 'origin_port', max: 255 },
         bookingRef: { col: 'booking_ref', max: 100 },
         blNumber: { col: 'bl_number', max: 100 },
@@ -347,6 +402,9 @@ function registerShipmentRoutes(app, deps) {
         vesselName: { col: 'vessel_name', orderCol: 'vessel_name', max: 255 },
         eta: { col: 'eta', orderCol: 'eta', type: 'date' },
         etd: { col: 'etd', orderCol: 'estimated_departure_date', type: 'date' },
+        // The actual arrival. Orders carry it as arrived_date, which is what
+        // the stage gates and the payments page read; nothing else can enter it.
+        ata: { col: 'ata', orderCol: 'arrived_date', type: 'date' },
     };
 
     function fieldValue(key, spec, raw) {
@@ -443,13 +501,37 @@ function registerShipmentRoutes(app, deps) {
                         if (parsed.mode && mode && parsed.mode !== mode) {
                             throw new ShipmentError(422, 'REFERENCE_MODE_MISMATCH', `Reference "${parsed.reference}" belongs to the ${parsed.mode} sequence.`);
                         }
+                        if (parsed.reference.length > rename.REFERENCE_MAX) {
+                            throw new ShipmentError(400, 'BAD_REFERENCE', `reference must be ${rename.REFERENCE_MAX} characters or fewer.`);
+                        }
+                        const holder = await sync.reservedHolder(conn, parsed.reference, { exceptShipmentId: ship.id });
+                        if (holder) {
+                            throw new ShipmentError(409, 'REFERENCE_IN_USE', `Reference "${parsed.reference}" is held by the open draft "${holder.name}".`,
+                                { reference: parsed.reference, reservedBy: holder.name, reservedByShipmentId: holder.id });
+                        }
                         if (!(await sync.referenceIsFree(conn, parsed.reference, { exceptShipmentId: ship.id }))) {
                             throw new ShipmentError(409, 'REFERENCE_IN_USE', `Reference "${parsed.reference}" is already in use.`);
                         }
-                        change('reference', 'reference', parsed.reference.slice(0, 100));
+                        // Payment records and paperwork name the container as
+                        // text. They move with it (below, after the orders),
+                        // but never unseen, and never onto a number that
+                        // already has records of its own: that would mix two
+                        // containers' paperwork.
+                        const theirs = await rename.recordsUnder(conn, parsed.reference);
+                        if (rename.total(theirs) > 0) {
+                            throw new ShipmentError(409, 'REFERENCE_HAS_RECORDS',
+                                `"${parsed.reference}" already has payment records or paperwork of its own.`, { reference: parsed.reference, records: theirs });
+                        }
+                        const own = ship.reference ? await rename.recordsUnder(conn, ship.reference, { shipmentId: ship.id }) : null;
+                        if (own && rename.total(own) > 0 && b.confirmRecords !== true) {
+                            throw new ShipmentError(409, 'RENAME_TOUCHES_RECORDS',
+                                `${rename.total(own)} record(s) kept under "${ship.reference}" move to "${parsed.reference}" with it. Confirm to rename.`,
+                                { from: ship.reference, reference: parsed.reference, records: own });
+                        }
+                        change('reference', 'reference', parsed.reference);
                         sets.push('reference_seq = ?');
                         vals.push(parsed.seq);
-                        newReference = parsed.reference.slice(0, 100);
+                        newReference = parsed.reference;
                         orderSets.container_number = newReference;
                     }
                 }
@@ -505,20 +587,39 @@ function registerShipmentRoutes(app, deps) {
                             userEmail: req.userEmail,
                         });
                     }
-                    if (orderSets.eta !== undefined || orderSets.vessel_name !== undefined) {
+                    if (orderSets.eta !== undefined || orderSets.vessel_name !== undefined || orderSets.arrived_date !== undefined) {
                         const ref = trackingChange ? trackingChange.value : (S.clean(ship.tracking_ref) || null);
                         if (ref && await hasShipsgoCache(conn, ref)) {
-                            warnings.push(`ShipsGo tracks ${ref}: its hourly sync overwrites eta and vessel on these orders.`);
+                            if (orderSets.eta !== undefined || orderSets.vessel_name !== undefined) {
+                                warnings.push(`ShipsGo tracks ${ref}: its hourly sync overwrites eta and vessel on these orders.`);
+                            }
+                            if (orderSets.arrived_date != null) {
+                                warnings.push(`ShipsGo tracks ${ref}: once it reports an actual arrival, its hourly sync replaces this arrival date on these orders.`);
+                            }
                         }
                     }
+                }
+                // The records that name the old number as text follow the orders.
+                let recordsMoved = null;
+                if (newReference && ship.reference) {
+                    const carried = await rename.carryRecords(conn, {
+                        shipmentId: ship.id, from: ship.reference, to: newReference, userEmail: req.userEmail, recordAudit,
+                    });
+                    recordsMoved = carried.moved;
+                    warnings.push(...carried.warnings);
+                    if (Object.values(recordsMoved).some(n => n > 0)) after.recordsMoved = recordsMoved;
                 }
                 await recordAudit(conn, {
                     entityType: 'shipment', entityId: ship.id, action: 'update', before, after, userEmail: req.userEmail,
                 });
-                return { id, warnings };
+                return { id, warnings, recordsMoved };
             }));
             const detail = await withConnection(conn => shipmentDetail(conn, result.id));
-            res.json({ ...detail, ...(result.warnings.length ? { warnings: result.warnings } : {}) });
+            res.json({
+                ...detail,
+                ...(result.warnings.length ? { warnings: result.warnings } : {}),
+                ...(result.recordsMoved ? { recordsMoved: result.recordsMoved } : {}),
+            });
         } catch (error) {
             sendError(res, error, '[PATCH /shipments/:id]');
         }
@@ -687,7 +788,7 @@ function registerShipmentRoutes(app, deps) {
             const id = idParam(req);
             const b = req.body || {};
             const r = await withConnection(conn => inTransaction(conn, () => transitionShipment(conn, {
-                shipmentId: id, stage: b.stage, note: b.note, force: b.force === true,
+                shipmentId: id, stage: b.stage, note: b.note, force: b.force === true, etd: b.etd,
                 isAdmin: req.userType === 'admin', userEmail: req.userEmail,
             })));
             const detail = await withConnection(conn => shipmentDetail(conn, id));
@@ -709,18 +810,24 @@ function registerShipmentRoutes(app, deps) {
                 if (!row) return null;
                 const ids = [id, ...(await mergedInto(conn, id))];
                 const idPh = ids.map(() => '?').join(',');
+                // An open draft also lists documents made under its name that
+                // no hook linked to it: booking links them by name, and until
+                // then nothing else would show them.
+                const openDraft = row.stage === 'DRAFT' && !row.deleted_at && !row.merged_into_id && S.clean(row.name);
+                const byName = openDraft ? ' OR (shipment_id IS NULL AND draft_container_name = ?)' : '';
+                const params = openDraft ? [...ids, row.name] : ids;
                 const [docs] = await conn.query(
                     `SELECT id, draft_container_name, version, type, supplier, s3_key, public_url, file_size,
                             csv_s3_key, csv_public_url, csv_file_size, batch_id, generated_by_email, generated_at, shipment_id
                        FROM draft_container_documents
-                      WHERE shipment_id IN (${idPh}) AND deleted_at IS NULL
-                      ORDER BY type ASC, generated_at DESC, id DESC`, ids);
+                      WHERE (shipment_id IN (${idPh})${byName}) AND deleted_at IS NULL
+                      ORDER BY type ASC, generated_at DESC, id DESC`, params);
                 const [qa] = await conn.query(
                     `SELECT id, ref, version, draft_container_name, order_ids, qc_units, s3_key, public_url, file_size,
                             csv_s3_key, csv_public_url, csv_file_size, comments, generated_by_email, generated_at, shipment_id
                        FROM quality_assurance_documents
-                      WHERE shipment_id IN (${idPh}) AND deleted_at IS NULL
-                      ORDER BY generated_at DESC, id DESC`, ids);
+                      WHERE (shipment_id IN (${idPh})${byName}) AND deleted_at IS NULL
+                      ORDER BY generated_at DESC, id DESC`, params);
                 const docSends = await sendsFor(conn, 'draft_container_document_sends', 'draft_container_document_id', docs.map(d => d.id));
                 const qaSends = await sendsFor(conn, 'quality_assurance_document_sends', 'quality_assurance_document_id', qa.map(d => d.id));
                 return { docs, qa, docSends, qaSends };

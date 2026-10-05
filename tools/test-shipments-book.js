@@ -156,6 +156,77 @@ async function run() {
     check('order audit rows written by book carry no shipmentId', Number(aud.n) === 0);
     const hist = await api.get(`/api/v1/shipments/${s.id}/history`);
     check('the shipment history has the booking', hist.data.data.some(e => e.entityType === 'shipment' && e.action === 'booked'));
+
+    section('11. Booking falls back to the header the draft already stores');
+    const M1 = await H.createOrder();
+    const M2 = await H.createOrder();
+    const s9 = await draft('SEA', [{ orderId: M1.id, quantity: 100 }, { orderId: M2.id, quantity: 30 }], { label: 'stored' });
+    r = await api.patch(`/api/v1/shipments/${s9.id}`, { eta: '2026-12-20', etd: '2026-11-05', vesselName: 'SHIPTEST STORED', originPort: 'Yantian' });
+    check('PATCH on a DRAFT stores eta, etd, vessel and port on the shipment only',
+        r.status === 200 && r.data.eta === '2026-12-20' && r.data.etd === '2026-11-05' && r.data.vesselName === 'SHIPTEST STORED' && r.data.originPort === 'Yantian'
+        && (await H.getOrder(M1.id)).eta === null, r.data);
+    const RS = H.reference('STORED');
+    r = await api.post(`/api/v1/shipments/${s9.id}/book`, { reference: RS });
+    check('booked with only a reference in the body', r.status === 200 && r.data.stage === 'BOOKED', r.data);
+    const m1 = await H.getOrder(M1.id);
+    check('full pack: the order carries the stored ETA, ETD, vessel and port',
+        m1.eta === '2026-12-20' && m1.estimated_departure_date === '2026-11-05' && m1.vessel_name === 'SHIPTEST STORED' && m1.port === 'Yantian',
+        { eta: m1.eta, etd: m1.estimated_departure_date, vessel: m1.vessel_name, port: m1.port });
+    const [m2child] = await H.sql(`SELECT * FROM orders WHERE container_number = ? AND id <> ? AND deleted_at IS NULL`, [RS, M1.id]);
+    check('partial pack: the split child carries them too',
+        m2child && m2child.quantity === 30 && m2child.eta === '2026-12-20' && m2child.estimated_departure_date === '2026-11-05'
+        && m2child.vessel_name === 'SHIPTEST STORED' && m2child.port === 'Yantian', m2child);
+    if (m2child) H.created.orders.push(m2child.id);
+
+    const N = await H.createOrder();
+    const s10 = await draft('SEA', [{ orderId: N.id, quantity: 100 }], { label: 'stored-override' });
+    await api.patch(`/api/v1/shipments/${s10.id}`, { eta: '2026-12-20', etd: '2026-11-05', vesselName: 'SHIPTEST STORED' });
+    r = await api.post(`/api/v1/shipments/${s10.id}/book`, { reference: H.reference('OVR'), eta: '2026-12-28', vesselName: null });
+    const n = await H.getOrder(N.id);
+    check('a value in the body wins, an explicit null clears, an absent key keeps the stored one',
+        r.status === 200 && n.eta === '2026-12-28' && n.vessel_name === null && n.estimated_departure_date === '2026-11-05',
+        { status: r.status, eta: n.eta, vessel: n.vessel_name, etd: n.estimated_departure_date });
+    check('the shipment header agrees: body eta, cleared vessel, stored etd',
+        r.data.eta === '2026-12-28' && r.data.vesselName === null && r.data.etd === '2026-11-05', r.data);
+
+    section('12. Documents made on a draft follow it, whatever it is called');
+    const P = await H.createOrder();
+    const s11 = await draft('SEA', [{ orderId: P.id, quantity: 100 }], { label: 'docs' });
+    const doc = async (name, shipmentId, tag) => {
+        const res = await getPool().query(
+            `INSERT INTO draft_container_documents (draft_container_name, version, s3_key, type, shipment_id) VALUES (?, 1, ?, 'forwarder-quote', ?)`,
+            [name, `shiptest/${H.STAMP}/${tag}.pdf`, shipmentId]
+        );
+        return res[0].insertId;
+    };
+    const linked = await doc(s11.name, s11.id, 'linked');
+    const unlinked = await doc(s11.name, null, 'unlinked');
+    const listed = async (id) => ((await api.get(`/api/v1/shipments/${id}/documents`)).data.data || []).map(x => x.id);
+    let ids = await listed(s11.id);
+    check('open draft: a document linked to the shipment is listed', ids.includes(linked), ids);
+    check('open draft: a document under its name that was never linked is listed too', ids.includes(unlinked), ids);
+    const RD = H.reference('DOCS');
+    r = await api.post(`/api/v1/shipments/${s11.id}/book`, { reference: RD });
+    check('booked under a number unlike the draft name', r.status === 200 && r.data.reference === RD && r.data.name === s11.name, r.data);
+    ids = await listed(s11.id);
+    check('after booking: both documents are still listed under the booked shipment', ids.includes(linked) && ids.includes(unlinked), ids);
+    await H.sql(`UPDATE draft_container_documents SET deleted_at = NOW() WHERE id IN (?, ?)`, [linked, unlinked]);
+
+    section('13. A number another open draft holds cannot be booked from under it');
+    const Q1 = await H.createOrder();
+    const Q2 = await H.createOrder();
+    r = await api.post('/api/v1/shipments', { mode: 'SEA', reserve: true, label: `SHIPTEST holder ${H.STAMP}`, lines: [{ orderId: Q1.id, quantity: 100 }] });
+    check('a draft created with reserve holds a number', r.status === 201 && Number.isInteger(r.data.reservedSeq), r.data);
+    const holder = r.data;
+    H.track(holder.id);
+    const s12 = await draft('SEA', [{ orderId: Q2.id, quantity: 100 }], { label: 'taker' });
+    r = await api.post(`/api/v1/shipments/${s12.id}/book`, { reference: String(holder.reservedSeq) });
+    check('booking another draft under that number: 409 REFERENCE_IN_USE naming the holder',
+        r.status === 409 && r.data.code === 'REFERENCE_IN_USE' && r.data.reservedBy === holder.name, r.data);
+    await unchanged(Q2, 'held number');
+    r = await api.post(`/api/v1/shipments/${holder.id}/book`, {});
+    check('the holder itself books under it', r.status === 200 && r.data.reference === String(holder.reservedSeq)
+        && r.data.booking.referenceSource === 'name_hint', r.data);
 }
 
 run().catch(err => H.fail('suite crashed', err)).finally(() => H.finish());

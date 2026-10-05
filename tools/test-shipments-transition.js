@@ -117,6 +117,61 @@ async function run() {
         arrived.some(x => x.id === sea.id), arrived.map(x => x.id));
     const bookedOnly = await H.shipmentsWhere({ stage: 'BOOKED', q: String(H.STAMP) });
     check('?stage=BOOKED does not list it', !bookedOnly.some(x => x.id === sea.id), bookedOnly.map(x => x.id));
+
+    section('8. IN_TRANSIT with an etd: the date and the move land together');
+    const F1 = await H.createOrder();
+    const F2 = await H.createOrder();
+    const withEtd = await booked('SEA', [F1, F2], { reference: H.reference('ETD') });
+    r = await move(withEtd.id, 'ARRIVED', { etd: '2026-10-03' });
+    check('an etd with any other stage: 400, nothing moved', r.status === 400 && r.data.code === 'ETD_NOT_APPLICABLE'
+        && (await H.getOrder(F1.id)).status === 'CONSOLIDATED', r.data);
+    r = await move(withEtd.id, 'IN_TRANSIT', { etd: 'tomorrow' });
+    check('an etd that is not a date: 400, nothing moved', r.status === 400 && r.data.code === 'BAD_DATE'
+        && (await H.getOrder(F1.id)).status === 'CONSOLIDATED', r.data);
+    r = await move(withEtd.id, 'IN_TRANSIT', { etd: '2026-10-03' });
+    check('200: both orders moved, etdApplied', r.status === 200 && r.data.moved.length === 2 && r.data.etdApplied === true, r.data);
+    const f1 = await H.getOrder(F1.id);
+    const f2 = await H.getOrder(F2.id);
+    check('both orders are ON_SEA with estimated_departure_date 2026-10-03',
+        f1.status === 'ON_SEA' && f1.estimated_departure_date === '2026-10-03' && f2.status === 'ON_SEA' && f2.estimated_departure_date === '2026-10-03',
+        [f1.status, f1.estimated_departure_date, f2.status, f2.estimated_departure_date]);
+    check('the shipment carries the etd', r.data.shipment && r.data.shipment.etd === '2026-10-03', r.data.shipment && r.data.shipment.etd);
+    const G = await H.createOrder();
+    const roadEtd = await booked('ROAD', [G], { reference: H.reference('ROADETD') });
+    r = await move(roadEtd.id, 'IN_TRANSIT', { etd: '2026-10-02' });
+    const g = await H.getOrder(G.id);
+    check('ROAD: no order moves, the etd is written all the same',
+        r.status === 200 && r.data.moved.length === 0 && r.data.etdApplied === true && g.status === 'CONSOLIDATED' && g.estimated_departure_date === '2026-10-02',
+        { data: r.data && r.data.moved, status: g.status, etd: g.estimated_departure_date });
+    const [etdAudit] = await H.sql(
+        `SELECT COUNT(*) AS n FROM audit_log WHERE entity_type = 'order' AND entity_id = ? AND action = 'update'
+            AND JSON_UNQUOTE(JSON_EXTRACT(after_json, '$.estimatedDepartureDate')) LIKE '2026-10-02%'`, [G.id]);
+    check('an order that did not move still gets an audit row for its new date', Number(etdAudit.n) === 1, etdAudit);
+
+    section('9. PATCH ata writes the arrival date onto the member orders');
+    r = await api.patch(`/api/v1/shipments/${withEtd.id}`, { ata: '2026-10-04' });
+    check('200 with the ata on the shipment', r.status === 200 && r.data.ata === '2026-10-04', r.data);
+    check('every member order has arrived_date 2026-10-04',
+        (await H.getOrder(F1.id)).arrived_date === '2026-10-04' && (await H.getOrder(F2.id)).arrived_date === '2026-10-04',
+        [(await H.getOrder(F1.id)).arrived_date, (await H.getOrder(F2.id)).arrived_date]);
+    const [ataAudit] = await H.sql(
+        `SELECT COUNT(*) AS n FROM audit_log WHERE entity_type = 'order' AND entity_id IN (?, ?) AND action = 'update'
+            AND JSON_UNQUOTE(JSON_EXTRACT(after_json, '$.arrivedDate')) LIKE '2026-10-04%'`, [F1.id, F2.id]);
+    check('one audit row per order', Number(ataAudit.n) === 2, ataAudit);
+    r = await api.patch(`/api/v1/shipments/${withEtd.id}`, { ata: null });
+    check('clearing it clears the orders', r.status === 200 && r.data.ata === null && (await H.getOrder(F1.id)).arrived_date === null, r.data.ata);
+    const J = await H.createOrder();
+    const openDraft = await api.post('/api/v1/shipments', { mode: 'SEA', name: H.draftName('ata-draft'), lines: [{ orderId: J.id, quantity: 100 }] });
+    H.track(openDraft.data.id);
+    r = await api.patch(`/api/v1/shipments/${openDraft.data.id}`, { ata: '2026-10-04' });
+    check('on a DRAFT it is stored on the shipment only', r.status === 200 && r.data.ata === '2026-10-04' && (await H.getOrder(J.id)).arrived_date === null, r.data.ata);
+    if (cache) {
+        r = await api.patch(`/api/v1/shipments/${sea.id}`, { ata: '2026-10-01' });
+        check('a shipment ShipsGo tracks: the response warns that its sync replaces the arrival date',
+            r.status === 200 && Array.isArray(r.data.warnings) && r.data.warnings.some(w => /arrival/i.test(w)), r.data.warnings);
+    } else {
+        console.log('  SKIP  ShipsGo arrival warning: no tracked container in the cache on this database');
+    }
 }
 
 run().catch(err => H.fail('suite crashed', err)).finally(() => H.finish());

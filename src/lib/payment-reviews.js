@@ -52,6 +52,18 @@ function parsePaymentKey(raw) {
     return { error: 'paymentKey must be "deposit:<purchase order id>", "balance:<currency>:<container>|<supplier>" or "qc:<QC invoice document id>".' };
 }
 
+// The balance key of a container renumbered `fromRef` -> `toRef`, or null when
+// `key` is not a balance key of `fromRef`. The page upper-cases the container
+// inside the key, so the match ignores case and the new part is upper-cased;
+// the supplier part is kept as it stands.
+function rekeyBalanceKey(key, fromRef, toRef) {
+    const bal = /^balance:([A-Z]{3}):([^|]+)\|(.+)$/.exec(String(key || ''));
+    const from = String(fromRef || '').trim().toUpperCase();
+    const to = String(toRef || '').trim().toUpperCase();
+    if (!bal || !from || !to || bal[2] === '-' || bal[2].trim().toUpperCase() !== from) return null;
+    return `balance:${bal[1]}:${to}|${bal[3]}`;
+}
+
 // { value } or { error } — a sign-off as the page sends it.
 function parseReviewBody(body) {
     const b = body || {};
@@ -176,6 +188,7 @@ module.exports = {
     canAssign,
     canWithdraw,
     parsePaymentKey,
+    rekeyBalanceKey,
     parseReviewBody,
     parseAssigneeBody,
     decideReview,

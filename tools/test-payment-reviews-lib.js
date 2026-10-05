@@ -213,3 +213,19 @@ test('rows serialise with the reviewer\'s name when the allowlist has one', () =
         paymentKey: 'balance:USD:324|sunmed', assigneeEmail: 'acc@x.com', assigneeName: null, assignedByEmail: 'ann@x.com', assignedAt: '2026-09-28T13:05:00.000Z',
     });
 });
+
+// A booked container renamed 310 -> 311 takes its balance sign-offs with it
+// (PATCH /shipments/:id { reference }, src/services/shipment-rename.js).
+test('rekeyBalanceKey: a balance key moves with its container, and only with its own', () => {
+    assert.equal(L.rekeyBalanceKey('balance:USD:310|acme ltd', '310', '311'), 'balance:USD:311|acme ltd');
+    assert.equal(L.rekeyBalanceKey('balance:USD:3100|acme ltd', '310', '311'), null, '3100 is another container');
+    assert.equal(L.rekeyBalanceKey('balance:USD:31|acme ltd', '310', '311'), null, '31 is another container');
+    // The page upper-cases the container in the key; the reference itself is mixed case.
+    assert.equal(L.rekeyBalanceKey('balance:GBP:104. AIR FREIGHT|acme', '104. Air Freight', '105. Air Freight'), 'balance:GBP:105. AIR FREIGHT|acme');
+    // Only the container part changes: a supplier called "310 trading|co" keeps its name.
+    assert.equal(L.rekeyBalanceKey('balance:EUR:310|310 trading|co', '310', '311'), 'balance:EUR:311|310 trading|co');
+    assert.equal(L.rekeyBalanceKey('balance:USD:-|acme ltd', '310', '311'), null, 'no container');
+    assert.equal(L.rekeyBalanceKey('deposit:310', '310', '311'), null, 'a deposit is keyed by purchase order');
+    assert.equal(L.rekeyBalanceKey('qc:310', '310', '311'), null, 'a QC invoice is keyed by document');
+    assert.equal(L.rekeyBalanceKey('nonsense', '310', '311'), null);
+});

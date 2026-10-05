@@ -282,10 +282,16 @@ function rowToShipment(row) {
             ? clean(row.member_awb) || clean(row.member_ext)
             : clean(row.member_ext) || clean(row.member_awb))
         : null;
+    // The number an open shipment's name holds ('… - 328'), by the rule booking
+    // applies: a hint counts only in the shipment's own sequence.
+    const hint = isOpenStage(stored) ? parseNameHint(row.name) : null;
+    const reserved = hint && (!row.mode || hint.mode === row.mode) ? hint : null;
     return {
         id: row.id,
         reference: row.reference || null,
         referenceSeq: row.reference_seq ?? null,
+        reservedReference: reserved ? reserved.reference : null,
+        reservedSeq: reserved ? reserved.seq : null,
         name: row.name || null,
         mode: row.mode || null,
         modeSource: row.mode_source || null,

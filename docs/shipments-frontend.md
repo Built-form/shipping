@@ -62,7 +62,8 @@ never in the path: look one up with `?name=`.
 ### Shipment object
 
 ```json
-{ "id": 42, "reference": "310", "referenceSeq": 310, "name": "…", "mode": "SEA", "modeSource": "reference",
+{ "id": 42, "reference": "310", "referenceSeq": 310, "reservedReference": null, "reservedSeq": null,
+  "name": "…", "mode": "SEA", "modeSource": "reference",
   "stage": "IN_TRANSIT", "storedStage": "BOOKED", "derivedStage": "IN_TRANSIT",
   "trackingRef": "SEKU4613920", "bookingRef": null, "blNumber": null, "forwarder": null,
   "vesselName": "…", "originPort": "Ningbo", "etd": "2026-09-20", "eta": "2026-10-20", "ata": null,
@@ -72,6 +73,11 @@ never in the path: look one up with `?name=`.
   "bookedAt": "…", "departedAt": null, "arrivedAt": null, "closedAt": null,
   "cancelledAt": null, "cancelledReason": null, "deletedAt": null }
 ```
+
+`reservedReference` / `reservedSeq`: the number an open (DRAFT / PLANNED)
+shipment's name holds (`… - 329` → `"329"`, on an AIR draft `"104. Air Freight"`),
+by the rule booking applies: a hint of the other sequence holds nothing. `null`
+from booking on.
 
 `GET /shipments/:id` adds `lines[]` (`{ orderId, quantity, overAllocated, order: {…} }`),
 `orders[]` (members, full order shape, booked shipments only), `mergedFrom[]` and
@@ -88,16 +94,28 @@ reference, name, tracking ref, booking ref, B/L) · `reference` · `trackingRef`
 ### `GET /shipments/next-reference?mode=SEA|AIR`
 
 Advisory next number: one past the highest carried by a live order or reserved
-by an open draft / planned name (`… - 328`). `200 { mode, seq, reference,
-maxBooked, maxReserved, reservedBy[] }` · `422` for `ROAD` (no sequence) · `400`
+by an open draft / planned name (`… - 328`), including a draft saved with no
+lines. `200 { mode, seq, reference, maxBooked, maxReserved,
+reservedBy[{ name, seq, shipmentId }] }` · `422` for `ROAD` (no sequence) · `400`
 bad mode.
 
 ### `POST /shipments` — new draft or planned shipment
 
 ```json
 { "mode": "SEA", "stage": "DRAFT", "name": "optional", "reference": "optional reserved number",
-  "originPort": "Ningbo", "notes": "…", "lines": [{ "orderId": 629, "quantity": 500 }] }
+  "reserve": false, "label": "optional, with reserve",
+  "originPort": "Ningbo", "notes": "…", "etd": "2026-11-05", "eta": "2026-12-20", "vesselName": "…",
+  "forwarder": "…", "bookingRef": "…", "blNumber": "…",
+  "lines": [{ "orderId": 629, "quantity": 500 }] }
 ```
+
+**`reserve: true`** (DRAFT, SEA / AIR, no `name` or `reference`) has the server
+take the next number in the mode's sequence and name the draft
+`<stamp> - <number> <label>`, one reserver at a time per mode, so two drafts
+never hold the same number. This is how a new draft should be created: a draft
+may have no lines, and it holds its number from that moment. `400
+RESERVE_CONFLICT` (sent with a name, a reference or `stage: PLANNED`) ·
+`422 NO_SEQUENCE` (ROAD) · `503 RESERVE_BUSY` (retry).
 
 Writes an ordinary legacy draft (registry row, allocations, their history
 events) or planned container in the same transaction. No `name` → a
@@ -105,8 +123,9 @@ events) or planned container in the same transaction. No `name` → a
 (`… - 329`), which is how a draft reserves its number. `201` the shipment (as
 `GET /shipments/:id`) plus `warnings?` — over-allocating an order is a warning,
 not an error (as today) ·
-`409 NAME_IN_USE` / `REFERENCE_IN_USE` · `422 LINES_REQUIRED` (a planned
-container is its lines) · `404 ORDER_NOT_FOUND`.
+`409 NAME_IN_USE` / `REFERENCE_IN_USE` (also when another open shipment's name
+holds that number: `reservedBy`, `reservedByShipmentId`) · `422 LINES_REQUIRED`
+(a planned container is its lines) · `404 ORDER_NOT_FOUND`.
 
 ### `PATCH /shipments/:id`
 
@@ -117,15 +136,39 @@ Any of `name`, `mode`, `reference`, `trackingRef`, `vesselName`, `eta`, `etd`,
 - `name` on a DRAFT renames the legacy draft everywhere (allocations,
   documents, QA sheets) like `POST /draft-containers/rename`; on a PLANNED one it
   renames the planned rows; on a booked one it is only the label.
-- On a booked shipment `reference`, `trackingRef`, `vesselName`, `eta` and `etd`
-  are written to every member order (one audited change per order;
-  `reference` → `containerNumber`, `etd` → `estimatedDepartureDate`, the tracking
-  ref → `awbNumber` if it is AWB-shaped, else `externalContainerNumber`). When
-  ShipsGo tracks the ref the response warns that its hourly sync overwrites
-  eta / vessel.
+- On a booked shipment `reference`, `trackingRef`, `vesselName`, `eta`, `etd`
+  and `ata` are written to every member order (one audited change per order;
+  `reference` → `containerNumber`, `etd` → `estimatedDepartureDate`, `ata` →
+  `arrivedDate`, the tracking ref → `awbNumber` if it is AWB-shaped, else
+  `externalContainerNumber`). When ShipsGo tracks the ref the response warns
+  that its hourly sync overwrites eta / vessel, and replaces the arrival date
+  once it reports an actual arrival.
+- On a DRAFT or PLANNED shipment the same fields are stored on the shipment
+  only. Booking carries them to the orders (see `book`).
 - `reference` is assigned at booking: `422` on a draft.
+- **Renaming a booked shipment** (`reference`) also moves every record that
+  names the old number as text, in the same transaction: balance records,
+  their invoice documents, extras, balance sign-offs and assignees (re-keyed),
+  packing lists, their sign-offs and approvals, photos, the closed draft's
+  registry row and the standing ETA alert. Amounts and statuses never change;
+  each money record gets an audit row.
+  - Records exist and the body has no `confirmRecords: true` →
+    `409 RENAME_TOUCHES_RECORDS { from, reference, records }`, nothing changed.
+    `records` counts what would move: `balances`, `paymentDocuments`, `extras`,
+    `signOffs`, `assignees`, `packingLists`, `packingSignOffs`,
+    `packingApprovals`, `photos`. Show them, then resend with the flag.
+  - The new number already has records of its own →
+    `409 REFERENCE_HAS_RECORDS { reference, records }`, with or without the flag.
+  - Another open draft's name holds the new number → `409 REFERENCE_IN_USE`
+    with `reservedBy`.
+  - More than 64 characters → `400 BAD_REFERENCE`.
+  - The `200` carries `recordsMoved`. Dismissed payment alerts are not moved
+    (their key hashes the wording, so the alert comes back under the new
+    number). Paperwork uploaded on a draft that only names the old number
+    (never closed as converted into it) stays behind and is named in `warnings`.
 
-`200` the shipment plus `warnings?` · `409 NAME_IN_USE` / `REFERENCE_IN_USE` /
+`200` the shipment plus `warnings?` / `recordsMoved?` · `409 NAME_IN_USE` /
+`REFERENCE_IN_USE` / `REFERENCE_HAS_RECORDS` / `RENAME_TOUCHES_RECORDS` /
 `CONFLICT` · `422`.
 
 ### `DELETE /shipments/:id`
@@ -157,9 +200,13 @@ splits it — **plus** what Create Real used to write order by order afterwards:
 the carrier ref (on the right column by its shape), the ETD
 (`estimatedDepartureDate`) and the origin port (`port`); closes the legacy
 draft as `converted`;
-moves the shipment to `BOOKED`. The reference is the explicit one, else the
+moves the shipment to `BOOKED`. `eta`, `etd`, `vesselName` and `originPort`
+fall back to what the draft already stores when the body leaves the key out
+(an explicit `null` clears it), so dates set on a draft reach its orders. The
+reference is the explicit one, else the
 number the draft's name reserves if still free, else the next in the mode's
-sequence (`ROAD` needs an explicit one). Either everything happens or nothing
+sequence (`ROAD` needs an explicit one). An explicit reference another open
+draft's name holds is `409 REFERENCE_IN_USE` (`reservedBy`). Either everything happens or nothing
 does. `200` the shipment plus `booking: { reference, referenceSource
 ('explicit' | 'name_hint' | 'allocated'), packedOrderIds, draft }` · replay →
 `200` the shipment plus `alreadyBooked: true` · `409 REFERENCE_IN_USE` /
@@ -173,13 +220,19 @@ booked) stays on the legacy pack + close flow for now.
 
 ### `POST /shipments/:id/transition`
 
-`{ "stage": "IN_TRANSIT" | "ARRIVED" | "CLOSED" | "CANCELLED", "note"?, "force"? }`
+`{ "stage": "IN_TRANSIT" | "ARRIVED" | "CLOSED" | "CANCELLED", "note"?, "force"?, "etd"? }`
 
 - Forward only (stages may be skipped), judged against the effective stage.
   Member orders move forward with it: `IN_TRANSIT` → `ON_SEA` / `ON_AIR` (ROAD:
   none yet, they stay `CONSOLIDATED`), `ARRIVED` → `ARRIVED_AT_WAREHOUSE`. An
   order that cannot move (not packed, already past, FQC) is skipped with a reason
-  and never blocks the rest. `CLOSED` needs every order received / destroyed.
+  and never blocks the rest. `CLOSED` needs every order received, partially
+  received (reconciled with a shortfall) or destroyed.
+- `etd` (with `IN_TRANSIT` only, else `400 ETD_NOT_APPLICABLE`) is the sailing
+  date: written to the shipment and to every member order in the same
+  transaction as the move, moved or not (a ROAD shipment moves none). The
+  response carries `etdApplied: true`. Send it here rather than as a PATCH
+  first: a refused move then leaves no date behind.
 - `CANCELLED` only from PLANNED / DRAFT (same write-through as DELETE).
 - Backward needs `force: true` and an admin; it moves only the stored stage.
 
@@ -194,7 +247,10 @@ stage: { stored, effective }, shipment }` (a same-stage call is
 Quote / forwarder / supplier documents and QA sheets by shipment, across
 renames and anything merged into it: `200 { data: [document], qaDocuments: [qa] }`
 (same shapes as `GET /draft-containers/:name/documents` and
-`GET /quality-assurance/documents`, plus `shipmentId`). `POST` (DRAFT only)
+`GET /quality-assurance/documents`, plus `shipmentId`). A draft's documents stay
+with it through booking whatever number it is booked under: they are linked by
+shipment id, not by name. On an open draft the list also returns documents made
+under its name that were never linked (`shipmentId: null`); booking links them. `POST` (DRAFT only)
 takes the body of `POST /draft-containers/:name/generate` and produces exactly
 the same set (the per-supplier split and shared `batchId` included). Emailing
 stays on `POST /draft-container-documents/:id/email`.
@@ -234,6 +290,13 @@ it came from (the `draft_container` vocabulary in
   `backfill-shipments.js --apply --rearm …`, wait 60 s, `--apply` again, verify.
 - A hook never fails the request it shadows; a failure is one coalescing row in
   `shipment_sync_failures`.
+- **Not rebuildable any more:** header fields set on an open shipment (etd, eta,
+  vessel, port, forwarder, booking ref, B/L, notes) and drafts saved with no
+  lines live only in `shipments`. A drop-and-backfill loses them. Re-arm and
+  `--fix` are safe; a full re-seed is not.
+- The legacy `PATCH /containers/:cn/status` also takes `estimatedDepartureDate`
+  (YYYY-MM-DD, `400` otherwise) and saves it with the status: the board sends it
+  on a drag to On Sea / On Air.
 
 ## Tests
 
@@ -243,7 +306,7 @@ it came from (the `draft_container` vocabulary in
 - Against `npm run dev:local` on the TEST database, with
   `TEST_BASE_URL=http://localhost:3031`: `test-shipments-dualwrite.js`,
   `test-shipments-api.js`, `test-shipments-book.js`,
-  `test-shipments-transition.js`, `test-order-split.js`, and
+  `test-shipments-transition.js`, `test-shipments-rename.js`, `test-order-split.js`, and
   `test-orders-shape-frozen.js` (`capture` against the previous code, `compare`
   against the new, `audit`). They refuse to run unless the server reports a TEST
   database.

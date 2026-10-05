@@ -64,6 +64,13 @@ function makeBookShipment(deps) {
                 throw new ShipmentError(422, 'REFERENCE_MODE_MISMATCH',
                     `Reference "${parsed.reference}" belongs to the ${parsed.mode} sequence, but this is a ${mode} shipment.`);
             }
+            // A number another open draft holds in its name is not free, even
+            // though nothing is booked under it yet.
+            const holder = await sync.reservedHolder(conn, parsed.reference, { exceptShipmentId: ship.id });
+            if (holder) {
+                throw new ShipmentError(409, 'REFERENCE_IN_USE', `Reference "${parsed.reference}" is held by the open draft "${holder.name}".`,
+                    { reference: parsed.reference, reservedBy: holder.name, reservedByShipmentId: holder.id });
+            }
             if (!(await sync.referenceIsFree(conn, parsed.reference, { exceptShipmentId: ship.id }))
                 || !(await takeReference(conn, ship.id, parsed.reference))) {
                 throw new ShipmentError(409, 'REFERENCE_IN_USE', `Reference "${parsed.reference}" is already in use.`,
@@ -115,17 +122,26 @@ function makeBookShipment(deps) {
             if (!mode) { mode = m; modeFromBody = true; }
         }
         if (!mode) throw new ShipmentError(422, 'MODE_REQUIRED', 'The shipment has no mode: send mode (SEA, AIR or ROAD).');
+        // eta / etd / vesselName / originPort: a key the body leaves out falls
+        // back to what the draft already stores (PATCHed while it was open), so
+        // the orders get it; an explicit null or '' clears it.
+        const stored = S.rowToShipment(ship);
         const dateField = (key) => {
-            if (b[key] === undefined || b[key] === null || b[key] === '') return null;
+            if (b[key] === undefined) return stored[key];
+            if (b[key] === null || b[key] === '') return null;
             const d = sync.validDate(b[key]);
             if (!d) throw new ShipmentError(400, 'BAD_DATE', `${key} must be a YYYY-MM-DD date.`);
             return d;
         };
+        const textField = (key) => {
+            if (b[key] === undefined) return stored[key];
+            return S.clean(b[key]) ? S.clean(b[key]).slice(0, 255) : null;
+        };
         const eta = dateField('eta');
         const etd = dateField('etd');
         const trackingRef = S.clean(b.trackingRef) ? S.clean(b.trackingRef).slice(0, 255) : null;
-        const vesselName = S.clean(b.vesselName) ? S.clean(b.vesselName).slice(0, 255) : null;
-        const originPort = S.clean(b.originPort) ? S.clean(b.originPort).slice(0, 255) : null;
+        const vesselName = textField('vesselName');
+        const originPort = textField('originPort');
         const bookingRef = S.clean(b.bookingRef) ? S.clean(b.bookingRef).slice(0, 100) : null;
         const blNumber = S.clean(b.blNumber) ? S.clean(b.blNumber).slice(0, 100) : null;
         const forwarder = S.clean(b.forwarder) ? S.clean(b.forwarder).slice(0, 255) : null;
@@ -268,10 +284,12 @@ function makeBookShipment(deps) {
         });
 
         // The shipment: booked, keys settled, header from the form.
+        // vessel / eta / etd / port are already resolved against the stored
+        // header above, so they are written as they stand (null = cleared).
         const sets = [
             `stage = 'BOOKED'`, 'open_key = NULL', 'booked_at = COALESCE(booked_at, NOW())',
-            'tracking_ref = COALESCE(?, tracking_ref)', 'vessel_name = COALESCE(?, vessel_name)',
-            'eta = COALESCE(?, eta)', 'etd = COALESCE(?, etd)', 'origin_port = COALESCE(?, origin_port)',
+            'tracking_ref = COALESCE(?, tracking_ref)', 'vessel_name = ?',
+            'eta = ?', 'etd = ?', 'origin_port = ?',
             'booking_ref = COALESCE(?, booking_ref)', 'bl_number = COALESCE(?, bl_number)', 'forwarder = COALESCE(?, forwarder)',
         ];
         const vals = [trackingRef, vesselName, eta, etd, originPort, bookingRef, blNumber, forwarder];

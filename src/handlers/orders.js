@@ -1710,8 +1710,15 @@ app.patch('/api/v1/containers/:containerNumber/status', async (req, res) => {
     try {
         await auditLogSchemaReady;
         await shipmentsSchemaReady;
-        const { status } = req.body || {};
+        const { status, estimatedDepartureDate } = req.body || {};
         if (!status) return res.status(400).json({ error: 'status is required.' });
+        // The board asks for the departure date on a drag to On Sea / On Air
+        // and sends it here: saved with the status, in the same UPDATE.
+        let departure = null;
+        if (estimatedDepartureDate !== undefined && estimatedDepartureDate !== null && estimatedDepartureDate !== '') {
+            departure = shipmentSync.validDate(estimatedDepartureDate);
+            if (!departure) return res.status(400).json({ error: 'estimatedDepartureDate must be a YYYY-MM-DD date.' });
+        }
 
         const result = await withConnection(async (conn) => {
             const { containerNumber } = req.params;
@@ -1724,8 +1731,8 @@ app.patch('/api/v1/containers/:containerNumber/status', async (req, res) => {
             for (const order of orders) {
                 const dates = setDateKey(parseDates(order.dates), status);
                 await conn.query(
-                    'UPDATE orders SET status = ?, dates = ? WHERE id = ?',
-                    [status, JSON.stringify(dates), order.id]
+                    `UPDATE orders SET status = ?, dates = ?${departure ? ', estimated_departure_date = ?' : ''} WHERE id = ?`,
+                    departure ? [status, JSON.stringify(dates), departure, order.id] : [status, JSON.stringify(dates), order.id]
                 );
             }
 

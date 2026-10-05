@@ -140,6 +140,50 @@ async function run() {
     const second = r.data;
     r = await api.post(`/api/v1/shipments/${second.id}/book`, { reference: R });
     check('the released reference books again', r.status === 200 && r.data.reference === R, r.data);
+
+    section('10. Reserved numbers');
+    const nextSea = async () => (await api.get('/api/v1/shipments/next-reference', { params: { mode: 'SEA' } })).data;
+    const before = await nextSea();
+    r = await api.post('/api/v1/shipments', { mode: 'SEA', reserve: true, label: `SHIPTEST reserve ${H.STAMP}`, etd: '2026-11-05', eta: '2026-12-20', vesselName: 'SHIPTEST V', forwarder: 'SHIPTEST F', bookingRef: 'SHIPTEST-BK' });
+    check('reserve: 201 DRAFT with no lines', r.status === 201 && r.data.stage === 'DRAFT' && r.data.lines.length === 0, r.data);
+    const held = r.data;
+    H.track(held.id);
+    check('it holds the next number: reservedReference / reservedSeq',
+        held.reservedReference === before.reference && held.reservedSeq === before.seq, { held: held.reservedReference, expected: before.reference });
+    check('the name is the stamp, the number, then the label',
+        new RegExp(`^DRAFT-SEA-\\d{6}-\\d{6} - ${before.seq} SHIPTEST reserve ${H.STAMP}$`).test(held.name), held.name);
+    check('POST keeps the header fields it was given',
+        held.etd === '2026-11-05' && held.eta === '2026-12-20' && held.vesselName === 'SHIPTEST V' && held.forwarder === 'SHIPTEST F' && held.bookingRef === 'SHIPTEST-BK', held);
+    const afterHold = await nextSea();
+    check('a draft with no lines still holds its number: next-reference moved past it',
+        afterHold.seq === before.seq + 1, { before: before.seq, after: afterHold.seq });
+    check('reservedBy names the shipment', afterHold.reservedBy.some(x => x.seq === before.seq && x.shipmentId === held.id), afterHold.reservedBy.slice(0, 3));
+    r = await api.post('/api/v1/shipments', { mode: 'SEA', name: H.draftName('steal'), reference: String(before.seq) });
+    if (r.status === 201) H.track(r.data.id);
+    check('an explicit reference another open shipment holds: 409 REFERENCE_IN_USE', r.status === 409 && r.data.code === 'REFERENCE_IN_USE', r.data);
+    // A post that should be refused must not leave a draft behind if it is not:
+    // a stray '… - 9999' would hold that number for everyone on this database.
+    const refused = async (body, status) => {
+        const x = await api.post('/api/v1/shipments', body);
+        if (x.status === 201) H.track(x.data.id);
+        return x.status === status;
+    };
+    check('reserve with a name or a reference: 400', (await refused({ mode: 'SEA', reserve: true, reference: '9999' }, 400))
+        && (await refused({ mode: 'SEA', reserve: true, name: H.draftName('reserve-named') }, 400)));
+    check('ROAD has no sequence to reserve from: 422', await refused({ mode: 'ROAD', reserve: true }, 422));
+
+    const five = await Promise.all([1, 2, 3, 4, 5].map(i => api.post('/api/v1/shipments', { mode: 'AIR', reserve: true, label: `SHIPTEST par${i} ${H.STAMP}` })));
+    for (const x of five) if (x.status === 201) H.track(x.data.id);
+    check('five reserve posts at once: five 201s', five.every(x => x.status === 201), five.map(x => [x.status, x.data && x.data.code]));
+    const seqs = five.map(x => x.data && x.data.reservedSeq);
+    check('five different numbers', new Set(seqs).size === 5 && seqs.every(n => Number.isInteger(n)), seqs);
+    check('AIR drafts keep the bare number in the name and report NN. Air Freight',
+        five.every(x => x.data && new RegExp(` - ${x.data.reservedSeq} SHIPTEST`).test(x.data.name) && x.data.reservedReference === `${x.data.reservedSeq}. Air Freight`),
+        five.map(x => x.data && [x.data.name, x.data.reservedReference]));
+
+    r = await api.delete(`/api/v1/shipments/${held.id}`);
+    const afterDelete = await nextSea();
+    check('deleting the draft releases its number', r.status === 200 && afterDelete.seq === before.seq, { before: before.seq, after: afterDelete.seq });
 }
 
 run().catch(err => H.fail('suite crashed', err)).finally(() => H.finish());

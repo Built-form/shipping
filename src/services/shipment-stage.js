@@ -18,6 +18,8 @@
 //   ARRIVED    -> ARRIVED_AT_WAREHOUSE (makes orders receivable on the public
 //                 /scan Lambda, so only this human-initiated route writes it)
 //   CLOSED     -> needs every member in a terminal status; moves nothing
+// An `etd` sent with IN_TRANSIT is the sailing date: it goes onto the shipment
+// and every member order (moved or not) in this same transaction.
 // orders.dates behaves exactly as PATCH /orders/:id/status (setDateKey); the
 // transit timestamps live on the shipment. A forced backward move rewrites the
 // stored stage, clears the later milestones and touches no orders, so the
@@ -49,9 +51,18 @@ function makeTransitionShipment(deps) {
         await sync.cancelShipment(conn, ship, { reason, userEmail });
     }
 
-    async function transitionShipment(conn, { shipmentId, stage: rawStage, note = null, force = false, isAdmin = false, userEmail = null }) {
+    async function transitionShipment(conn, { shipmentId, stage: rawStage, note = null, force = false, isAdmin = false, userEmail = null, etd: rawEtd }) {
         const target = String(rawStage || '').trim().toUpperCase();
         if (!S.isStage(target)) throw new ShipmentError(400, 'BAD_STAGE', `stage must be one of ${S.STAGES.join(', ')}.`);
+        // The sailing date, taken only with the departure itself so the two
+        // land in one transaction (a separate PATCH first would leave the date
+        // changed on every order when the move is then refused).
+        let etd = null;
+        if (rawEtd !== undefined && rawEtd !== null && rawEtd !== '') {
+            if (target !== 'IN_TRANSIT') throw new ShipmentError(400, 'ETD_NOT_APPLICABLE', 'etd is taken only with a move to IN_TRANSIT.');
+            etd = sync.validDate(rawEtd);
+            if (!etd) throw new ShipmentError(400, 'BAD_DATE', 'etd must be a YYYY-MM-DD date.');
+        }
         const ship = await sync.lockShipment(conn, shipmentId);
         if (!ship || ship.deleted_at) throw new ShipmentError(404, 'NOT_FOUND', `Shipment ${shipmentId} not found.`);
         if (ship.merged_into_id) {
@@ -136,42 +147,55 @@ function makeTransitionShipment(deps) {
             throw new ShipmentError(422, 'MODE_REQUIRED', 'Set the shipment mode (PATCH) before it departs.');
         }
 
-        // Fan-out.
+        // Fan-out. An etd goes to every member, moved or not (a ROAD shipment
+        // moves none), exactly as PATCH etd writes it.
         const targetStatus = S.statusForStage(target, ship.mode);
         const moved = [];
         const skipped = [];
-        if (targetStatus) {
+        const touched = [];
+        const beforeById = new Map();
+        if ((targetStatus || etd) && members.length) {
             const ids = members.map(m => m.id);
-            const beforeById = new Map();
-            if (ids.length) {
-                const [rows] = await conn.query(`${ORDER_SELECT} AND orders.id IN (${ids.map(() => '?').join(',')})`, ids);
-                for (const r of rows) beforeById.set(r.id, rowToOrder(r));
-            }
-            for (const m of members) {
+            const [rows] = await conn.query(`${ORDER_SELECT} AND orders.id IN (${ids.map(() => '?').join(',')})`, ids);
+            for (const r of rows) beforeById.set(r.id, rowToOrder(r));
+        }
+        for (const m of members) {
+            const sets = [];
+            const vals = [];
+            if (targetStatus) {
                 const d = S.fanOutDecision(m, targetStatus);
-                if (!d.move) { skipped.push({ orderId: m.id, status: m.status, reason: d.reason }); continue; }
-                const dates = setDateKey(parseDates(m.dates), targetStatus);
-                await conn.query('UPDATE orders SET status = ?, dates = ? WHERE id = ?', [targetStatus, JSON.stringify(dates), m.id]);
-                moved.push({ orderId: m.id, from: m.status, to: targetStatus });
-            }
-            if (moved.length) {
-                const movedIds = moved.map(x => x.orderId);
-                const [rows] = await conn.query(`${ORDER_SELECT} AND orders.id IN (${movedIds.map(() => '?').join(',')})`, movedIds);
-                for (const r of rows) {
-                    await recordAudit(conn, {
-                        entityType: 'order', entityId: r.id, action: 'update',
-                        before: S.auditSnapshot(beforeById.get(r.id)), after: S.auditSnapshot(rowToOrder(r)), userEmail,
-                    });
+                if (d.move) {
+                    sets.push('status = ?', 'dates = ?');
+                    vals.push(targetStatus, JSON.stringify(setDateKey(parseDates(m.dates), targetStatus)));
+                    moved.push({ orderId: m.id, from: m.status, to: targetStatus });
+                } else {
+                    skipped.push({ orderId: m.id, status: m.status, reason: d.reason });
                 }
+            } else if (target === 'IN_TRANSIT') {
+                skipped.push({ orderId: m.id, status: m.status, reason: 'no_order_status_for_mode' });
             }
-        } else if (target === 'IN_TRANSIT') {
-            for (const m of members) skipped.push({ orderId: m.id, status: m.status, reason: 'no_order_status_for_mode' });
+            if (etd && String(m.estimated_departure_date || '').slice(0, 10) !== etd) {
+                sets.push('estimated_departure_date = ?');
+                vals.push(etd);
+            }
+            if (!sets.length) continue;
+            await conn.query(`UPDATE orders SET ${sets.join(', ')} WHERE id = ?`, [...vals, m.id]);
+            touched.push(m.id);
+        }
+        if (touched.length) {
+            const [rows] = await conn.query(`${ORDER_SELECT} AND orders.id IN (${touched.map(() => '?').join(',')})`, touched);
+            for (const r of rows) {
+                await recordAudit(conn, {
+                    entityType: 'order', entityId: r.id, action: 'update',
+                    before: S.auditSnapshot(beforeById.get(r.id)), after: S.auditSnapshot(rowToOrder(r)), userEmail,
+                });
+            }
         }
 
         const milestone = S.MILESTONE_BY_STAGE[target];
         await conn.query(
-            `UPDATE shipments SET stage = ?, ${milestone} = COALESCE(${milestone}, NOW()) WHERE id = ?`,
-            [target, ship.id]
+            `UPDATE shipments SET stage = ?, ${milestone} = COALESCE(${milestone}, NOW())${etd ? ', etd = ?' : ''} WHERE id = ?`,
+            etd ? [target, etd, ship.id] : [target, ship.id]
         );
         const statusesAfter = members.map(m => {
             const mv = moved.find(x => x.orderId === m.id);
@@ -181,10 +205,10 @@ function makeTransitionShipment(deps) {
         await recordAudit(conn, {
             entityType: 'shipment', entityId: ship.id, action: 'stage_changed',
             before: { stage: ship.stage, effective },
-            after: { stage: target, effective: effectiveAfter, moved: moved.length, skipped: skipped.length, note: noteText },
+            after: { stage: target, effective: effectiveAfter, moved: moved.length, skipped: skipped.length, note: noteText, ...(etd ? { etd } : {}) },
             userEmail,
         });
-        return { moved, skipped, stage: { stored: target, effective: effectiveAfter } };
+        return { moved, skipped, stage: { stored: target, effective: effectiveAfter }, ...(etd ? { etdApplied: true } : {}) };
     }
 
     return { transitionShipment, cancelOpen };

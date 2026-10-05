@@ -164,6 +164,14 @@ async function run() {
     check('container status 200, rows carry shipmentId', r.status === 200 && r.data.data.every(o => o.shipmentId === s3.id), r.data);
     check('effective ARRIVED', (await H.shipment(s3.id)).stage === 'ARRIVED');
     await api.patch(`/api/v1/containers/${encodeURIComponent(N2)}/status`, { status: 'CONSOLIDATED' });
+    r = await api.patch(`/api/v1/containers/${encodeURIComponent(N2)}/status`, { status: 'ON_SEA', estimatedDepartureDate: '2026-10-03' });
+    check('a departure date sent with the status is saved on every order (the board sends it on a drag to On Sea)',
+        r.status === 200 && r.data.data.length > 0 && r.data.data.every(o => String(o.estimatedDepartureDate).slice(0, 10) === '2026-10-03'),
+        r.data.data && r.data.data.map(o => o.estimatedDepartureDate));
+    r = await api.patch(`/api/v1/containers/${encodeURIComponent(N2)}/status`, { status: 'CONSOLIDATED', estimatedDepartureDate: 'next week' });
+    check('a departure date that is not a date: 400, status untouched',
+        r.status === 400 && (await H.getOrder(D.id)).status === 'ON_SEA', { status: r.status, order: (await H.getOrder(D.id)).status });
+    await api.patch(`/api/v1/containers/${encodeURIComponent(N2)}/status`, { status: 'CONSOLIDATED' });
 
     section('13. A hand-edited container number (PUT /orders/:id)');
     const N3 = H.reference('N3');

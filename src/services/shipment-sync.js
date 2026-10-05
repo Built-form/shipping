@@ -1078,17 +1078,48 @@ async function nextReference(conn, mode) {
          UNION
          SELECT DISTINCT planned_container_name FROM planned_container_allocations`
     );
+    // Open shipments as well: a draft saved with no lines has no allocation
+    // row, and its name holds a number all the same.
+    const [openRows] = await conn.query(
+        `SELECT s.id, s.name FROM shipments s
+          WHERE s.stage IN ('DRAFT','PLANNED') AND ${LIVE} AND s.name IS NOT NULL`
+    );
+    const names = new Map();
+    for (const r of nameRows) if (r.name) names.set(String(r.name).toLowerCase(), { name: r.name, shipmentId: null });
+    for (const r of openRows) {
+        const key = String(r.name).toLowerCase();
+        names.set(key, { name: names.has(key) ? names.get(key).name : r.name, shipmentId: r.id });
+    }
     let maxReserved = 0;
     const reservedBy = [];
-    for (const r of nameRows) {
-        const hint = S.parseNameHint(r.name);
+    for (const { name, shipmentId } of names.values()) {
+        const hint = S.parseNameHint(name);
         if (!hint || hint.mode !== mode) continue;
-        reservedBy.push({ name: r.name, seq: hint.seq });
+        reservedBy.push({ name, seq: hint.seq, shipmentId });
         if (hint.seq > maxReserved) maxReserved = hint.seq;
     }
     const seq = Math.max(maxBooked, maxReserved) + 1;
     reservedBy.sort((a, b) => b.seq - a.seq);
     return { mode, seq, reference: S.formatReference(mode, seq), maxBooked, maxReserved, reservedBy };
+}
+
+// The open shipment, other than `exceptShipmentId`, whose name holds
+// `reference` ('… - 328' holds 328), or null. Before booking the name is the
+// only place a number is held, so creating or booking under a held number
+// has to ask here: referenceIsFree() sees booked numbers only.
+async function reservedHolder(conn, reference, { exceptShipmentId = null } = {}) {
+    const parsed = S.parseReference(reference);
+    if (!parsed || !parsed.known) return null;
+    const [rows] = await conn.query(
+        `SELECT s.id, s.name FROM shipments s
+          WHERE s.stage IN ('DRAFT','PLANNED') AND ${LIVE} AND s.name IS NOT NULL AND NOT (s.id <=> ?)`,
+        [exceptShipmentId]
+    );
+    for (const r of rows) {
+        const hint = S.parseNameHint(r.name);
+        if (hint && hint.mode === parsed.mode && hint.seq === parsed.seq) return { id: r.id, name: r.name };
+    }
+    return null;
 }
 
 // Is `reference` free to take: no live shipment holds it and no live order
@@ -1819,6 +1850,7 @@ module.exports = {
     loadLines,
     loadLinesFor,
     nextReference,
+    reservedHolder,
     referenceIsFree,
     backfillAll,
     verifyAll,
