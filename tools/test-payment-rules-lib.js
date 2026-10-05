@@ -77,3 +77,19 @@ test('row → JSON: a supplier row never reports a start date', () => {
     assert.equal(j.airOwedFrom, null);
     assert.equal(j.airLimitDays, 30);
 });
+
+// "Departure": how long after its goods are ready a shipment in no container
+// is expected to leave (user, 2026-10-05). Counted from the ready date only.
+test('estimates.departure: days after goods ready, kept through body and row', () => {
+    const { parsePaymentRuleEstimates } = require('../src/lib/payment-rules');
+    assert.deepEqual(parsePaymentRuleEstimates({ departure: { from: 'ready', days: 21 } }).value.departure, { from: 'ready', days: 21 });
+    assert.equal(parsePaymentRuleEstimates({}).value.departure, null);
+    assert.equal(parsePaymentRuleEstimates({ departure: '' }).value.departure, null);
+    assert.equal(parsePaymentRuleEstimates({ departure: { from: 'po', days: 21 } }).error, 'estimates.departure.from must be one of: ready.');
+    assert.equal(parsePaymentRuleEstimates({ departure: { from: 'ready', days: 400 } }).error, 'estimates.departure.days must be a whole number of days between 0 and 365.');
+    const body = parsePaymentRuleBody({ scope: 'default', estimates: { departure: { from: 'ready', days: 21 } } });
+    assert.deepEqual(JSON.parse(body.row.estimates_json).departure, { from: 'ready', days: 21 });
+    const row = paymentRuleRowToJson({ ...ROW, estimates_json: body.row.estimates_json });
+    assert.deepEqual(row.estimates.departure, { from: 'ready', days: 21 });
+    assert.equal(paymentRuleRowToJson(ROW).estimates.departure, null);
+});

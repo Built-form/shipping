@@ -8,7 +8,9 @@ const PAYMENT_RULE_BALANCE_TRIGGERS = ['terms', 'before_dispatch', 'bl', 'telex_
 
 // Each estimate step counts from one event; the anchors allowed per step keep
 // the chain acyclic (artwork cannot count from ready, ready cannot count from
-// arrival…). Transit is per mode from the ETD.
+// arrival…). Transit is per mode from the ETD. `departure` is how long after
+// its goods are ready a shipment in no container (booked, draft or planned) is
+// expected to leave: counted from the ready date only.
 const PAYMENT_RULE_ESTIMATE_STEPS = {
     artwork: ['po', 'pi', 'pi_signed'],
     pi: ['po', 'artwork'],
@@ -16,10 +18,11 @@ const PAYMENT_RULE_ESTIMATE_STEPS = {
     ready: ['po', 'pi', 'pi_signed', 'artwork', 'deposit_paid'],
     telex: ['bl', 'etd', 'arrival'],
     document: ['bl', 'etd', 'arrival'],
+    departure: ['ready'],
 };
 const PAYMENT_RULE_FREIGHT_MODES = ['sea', 'air', 'road'];
 const EMPTY_PAYMENT_RULE_ESTIMATES = () => ({
-    artwork: null, pi: null, piSigned: null, ready: null, telex: null, document: null,
+    artwork: null, pi: null, piSigned: null, ready: null, telex: null, document: null, departure: null,
     transit: { sea: null, air: null, road: null },
 });
 

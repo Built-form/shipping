@@ -111,7 +111,8 @@ DELETE /api/v1/payment-rules/:id      → 204                       (admin only;
     "ready":    { "from": "deposit_paid", "days": 42 },// from: po | pi | pi_signed | artwork | deposit_paid
     "telex":    { "from": "bl", "days": 7 },           // from: bl | etd | arrival
     "document": null,                                  // from: bl | etd | arrival
-    "transit":  { "sea": 35, "air": 5, "road": 14 }    // ETD → arrival by mode, days; null = none
+    "departure": { "from": "ready", "days": 21 },      // from: ready ONLY. Goods in no container (booked, draft or planned): expected to leave this long after they are ready
+    "transit":  { "sea": 35, "air": 5, "road": 14 }    // ETD → arrival by mode, days; null = none. Dates a booked container, draft or plan with an ETD and no ETA; goods in no container only when `departure` is set
   },
   "airOwedFrom": null,                 // default rule ONLY (400 on a supplier rule): YYYY-MM-DD; null = air counts as paid once delivered
   "airLimitDays": 30,                  // 1–365; null = inherit the default's, then 60
@@ -139,6 +140,22 @@ real or forecast. Days are 0–365; the allowed anchors per step keep the chain
 acyclic (the backend rejects others). On a supplier rule a null step inherits
 the default's; transit inherits per mode. Stored as one JSON column
 (`estimates_json`).
+
+Goods not yet booked (the page reads `GET /shipments?stage=DRAFT,PLANNED&include=lines`
+for this; nothing extra is stored):
+
+- In a draft or planned container that has an ETD or ETA: dated from that
+  container. Dispatch / B/L terms use its ETD; arrival / delivery terms use
+  its ETA, else its ETD + `transit` for its mode. `departure` is not applied.
+  An order split between a draft and nothing is split by quantity into
+  separate balance items.
+- In no container, or in a draft / plan with no dates: the order's own ETD if
+  it has one, else ready date + `departure`, else the ready date. Arrival
+  terms get a date (that departure + `transit`) only when `departure` is set;
+  with it blank they stay undated.
+
+A backend without `departure` in its whitelist drops the key on save without
+an error, so deploy the backend before the frontend.
 
 A supplier rule overrides the default field by field; a null field inherits
 the default's value. To give a supplier *less* than the default, say so:
