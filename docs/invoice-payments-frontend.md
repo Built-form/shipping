@@ -147,12 +147,16 @@ for this; nothing extra is stored):
 - In a draft or planned container that has an ETD or ETA: dated from that
   container. Dispatch / B/L terms use its ETD; arrival / delivery terms use
   its ETA, else its ETD + `transit` for its mode. `departure` is not applied.
-  An order split between a draft and nothing is split by quantity into
-  separate balance items.
 - In no container, or in a draft / plan with no dates: the order's own ETD if
   it has one, else ready date + `departure`, else the ready date. Arrival
-  terms get a date (that departure + `transit`) only when `departure` is set;
-  with it blank they stay undated.
+  terms get a date (that departure + `transit`, by the draft's mode when the
+  goods sit in one) only when `departure` is set; with it blank they stay
+  undated.
+- Every draft or plan names the goods it holds, dated or not: the "Not payable
+  yet" line shows a DRAFT / PLAN chip, the container (its number and label)
+  and its ETD. An order split between containers, or between one and nothing,
+  is split by quantity into separate balance items. Units in both a dated and
+  an undated container go to the dated one; then a draft before a plan.
 
 A backend without `departure` in its whitelist drops the key on save without
 an error, so deploy the backend before the frontend.
