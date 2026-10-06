@@ -1,0 +1,3 @@
+[dev-server] database admin@explorer-test.db.built-form.co.uk/jfa
+[dev-server] auth bypassed: every request is local@dev (admin)
+[dev-server] http://localhost:3041  (Ctrl+C to stop)

@@ -69,9 +69,16 @@ PaymentDueDate {
   by Ops on 06 OCT · derived 01 NOV"); the pop-up's flag list carries "date set
   by hand". A group (a container row, a payment) whose rows are only partly
   set says "N of M rows have a date set by hand".
-- Controls live in the payment pop-up: the header sets or clears the whole
-  payment (stored under the payment key; under the row key for a "not payable
-  yet" row); with several POs in one payment each row has its own "Set" /
-  "Back to derived".
+- Every date cell edits in place: click the date, type, Enter (Escape
+  cancels), ↺ goes back to the derived date. On a Balances due payment row
+  that is the whole payment (every PO in it, stored under the payment key); on
+  a Balances due container header, and on a By container row, it is every
+  supplier's — and forwarder's — payment in that container (one row per key);
+  on a Deposits due or Not payable yet row it is that line (the deposit key,
+  or the row key). The payment pop-up has the same:
+  "Set date" / "Change" / "Back to derived" in the header for the whole
+  payment, and each PO row's date in place for that row alone.
+- An extra charge in a payment (or a forwarder's cost that is a payment on its
+  own) takes a date set on its payment key like any other row.
 - A backend without the route: the page shows derived dates and offers no
   controls. Deploy the backend first.
