@@ -9,6 +9,7 @@
 //                                     shipment_reference
 //   payment_reviews, payment_assignees
 //                                     'balance:<currency>:<CONTAINER>|<supplier>' keys
+//   payment_due_dates                 those keys, and 'item:…:<container>' row keys
 //   packing_lists, packing_list_sign_offs, packing_approvals, container_photos
 //                                     container_number
 //   draft_containers                  container_number of the draft that became it
@@ -22,6 +23,7 @@
 
 const S = require('../lib/shipments');
 const R = require('../lib/payment-reviews');
+const D = require('../lib/payment-due-dates');
 
 // payment_extras.shipment_reference is VARCHAR(64); the others take 100.
 const REFERENCE_MAX = 64;
@@ -37,7 +39,7 @@ const PAPER_TABLES = [
     { table: 'packing_approvals', count: 'packingApprovals', live: ' AND withdrawn_at IS NULL' },
     { table: 'container_photos', count: 'photos', live: ' AND deleted_at IS NULL' },
 ];
-const COUNT_KEYS = [...MONEY_TABLES.map(t => t.count), 'signOffs', 'assignees', ...PAPER_TABLES.map(t => t.count)];
+const COUNT_KEYS = [...MONEY_TABLES.map(t => t.count), 'signOffs', 'assignees', 'dueDates', ...PAPER_TABLES.map(t => t.count)];
 
 function total(records) {
     return COUNT_KEYS.reduce((n, k) => n + (Number(records && records[k]) || 0), 0);
@@ -56,6 +58,15 @@ async function assigneesOf(conn, reference, { lock = false } = {}) {
     return rows.filter(r => R.rekeyBalanceKey(r.payment_key, reference, reference) !== null);
 }
 
+// Due dates set by hand under the container: on its balance payments, or on
+// one row of them (the key is all there is).
+async function dueDatesOf(conn, reference, { lock = false } = {}) {
+    const [rows] = await conn.query(
+        `SELECT id, target_key FROM payment_due_dates WHERE target_key LIKE 'balance:%' OR target_key LIKE 'item:%'${lock ? ' FOR UPDATE' : ''}`
+    );
+    return rows.filter(r => D.rekeyTargetKey(r.target_key, reference, reference) !== null);
+}
+
 // The live records kept under `reference`: by the text, and by `shipmentId`
 // too when one is given. This is what a rename moves, and what a confirm shows.
 async function recordsUnder(conn, reference, { shipmentId = null } = {}) {
@@ -68,6 +79,7 @@ async function recordsUnder(conn, reference, { shipmentId = null } = {}) {
     out.signOffs = await scalar(conn,
         `SELECT COUNT(*) AS n FROM payment_reviews WHERE kind = 'balance' AND UPPER(container_ref) = ? AND revoked_at IS NULL`, [reference.toUpperCase()]);
     out.assignees = (await assigneesOf(conn, reference)).length;
+    out.dueDates = (await dueDatesOf(conn, reference)).length;
     for (const t of PAPER_TABLES) {
         out[t.count] = await scalar(conn,
             `SELECT COUNT(*) AS n FROM ${t.table} WHERE container_kind = 'booked' AND container_number = ?${t.live}`, [reference]);
@@ -141,6 +153,16 @@ async function carryRecords(conn, { shipmentId, from, to, userEmail = null, reco
             before: { paymentKey: row.payment_key }, after: { paymentKey: key }, userEmail,
         });
         moved.assignees++;
+    }
+    moved.dueDates = 0;
+    for (const row of await dueDatesOf(conn, from, { lock: true })) {
+        const key = D.rekeyTargetKey(row.target_key, from, to);
+        await conn.query(`UPDATE payment_due_dates SET target_key = ?, updated_at = updated_at WHERE id = ?`, [key, row.id]);
+        await recordAudit(conn, {
+            entityType: 'payment_due_date', entityId: row.id, action: 'update',
+            before: { key: row.target_key }, after: { key }, userEmail,
+        });
+        moved.dueDates++;
     }
 
     // Booked rows by the number; a draft's own rows as well when the draft

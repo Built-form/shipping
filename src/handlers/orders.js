@@ -52,6 +52,7 @@ const { registerContainerPhotoRoutes } = require('../services/container-photo-ro
 const { registerPaymentReviewRoutes } = require('../services/payment-review-routes');
 const { registerPaymentExtraRoutes } = require('../services/payment-extra-routes');
 const { registerPaymentAlertRoutes } = require('../services/payment-alert-routes');
+const { registerPaymentDueDateRoutes } = require('../services/payment-due-date-routes');
 const extrasLib = require('../lib/payment-extras');
 const paymentDocumentsLib = require('../lib/payment-documents');
 const { makeSplitOrder } = require('../services/order-split');
@@ -11546,6 +11547,16 @@ registerPaymentReviewRoutes(app, {
 // ── Dismissed "Needs attention" lines (/api/v1/payment-alert-dismissals) ──
 // The Payments flow page works its alerts out itself; an admin can dismiss one.
 registerPaymentAlertRoutes(app, {
+    withConnection,
+    recordAudit,
+    auditLogSchemaReady,
+    log,
+});
+
+// ── Due dates set by hand (/api/v1/payment-due-dates) ─────────────────────
+// A date a person sets on a payment, or on one row of it, in place of the one
+// the Payments flow page derives; cleared to go back to the derived date.
+registerPaymentDueDateRoutes(app, {
     withConnection,
     recordAudit,
     auditLogSchemaReady,

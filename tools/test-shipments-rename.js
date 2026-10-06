@@ -54,6 +54,11 @@ async function run() {
     const reviewId = await insert('payment_reviews', { payment_key: oldKey, kind: 'balance', supplier_name: SUP, container_ref: OLD.toUpperCase(), currency: 'USD', amount: 100, reviewed_by_email: 'shiptest-a@example.com' });
     const neighbourReviewId = await insert('payment_reviews', { payment_key: neighbourKey, kind: 'balance', supplier_name: SUP, container_ref: `${OLD.toUpperCase()}0`, currency: 'USD', amount: 100, reviewed_by_email: 'shiptest-a@example.com' });
     const assigneeId = await insert('payment_assignees', { payment_key: oldKey, assignee_email: 'shiptest-acc@example.com' });
+    // Due dates set by hand: on the balance payment, on one row of it, and one on the …0 neighbour.
+    const dueId = await insert('payment_due_dates', { target_key: oldKey, due_date: '2026-11-20', set_by_email: 'shiptest-a@example.com' });
+    const dueRowKey = `item:derived:bal:${A.purchase_order_id ?? 1}:${OLD}`;
+    const dueRowId = await insert('payment_due_dates', { target_key: dueRowKey, due_date: '2026-11-21', set_by_email: 'shiptest-a@example.com' });
+    const neighbourDueId = await insert('payment_due_dates', { target_key: `item:derived:bal:1:${OLD}0`, due_date: '2026-11-22', set_by_email: 'shiptest-a@example.com' });
     const listId = await insert('packing_lists', { container_kind: 'booked', container_number: OLD, supplier_key: KEY, filename: 'shiptest.xlsx', s3_key: `shiptest/${H.STAMP}/packing.xlsx` });
     const signOffId = await insert('packing_list_sign_offs', { container_kind: 'booked', container_number: OLD, supplier_key: KEY, line_key: 'shiptest', fingerprint: 'f'.repeat(40) });
     const approvalId = await insert('packing_approvals', { container_kind: 'booked', container_number: OLD });
@@ -64,9 +69,9 @@ async function run() {
     section('1. Without a confirm nothing moves');
     let r = await api.patch(`/api/v1/shipments/${s.id}`, { reference: NEW });
     check('409 RENAME_TOUCHES_RECORDS', r.status === 409 && r.data.code === 'RENAME_TOUCHES_RECORDS', r.data);
-    check('it says what would move: 1 balance, 1 invoice document, 2 extras, 1 sign-off, 1 assignee, 1 packing list, 1 packing sign-off, 1 packing approval, 1 photo',
+    check('it says what would move: 1 balance, 1 invoice document, 2 extras, 1 sign-off, 1 assignee, 2 due dates, 1 packing list, 1 packing sign-off, 1 packing approval, 1 photo',
         r.data.records && r.data.records.balances === 1 && r.data.records.paymentDocuments === 1 && r.data.records.extras === 2
-        && r.data.records.signOffs === 1 && r.data.records.assignees === 1 && r.data.records.packingLists === 1
+        && r.data.records.signOffs === 1 && r.data.records.assignees === 1 && r.data.records.dueDates === 2 && r.data.records.packingLists === 1
         && r.data.records.packingSignOffs === 1 && r.data.records.packingApprovals === 1 && r.data.records.photos === 1, r.data.records);
     check('the orders keep the old number', (await H.getOrder(A.id)).container_number === OLD && (await H.getOrder(B.id)).container_number === OLD);
     check('the balance keeps the old number', (await one('shipment_payments', payId)).shipment_reference === OLD);
@@ -88,6 +93,11 @@ async function run() {
     const neighbour = await one('payment_reviews', neighbourReviewId);
     check('a sign-off of the container numbered …0 is left alone', neighbour.payment_key === neighbourKey && neighbour.container_ref === `${OLD.toUpperCase()}0`, neighbour);
     check('assignee re-keyed', (await one('payment_assignees', assigneeId)).payment_key === newKey);
+    check('due date on the payment re-keyed', (await one('payment_due_dates', dueId)).target_key === newKey);
+    check('due date on one row re-keyed, the number as given', (await one('payment_due_dates', dueRowId)).target_key === dueRowKey.replace(OLD, NEW));
+    check('a due date of the container numbered …0 is left alone', (await one('payment_due_dates', neighbourDueId)).target_key === `item:derived:bal:1:${OLD}0`);
+    check('the moved due dates keep their dates and who set them', (await one('payment_due_dates', dueId)).due_date.toISOString().slice(0, 10) === '2026-11-20'
+        && (await one('payment_due_dates', dueRowId)).set_by_email === 'shiptest-a@example.com');
     check('packing list', (await one('packing_lists', listId)).container_number === NEW);
     check('packing sign-off', (await one('packing_list_sign_offs', signOffId)).container_number === NEW);
     check('packing approval', (await one('packing_approvals', approvalId)).container_number === NEW);
@@ -106,6 +116,7 @@ async function run() {
     check('so does the invoice document', (await audits('shipment_payment_document', docId) || {}).shipmentReference === NEW);
     check('and each extra', (await audits('payment_extra', extraId) || {}).shipmentReference === NEW && (await audits('payment_extra', looseExtraId) || {}).shipmentReference === NEW);
     check('and the sign-off', (await audits('payment_review', reviewId) || {}).paymentKey === newKey, await audits('payment_review', reviewId));
+    check('and each due date', (await audits('payment_due_date', dueId) || {}).key === newKey && (await audits('payment_due_date', dueRowId) || {}).key === dueRowKey.replace(OLD, NEW));
     const ship = await audits('shipment', s.id);
     check('the shipment audit row carries the counts', ship && ship.reference === NEW && ship.recordsMoved && ship.recordsMoved.balances === 1, ship);
 

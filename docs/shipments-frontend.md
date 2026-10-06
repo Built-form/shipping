@@ -149,13 +149,14 @@ Any of `name`, `mode`, `reference`, `trackingRef`, `vesselName`, `eta`, `etd`,
 - **Renaming a booked shipment** (`reference`) also moves every record that
   names the old number as text, in the same transaction: balance records,
   their invoice documents, extras, balance sign-offs and assignees (re-keyed),
+  due dates set by hand (re-keyed — see `payment-due-dates-frontend.md`),
   packing lists, their sign-offs and approvals, photos, the closed draft's
   registry row and the standing ETA alert. Amounts and statuses never change;
   each money record gets an audit row.
   - Records exist and the body has no `confirmRecords: true` →
     `409 RENAME_TOUCHES_RECORDS { from, reference, records }`, nothing changed.
     `records` counts what would move: `balances`, `paymentDocuments`, `extras`,
-    `signOffs`, `assignees`, `packingLists`, `packingSignOffs`,
+    `signOffs`, `assignees`, `dueDates`, `packingLists`, `packingSignOffs`,
     `packingApprovals`, `photos`. Show them, then resend with the flag.
   - The new number already has records of its own →
     `409 REFERENCE_HAS_RECORDS { reference, records }`, with or without the flag.
