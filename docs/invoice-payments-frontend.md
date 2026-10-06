@@ -111,7 +111,7 @@ DELETE /api/v1/payment-rules/:id      → 204                       (admin only;
     "ready":    { "from": "deposit_paid", "days": 42 },// from: po | pi | pi_signed | artwork | deposit_paid
     "telex":    { "from": "bl", "days": 7 },           // from: bl | etd | arrival
     "document": null,                                  // from: bl | etd | arrival
-    "departure": { "from": "ready", "days": 21 },      // from: ready ONLY. Goods in no container (booked, draft or planned): expected to leave this long after they are ready
+    "departure": { "from": "ready", "days": 21 },      // from: ready ONLY (the stored value; the page shows it as "from today"). Goods in no container: expected to leave this long from TODAY, or from a ready date still ahead
     "transit":  { "sea": 35, "air": 5, "road": 14 }    // ETD → arrival by mode, days; null = none. Dates a booked container, draft or plan with an ETD and no ETA; goods in no container only when `departure` is set
   },
   "airOwedFrom": null,                 // default rule ONLY (400 on a supplier rule): YYYY-MM-DD; null = air counts as paid once delivered
@@ -147,16 +147,26 @@ for this; nothing extra is stored):
 - In a draft or planned container that has an ETD or ETA: dated from that
   container. Dispatch / B/L terms use its ETD; arrival / delivery terms use
   its ETA, else its ETD + `transit` for its mode. `departure` is not applied.
-- In no container, or in a draft / plan with no dates: the order's own ETD if
-  it has one, else ready date + `departure`, else the ready date. Arrival
-  terms get a date (that departure + `transit`, by the draft's mode when the
-  goods sit in one) only when `departure` is set; with it blank they stay
-  undated.
+- In no container, or in a draft / plan with no dates, **with `departure`
+  set** — "anything not in a container leaves N from today": the order's own
+  ETD when it is today or later; else `departure` days counted from today,
+  whatever the goods' status. A ready date (on file, else the `ready`
+  estimate) counts instead of today only while it is still ahead; an old one
+  loses to today. Among several lines the earliest wins. Arrival terms add
+  `transit` (by the draft's mode when the goods sit in one). A date counted
+  from today moves on a day each day (flag `from_today`).
+- The same goods **with `departure` blank**: dates on file as they stand — the
+  order's own ETD, else the ready date; arrival terms stay undated; a date
+  already behind us leaves the item undated. One exception: goods already made
+  (Ready for QC, Ready at Factory, Consolidated) with no ready date count as
+  ready today, unless a line's ready date on file is earlier.
+- A booked container is never dated from today.
 - Every draft or plan names the goods it holds, dated or not: the "Not payable
   yet" line shows a DRAFT / PLAN chip, the container (its number and label)
   and its ETD. An order split between containers, or between one and nothing,
-  is split by quantity into separate balance items. Units in both a dated and
-  an undated container go to the dated one; then a draft before a plan.
+  is split by quantity into separate balance items — a balance a PI asks for
+  as well as one worked out from the terms. Units in both a dated and an
+  undated container go to the dated one; then a draft before a plan.
 
 A backend without `departure` in its whitelist drops the key on save without
 an error, so deploy the backend before the frontend.
