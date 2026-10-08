@@ -54,6 +54,7 @@ const { registerPaymentExtraRoutes } = require('../services/payment-extra-routes
 const { registerPaymentAlertRoutes } = require('../services/payment-alert-routes');
 const { registerPaymentDueDateRoutes } = require('../services/payment-due-date-routes');
 const extrasLib = require('../lib/payment-extras');
+const { correctBalance } = require('../lib/balance-correction');
 const paymentDocumentsLib = require('../lib/payment-documents');
 const { makeSplitOrder } = require('../services/order-split');
 const shipmentsLib = require('../lib/shipments');
@@ -10748,6 +10749,13 @@ function parseSupplierPaymentBody(body, { partial = false } = {}) {
             if (seen.has(key)) return { error: `lines name ${key} twice.`, code: 'BAD_LINES' };
             seen.add(key);
             const line = { kind, id, amount: Math.round(amount * 100) / 100 };
+            if (kind === 'balance' && entry.balanceAmount != null && entry.balanceAmount !== '') {
+                // An open record stored at its invoice's goods total: the
+                // balance the terms give, which the record comes down to.
+                const ba = Number(entry.balanceAmount);
+                if (!Number.isFinite(ba) || ba <= 0) return { error: 'lines[].balanceAmount must be a number above 0.', code: 'BAD_LINES' };
+                line.balanceAmount = Math.round(ba * 100) / 100;
+            }
             if (kind === 'container_balance') {
                 // The balance to record: the projected figure (default: what
                 // is being paid), optionally already split by the page.
@@ -10837,6 +10845,34 @@ async function materialiseContainerBalances(conn, { lines, supplierName, supplie
         out.push({ kind: 'balance', id: ins.insertId, amount: l.amount });
     }
     return { lines: out, created };
+}
+
+// A 'balance' line that names the balance (`balanceAmount`): its open record
+// was stored at the invoice's goods total, and comes down to that figure —
+// split included — before the checks, so paying the balance settles it.
+// Never raised, never below what is already applied. Returns { fail } or {}.
+async function correctBalanceRecords(conn, { lines, userEmail, excludePaymentId = null }) {
+    const named = lines.filter(l => l.kind === 'balance' && l.balanceAmount != null);
+    if (!named.length) return {};
+    const applied = await loadSupplierPaymentApplied(conn, named, { excludePaymentId });
+    for (const l of named) {
+        const before = await loadShipmentPaymentById(conn, l.id);
+        if (!before || (before.status !== 'pending' && before.status !== 'arranged')) continue;
+        const fixed = correctBalance({
+            amount: before.amount, applied: applied.get(`balance:${l.id}`) || 0, balanceAmount: l.balanceAmount,
+            allocations: before.allocations.map(a => ({ purchaseOrderId: a.purchaseOrderId, poRef: a.poRef, amount: a.amount, source: a.source })),
+        });
+        if (!fixed) continue;
+        if (fixed.error) return { fail: { status: 422, error: `${before.shipmentReference}: ${fixed.error}`, code: fixed.code, payload: { kind: 'balance', id: l.id } } };
+        await conn.query(`UPDATE shipment_payments SET amount = ?, updated_by_email = ? WHERE id = ?`, [fixed.amount, userEmail || null, l.id]);
+        if (fixed.allocations.length) await writeShipmentPaymentAllocations(conn, l.id, fixed.allocations);
+        await recordAudit(conn, {
+            entityType: 'shipment_payment', entityId: l.id, action: 'update',
+            before, after: { ...(await loadShipmentPaymentById(conn, l.id)), via: 'payment', reason: 'The record held the goods total of its invoice; brought down to the balance being paid.' },
+            userEmail,
+        });
+    }
+    return {};
 }
 
 // Check every line against what it points at and what is still owed on it.
@@ -11333,6 +11369,8 @@ app.post('/api/v1/supplier-payments', async (req, res) => {
                 });
                 if (mat.fail) { await conn.rollback(); return { fail: mat.fail }; }
                 const lines = mat.lines;
+                const corrected = await correctBalanceRecords(conn, { lines, userEmail: req.userEmail });
+                if (corrected.fail) { await conn.rollback(); return { fail: corrected.fail }; }
                 const checked = await checkSupplierPaymentLines(conn, {
                     lines, currency: parsed.row.currency, amount: parsed.row.amount, supplierKeyValue: parsed.row.supplier_key,
                 });
@@ -11410,6 +11448,8 @@ app.put('/api/v1/supplier-payments/:id(\\d+)', async (req, res) => {
                 });
                 if (mat.fail) { await conn.rollback(); return { fail: mat.fail }; }
                 const lines = mat.lines;
+                const corrected = await correctBalanceRecords(conn, { lines, userEmail: req.userEmail, excludePaymentId: id });
+                if (corrected.fail) { await conn.rollback(); return { fail: corrected.fail }; }
                 const checked = await checkSupplierPaymentLines(conn, {
                     lines, currency: next.currency, amount: next.amount, supplierKeyValue: next.supplier_key, excludePaymentId: id,
                 });
