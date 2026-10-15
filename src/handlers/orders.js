@@ -52,6 +52,7 @@ const { registerContainerPhotoRoutes } = require('../services/container-photo-ro
 const { registerPaymentReviewRoutes } = require('../services/payment-review-routes');
 const { registerPaymentExtraRoutes } = require('../services/payment-extra-routes');
 const { registerPaymentAlertRoutes } = require('../services/payment-alert-routes');
+const { registerPoChangeRequestRoutes } = require('../services/po-change-request-routes');
 const { registerPaymentDueDateRoutes } = require('../services/payment-due-date-routes');
 const extrasLib = require('../lib/payment-extras');
 const paymentDocumentsLib = require('../lib/payment-documents');
@@ -11574,6 +11575,20 @@ registerPaymentExtraRoutes(app, {
     loadAppliedByTarget,
     loadSettlementsByTarget,
     sameSupplierName,
+});
+
+// ── Supplier change requests (/api/v1/po-change-requests) ─────────────────
+// Ready-date / ready-for-QC changes suppliers staged in the supplier portal
+// (jportal.po_change_requests), shown old vs new and applied to orders here.
+registerPoChangeRequestRoutes(app, {
+    withConnection,
+    ready: async () => {
+        await auditLogSchemaReady;
+        await shipmentsSchemaReady;
+    },
+    ORDER_SELECT, rowToOrder, parseDates, setDateKey,
+    shipmentSync, membershipKey, patchShipmentIds,
+    log,
 });
 
 // ── Serverless export ────────────────────────────────────────────────────

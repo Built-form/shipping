@@ -106,6 +106,10 @@ provider:
     FRONT_API_TOKEN: ${self:custom.secrets.FRONT_API_TOKEN, ''}
     FRONT_CHANNEL_ID: ${self:custom.secrets.FRONT_CHANNEL_ID, ''}
     GEMINI_API_KEY: ${self:custom.secrets.GEMINI_API_KEY, ''}
+    # Schema of the supplier portal (jportal) on the same MySQL server, read and
+    # updated by /api/v1/po-change-requests. The DB login needs SELECT + UPDATE
+    # on <schema>.po_change_requests.
+    JPORTAL_DB_SCHEMA: ${self:custom.secrets.JPORTAL_DB_SCHEMA, 'jportal'}
     # Email receipt confirmation: optional static page (e.g. an S3-hosted
     # confirmation page) that the "Confirm receipt" click 302-redirects to after
     # recording it. Leave blank to render the built-in thank-you page from the
