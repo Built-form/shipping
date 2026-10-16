@@ -48,6 +48,10 @@ const ITEM_COL = COLS[1];
 const MAX_NAME_LEN = 75;
 const ROW_PAD_Y = 8; // vertical padding above/below the wrapped item text
 
+// Header address block: the supplier column runs from x=50 to the delivery
+// column at x=280, less a 10pt gutter.
+const SUPPLIER_COL_W = 220;
+
 function truncateName(name) {
     const s = String(name || '');
     if (s.length <= MAX_NAME_LEN) return s;
@@ -95,8 +99,13 @@ function drawHeaderBlock(doc, po) {
     // Three-column address block
     const addrTop = 165;
     doc.fontSize(10).font('Helvetica-Bold').text('Supplier Details:', 50, addrTop);
-    doc.text(po.supplier || '-', 50, addrTop + 15);
-    let y = addrTop + 30;
+    // Supplier names can run long. Wrap them inside the supplier column so they
+    // never run across the delivery address, and start the address below
+    // however many lines the name took (one line keeps the original spacing).
+    const supplierName = po.supplier || '-';
+    doc.text(supplierName, 50, addrTop + 15, { width: SUPPLIER_COL_W });
+    const supplierNameH = doc.heightOfString(supplierName, { width: SUPPLIER_COL_W });
+    let y = addrTop + 15 + Math.ceil(supplierNameH) + 3;
     for (const line of (po.supplierAddress || [])) {
         doc.font('Helvetica').text(line, 50, y);
         y += 12;
