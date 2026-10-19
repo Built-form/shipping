@@ -68,8 +68,9 @@ changed. The supplier can send a new change for that line afterwards.
 **Approve all** — a button per supplier, labelled with the number of approvable
 rows. Confirm first ("Apply 7 changes from Acme to their orders?"), then
 `POST /api/v1/po-change-requests/apply-supplier` with `{ supplierId, ids }`,
-where `ids` are the ids of the rows **shown and approvable**. Sending `ids` makes
-sure a request that arrives while the page is open is never applied unseen. Then
+where `ids` are the ids of the rows **shown and approvable** (required, at most
+500). The route only ever applies the ids it is sent, so a request that arrives
+while the page is open is never applied unseen. Then
 show "7 applied, 1 skipped" and list the skipped ones with their reasons, and
 reload the supplier's list and the suppliers list.
 
@@ -93,8 +94,9 @@ backend so it can enforce it too.
 | `POST /api/v1/po-change-requests/:id/reject` | `200 { request: ChangeRequest }` — now `rejected`; the order is not touched |
 
 `apply` and `reject` body: `{ rowVersion?: number, note?: string }`.
-`apply-supplier` body: `{ supplierId: number, ids?: number[], note?: string }` (up to 500 ids).
-Without `ids` it applies every pending request from that supplier.
+`apply-supplier` body: `{ supplierId: number, ids: number[], note?: string }` (1 to 500 ids).
+`ids` is required (`400 BAD_FIELD` without it); there is no "apply everything
+pending" call.
 
 `order` / `orders` are the same `Order` shape as `GET /api/v1/orders` (only the
 orders that actually changed; `order` is `null` when nothing needed writing).
@@ -103,8 +105,8 @@ Refusals (`{ error, code }`):
 
 | Status | Code | When |
 | --- | --- | --- |
-| 400 | `BAD_FIELD` | bad id, status filter, note or ids |
-| 400 | `TOO_MANY` | more than 500 in one bulk call; send `ids` in parts |
+| 400 | `BAD_FIELD` | bad id, status filter, note, or `ids` missing, empty or not ids |
+| 400 | `TOO_MANY` | more than 500 `ids` in one bulk call; send them in parts |
 | 404 | `NOT_FOUND` | no such request |
 | 409 | `NOT_PENDING` | already applied, rejected, superseded or withdrawn — reload |
 | 409 | `STALE` | `rowVersion` no longer matches — reload |
@@ -136,7 +138,8 @@ interface Change {
 }
 
 interface Blocker {
-  code: 'line_missing' | 'line_locked' | 'bad_date' | 'qc_from' | 'qc_no_date' | 'nothing_requested' | 'not_pending';
+  code: 'line_missing' | 'po_supplier_changed' | 'line_locked' | 'bad_date' | 'qc_from' | 'qc_no_date'
+      | 'nothing_requested' | 'not_pending';
   message: string;                  // English, ready to show
 }
 
@@ -167,11 +170,14 @@ interface Skipped { id: number; orderId: number | null; blockers: Blocker[] }
 ```
 
 Blockers, for reference: the line was deleted or moved to another PO
-(`line_missing`); it has moved past the factory stages — only `PO_SENT`,
-`IN_PRODUCTION`, `READY_FOR_QC` and `READY` lines can change (`line_locked`);
-"ready for QC" only from `IN_PRODUCTION` (`qc_from`) and only with an actual ready
-date, already on the order or in the same request (`qc_no_date`). These are the
-same rules the old supplier page enforced.
+(`line_missing`); the PO was deleted, or its supplier is no longer the one that
+sent the request, e.g. the PO was reassigned or the supplier deleted
+(`po_supplier_changed`, checked again when approving); it has moved past the
+factory stages — only `PO_SENT`, `IN_PRODUCTION`, `READY_FOR_QC` and `READY`
+lines can change (`line_locked`); "ready for QC" only from `IN_PRODUCTION`
+(`qc_from`) and only with an actual ready date, already on the order or in the
+same request (`qc_no_date`). Apart from `po_supplier_changed`, these are the same
+rules the old supplier page enforced.
 
 ## What to deploy
 

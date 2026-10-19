@@ -10,7 +10,12 @@
 //   actualReadyDate    → orders.actual_ready_date      (date, or null to clear)
 //   markReadyForQc     → orders.status IN_PRODUCTION → READY_FOR_QC, only with
 //                        an actual ready date (stored, or set by the same row)
-// and only while the line is still at the factory (EDITABLE_STATUSES).
+// and only while the line is still at the factory (EDITABLE_STATUSES), and its
+// purchase order is live and still belongs to the row's supplier. jportal checks
+// that when the supplier submits, but shipping does not take the row's word for
+// it: the routes re-check it against purchase_orders and suppliers (a supplier
+// row with id = supplier_id whose name is exactly purchase_orders.supplier, as
+// jportal's own access rule) and pass the answer in as `poOwned`.
 //
 // Pure: no database, no clock. The routes (src/services/po-change-request-routes.js)
 // read and lock the rows, call planApply, and write what it returns.
@@ -30,6 +35,7 @@ const REQUEST_STATUSES = new Set(['pending', 'applied', 'rejected', 'superseded'
 // Why a row cannot be applied as it stands. The codes are API surface.
 const BLOCKERS = {
     line_missing: 'The line has been deleted or moved to another PO.',
+    po_supplier_changed: 'The purchase order no longer belongs to this supplier, or has been deleted.',
     line_locked: 'The line has moved past the factory stages; its ready dates are locked.',
     bad_date: 'The requested date is not a valid YYYY-MM-DD date.',
     qc_from: 'The line can only be marked ready for QC while it is under production.',
@@ -39,13 +45,9 @@ const BLOCKERS = {
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
-// The schema jportal lives in, backtick-quoted for interpolation. No
-// placeholder can carry an identifier, so the name is whitelisted.
-function jportalSchema(env = process.env) {
-    const name = env.JPORTAL_DB_SCHEMA || 'jportal';
-    if (!/^[A-Za-z0-9_]+$/.test(name)) throw new Error('JPORTAL_DB_SCHEMA is not a plain identifier');
-    return `\`${name}\``;
-}
+// The schema jportal lives in: moved to src/lib/jportal.js (shared with the
+// proforma-invoice routes) and re-exported from here unchanged.
+const { jportalSchema } = require('./jportal');
 
 // A JSON column as mysql2 returns it (object, or a string on some servers).
 function parseJsonObject(value) {
@@ -89,15 +91,19 @@ function lineFromRow(row) {
  * What applying `requested` to `line` would write.
  *   requested: the row's requested_json, parsed.
  *   line: lineFromRow(...) of the live line, or null when it is gone.
- *   purchaseOrderId: the row's purchase_order_id; a line now on another PO is gone.
+ *   purchaseOrderId: the row's purchase_order_id; a line now on another PO is
+ *     gone, and so is one when this is missing (fails closed).
+ *   poOwned: true only when that purchase order is not deleted and the row's
+ *     supplier still owns it (worked out by the caller); anything else blocks.
  * Returns { blockers: string[], cols: { column: value }, before, after, moveToQc }.
  * `cols` holds only columns whose value actually changes; with blockers it is empty.
  */
-function planApply(requested, line, purchaseOrderId) {
+function planApply(requested, line, purchaseOrderId, poOwned) {
     const empty = { cols: {}, before: {}, after: {}, moveToQc: false };
-    if (!line || (purchaseOrderId != null && line.purchaseOrderId !== Number(purchaseOrderId))) {
+    if (!line || purchaseOrderId == null || line.purchaseOrderId !== Number(purchaseOrderId)) {
         return { blockers: ['line_missing'], ...empty };
     }
+    if (poOwned !== true) return { blockers: ['po_supplier_changed'], ...empty };
     if (!EDITABLE_STATUSES.has(line.status)) return { blockers: ['line_locked'], ...empty };
 
     const blockers = [];
@@ -145,7 +151,8 @@ function planApply(requested, line, purchaseOrderId) {
  * One change-request row for the API: the line's live (old) value and the
  * requested (new) value for every field the supplier asked to change, plus
  * whether it can be applied right now. `row` is a po_change_requests row
- * joined with the live line (live_* columns); see the routes' SELECT.
+ * joined with the live line (live_* columns) and po_owned (1 when its purchase
+ * order is live and still the supplier's); see the routes' SELECT.
  */
 function requestToJson(row) {
     const base = parseJsonObject(row.base_json);
@@ -186,7 +193,7 @@ function requestToJson(row) {
         changes.push(change('status', base.status ?? null, line ? line.status : null, READY_FOR_QC_STATUS));
     }
 
-    const plan = pending ? planApply(requested, line, row.purchase_order_id) : null;
+    const plan = pending ? planApply(requested, line, row.purchase_order_id, Number(row.po_owned) === 1) : null;
 
     return {
         id: Number(row.id),
@@ -221,9 +228,11 @@ function parseNote(raw) {
     return { value: note || null };
 }
 
+// A positive id from a query string or a JSON body, or null. Past
+// MAX_SAFE_INTEGER the number is no longer the id that was sent.
 function positiveInt(raw) {
     const n = typeof raw === 'string' && raw.trim() !== '' ? Number(raw) : raw;
-    return Number.isInteger(n) && n > 0 ? n : null;
+    return Number.isSafeInteger(n) && n > 0 ? n : null;
 }
 
 module.exports = {

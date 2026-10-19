@@ -59,4 +59,24 @@ async function recordAudit(conn, { entityType, entityId, action, before, after, 
     }
 }
 
-module.exports = { deepEqual, diffSnapshots, recordAudit };
+// recordAudit's diff and no-op skip, but errors propagate. For audit rows
+// written inside a transaction whose writes must not commit without them:
+// recordAudit swallows errors, and after a deadlock InnoDB has already rolled
+// the transaction back, so the statements after it would run in autocommit.
+// (Moved here from src/services/po-change-request-routes.js.)
+async function recordAuditStrict(conn, { entityType, entityId, action, before, after, userEmail }) {
+    const diffed = diffSnapshots(before, after);
+    if (action === 'update' && diffed.before && Object.keys(diffed.before).length === 0) return;
+    await conn.query(
+        `INSERT INTO audit_log (entity_type, entity_id, action, before_json, after_json, user_email)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [
+            entityType, entityId, action,
+            diffed.before ? JSON.stringify(diffed.before) : null,
+            diffed.after ? JSON.stringify(diffed.after) : null,
+            userEmail || null,
+        ]
+    );
+}
+
+module.exports = { deepEqual, diffSnapshots, recordAudit, recordAuditStrict };

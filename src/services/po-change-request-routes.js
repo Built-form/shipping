@@ -3,7 +3,7 @@
 // /api/v1/po-change-requests — supplier changes staged by the supplier portal
 // (jportal) in jportal.po_change_requests, shown with the line's live (old)
 // value beside the requested (new) one, and applied to orders here: one at a
-// time, or every pending one from a supplier at once. The rules are in
+// time, or a supplier's at once (only the ids staff were shown). The rules are in
 // src/lib/po-change-requests.js; the frontend guide is
 // docs/po-change-requests-frontend.md.
 //
@@ -22,6 +22,13 @@
 // before/after) are taken after the locks. A deadlock is retried once, then
 // answered 409 CONFLICT.
 //
+// The row's supplier_id is not trusted to mean the PO is still theirs: every
+// read (the list's po_owned, and the apply after the orders lock) re-checks
+// that purchase_orders.deleted_at IS NULL and that a live supplier with that
+// id has a name exactly equal to purchase_orders.supplier, jportal's own rule
+// (src/handlers/purchaseOrders.js there). Otherwise the row is blocked
+// `po_supplier_changed`. Those purchase_orders / suppliers reads take no locks.
+//
 // Audit rows are written with recordAuditStrict: inside these transactions a
 // failed audit insert must fail the apply. recordAudit swallows errors, and
 // after a deadlock InnoDB has already rolled the transaction back, so the
@@ -31,7 +38,12 @@
 // Registered from orders.js; authed through the greedy /api/v1/{proxy+} route.
 
 const L = require('../lib/po-change-requests');
-const { diffSnapshots } = require('../lib/audit');
+// Shared with the proforma-invoice routes (src/services/pi-submission-routes.js):
+// SUPPLIER_NAME_MATCH (supplier `s` is named exactly as purchase order `po`'s
+// supplier, jportal's rule) and recordAuditStrict (recordAudit's diff and
+// no-op skip, but errors propagate).
+const { SUPPLIER_NAME_MATCH } = require('../lib/jportal');
+const { recordAuditStrict } = require('../lib/audit');
 
 const LIST_LIMIT = 500;
 const BULK_LIMIT = 500;
@@ -39,22 +51,6 @@ const BULK_LIMIT = 500;
 const isDeadlock = err => Boolean(err) && (err.code === 'ER_LOCK_DEADLOCK' || err.errno === 1213);
 const isLockTimeout = err => Boolean(err) && (err.code === 'ER_LOCK_WAIT_TIMEOUT' || err.errno === 1205);
 const CONFLICT = { status: 409, code: 'CONFLICT', error: 'Someone changed these requests at the same moment; reload and try again.' };
-
-// recordAudit's diff and no-op skip, but errors propagate.
-async function recordAuditStrict(conn, { entityType, entityId, action, before, after, userEmail }) {
-    const diffed = diffSnapshots(before, after);
-    if (action === 'update' && diffed.before && Object.keys(diffed.before).length === 0) return;
-    await conn.query(
-        `INSERT INTO audit_log (entity_type, entity_id, action, before_json, after_json, user_email)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-        [
-            entityType, entityId, action,
-            diffed.before ? JSON.stringify(diffed.before) : null,
-            diffed.after ? JSON.stringify(diffed.after) : null,
-            userEmail || null,
-        ]
-    );
-}
 
 function registerPoChangeRequestRoutes(app, deps) {
     const {
@@ -64,9 +60,11 @@ function registerPoChangeRequestRoutes(app, deps) {
 
     const refuse = (res, r) => res.status(r.status).json({ error: r.error, code: r.code, ...(r.extra || {}) });
 
-    // Every column the API returns, with the live line joined in. Read on every
-    // call: an invalid JPORTAL_DB_SCHEMA is a 500 on these routes, not a failed
-    // import that would take the whole Lambda down.
+    // Every column the API returns, with the live line joined in, and
+    // po_owned: 1 when the row's purchase order is live and its supplier still
+    // owns it (0 otherwise, so the list shows po_supplier_changed). Read on
+    // every call: an invalid JPORTAL_DB_SCHEMA is a 500 on these routes, not a
+    // failed import that would take the whole Lambda down.
     const selectSql = () => {
         const jp = L.jportalSchema();
         return `SELECT r.id, r.supplier_id, r.supplier_name, r.purchase_order_id, r.po_number, r.order_id,
@@ -76,9 +74,14 @@ function registerPoChangeRequestRoutes(app, deps) {
                        DATE_FORMAT(r.decided_at, '%Y-%m-%dT%H:%i:%sZ') AS decided_at_iso,
                        DATE_FORMAT(r.applied_at, '%Y-%m-%dT%H:%i:%sZ') AS applied_at_iso,
                        o.id AS live_id, o.purchase_order_id AS live_purchase_order_id, o.status AS live_status,
-                       o.estimated_ready_date AS live_estimated_ready_date, o.actual_ready_date AS live_actual_ready_date
+                       o.estimated_ready_date AS live_estimated_ready_date, o.actual_ready_date AS live_actual_ready_date,
+                       (po.id IS NOT NULL AND EXISTS (
+                           SELECT 1 FROM suppliers s
+                            WHERE s.id = r.supplier_id AND s.deleted_at IS NULL
+                              AND ${SUPPLIER_NAME_MATCH})) AS po_owned
                   FROM ${jp}.po_change_requests r
-                  LEFT JOIN orders o ON o.id = r.order_id AND o.deleted_at IS NULL`;
+                  LEFT JOIN orders o ON o.id = r.order_id AND o.deleted_at IS NULL
+                  LEFT JOIN purchase_orders po ON po.id = r.purchase_order_id AND po.deleted_at IS NULL`;
     };
 
     const readByIds = async (conn, ids) => {
@@ -89,7 +92,8 @@ function registerPoChangeRequestRoutes(app, deps) {
 
     /**
      * Apply locked, pending change-request rows inside the caller's transaction.
-     * Rows with blockers are skipped and reported, nothing written for them.
+     * Rows with blockers (planApply's, including a PO that is deleted or no
+     * longer the row's supplier's) are skipped and reported, nothing written for them.
      * Returns { applied: [{ id, orderId }], skipped: [{ id, orderId, blockers }], orders }.
      */
     const applyLocked = async (conn, rows, { userEmail, note }) => {
@@ -106,6 +110,25 @@ function registerPoChangeRequestRoutes(app, deps) {
             for (const row of live) liveById.set(Number(row.id), row);
         }
 
+        // Which (purchase order, supplier) pairs still hold: the PO is not
+        // deleted and the row's supplier is still the one it is raised to. A
+        // plain read, after the orders lock (lock order unchanged).
+        const poIds = [...new Set(rows.map(r => Number(r.purchase_order_id)))].filter(Number.isSafeInteger);
+        const supplierIds = [...new Set(rows.map(r => Number(r.supplier_id)))].filter(Number.isSafeInteger);
+        const owned = new Set();
+        if (poIds.length && supplierIds.length) {
+            const [pairs] = await conn.query(
+                `SELECT po.id AS purchase_order_id, s.id AS supplier_id
+                   FROM purchase_orders po
+                   INNER JOIN suppliers s ON s.deleted_at IS NULL AND ${SUPPLIER_NAME_MATCH}
+                  WHERE po.deleted_at IS NULL
+                    AND po.id IN (${poIds.map(() => '?').join(', ')})
+                    AND s.id IN (${supplierIds.map(() => '?').join(', ')})`,
+                [...poIds, ...supplierIds]
+            );
+            for (const p of pairs) owned.add(`${Number(p.purchase_order_id)}:${Number(p.supplier_id)}`);
+        }
+
         const applied = [];
         const skipped = [];
         const touched = [];
@@ -113,7 +136,8 @@ function registerPoChangeRequestRoutes(app, deps) {
             const orderId = Number(row.order_id);
             const liveRow = liveById.get(orderId) || null;
             const requested = L.parseJsonObject(row.requested_json);
-            const plan = L.planApply(requested, L.lineFromRow(liveRow), row.purchase_order_id);
+            const poOwned = owned.has(`${Number(row.purchase_order_id)}:${Number(row.supplier_id)}`);
+            const plan = L.planApply(requested, L.lineFromRow(liveRow), row.purchase_order_id, poOwned);
             if (plan.blockers.length) {
                 skipped.push({
                     id: Number(row.id), orderId,
@@ -388,11 +412,11 @@ function registerPoChangeRequestRoutes(app, deps) {
         }
     });
 
-    // POST /api/v1/po-change-requests/apply-supplier — body { supplierId, ids?, note? }.
-    // Applies every pending request from that supplier, or only `ids` (the
-    // ones the user was shown; recommended, so a request that arrives while
-    // they look is not applied unseen). One transaction. Rows that cannot be
-    // applied are skipped and listed; the rest are applied.
+    // POST /api/v1/po-change-requests/apply-supplier — body { supplierId, ids, note? }.
+    // Applies the pending requests `ids` from that supplier: the ones the user
+    // was shown. `ids` is required, so a request that arrives while they look
+    // is never applied unseen. One transaction. Rows that cannot be applied are
+    // skipped and listed; the rest are applied.
     // 200 { applied: Request[], skipped: [{ id, orderId, blockers }], orders }
     app.post('/api/v1/po-change-requests/apply-supplier', async (req, res) => {
         try {
@@ -401,39 +425,32 @@ function registerPoChangeRequestRoutes(app, deps) {
             if (!supplierId) return refuse(res, { status: 400, code: 'BAD_FIELD', error: 'supplierId must be a positive integer.' });
             const note = L.parseNote(b.note);
             if (note.error) return refuse(res, { status: 400, code: 'BAD_FIELD', error: note.error });
-            let ids = null;
-            if (b.ids !== undefined && b.ids !== null) {
-                if (!Array.isArray(b.ids) || b.ids.length === 0) {
-                    return refuse(res, { status: 400, code: 'BAD_FIELD', error: 'ids must be a non-empty list when sent.' });
-                }
-                ids = [...new Set(b.ids.map(L.positiveInt))];
-                if (ids.includes(null)) return refuse(res, { status: 400, code: 'BAD_FIELD', error: 'ids must be positive integers.' });
-                if (ids.length > BULK_LIMIT) return refuse(res, { status: 400, code: 'TOO_MANY', error: `At most ${BULK_LIMIT} requests at once.` });
+            if (!Array.isArray(b.ids) || b.ids.length === 0) {
+                return refuse(res, { status: 400, code: 'BAD_FIELD', error: 'ids must be a non-empty list of the request ids to apply.' });
             }
+            // Checked before mapping, so an oversized body is not walked.
+            if (b.ids.length > BULK_LIMIT) return refuse(res, { status: 400, code: 'TOO_MANY', error: `At most ${BULK_LIMIT} requests at once.` });
+            const ids = [...new Set(b.ids.map(L.positiveInt))];
+            if (ids.includes(null)) return refuse(res, { status: 400, code: 'BAD_FIELD', error: 'ids must be positive integers.' });
             await ready();
 
-            // Before the transaction: which lines have a pending request from
-            // this supplier (unlocked). Inside it: lock exactly those through
-            // uniq_pending_order, ascending, and re-check what was locked.
+            // Before the transaction: which lines have one of `ids` pending
+            // from this supplier (unlocked). Inside it: lock exactly those
+            // through uniq_pending_order, ascending, and re-check what was locked.
             const findCandidates = async (conn) => {
-                const params = [supplierId];
-                let idFilter = '';
-                if (ids) {
-                    idFilter = ` AND id IN (${ids.map(() => '?').join(', ')})`;
-                    params.push(...ids);
-                }
                 const [rows] = await conn.query(
                     `SELECT order_id FROM ${L.jportalSchema()}.po_change_requests
-                      WHERE supplier_id = ? AND status = 'pending'${idFilter}
+                      WHERE supplier_id = ? AND status = 'pending' AND id IN (${ids.map(() => '?').join(', ')})
                       ORDER BY order_id LIMIT ${BULK_LIMIT + 1}`,
-                    params
+                    [supplierId, ...ids]
                 );
                 return rows.map(r => Number(r.order_id));
             };
 
             const out = await inTransaction('POST /po-change-requests/apply-supplier', async (conn, orderIds) => {
+                // Cannot happen with at most BULK_LIMIT ids; kept as a guard.
                 if (orderIds.length > BULK_LIMIT) {
-                    return { fail: { status: 400, code: 'TOO_MANY', error: `More than ${BULK_LIMIT} pending requests; send ids to apply them in parts.` } };
+                    return { fail: { status: 400, code: 'TOO_MANY', error: `At most ${BULK_LIMIT} requests at once.` } };
                 }
                 let rows = [];
                 if (orderIds.length) {
@@ -444,20 +461,18 @@ function registerPoChangeRequestRoutes(app, deps) {
                         orderIds
                     );
                     // A line's pending row may have been superseded by a new one
-                    // (new id) since the candidate read: with `ids`, only the ids
-                    // the user saw are applied; a new one is reported not_pending.
-                    const wanted = ids ? new Set(ids) : null;
+                    // (new id) since the candidate read: only the ids the user
+                    // saw are applied; the asked-for one is reported not_pending.
+                    const wanted = new Set(ids);
                     rows = locked.filter(r => Number(r.supplier_id) === supplierId && r.status === 'pending'
-                        && (!wanted || wanted.has(Number(r.id))));
+                        && wanted.has(Number(r.id)));
                 }
                 const result = await applyLocked(conn, rows, { userEmail: req.userEmail, note: note.value });
                 // Asked-for ids that were not pending for this supplier.
-                if (ids) {
-                    const found = new Set(rows.map(r => Number(r.id)));
-                    for (const id of ids) {
-                        if (!found.has(id)) {
-                            result.skipped.push({ id, orderId: null, blockers: [{ code: 'not_pending', message: 'Not a pending request from this supplier.' }] });
-                        }
+                const found = new Set(rows.map(r => Number(r.id)));
+                for (const id of ids) {
+                    if (!found.has(id)) {
+                        result.skipped.push({ id, orderId: null, blockers: [{ code: 'not_pending', message: 'Not a pending request from this supplier.' }] });
                     }
                 }
                 return { ...result, userEmail: req.userEmail };

@@ -7,6 +7,14 @@
 // so an ops edit is never clobbered), and the send handlers in
 // src/handlers/orders.js fall back to these if a row is missing. Subjects
 // support {placeholder} tokens substituted per send (e.g. {poNumber}).
+//
+// The 'Supplier portal' templates are sent by the system, not from a send
+// dialog: the decision email for a PI a supplier uploaded through the supplier
+// portal (src/services/pi-submission-routes.js), looked up by key. Seeded by
+// 2026-10-20_20_seed_supplier_pi_email_templates.js. Their body tokens are
+// HTML-escaped by the sender: {poNumber} {filename} {note} {noteHtml}
+// (the staff note as a paragraph, or nothing) {portalLinkHtml} (a link into
+// the portal, or nothing).
 
 const DEFAULT_EMAIL_TEMPLATES = [
     {
@@ -69,6 +77,45 @@ const DEFAULT_EMAIL_TEMPLATES = [
             '</div>',
         ].join(''),
     },
+    {
+        key: 'supplier_pi_imported',
+        name: 'Supplier PI accepted',
+        category: 'Supplier portal',
+        description: 'Sent automatically to the supplier when a PI they uploaded in the supplier portal is accepted. Tokens: {poNumber} {filename} {note} {noteHtml} {portalLinkHtml}.',
+        subject: 'PI accepted – {poNumber}',
+        bodyHtml: [
+            '<div style="font-family:Helvetica,Arial,sans-serif;font-size:14px;color:#222;line-height:1.5;">',
+            '<p>Greetings,</p>',
+            '<p>Thank you. We have accepted your proforma invoice <strong>{filename}</strong> for {poNumber}.</p>',
+            '<p>您好，</p>',
+            '<p>谢谢。我们已接受您为 {poNumber} 上传的形式发票 <strong>{filename}</strong>。</p>',
+            '{noteHtml}',
+            '{portalLinkHtml}',
+            '<p>Kind Regards,<br>Operations Team.<br>JFA Medical Ltd.</p>',
+            '</div>',
+        ].join(''),
+    },
+    {
+        key: 'supplier_pi_rejected',
+        name: 'Supplier PI not accepted',
+        category: 'Supplier portal',
+        description: 'Sent automatically to the supplier when a PI they uploaded in the supplier portal is not accepted, with the reason and a link to upload a corrected one. Tokens: {poNumber} {filename} {note} {noteHtml} {portalLinkHtml}.',
+        subject: 'PI not accepted – {poNumber}',
+        bodyHtml: [
+            '<div style="font-family:Helvetica,Arial,sans-serif;font-size:14px;color:#222;line-height:1.5;">',
+            '<p>Greetings,</p>',
+            '<p>We could not accept your proforma invoice <strong>{filename}</strong> for {poNumber}. Please see the reason below, and upload a corrected PI in the supplier portal.</p>',
+            '<p>您好，</p>',
+            '<p>很抱歉，我们未能接受您为 {poNumber} 上传的形式发票 <strong>{filename}</strong>。请查看以下原因，并在供应商门户中上传更正后的形式发票。</p>',
+            '{noteHtml}',
+            '{portalLinkHtml}',
+            '<p>Kind Regards,<br>Operations Team.<br>JFA Medical Ltd.</p>',
+            '</div>',
+        ].join(''),
+    },
 ];
 
-module.exports = { DEFAULT_EMAIL_TEMPLATES };
+// The templates the supplier-portal PI decision email uses (seeded by their own migration).
+const SUPPLIER_PI_TEMPLATE_KEYS = ['supplier_pi_imported', 'supplier_pi_rejected'];
+
+module.exports = { DEFAULT_EMAIL_TEMPLATES, SUPPLIER_PI_TEMPLATE_KEYS };

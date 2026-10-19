@@ -11,11 +11,17 @@
 //
 // Consumers: thin HTTP handlers in src/handlers/orders.js — keep all
 // comparison logic here so future tweaks (rubric, model, output shape)
-// don't ripple into the handlers.
+// don't ripple into the handlers. The supplier-portal check
+// (src/services/pi-check.js) calls checkDocument() directly with the bytes it
+// fetched from the portal's bucket, the same prompt and schema, plus
+// SUPPLIER_PORTAL_ADDENDUM and a deadline.
 
 const { GoogleGenAI } = require('@google/genai');
 const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
 const log = require('../lib/logger');
+const { withGeminiRetry } = require('../lib/gemini-retry');
+const bank = require('../lib/bank-verification');
+const { recordAuditStrict } = require('../lib/audit');
 // Charges a PI bills that are not goods (mould, handling, …) come back as
 // otherCharges. The page shows them as already inside the PI's own figures.
 const { EXTRA_KINDS, OTHER_CHARGES_SCHEMA } = require('../lib/payment-extras');
@@ -69,6 +75,15 @@ Verdict rules:
 - "major_discrepancies" — material differences that need supplier action: missing lines, wrong quantities, totals more than 1% apart, wrong supplier, wrong currency.
 
 Be strict on numbers — even a 0.5% unit-price drift across a 16-line PO is material.`;
+
+// Appended for a PI a supplier uploaded through the supplier portal, from the
+// page of one PO: the PO is known before the upload, so a PI quoting another
+// PO number is the wrong document (or the wrong page), not a typo.
+const SUPPLIER_PORTAL_ADDENDUM = 'The supplier uploaded this for PO {poNumber}. If the document quotes a different PO number, add a discrepancy of type `other` and set overallVerdict to `major_discrepancies`.';
+
+function supplierPortalInstructions(poNumber) {
+    return SUPPLIER_PORTAL_ADDENDUM.replace('{poNumber}', String(poNumber == null ? '' : poNumber));
+}
 
 const RESPONSE_SCHEMA = {
     type: 'object',
@@ -243,8 +258,8 @@ async function fetchInvoicePdf(s3Key) {
 }
 
 // ── Compare ──────────────────────────────────────────────────────────────
-// Loads the PO and the invoice PDF, runs Gemini, returns the structured
-// result plus usage metadata so the caller can surface cost.
+// Loads the PO and the invoice PDF, runs Gemini (checkDocument, below),
+// returns the structured result plus usage metadata so the caller can surface cost.
 async function compare(conn, { purchaseOrderId, invoiceId, model }) {
     const modelId = model || GEMINI_MODEL_DEFAULT;
     if (!process.env.GEMINI_API_KEY) {
@@ -292,9 +307,54 @@ async function compare(conn, { purchaseOrderId, invoiceId, model }) {
         throw err;
     }
 
+    const { result: parsed, usage } = await checkDocument({
+        po, bytes: pdfBytes, mimeType: invoice.content_type || 'application/pdf', modelId,
+    });
+
+    return {
+        invoiceId: invoice.id,
+        purchaseOrderId: po.poNumber,
+        invoiceFilename: invoice.filename,
+        check: parsed,
+        po: {
+            poNumber: po.poNumber,
+            supplier: po.supplier,
+            currency: po.currency,
+            lineCount: po.lines.length,
+            subtotal: po.subtotal,
+            shippingTotal: po.shippingTotal,
+            grandTotal: po.grandTotal,
+        },
+        modelUsed: modelId,
+        usage,
+    };
+}
+
+// ── Check one document ───────────────────────────────────────────────────
+// The Gemini call itself, on a PO already loaded (loadPoForCheck) and the
+// document's bytes already fetched — no database, no S3. compare() is a thin
+// wrapper around it; the supplier-portal check (src/services/pi-check.js)
+// calls it directly.
+//   extraInstructions: added after the system instruction (e.g.
+//     supplierPortalInstructions(po.poNumber)); omitted, the prompt is exactly
+//     the one compare() has always sent.
+//   deadline: epoch ms. Without it there is one attempt, as compare() always
+//     made. With it, transient errors are retried (src/lib/gemini-retry.js)
+//     while enough time remains, and each attempt is cut off before it.
+// → { result, usage, model }. Throws coded errors as before: NOT_CONFIGURED,
+// MODEL_CALL_FAILED (the SDK error as .cause), MODEL_NO_JSON.
+async function checkDocument({ po, bytes, mimeType, modelId, extraInstructions = null, deadline = null }) {
+    const model = modelId || GEMINI_MODEL_DEFAULT;
+    if (!process.env.GEMINI_API_KEY) {
+        const err = new Error('GEMINI_API_KEY is not configured.');
+        err.code = 'NOT_CONFIGURED';
+        throw err;
+    }
+
     const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
     const promptText = [
         SYSTEM_INSTRUCTION,
+        ...(extraInstructions ? ['', '## Additional instructions', String(extraInstructions)] : []),
         '',
         '## Purchase Order (structured)',
         '```json',
@@ -305,24 +365,36 @@ async function compare(conn, { purchaseOrderId, invoiceId, model }) {
         'The attached PDF is the supplier invoice. Read it and compare against the PO above. Return the structured discrepancy report per the JSON schema.',
     ].join('\n');
 
-    let response;
-    try {
-        response = await ai.models.generateContent({
-            model: modelId,
+    const request = () => {
+        const config = {
+            responseMimeType: 'application/json',
+            responseSchema: RESPONSE_SCHEMA,
+        };
+        if (deadline != null) {
+            // Leave a minute after the call for the caller to write its result.
+            const left = deadline - Date.now() - 60 * 1000;
+            config.httpOptions = { timeout: Math.max(15 * 1000, Math.min(180 * 1000, left)) };
+        }
+        return ai.models.generateContent({
+            model,
             contents: [
                 { text: promptText },
                 {
                     inlineData: {
-                        mimeType: invoice.content_type || 'application/pdf',
-                        data: pdfBytes.toString('base64'),
+                        mimeType: mimeType || 'application/pdf',
+                        data: Buffer.from(bytes).toString('base64'),
                     },
                 },
             ],
-            config: {
-                responseMimeType: 'application/json',
-                responseSchema: RESPONSE_SCHEMA,
-            },
+            config,
         });
+    };
+
+    let response;
+    try {
+        response = deadline != null
+            ? await withGeminiRetry(`po-invoice-check(${model})`, request, 5, { deadline })
+            : await request();
     } catch (e) {
         log.error('[po-invoice-check] Gemini call failed', { message: e.message });
         const err = new Error(`Gemini call failed: ${e.message}`);
@@ -340,24 +412,7 @@ async function compare(conn, { purchaseOrderId, invoiceId, model }) {
         err.code = 'MODEL_NO_JSON';
         throw err;
     }
-
-    return {
-        invoiceId: invoice.id,
-        purchaseOrderId: po.poNumber,
-        invoiceFilename: invoice.filename,
-        check: parsed,
-        po: {
-            poNumber: po.poNumber,
-            supplier: po.supplier,
-            currency: po.currency,
-            lineCount: po.lines.length,
-            subtotal: po.subtotal,
-            shippingTotal: po.shippingTotal,
-            grandTotal: po.grandTotal,
-        },
-        modelUsed: modelId,
-        usage: response?.usageMetadata ?? null,
-    };
+    return { result: parsed, usage: response?.usageMetadata ?? null, model };
 }
 
 // ── Persistence of the extracted payment instructions ─────────────────────
@@ -373,8 +428,28 @@ function toDateOnlyOrNull(v) {
 // purchase_order_invoice_payments. One row per invoice (UNIQUE), so a re-check
 // refreshes the same row. payment_status is intentionally left out of the
 // UPDATE clause: it's owned by the operator / payment job and must survive a
-// re-extraction. Best-effort — a storage failure here must not fail the check.
-async function upsertInvoicePaymentTerms(conn, { invoiceId, purchaseOrderId, checkId, paymentTerms, modelUsed }) {
+// re-extraction. Best-effort — a storage failure here must not fail the check
+// (recordInvoiceCheck in orders.js catches it; the PI import calls it inside
+// its transaction and lets errors, deadlocks included, propagate).
+//
+// A PI that came through the supplier portal (purchase_order_invoices
+// .pi_submission_id set) also carries bank verification
+// (src/lib/bank-verification.js): see upsertPortalPaymentTerms below. Every
+// other PI is written exactly as before, and its bank_* verification columns
+// stay NULL (not applicable).
+async function upsertInvoicePaymentTerms(conn, opts) {
+    const [inv] = await conn.query(
+        `SELECT pi_submission_id FROM purchase_order_invoices WHERE id = ?`,
+        [opts.invoiceId]
+    );
+    if (inv.length && inv[0].pi_submission_id != null) return upsertPortalPaymentTerms(conn, opts);
+    return upsertLegacyPaymentTerms(conn, opts);
+}
+
+const clip = (v, n) => (v == null ? null : String(v).slice(0, n));
+const numOrNull = (v) => (v == null || v === '' || Number.isNaN(Number(v)) ? null : Number(v));
+
+async function upsertLegacyPaymentTerms(conn, { invoiceId, purchaseOrderId, checkId, paymentTerms, modelUsed }) {
     if (!paymentTerms || typeof paymentTerms !== 'object') return;
     const pt = paymentTerms;
     const s = (v, n) => (v == null ? null : String(v).slice(0, n));
@@ -408,8 +483,103 @@ async function upsertInvoicePaymentTerms(conn, { invoiceId, purchaseOrderId, che
     );
 }
 
+// A portal PI's payment row. Always written, so the PI's bank state is explicit
+// from the moment it is imported:
+//   - paymentTerms null (the supplier's check was unusable): creates the row
+//     with empty terms, an empty fingerprint and 'needs_verification'; an
+//     existing row is left alone. The later re-check fills it in.
+//   - otherwise the extracted terms and bank fields are written with
+//     bank_fingerprint, as for any PI.
+//   - verification { fingerprint, details, method, note, by } (the import's
+//     bank gate passed, or staff verified): the verified fields are written too.
+// bank_verification_status is computed in the same statement —
+//   fingerprint non-empty AND = bank_verified_fingerprint ? verified : needs_verification
+// — so there is no transient needs_verification and no false audit row. A
+// move from verified to needs_verification (a re-check read different
+// details) is audited as bank_details_unverified on the purchase order.
+// → { status, previousStatus, fingerprint, created }
+async function upsertPortalPaymentTerms(conn, { invoiceId, purchaseOrderId, checkId, paymentTerms, modelUsed, verification = null, userEmail = null }) {
+    const pt = paymentTerms && typeof paymentTerms === 'object' ? paymentTerms : null;
+    // A plain read: a locking read of a row that does not exist yet would take
+    // a gap lock that two imports could deadlock on.
+    const [prevRows] = await conn.query(
+        `SELECT * FROM purchase_order_invoice_payments WHERE purchase_order_invoice_id = ?`,
+        [invoiceId]
+    );
+    const prev = prevRows[0] || null;
+    if (!pt && prev) {
+        return { status: prev.bank_verification_status || null, previousStatus: prev.bank_verification_status || null, fingerprint: prev.bank_fingerprint || '', created: false };
+    }
+
+    const details = bank.bankDetailsOf(pt);
+    const fingerprint = bank.bankFingerprint(details);
+    const p = pt || {};
+    const cols = [
+        'purchase_order_invoice_id', 'purchase_order_id', 'payment_type', 'amount_due', 'currency',
+        'deposit_percentage', 'invoice_total', 'due_date', 'due_terms',
+        'beneficiary_name', 'bank_name', 'bank_address', 'account_number', 'iban', 'swift_bic',
+        'intermediary_bank', 'payment_reference', 'raw_terms_text', 'extracted_from_check_id', 'model_used',
+        'bank_fingerprint',
+    ];
+    const vals = [
+        invoiceId, purchaseOrderId, clip(p.paymentType, 32), numOrNull(p.amountDueNow),
+        clip(p.currency, 3), numOrNull(p.depositPercentage), numOrNull(p.invoiceTotal),
+        toDateOnlyOrNull(p.dueDate), clip(p.dueTerms, 500),
+        details.beneficiaryName, details.bankName, details.bankAddress,
+        details.accountNumber, details.iban, details.swiftBic,
+        details.intermediaryBank, clip(p.paymentReference, 255),
+        p.rawText != null ? String(p.rawText).slice(0, 8000) : null, checkId || null, modelUsed || null,
+        fingerprint,
+    ];
+    const updates = cols.slice(2).map(c => `${c} = VALUES(${c})`);
+    if (verification) {
+        cols.push('bank_verified_fingerprint', 'bank_verified_json', 'bank_verified_by',
+            'bank_verification_method', 'bank_verification_note');
+        vals.push(verification.fingerprint || '', JSON.stringify(bank.bankDetailsOf(verification.details || details)),
+            clip(verification.by, 255), clip(verification.method, 32), clip(verification.note, 1000));
+        updates.push('bank_verified_fingerprint = VALUES(bank_verified_fingerprint)',
+            'bank_verified_json = VALUES(bank_verified_json)', 'bank_verified_by = VALUES(bank_verified_by)',
+            'bank_verified_at = NOW()', 'bank_verification_method = VALUES(bank_verification_method)',
+            'bank_verification_note = VALUES(bank_verification_note)');
+    }
+    // A new row's status, from what this statement writes; an existing row's
+    // is recomputed in the UPDATE clause from its (possibly just updated)
+    // verified fingerprint — assignments there are applied left to right.
+    const insertStatus = bank.statusFor(fingerprint, verification ? verification.fingerprint : null);
+    cols.push('bank_verification_status');
+    vals.push(insertStatus);
+    updates.push(`bank_verification_status = IF(VALUES(bank_fingerprint) <> '' AND VALUES(bank_fingerprint) = bank_verified_fingerprint, '${bank.VERIFIED}', '${bank.NEEDS_VERIFICATION}')`);
+    const placeholders = cols.map(() => '?');
+    let colSql = cols.join(', ');
+    let valSql = placeholders.join(', ');
+    if (verification) { colSql += ', bank_verified_at'; valSql += ', NOW()'; }
+
+    await conn.query(
+        `INSERT INTO purchase_order_invoice_payments (${colSql})
+         VALUES (${valSql})
+         ON DUPLICATE KEY UPDATE ${updates.join(', ')}`,
+        vals
+    );
+    const [after] = await conn.query(
+        `SELECT bank_verification_status FROM purchase_order_invoice_payments WHERE purchase_order_invoice_id = ?`,
+        [invoiceId]
+    );
+    const status = after[0] ? after[0].bank_verification_status : null;
+    const previousStatus = prev ? prev.bank_verification_status || null : null;
+    if (previousStatus === bank.VERIFIED && status === bank.NEEDS_VERIFICATION) {
+        await recordAuditStrict(conn, {
+            entityType: 'purchase_order', entityId: Number(purchaseOrderId), action: 'bank_details_unverified',
+            before: { invoiceId: Number(invoiceId), bankVerificationStatus: previousStatus, bank: bank.bankDetailsOf(prev, { fromRow: true }) },
+            after: { invoiceId: Number(invoiceId), bankVerificationStatus: status, bank: details, checkId: checkId || null },
+            userEmail,
+        });
+    }
+    return { status, previousStatus, fingerprint, created: !prev };
+}
+
 module.exports = {
-    compare, loadPoForCheck, fetchInvoicePdf,
+    compare, checkDocument, loadPoForCheck, fetchInvoicePdf,
     toDateOnlyOrNull, upsertInvoicePaymentTerms,
-    RESPONSE_SCHEMA,
+    RESPONSE_SCHEMA, SUPPLIER_PORTAL_ADDENDUM, supplierPortalInstructions,
+    GEMINI_MODEL_DEFAULT,
 };

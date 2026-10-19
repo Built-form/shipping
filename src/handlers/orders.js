@@ -53,6 +53,9 @@ const { registerPaymentReviewRoutes } = require('../services/payment-review-rout
 const { registerPaymentExtraRoutes } = require('../services/payment-extra-routes');
 const { registerPaymentAlertRoutes } = require('../services/payment-alert-routes');
 const { registerPoChangeRequestRoutes } = require('../services/po-change-request-routes');
+const { registerPiSubmissionRoutes } = require('../services/pi-submission-routes');
+// Bank-detail verification on portal PIs: the positive payment gate (isPayable).
+const bankVerification = require('../lib/bank-verification');
 const { registerPaymentDueDateRoutes } = require('../services/payment-due-date-routes');
 const extrasLib = require('../lib/payment-extras');
 const { correctBalance } = require('../lib/balance-correction');
@@ -6496,6 +6499,9 @@ function invoiceRowToJson(r) {
         notes: r.notes || null,
         uploadedByEmail: r.uploaded_by_email || null,
         uploadedAt: r.uploaded_at?.toISOString?.() ?? r.uploaded_at,
+        // Set when the PI came through the supplier portal (jportal.pi_submissions.id):
+        // uploadedByEmail is then the supplier's email, display only.
+        piSubmissionId: r.pi_submission_id != null ? Number(r.pi_submission_id) : null,
     };
 }
 
@@ -6660,7 +6666,7 @@ app.get('/api/v1/purchase-orders/:id/invoices', async (req, res) => {
         const { rows, latestByInvoiceId, paymentByInvoiceId, settlements } = await withConnection(async (conn) => {
             const [invoiceRows] = await conn.query(
                 `SELECT id, purchase_order_id, filename, s3_key, public_url, content_type,
-                        file_size, notes, uploaded_by_email, uploaded_at
+                        file_size, notes, uploaded_by_email, uploaded_at, pi_submission_id
                    FROM purchase_order_invoices
                   WHERE purchase_order_id = ? AND deleted_at IS NULL
                   ORDER BY uploaded_at DESC, id DESC`,
@@ -6719,6 +6725,9 @@ app.get('/api/v1/purchase-orders/:id/invoices', async (req, res) => {
 // paid → skipped). This is what the operator / WorldFirst job flips once a
 // transfer has been arranged or settled; it never touches the extracted terms.
 // Body: { paymentStatus }
+// A PI from the supplier portal can only be marked arranged or paid once its
+// bank details are verified (src/lib/bank-verification.js isPayable):
+// 409 BANK_UNVERIFIED otherwise.
 const INVOICE_PAYMENT_STATUSES = ['pending', 'arranged', 'paid', 'skipped'];
 app.put('/api/v1/purchase-orders/:poId/invoices/:invoiceId/payment-status', async (req, res) => {
     try {
@@ -6732,13 +6741,17 @@ app.put('/api/v1/purchase-orders/:poId/invoices/:invoiceId/payment-status', asyn
 
         const result = await withConnection(async (conn) => {
             const [payRows] = await conn.query(
-                `SELECT p.* FROM purchase_order_invoice_payments p
+                `SELECT p.*, i.pi_submission_id FROM purchase_order_invoice_payments p
                    JOIN purchase_order_invoices i ON i.id = p.purchase_order_invoice_id
                   WHERE p.purchase_order_invoice_id = ? AND p.purchase_order_id = ?
                     AND i.deleted_at IS NULL`,
                 [invoiceId, poId]
             );
             if (!payRows.length) return { notFound: true };
+            if ((paymentStatus === 'arranged' || paymentStatus === 'paid')
+                && !bankVerification.isPayable({ invoice: payRows[0], payment: payRows[0] })) {
+                return { bankUnverified: true };
+            }
             const before = payRows[0].payment_status;
             await conn.query(
                 `UPDATE purchase_order_invoice_payments SET payment_status = ?
@@ -6762,6 +6775,12 @@ app.put('/api/v1/purchase-orders/:poId/invoices/:invoiceId/payment-status', asyn
 
         if (result.notFound) {
             return res.status(404).json({ error: `No payment instruction found for invoice ${invoiceId} on PO ${poId}.` });
+        }
+        if (result.bankUnverified) {
+            return res.status(409).json({
+                error: 'This PI came through the supplier portal and its bank details are not verified yet. Verify them before arranging or paying it.',
+                code: 'BANK_UNVERIFIED',
+            });
         }
         res.json(result.payment);
     } catch (error) {
@@ -7335,7 +7354,7 @@ app.delete('/api/v1/purchase-order-invoices/:id', async (req, res) => {
 // upload and the manual /check endpoint, so both paths produce identical
 // rows. A given invoice accumulates a check row per attempt — query the
 // table to see the full history.
-const { compare: comparePoInvoice, upsertInvoicePaymentTerms, toDateOnlyOrNull } = require('../services/po-invoice-check');
+const { compare: comparePoInvoice, upsertInvoicePaymentTerms, toDateOnlyOrNull, loadPoForCheck } = require('../services/po-invoice-check');
 
 function invoiceCheckRowToJson(r) {
     if (!r) return null;
@@ -7384,6 +7403,9 @@ function invoicePaymentRowToJson(r) {
         modelUsed: r.model_used || null,
         createdAt: r.created_at?.toISOString?.() ?? r.created_at,
         updatedAt: r.updated_at?.toISOString?.() ?? r.updated_at,
+        // Portal PIs only (null = not applicable): bankVerificationStatus,
+        // bankVerified (the details as verified), by / at / method / note.
+        ...bankVerification.verificationToJson(r),
     };
 }
 
@@ -7464,6 +7486,7 @@ async function recordInvoiceCheck(conn, { purchaseOrderId, invoiceId, triggeredB
                 checkId: rowId,
                 paymentTerms: out.check?.paymentTerms,
                 modelUsed,
+                userEmail: triggeredByEmail,
             });
         } catch (e) {
             log.warn('[invoice-check] payment-terms upsert failed', { invoiceId, error: e.message });
@@ -7695,7 +7718,7 @@ async function loadPurchaseOrdersForOrders(conn, orders) {
     // Invoices (+ the latest check per invoice).
     const [invRows] = await conn.query(
         `SELECT id, purchase_order_id, filename, s3_key, public_url, content_type,
-                file_size, notes, uploaded_by_email, uploaded_at
+                file_size, notes, uploaded_by_email, uploaded_at, pi_submission_id
            FROM purchase_order_invoices
           WHERE purchase_order_id IN (${ph}) AND deleted_at IS NULL
           ORDER BY uploaded_at DESC, id DESC`,
@@ -10571,7 +10594,7 @@ async function loadSupplierPaymentTargets(conn, lines) {
     if (piIds.length) {
         const ph = piIds.map(() => '?').join(',');
         const [rows] = await conn.query(
-            `SELECT p.*, po.po_number, po.supplier AS po_supplier
+            `SELECT p.*, po.po_number, po.supplier AS po_supplier, i.pi_submission_id
                FROM purchase_order_invoice_payments p
                JOIN purchase_orders po ON po.id = p.purchase_order_id AND po.deleted_at IS NULL
                JOIN purchase_order_invoices i ON i.id = p.purchase_order_invoice_id AND i.deleted_at IS NULL
@@ -10585,6 +10608,8 @@ async function loadSupplierPaymentTargets(conn, lines) {
                 label: r.po_number, purchaseOrderId: r.purchase_order_id, poNumber: r.po_number,
                 paymentType: r.payment_type || null, invoiceId: r.purchase_order_invoice_id,
                 shipmentId: null, shipmentReference: null, invoiceNumber: null,
+                // isPayable's inputs: a portal PI is payable only once its bank details are verified.
+                piSubmissionId: r.pi_submission_id ?? null, bankVerificationStatus: r.bank_verification_status ?? null,
             });
         }
     }
@@ -10895,6 +10920,13 @@ async function checkSupplierPaymentLines(conn, { lines, currency, amount, suppli
         }
         if (t.status === 'skipped') {
             return { fail: { status: 422, error: `${t.label} is marked skipped — nothing is owed on it.`, code: 'TARGET_NOT_OPEN', payload: { kind: l.kind, id: l.id } } };
+        }
+        // Before settleSupplierPaymentTargets can mark it paid: a supplier-portal
+        // PI takes money only once its bank details are verified.
+        if (t.kind === 'pi' && !bankVerification.isPayable({
+            invoice: { pi_submission_id: t.piSubmissionId }, payment: { bank_verification_status: t.bankVerificationStatus },
+        })) {
+            return { fail: { status: 422, error: `${t.label}: this PI came through the supplier portal and its bank details are not verified yet.`, code: 'BANK_UNVERIFIED', payload: { kind: 'pi', id: l.id, invoiceId: t.invoiceId } } };
         }
         if (t.supplierKey && supplierKeyValue && t.supplierKey !== supplierKeyValue && !sameSupplierName(t.supplier, supplierKeyValue)) {
             warnings.push(`${t.label} is filed under "${t.supplier}".`);
@@ -11628,6 +11660,30 @@ registerPoChangeRequestRoutes(app, {
     },
     ORDER_SELECT, rowToOrder, parseDates, setDateKey,
     shipmentSync, membershipKey, patchShipmentIds,
+    log,
+});
+
+// ── Supplier-portal proforma invoices (/api/v1/pi-submissions) ────────────
+// PIs suppliers uploaded through the supplier portal (jportal.pi_submissions),
+// checked by the piCheck Lambda, imported or rejected here; plus
+// POST /purchase-order-invoices/:id/verify-bank. Frontend guide:
+// docs/pi-submissions-frontend.md.
+registerPiSubmissionRoutes(app, {
+    withConnection,
+    pool,
+    ready: async () => {
+        await auditLogSchemaReady;
+        await purchaseOrdersSchemaReady;
+        await emailTemplatesSchemaReady;
+    },
+    s3,
+    poBucket: PO_BUCKET,
+    publicS3Url,
+    invoiceRowToJson, invoiceCheckRowToJson, invoicePaymentRowToJson,
+    createPendingInvoiceCheck, recordInvoiceCheck, upsertInvoicePaymentTerms,
+    loadPoForCheck,
+    recordAudit,
+    getEmailTemplate, renderTemplate,
     log,
 });
 

@@ -107,9 +107,20 @@ provider:
     FRONT_CHANNEL_ID: ${self:custom.secrets.FRONT_CHANNEL_ID, ''}
     GEMINI_API_KEY: ${self:custom.secrets.GEMINI_API_KEY, ''}
     # Schema of the supplier portal (jportal) on the same MySQL server, read and
-    # updated by /api/v1/po-change-requests. The DB login needs SELECT + UPDATE
-    # on <schema>.po_change_requests.
+    # updated by /api/v1/po-change-requests and /api/v1/pi-submissions (and the
+    # piCheck Lambda). The DB login needs SELECT + UPDATE on
+    # <schema>.po_change_requests, and SELECT + the column-level UPDATE in
+    # docs/pi-submissions-frontend.md on <schema>.pi_submissions.
     JPORTAL_DB_SCHEMA: ${self:custom.secrets.JPORTAL_DB_SCHEMA, 'jportal'}
+    # Supplier-uploaded proforma invoices: the supplier portal's private bucket
+    # (owned by the portal's stack). piCheck reads the uploads; an import
+    # copies one into PO_DOCS_BUCKET. Read only: no tagging, no delete.
+    PI_UPLOADS_BUCKET: jportal-pi-uploads-${self:custom.envName}
+    # The supplier portal's base URL, for the link in the PI decision emails
+    # (blank = no link). PI_NOTIFY_REDIRECT_TO (test only): send every PI
+    # decision email there instead of to the supplier.
+    SUPPLIER_PORTAL_URL: ${self:custom.secrets.SUPPLIER_PORTAL_URL, ''}
+    PI_NOTIFY_REDIRECT_TO: ${self:custom.secrets.PI_NOTIFY_REDIRECT_TO, ''}
     # Email receipt confirmation: optional static page (e.g. an S3-hosted
     # confirmation page) that the "Confirm receipt" click 302-redirects to after
     # recording it. Leave blank to render the built-in thank-you page from the
@@ -165,6 +176,19 @@ provider:
             - s3:GetObject
           Resource:
             - arn:aws:s3:::shipping-purchase-orders-${sls:stage}/*
+        # The supplier portal's PI uploads (its bucket, its stack): read only.
+        # ListBucket only so a missing object answers 404, not 403 — piCheck
+        # tells "not uploaded yet" from "denied" by it.
+        - Effect: Allow
+          Action:
+            - s3:GetObject
+          Resource:
+            - arn:aws:s3:::jportal-pi-uploads-${self:custom.envName}/pi/*
+        - Effect: Allow
+          Action:
+            - s3:ListBucket
+          Resource:
+            - arn:aws:s3:::jportal-pi-uploads-${self:custom.envName}
         # Nightly live→test S3 mirror (s3-sync-live-to-test.js; its schedule is
         # enabled in the TEST stack only): list both sides, read live, write
         # test. Bucket names are literal because the pairing is fixed regardless
@@ -501,6 +525,43 @@ functions:
       - schedule:
           rate: rate(1 hour)
           enabled: ${self:custom.schedulesEnabled.${sls:stage}, false}
+
+  # ── Supplier-portal PI check ──
+  # Checks a proforma invoice a supplier uploaded through the supplier portal
+  # (jportal) against its PO, with the staff check's prompt and schema, and
+  # writes the result to jportal.pi_submissions (src/services/pi-check.js).
+  # Triggered by the portal bucket's EventBridge "Object Created" events — this
+  # stack owns the rule and matches the bucket by NAME, so nothing crosses
+  # between the two stacks — and invoked directly (async, { submissionId }) by
+  # the portal, which grants itself lambda:InvokeFunction on this explicit name.
+  # The portal's stage names equal envName (prod / test), so the three names
+  # jportal-pi-uploads-<env>, jportal-pi-check-<env> and the rule's bucket agree;
+  # the portal's deploy.sh checks this wiring. 300 s is well under the claim's
+  # STALE_CHECK_SECONDS (600), so a run is dead before its row can be
+  # re-claimed. Concurrency 3 caps Gemini spend; one async retry only helps a
+  # failure before the claim. Runs on the provider VPC (NAT for Gemini, the S3
+  # gateway endpoint for the bucket) and the existing GEMINI_API_KEY.
+  piCheck:
+    handler: src/handlers/pi-check.handler
+    name: jportal-pi-check-${self:custom.envName}
+    timeout: 300
+    memorySize: 1024
+    reservedConcurrency: 3
+    maximumRetryAttempts: 1
+    events:
+      - eventBridge:
+          pattern:
+            source:
+              - aws.s3
+            detail-type:
+              - Object Created
+            detail:
+              bucket:
+                name:
+                  - jportal-pi-uploads-${self:custom.envName}
+              object:
+                key:
+                  - prefix: 'pi/'
 
   # ── Daily alerts generator (nightly) ──
   # Aggregates the day's container ETAs + supplier ready dates into the

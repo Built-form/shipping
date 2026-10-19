@@ -119,30 +119,10 @@ const DATE_FIELDS = new Set([
 ]);
 const STRING_FIELDS = new Set(['supplier', 'lotNumber', 'qcInvoiceNumber', 'containerNumber', 'vesselName']);
 
-// ── Transient retry (mirrors qc-report-check.js) ─────────────────────────────
-function isTransientGeminiError(e) {
-    if (!e) return false;
-    const code = e.status ?? e.code ?? e.statusCode;
-    if (typeof code === 'number' && (code >= 500 || code === 429)) return true;
-    return /50\d|429|unavailable|high demand|overloaded|RESOURCE_EXHAUSTED|ECONNRESET|ETIMEDOUT|socket hang up/i
-        .test(String((e && e.message) || ''));
-}
-
-async function withGeminiRetry(label, fn, tries = 5) {
-    let lastErr;
-    for (let i = 0; i < tries; i++) {
-        try { return await fn(); }
-        catch (e) {
-            lastErr = e;
-            if (!isTransientGeminiError(e) || i === tries - 1) throw e;
-            const backoff = Math.min(20000, 1500 * Math.pow(2, i)) + Math.floor(Math.random() * 750);
-            log.warn(`[supplier-email-check] ${label} transient — retry ${i + 1}/${tries - 1} in ${backoff}ms`,
-                { error: String((e && e.message) || '').slice(0, 160) });
-            await new Promise(r => setTimeout(r, backoff));
-        }
-    }
-    throw lastErr;
-}
+// ── Transient retry ──────────────────────────────────────────────────────────
+// Moved to src/lib/gemini-retry.js (shared with the supplier-portal PI check,
+// which adds a deadline); re-exported below so existing importers keep working.
+const { withGeminiRetry, isTransientGeminiError } = require('../lib/gemini-retry');
 
 function toDateOrNull(v) {
     if (v == null || typeof v !== 'string') return null;
