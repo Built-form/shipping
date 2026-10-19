@@ -66,8 +66,10 @@ is what to branch on.
 - `source` is `manual` or `extracted` (phase 2, from an uploaded invoice).
 - `appliedTotal` / `remaining` are what supplier payments have applied to it so
   far; a part payment leaves it `pending` with a remainder. `settledByPaymentId`
-  names the transfer that completed it — null on a balance someone marked paid
-  by hand, which the page flags `NO PROOF`.
+  names a live transfer that paid it (the one that completed it, or the newest
+  left once that one is deleted) — null on a balance someone marked paid by
+  hand, which the page flags `NO PROOF`; a transfer never takes one of those
+  over (see "Settling" under Supplier payments).
 - `shipmentReference` is exactly what orders carry as `containerNumber`, so the
   page can join records to its container × supplier payables without another
   fetch. `shipments` in the response is a side-map of summaries keyed by id.
@@ -364,20 +366,24 @@ payment's `container_balance` line, at the page's figure).
 
 One bank transfer to a supplier, applied to the obligations it settled. Each
 line carries the amount applied, so one transfer covers four things and a part
-payment is representable. Schema: `src/db/migrate/*_supplier_payments.sql`.
+payment is representable. Schema: `src/db/migrate/*_supplier_payments.sql`,
+`*_supplier_payment_lines_paid_with.sql` (`paidWith`).
 
 ```json
 { "id": 7, "supplierName": "SUNMED", "supplierKey": "sunmed",
   "amount": 5800, "currency": "USD", "paidOn": "2026-09-19", "bankRef": "2026091911472006100482719930", "note": null, "source": "manual",
   "lines": [
     { "id": 1, "kind": "balance",    "targetId": 96,  "amount": 5000, "label": "308",       "shipmentId": 61, "shipmentReference": "308", "purchaseOrderId": null, "poNumber": null,      "paymentType": null,      "targetAmount": 5000,    "targetStatus": "paid", "targetMissing": false },
-    { "id": 2, "kind": "pi",         "targetId": 124, "amount": 800,  "label": "PO_00393J", "shipmentId": null, "shipmentReference": null, "purchaseOrderId": 393, "poNumber": "PO_00393J", "paymentType": "full",    "targetAmount": 125319.46, "targetStatus": "pending", "targetMissing": false },
+    { "id": 2, "kind": "pi",         "targetId": 124, "amount": 800,  "label": "PO_00393J", "shipmentId": null, "shipmentReference": null, "purchaseOrderId": 393, "poNumber": "PO_00393J", "paymentType": "full",    "targetAmount": 125319.46, "targetStatus": "pending", "targetMissing": false,
+      "paidWith": [ { "shipmentReference": "310", "amount": 800 } ] },
     { "id": 3, "kind": "po_deposit", "targetId": 84,  "amount": 0,    "label": "SUNMED-95", "shipmentId": null, "shipmentReference": null, "purchaseOrderId": 84,  "poNumber": "SUNMED-95", "paymentType": "deposit", "targetAmount": null,    "targetStatus": null,   "targetMissing": false }
   ],
   "linesTotal": 5800, "unexplained": 0,
   "documents": [ { "...": "the proof(s) of payment, same shape as any document" } ],
   "createdByEmail": "…", "updatedByEmail": null, "createdAt": "…", "updatedAt": "…" }
 ```
+
+Every line carries `paidWith` (null on all but some `pi` lines, below).
 
 Line kinds: `balance` → `shipment_payments.id` · `pi` →
 `purchase_order_invoice_payments.id` (a deposit, balance or full PI) ·
@@ -411,6 +417,25 @@ the ones each transfer pays.
   `poNumber`, `purchaseOrderId`, and `targetAmount` (the value).
 - **open-items does not list QC units.** The page passes its own.
 
+**`paidWith` on a `pi` line (2026-10-19).** A `pi` line names a PI, not a
+container, so the page used to guess which box a part payment of a 100 % PI
+paid. Record payment knows the boxes it ticked, and sends them:
+`{ "kind": "pi", "id": 124, "amount": 10000, "paidWith": [{ "shipmentReference": "310", "amount": 5568 }, { "shipmentReference": "123", "amount": 4432 }] }`
+— the PI money per container. It is what the page's model uses first for that
+PI (`paymentsFlowMath.ts`).
+- **Optional, on `pi` only.** On any other kind it is refused (`400 BAD_LINES`);
+  `null` or `[]` means "not said". A PI typed by hand with no box sends none.
+- **Each entry:** a non-empty `shipmentReference` (trimmed, ≤ 255 characters)
+  and an `amount` above 0; the same container twice is added up. Together never
+  more than the line + 0.01 (`400 BAD_LINES`).
+- **Stored** in `supplier_payment_lines.paid_with_json` (nullable JSON, migration
+  `2026-10-19_10`). **Read back** as `paidWith: [...] | null` on every line.
+- **Before the migration is applied** the line is saved without it, with a
+  warning ("…paidWith was not saved…") — never a 500. Lines sent then stay
+  `paidWith: null`; re-save the transfer to add it.
+- **A PUT** with `lines` replaces it with what is sent; a PUT without `lines`
+  (a note, a date, a proof) keeps it.
+
 A fourth kind exists **on the way in only**: `container_balance` → a shipment
 id, for a box nobody has recorded a balance for yet. Saving records that
 balance (`balanceAmount`, default the amount paid; split by `allocations`
@@ -421,7 +446,12 @@ balance — apply to it instead; `409 BALANCE_PAID { balanceId, paidOn,
 purchaseOrderId, shipmentId }` when a PAID balance on that shipment × supplier
 already covers any of the POs being paid (or was recorded with no split, so
 covers the whole box) — it would pay the same goods twice. Another PO in the
-same box is allowed: air freight is often paid PO by PO. `422 NOT_BOOKED` /
+same box is allowed: air freight is often paid PO by PO. Both look at every
+record on the shipment filed under this supplier **however the name is
+spelled** — the same test as the PO pool (exact key, or `sameSupplier`; see
+"Supplier names"): a record filed as "KINGPHAR MEDICAL MATERIAL CO. LTD" blocks
+a transfer from "Hubei Qianjiang Kingphar Medical Material Co., Ltd" (until
+2026-10-19 only the exact spelling did). `422 NOT_BOOKED` /
 `NO_MEMBER_POS` / `PO_NOT_IN_SHIPMENT` as for a balance.
 
 ### `GET /api/v1/supplier-payments/delivered-air?supplier=&currency=`
@@ -452,17 +482,41 @@ settlement: `{ paymentId, paidOn, amount (applied here), paymentAmount,
 currency, bankRef, note, documents: [{ id, filename, url }], also: [the
 transfer's other lines] }`.
 
-**Settling.** An obligation (`balance`, `pi`, `extra` — on absolute amounts,
-so a credit settles when it is used up) is marked paid once the live
-lines applied to it cover its amount within a bank charge — max(1, 1 %) — with
-`paidOn` = the transfer's date and (for a balance) `bankRef` kept if already
-set; `settled_by_payment_id` remembers which transfer completed it. Less than
-that leaves it open with `appliedTotal` / `remaining`. Editing or deleting a
-transfer reverts only what *that* transfer settled — a balance or PI someone
-marked paid by hand is never touched. Audit: `supplier_payment` (`create` /
-`update` / `delete`); each flip is audited on the obligation as before
-(`shipment_payment` `status` with `via: "payment"`, `purchase_order`
-`invoice_payment_status` with `via: "payment"`).
+**Settling** (rules as of 2026-10-19, `reconcileSupplierPaymentTargets`). An
+obligation (`balance`, `pi`, `extra` — on absolute amounts, so a credit
+settles when it is used up) is paid once the live lines applied to it, across
+**all** live transfers, cover its amount within a bank charge — max(1, 1 %).
+Less than that leaves it open with `appliedTotal` / `remaining`. Every save,
+edit or delete of a transfer re-judges each balance, PI and extra its old or
+new lines touch:
+- **Newly covered** (by the lines just saved): paid, held by the newest live
+  transfer on it (by `paidOn`, then id) — the one whose money completed it.
+  `paidOn` = that transfer's date; a balance keeps a `bankRef` already set.
+  `settled_by_payment_id` (`settledByPaymentId`) names that transfer.
+- **Still covered, its transfer still pays it**: left as it is (a top-up
+  within the tolerance does not move it); if that transfer's date is edited,
+  `paidOn` follows.
+- **Still covered, but its transfer was deleted or no longer pays it**: stays
+  paid, now held by the newest live transfer on it.
+- **No longer covered and paid by a transfer**: back to `pending` (an extra:
+  `open`), whichever transfer was edited or deleted — deleting or cutting an
+  EARLIER part payment reopens what a later one completed.
+- **Paid by hand** (`paid`, no `settledByPaymentId`; the page's NO PROOF): never
+  taken over and never reverted. A line on one is accepted with a warning
+  ("… is marked paid by hand — the money is recorded against it, and its status
+  is left as it is").
+
+Audit: `supplier_payment` (`create` / `update` / `delete`); each change is
+audited on the obligation (`shipment_payment` / `payment_extra` `status`,
+`purchase_order` `invoice_payment_status`) with `via: "payment"` (became
+paid), `"payment_moved"` (stays paid, another transfer or date) or
+`"payment_reverted"`, plus `paymentId`, `previousPaymentId`, `applied`.
+
+**Saves at the same time.** A save, edit or delete locks, first thing in its
+transaction, the transfer and every obligation its lines touch (and the
+shipment of a `container_balance` line). A second save on the same obligation
+waits until the first commits, then sees its money: it gets `422 OVER_APPLIED`
+or `409 BALANCE_EXISTS` / `BALANCE_PAID` instead of both going through.
 
 ### `GET /api/v1/supplier-payments?supplier=&shipmentId=&updatedSince=`
 
@@ -508,20 +562,29 @@ so one box's share can be paid as a part payment.
 ```
 
 Refusals: `400 BAD_FIELD` (no `paidOn`, bad currency…) · `400 BAD_LINES` (none,
-unknown kind, the same target twice) · `404 TARGET_NOT_FOUND { kind, id }` ·
+unknown kind, the same target twice, a bad `paidWith` or one on a non-`pi`
+line) · `404 TARGET_NOT_FOUND { kind, id }` ·
 `422 CURRENCY_MISMATCH { kind, id, targetCurrency }` · `422 TARGET_NOT_OPEN`
 (skipped) · `422 OVER_APPLIED { kind, id, remaining, applied }` (a line above
 what is still owed) · `422 NOT_FULLY_ALLOCATED` (the line would settle a balance
 not yet split across its POs) · `422 OVER_ALLOCATED { linesTotal, amount }`
 (lines add up to more than was sent; less is fine and comes back as
-`unexplained`) · `409 DOCUMENT_LINKED { paymentId }`. `warnings[]` on success:
+`unexplained`) · `422 EXTRA_PAYEE_MISMATCH { kind, id, payee }` (an extra that
+rides with the shipment — a forwarder's freight, customs… — paid by a transfer
+to anyone but its payee; matched on the name however it is spelled) ·
+`409 DOCUMENT_LINKED { paymentId }`. `warnings[]` on success:
 a line filed under another spelling of the supplier, a deposit applied to a PO
-that has a deposit PI (apply to the PI instead).
+that has a deposit PI (apply to the PI instead), a line on something marked
+paid by hand (its status is left alone), `paidWith` not saved because the
+database lacks the column.
 
-`PUT /:id` takes any header field and/or `lines` (replaced wholesale: what the
-transfer had settled is reverted first, then the new lines applied).
-`DELETE /:id` (admin) soft-deletes, reverts, and frees its proof to be applied
-again.
+`PUT /:id` takes any header field and/or `lines` (replaced wholesale; without
+`lines` the same lines are saved again, `paidWith` included), then re-judges
+every obligation the old or new lines touch (see "Settling"): a note-only edit
+leaves everything as it was. `DELETE /:id` (admin) soft-deletes, re-judges
+what its lines touched against the transfers left, and frees its proof to be
+applied again. Both answer `409 PAYMENT_CHANGED` when someone else changed the
+transfer's lines a moment before — reload it and try again.
 
 ### Supplier names
 
