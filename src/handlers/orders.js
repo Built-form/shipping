@@ -10837,6 +10837,8 @@ function parseSupplierPaymentBody(body, { partial = false } = {}) {
                 const ba = Number(entry.balanceAmount);
                 if (!Number.isFinite(ba) || ba <= 0) return { error: 'lines[].balanceAmount must be a number above 0.', code: 'BAD_LINES' };
                 line.balanceAmount = Math.round(ba * 100) / 100;
+                // The record is the invoice total with extras paid on their own lines: keep its split.
+                if (entry.balanceKeepSplit === true) line.balanceKeepSplit = true;
             }
             if (kind === 'container_balance') {
                 // The balance to record: the projected figure (default: what
@@ -10949,7 +10951,7 @@ async function correctBalanceRecords(conn, { lines, userEmail, excludePaymentId 
         const before = await loadShipmentPaymentById(conn, l.id);
         if (!before || (before.status !== 'pending' && before.status !== 'arranged')) continue;
         const fixed = correctBalance({
-            amount: before.amount, applied: applied.get(`balance:${l.id}`) || 0, balanceAmount: l.balanceAmount,
+            amount: before.amount, applied: applied.get(`balance:${l.id}`) || 0, balanceAmount: l.balanceAmount, keepSplit: !!l.balanceKeepSplit,
             allocations: before.allocations.map(a => ({ purchaseOrderId: a.purchaseOrderId, poRef: a.poRef, amount: a.amount, source: a.source })),
         });
         if (!fixed) continue;
