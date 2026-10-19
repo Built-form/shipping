@@ -26,7 +26,9 @@ Rules and shapes: `src/lib/payment-extras.js`. Routes:
     it is its own payable (container × forwarder: its own sign-off key) in its
     currency's tab; its `dueDate` if given, else the container's goods balances'
     date (any currency), else now. A transfer to the forwarder pays it with an
-    ordinary `extra` line; a transfer to anyone else is refused.
+    ordinary `extra` line (its name matched however it is spelled); a transfer
+    to anyone else is refused, `422 EXTRA_PAYEE_MISMATCH { kind, id, payee }`
+    (enforced since 2026-10-19; before, it was only a warning).
   - `account` (2026-10-01) — a **supplier credit note**: a credit held with the
     supplier, tied to no PO and no container (`purchaseOrderId` and the shipment
     fields refused, 400). `amount` must be negative; `kind` is normally
@@ -115,9 +117,15 @@ when a recorded transfer paid it — undo it through that transfer. Audited as
 A line `{ "kind": "extra", "id": 7, "amount": 500 }`. A credit is used as a
 negative line: `{ "kind": "extra", "id": 8, "amount": -120 }` next to what is
 being paid — `amount` sent is the net. Refusals on top of the usual ones:
-`422 SIGN_MISMATCH`, `422 OVER_APPLIED { remaining }`, `422 CREDIT_ALONE`.
-Settles when |applied| ≥ |amount| − max(1, 1 %); editing or deleting the
-transfer reopens what it settled. `open-items` lists open extras and credits.
+`422 SIGN_MISMATCH`, `422 OVER_APPLIED { remaining }`, `422 CREDIT_ALONE`,
+`422 EXTRA_PAYEE_MISMATCH` (a `shipment` extra paid by anyone but its payee).
+Settles when |applied| ≥ |amount| − max(1, 1 %), across all live transfers.
+Editing or deleting any transfer that applies money to it re-judges it (the
+"Settling" rules in `docs/shipment-payments-frontend.md`): it reopens once the
+transfers left no longer cover it — deleting an earlier part payment included
+— and stays paid while they do; a re-save of the transfer that paid it (a
+note, a proof) keeps it paid. An extra marked paid by hand is never taken over
+or reopened by a transfer. `open-items` lists open extras and credits.
 
 ## Suggestions from invoices
 
@@ -159,4 +167,6 @@ twice, and the server cannot tell, so the page warns and never blocks (user,
   it lists the PO's charges and the PI's own read charges.
 
 Audit: `payment_extra` (`create`, `update`, `delete`, `status`); settling and
-reverting by a transfer are `status` with `via: "payment"` / `"payment_reverted"`.
+reverting by a transfer are `status` with `via: "payment"` / `"payment_reverted"`,
+and `"payment_moved"` when it stays paid but another live transfer (or a new
+date) now holds it.

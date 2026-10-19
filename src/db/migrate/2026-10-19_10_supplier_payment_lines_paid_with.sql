@@ -1,0 +1,15 @@
+-- Which containers a PI's money paid (/api/v1/supplier-payments, `paidWith`
+-- on a `pi` line — see the "Supplier payments" section of
+-- src/handlers/orders.js and docs/shipment-payments-frontend.md).
+--
+-- A `pi` line names a PI, not a container, so ShipLine's Payments flow page
+-- had to guess which box a part payment of a 100 % PI paid. Record payment
+-- knows (the boxes it ticked), and now sends it:
+--   [{ "shipmentReference": "310", "amount": 5568.00 }, …]
+-- the PI money per container, together never more than the line. NULL on
+-- every other kind, and on a pi line typed by hand with no box.
+--
+-- Nullable, no default, no backfill: the code reads a missing value as "not
+-- said". Code that runs before this file is applied saves the line without
+-- it (errno 1054) and warns; it never fails the transfer.
+ALTER TABLE supplier_payment_lines ADD COLUMN paid_with_json JSON NULL;
