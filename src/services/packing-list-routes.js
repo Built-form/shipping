@@ -19,6 +19,7 @@ const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const { v4: uuidv4 } = require('uuid');
 const P = require('./packing-list-check');
 const R = require('./packing-review');
+const PL = require('./pl-results');
 
 // Two ways in. dataBase64 in the JSON body is capped at 4 MB: base64 grows it
 // by a third and the HTTP API / Lambda request cap is 6 MB, beyond which the
@@ -67,29 +68,9 @@ function registerPackingListRoutes(app, deps) {
     }
 
     // Resolve { containerNumber | draftContainerId } to a container with lines,
-    // or a { status, error, code, payload } failure. Shared by /context and POST.
-    async function resolveForRequest(conn, { containerNumber, draftContainerId }) {
-        const typed = String(containerNumber ?? '').trim();
-        if (!typed && (draftContainerId == null || draftContainerId === '')) {
-            return { fail: { status: 400, error: 'containerNumber or draftContainerId is required.', code: 'BAD_FIELD' } };
-        }
-        const r = await P.resolveContainer(conn, { containerNumber: typed, draftContainerId });
-        if (r && r.ambiguous) {
-            return { fail: {
-                status: 409, code: 'AMBIGUOUS_CONTAINER',
-                error: `More than one open draft reserves ${typed}. Pick one and send its draftContainerId.`,
-                payload: { candidates: r.ambiguous.map(c => ({ ...P.describeContainer(c), lineCount: c.lineCount, units: c.units })) },
-            } };
-        }
-        if (!r) {
-            return { fail: { status: 404, code: 'CONTAINER_NOT_FOUND',
-                error: `No booked container or open draft matches ${typed || `draft ${draftContainerId}`}.` } };
-        }
-        if (r.container.kind === 'draft' && !r.container.lineCount) {
-            return { fail: { status: 422, code: 'CONTAINER_EMPTY', error: `Draft ${r.container.draftName} has no lines.` } };
-        }
-        return { container: r.container };
-    }
+    // or a { status, error, code, payload } failure. Shared by /context, POST
+    // and the portal submission routes (it lives in the check service).
+    const resolveForRequest = P.resolveContainerForRequest;
 
     const sendFail = (res, f) => res.status(f.status).json({ error: f.error, code: f.code, ...(f.payload || {}) });
 
@@ -501,7 +482,7 @@ function registerPackingListRoutes(app, deps) {
                             supplier_key, supplier_name, filename, content_type, file_size, status,
                             verdict, discrepancy_count, row_count, invoice_number, document_date, supplier_printed,
                             model_used, error_message, version, replaces_id, superseded_by_id, superseded_at,
-                            uploaded_by_email, created_at, analyzed_at
+                            uploaded_by_email, source, portal_submission_id, created_at, analyzed_at
                        FROM packing_lists WHERE ${where.join(' AND ')} ORDER BY id DESC LIMIT 200`,
                     params
                 );
@@ -600,23 +581,32 @@ function registerPackingListRoutes(app, deps) {
 
     // DELETE /api/v1/packing-lists/:id — soft delete; the S3 object stays. A
     // deleted replacement puts the version it replaced back into the check.
+    // A portal submission filed as either goes back to Pending / becomes
+    // confirmed again (pl-results.js syncPortalResults, after the commit).
     app.delete('/api/v1/packing-lists/:id(\\d+)', async (req, res) => {
         try {
             await schemaReady;
             await auditLogSchemaReady;
             const id = Number(req.params.id);
-            const ok = await withConnection(async (conn) => {
+            const out = await withConnection(async (conn) => {
                 const [rows] = await conn.query(`SELECT * FROM packing_lists WHERE id = ? AND deleted_at IS NULL`, [id]);
-                if (!rows.length) return false;
+                if (!rows.length) return null;
                 await conn.query(`UPDATE packing_lists SET deleted_at = NOW() WHERE id = ?`, [id]);
                 await recordAudit(conn, {
                     entityType: 'packing_list', entityId: id, action: 'delete',
                     before: rowToJson(rows[0]), after: null, userEmail: req.userEmail,
                 });
-                await R.restorePredecessor(conn, { deletedRow: rows[0], userEmail: req.userEmail });
-                return true;
+                const restoredId = await R.restorePredecessor(conn, { deletedRow: rows[0], userEmail: req.userEmail });
+                return { restoredId };
             });
-            if (!ok) return res.status(404).json({ error: `Packing list ${id} not found.`, code: 'NOT_FOUND' });
+            if (!out) return res.status(404).json({ error: `Packing list ${id} not found.`, code: 'NOT_FOUND' });
+            // Best effort, on its own connections, before the response so the
+            // Lambda doesn't freeze it mid-write.
+            try {
+                await PL.syncPortalResults(pool, { packingListIds: [id, out.restoredId] });
+            } catch (e) {
+                log.warn('[DELETE /packing-lists/:id] portal sync failed', { id, error: e.message });
+            }
             res.status(204).end();
         } catch (error) {
             log.error('[DELETE /packing-lists/:id]', error);

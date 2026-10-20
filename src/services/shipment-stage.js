@@ -40,15 +40,20 @@ const LATER_MILESTONES = {
 function makeTransitionShipment(deps) {
     const { ORDER_SELECT, rowToOrder, setDateKey, parseDates, recordAudit, draftAudit } = deps;
 
+    // → { closedDraft: { id, name } | null }: the draft this closed, so the
+    // route can tell the supplier portal after the commit (pl-results.js).
     async function cancelOpen(conn, ship, { userEmail, reason }) {
+        let closedDraft = null;
         if (ship.stage === 'DRAFT') {
             // Legacy half first: the registry row closes 'deleted' and its
             // allocations go, exactly as POST /draft-containers/close does.
-            await draftAudit.closeDraft(conn, { name: ship.name, reason: 'deleted', userEmail });
+            const r = await draftAudit.closeDraft(conn, { name: ship.name, reason: 'deleted', userEmail });
+            if (r && r.id != null && !r.alreadyClosed) closedDraft = { id: r.id, name: r.name };
         } else if (ship.stage === 'PLANNED') {
             await conn.query(`DELETE FROM planned_container_allocations WHERE planned_container_name = ?`, [ship.name]);
         }
         await sync.cancelShipment(conn, ship, { reason, userEmail });
+        return { closedDraft };
     }
 
     async function transitionShipment(conn, { shipmentId, stage: rawStage, note = null, force = false, isAdmin = false, userEmail = null, etd: rawEtd }) {
@@ -76,12 +81,12 @@ function makeTransitionShipment(deps) {
                 throw new ShipmentError(409, 'NOT_CANCELLABLE',
                     `Only a PLANNED or DRAFT shipment can be cancelled (this one is ${ship.stage}).`);
             }
-            await cancelOpen(conn, ship, { userEmail, reason: 'cancelled' });
+            const { closedDraft } = await cancelOpen(conn, ship, { userEmail, reason: 'cancelled' });
             await recordAudit(conn, {
                 entityType: 'shipment', entityId: ship.id, action: 'stage_changed',
                 before: { stage: ship.stage }, after: { stage: 'CANCELLED', note: noteText }, userEmail,
             });
-            return { moved: [], skipped: [], stage: { stored: 'CANCELLED', effective: 'CANCELLED' } };
+            return { moved: [], skipped: [], stage: { stored: 'CANCELLED', effective: 'CANCELLED' }, closedDraft };
         }
         if (!S.isBookedStage(target)) {
             throw new ShipmentError(422, 'UNSUPPORTED_TARGET',

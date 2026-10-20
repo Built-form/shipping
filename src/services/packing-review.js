@@ -67,6 +67,10 @@ function packingListToJson(r) {
         supersededById: r.superseded_by_id != null ? Number(r.superseded_by_id) : null,
         supersededAt: iso(r.superseded_at),
         uploadedByEmail: r.uploaded_by_email || null,
+        // 'staff' (uploaded in ShipLine) or 'portal' (imported from a supplier's
+        // jportal.pl_submissions row, whose id portalSubmissionId is).
+        source: r.source || 'staff',
+        portalSubmissionId: r.portal_submission_id != null ? Number(r.portal_submission_id) : null,
         createdAt: iso(r.created_at),
         analyzedAt: iso(r.analyzed_at),
     };
@@ -186,19 +190,28 @@ function containerColumns(container) {
 const STUCK_AFTER_MS = 5 * 60_000;
 const INTERRUPTED_MESSAGE = 'INTERRUPTED: the reading was cut short (a deploy or a timeout) — read it again.';
 
+// The age is measured by the database, not by comparing Date.now() with a
+// DATETIME mysql2 parsed in Node's local zone: the server runs UTC and a BST
+// client would see a row created seconds ago as an hour old and reap it.
 async function reapStuckReads(conn, rows) {
-    const now = Date.now();
-    for (const r of rows) {
-        if (r.status !== 'processing') continue;
-        const since = new Date(r.analyzed_at || r.created_at).getTime();
-        if (!(now - since > STUCK_AFTER_MS)) continue;
+    const processing = rows.filter(r => r.status === 'processing');
+    if (!processing.length) return rows;
+    const [ages] = await conn.query(
+        `SELECT id, TIMESTAMPDIFF(SECOND, COALESCE(analyzed_at, created_at), NOW()) AS age_seconds
+           FROM packing_lists WHERE id IN (?) AND status = 'processing'`,
+        [processing.map(r => r.id)]
+    );
+    const ageOf = new Map(ages.map(a => [Number(a.id), Number(a.age_seconds)]));
+    for (const r of processing) {
+        const age = ageOf.get(Number(r.id));
+        if (age == null || !(age * 1000 > STUCK_AFTER_MS)) continue;
         await conn.query(
             `UPDATE packing_lists SET status = 'failed', error_message = ? WHERE id = ? AND status = 'processing'`,
             [INTERRUPTED_MESSAGE, r.id]
         );
         await recordAudit(conn, {
             entityType: 'packing_list', entityId: r.id, action: 'read_interrupted', before: null,
-            after: { stuckForSeconds: Math.round((now - since) / 1000) }, userEmail: null,
+            after: { stuckForSeconds: age }, userEmail: null,
         });
         r.status = 'failed';
         r.error_message = INTERRUPTED_MESSAGE;
@@ -585,6 +598,7 @@ module.exports = {
     signOffToJson,
     approvalToJson,
     containerScope,
+    containerColumns,
     draftsBehind,
     loadPackingLists,
     loadSignOffs,

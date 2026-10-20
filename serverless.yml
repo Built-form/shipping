@@ -44,6 +44,11 @@ custom:
   # replication finishes.
   s3SyncEnabled:
     test: true
+  # SNS topic the supplier-portal packing-list alarms (resources: PlCheck* /
+  # PlRefresh*) notify. Optional: ALERTS_TOPIC_ARN in the secret; absent, the
+  # alarms still exist (and show in the console) but notify nobody. The stack
+  # has no topic of its own.
+  alertsTopicArn: ${self:custom.secrets.ALERTS_TOPIC_ARN, ''}
 
 provider:
   name: aws
@@ -112,9 +117,10 @@ provider:
     # <schema>.po_change_requests, and SELECT + the column-level UPDATE in
     # docs/pi-submissions-frontend.md on <schema>.pi_submissions.
     JPORTAL_DB_SCHEMA: ${self:custom.secrets.JPORTAL_DB_SCHEMA, 'jportal'}
-    # Supplier-uploaded proforma invoices: the supplier portal's private bucket
-    # (owned by the portal's stack). piCheck reads the uploads; an import
-    # copies one into PO_DOCS_BUCKET. Read only: no tagging, no delete.
+    # Supplier-uploaded proforma invoices (pi/*) and packing lists (pl/*): the
+    # supplier portal's private bucket (owned by the portal's stack). piCheck /
+    # plCheck read the uploads; an import copies one into PO_DOCS_BUCKET. Read
+    # only: no tagging, no delete.
     PI_UPLOADS_BUCKET: jportal-pi-uploads-${self:custom.envName}
     # The supplier portal's base URL, for the link in the PI decision emails
     # (blank = no link). PI_NOTIFY_REDIRECT_TO (test only): send every PI
@@ -176,14 +182,16 @@ provider:
             - s3:GetObject
           Resource:
             - arn:aws:s3:::shipping-purchase-orders-${sls:stage}/*
-        # The supplier portal's PI uploads (its bucket, its stack): read only.
-        # ListBucket only so a missing object answers 404, not 403 — piCheck
-        # tells "not uploaded yet" from "denied" by it.
+        # The supplier portal's PI (pi/*) and packing-list (pl/*) uploads (its
+        # bucket, its stack): read only. ListBucket only so a missing object
+        # answers 404, not 403 — piCheck / plCheck tell "not uploaded yet"
+        # from "denied" by it.
         - Effect: Allow
           Action:
             - s3:GetObject
           Resource:
             - arn:aws:s3:::jportal-pi-uploads-${self:custom.envName}/pi/*
+            - arn:aws:s3:::jportal-pi-uploads-${self:custom.envName}/pl/*
         - Effect: Allow
           Action:
             - s3:ListBucket
@@ -563,6 +571,54 @@ functions:
                 key:
                   - prefix: 'pi/'
 
+  # ── Supplier-portal packing-list check ──
+  # Reads a packing list a supplier uploaded through the supplier portal with
+  # the staff check's prompt and schema, suggests which of the supplier's
+  # containers it belongs to and writes a supplier-safe result to
+  # jportal.pl_submissions (src/services/pl-check.js). Same wiring as piCheck:
+  # this stack's EventBridge rule on the portal bucket (prefix pl/), plus the
+  # portal's direct async invoke by this explicit name (its deploy.sh checks
+  # jportal-pl-check-<env> and jportal-pl-refresh-<env>). 300 s under the
+  # claim's STALE_CHECK_SECONDS (600); concurrency 5 caps Gemini spend; one
+  # async retry only helps a failure before the claim. Alarms: resources below.
+  plCheck:
+    handler: src/handlers/pl-check.handler
+    name: jportal-pl-check-${self:custom.envName}
+    timeout: 300
+    memorySize: 1024
+    reservedConcurrency: 5
+    maximumRetryAttempts: 1
+    events:
+      - eventBridge:
+          pattern:
+            source:
+              - aws.s3
+            detail-type:
+              - Object Created
+            detail:
+              bucket:
+                name:
+                  - jportal-pi-uploads-${self:custom.envName}
+              object:
+                key:
+                  - prefix: 'pl/'
+
+  # ── Supplier-portal packing-list refresh ──
+  # Recomputes one submission's supplier-facing result (the provisional
+  # suggestion of a checked draft, or the confirmed check of an imported row)
+  # whenever the supplier opens the page: the portal invokes it directly
+  # ({ submissionId }, throttled to once per 60 s per row) by this explicit
+  # name (src/services/pl-results.js refreshSubmission). Database only — no
+  # S3, no Gemini — and its own concurrency, so a batch of checks can't hold
+  # up page opens; the guarded write makes a late or duplicate run harmless.
+  plRefresh:
+    handler: src/handlers/pl-refresh.handler
+    name: jportal-pl-refresh-${self:custom.envName}
+    timeout: 60
+    memorySize: 512
+    reservedConcurrency: 5
+    maximumRetryAttempts: 1
+
   # ── Daily alerts generator (nightly) ──
   # Aggregates the day's container ETAs + supplier ready dates into the
   # daily_alerts table for the Shipsline slide-out alert window. Runs at 04:00
@@ -616,6 +672,10 @@ functions:
 #  - serverless-offline
 
 resources:
+  Conditions:
+    # The packing-list alarms notify a topic only when ALERTS_TOPIC_ARN is in
+    # the secret (custom.alertsTopicArn); without it they have no action.
+    HasAlertsTopic: !Not [!Equals ['${self:custom.alertsTopicArn}', '']]
   # ── Per-route throttle on the PUBLIC supplier-portal routes ──
   # The supplier portal is unauthenticated and gated only by a per-supplier
   # access code, so throttle brute-force / abuse at the edge (API Gateway
@@ -727,3 +787,98 @@ resources:
               Principal: '*'
               Action: s3:GetObject
               Resource: !Sub '${PurchaseOrderDocsBucket.Arn}/*'
+
+    # ── Supplier-portal packing-list alarms (plCheck / plRefresh) ──
+    # A supplier is waiting on each of these runs, and nothing else watches
+    # them (piCheck has no alarms today). Errors > 0: run() threw — only a
+    # failure to write the failed row itself, or a crash before the claim.
+    # Throttles > 0: the reserved concurrency is saturated. plCheck p99
+    # Duration > 270 s: runs are close to the 300 s timeout (a Gemini call
+    # that keeps retrying). One datapoint per 5-minute period; missing data
+    # is not breaching (most periods have no runs). AlarmActions: the topic
+    # in ALERTS_TOPIC_ARN, or none (HasAlertsTopic).
+    PlCheckErrorsAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: jportal-pl-check-${self:custom.envName}-errors
+        AlarmDescription: The supplier-portal packing-list check (plCheck) threw. Check its log group.
+        Namespace: AWS/Lambda
+        MetricName: Errors
+        Dimensions:
+          - Name: FunctionName
+            Value: jportal-pl-check-${self:custom.envName}
+        Statistic: Sum
+        Period: 300
+        EvaluationPeriods: 1
+        Threshold: 0
+        ComparisonOperator: GreaterThanThreshold
+        TreatMissingData: notBreaching
+        AlarmActions: !If [HasAlertsTopic, ['${self:custom.alertsTopicArn}'], !Ref 'AWS::NoValue']
+    PlCheckThrottlesAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: jportal-pl-check-${self:custom.envName}-throttles
+        AlarmDescription: The supplier-portal packing-list check (plCheck) was throttled; its reserved concurrency is saturated.
+        Namespace: AWS/Lambda
+        MetricName: Throttles
+        Dimensions:
+          - Name: FunctionName
+            Value: jportal-pl-check-${self:custom.envName}
+        Statistic: Sum
+        Period: 300
+        EvaluationPeriods: 1
+        Threshold: 0
+        ComparisonOperator: GreaterThanThreshold
+        TreatMissingData: notBreaching
+        AlarmActions: !If [HasAlertsTopic, ['${self:custom.alertsTopicArn}'], !Ref 'AWS::NoValue']
+    PlCheckDurationAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: jportal-pl-check-${self:custom.envName}-duration-p99
+        AlarmDescription: The supplier-portal packing-list check (plCheck) is running close to its 300 s timeout (p99 over 270 s).
+        Namespace: AWS/Lambda
+        MetricName: Duration
+        Dimensions:
+          - Name: FunctionName
+            Value: jportal-pl-check-${self:custom.envName}
+        ExtendedStatistic: p99
+        Period: 300
+        EvaluationPeriods: 1
+        Threshold: 270000
+        ComparisonOperator: GreaterThanThreshold
+        TreatMissingData: notBreaching
+        AlarmActions: !If [HasAlertsTopic, ['${self:custom.alertsTopicArn}'], !Ref 'AWS::NoValue']
+    PlRefreshErrorsAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: jportal-pl-refresh-${self:custom.envName}-errors
+        AlarmDescription: The supplier-portal packing-list refresh (plRefresh) threw. Check its log group.
+        Namespace: AWS/Lambda
+        MetricName: Errors
+        Dimensions:
+          - Name: FunctionName
+            Value: jportal-pl-refresh-${self:custom.envName}
+        Statistic: Sum
+        Period: 300
+        EvaluationPeriods: 1
+        Threshold: 0
+        ComparisonOperator: GreaterThanThreshold
+        TreatMissingData: notBreaching
+        AlarmActions: !If [HasAlertsTopic, ['${self:custom.alertsTopicArn}'], !Ref 'AWS::NoValue']
+    PlRefreshThrottlesAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: jportal-pl-refresh-${self:custom.envName}-throttles
+        AlarmDescription: The supplier-portal packing-list refresh (plRefresh) was throttled; its reserved concurrency is saturated.
+        Namespace: AWS/Lambda
+        MetricName: Throttles
+        Dimensions:
+          - Name: FunctionName
+            Value: jportal-pl-refresh-${self:custom.envName}
+        Statistic: Sum
+        Period: 300
+        EvaluationPeriods: 1
+        Threshold: 0
+        ComparisonOperator: GreaterThanThreshold
+        TreatMissingData: notBreaching
+        AlarmActions: !If [HasAlertsTopic, ['${self:custom.alertsTopicArn}'], !Ref 'AWS::NoValue']

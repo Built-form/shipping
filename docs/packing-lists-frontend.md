@@ -73,6 +73,8 @@ A booked container wins over a draft that reserves the same number. To choose th
 
 `packingList` records the container as it was uploaded: `containerKind` (`booked` or `draft`), `containerNumber`, `draftContainerId` and `containerName`.
 
+It also says where it came from: `source` is `"staff"` (uploaded here) or `"portal"` (imported from a supplier's upload in the supplier portal by `POST /api/v1/pl-submissions/:id/import`), and `portalSubmissionId` is that submission's id (`null` for staff uploads). Show a "From supplier portal" pill where `source === "portal"`; everything else — the check, sign-offs, versions, delete — works the same. Deleting a portal one sends its submission back to the staff Pending list (see `docs/pl-submissions-frontend.md`).
+
 ## 3. Poll for the result
 
 Call `GET /api/v1/packing-lists/:id` every 3–5 s until `packingList.status` is `succeeded` or `failed`. When it is `failed`, `packingList.error` has the reason.

@@ -26,7 +26,11 @@
 // Co., Ltd", "Suzhou Sunmed Co.,Ltd.") share one suppliers.portal_code and so
 // one packing list. Groups are keyed 's:<lowest supplier id sharing the code>'
 // — never the code itself, which is the supplier-portal credential. A name with
-// no suppliers row falls back to 'n:<lower-cased name>'.
+// no suppliers row falls back to 'n:<lower-cased name>'. (The supplier portal's
+// packing-list flow groups differently — by the supplier ids the uploader was
+// granted, see "The portal's supplier group" below — and files its packing
+// lists under 's:<lowest granted id>', which may differ from this grouping's
+// key until it moves off portal_code too.)
 //
 // The pool has a single connection, so the model call happens with none held:
 // load, release, call Gemini, reacquire, write (same as shipment-payment-extract).
@@ -38,6 +42,15 @@ const { fetchInvoicePdf } = require('./po-invoice-check');
 const { withGeminiRetry } = require('./supplier-email-check');
 const { recordAudit } = require('../lib/audit');
 const S = require('../lib/shipments');
+const PM = require('../lib/pl-match');
+
+// A line still on its way: what the supplier-portal matcher may suggest a
+// container for (src/lib/pl-match.js). Received or destroyed stock, and lines
+// not yet in production, are never candidates.
+const LIVE_STATUSES = ['IN_PRODUCTION', 'READY_FOR_QC', 'READY', 'CONSOLIDATED', 'ON_SEA', 'ON_AIR'];
+const CANDIDATE_CAP = 60;
+// Skip the fallback model when less than this is left before the deadline.
+const FALLBACK_MIN_MS = 120 * 1000;
 
 // gemini-3-flash-preview returned truncated JSON on a 7-page Sunmed list;
 // 3.8 Flash is the default, Pro the fallback. Env override for retuning.
@@ -396,6 +409,32 @@ async function resolveStoredContainer(conn, row) {
     return followDraft(conn, { draftId, draftName: name });
 }
 
+// Resolve { containerNumber | draftContainerId } from a request to a container
+// with lines, or a { status, error, code, payload } failure the route sends
+// as is. Shared by the packing-list routes and the portal submission routes.
+async function resolveContainerForRequest(conn, { containerNumber, draftContainerId }) {
+    const typed = String(containerNumber ?? '').trim();
+    if (!typed && (draftContainerId == null || draftContainerId === '')) {
+        return { fail: { status: 400, error: 'containerNumber or draftContainerId is required.', code: 'BAD_FIELD' } };
+    }
+    const r = await resolveContainer(conn, { containerNumber: typed, draftContainerId });
+    if (r && r.ambiguous) {
+        return { fail: {
+            status: 409, code: 'AMBIGUOUS_CONTAINER',
+            error: `More than one open draft reserves ${typed}. Pick one and send its draftContainerId.`,
+            payload: { candidates: r.ambiguous.map(c => ({ ...describeContainer(c), lineCount: c.lineCount, units: c.units })) },
+        } };
+    }
+    if (!r) {
+        return { fail: { status: 404, code: 'CONTAINER_NOT_FOUND',
+            error: `No booked container or open draft matches ${typed || `draft ${draftContainerId}`}.` } };
+    }
+    if (r.container.kind === 'draft' && !r.container.lineCount) {
+        return { fail: { status: 422, code: 'CONTAINER_EMPTY', error: `Draft ${r.container.draftName} has no lines.` } };
+    }
+    return { container: r.container };
+}
+
 // ── Expected lines ───────────────────────────────────────────────────────
 const LINE_COLS = `
            o.id, o.jf_code, o.product_name, o.po_number, o.lot_number,
@@ -409,6 +448,18 @@ const LINE_COLS = `
 // booked into a container (the gap between the legacy pack and close calls, or
 // a close that never ran) — counting them too would double-count those units.
 async function loadContainerLines(conn, container) {
+    const { rows, skipped } = await queryContainerLines(conn, container);
+    const resolve = await resolveSupplierNames(conn, [...rows, ...skipped].flatMap(r => [r.po_supplier, r.supplier]));
+    const tag = r => {
+        const g = groupFor(resolve, r.po_supplier, r.supplier);
+        return { ...r, quantity: Number(r.quantity) || 0, supplier_group_key: g.key, supplier_group_id: g.groupId };
+    };
+    return { rows: rows.map(tag), skipped: skipped.map(tag) };
+}
+
+// The container's lines as stored, untagged (the queries behind
+// loadContainerLines; the portal flow reads them without the staff grouping).
+async function queryContainerLines(conn, container) {
     let rows;
     const skipped = [];
     if (container.kind === 'booked') {
@@ -436,12 +487,7 @@ async function loadContainerLines(conn, container) {
             (cn ? skipped : rows).push(r);
         }
     }
-    const resolve = await resolveSupplierNames(conn, [...rows, ...skipped].flatMap(r => [r.po_supplier, r.supplier]));
-    const tag = r => {
-        const g = groupFor(resolve, r.po_supplier, r.supplier);
-        return { ...r, quantity: Number(r.quantity) || 0, supplier_group_key: g.key, supplier_group_id: g.groupId };
-    };
-    return { rows: rows.map(tag), skipped: skipped.map(tag) };
+    return { rows, skipped };
 }
 
 // The supplier picker for one container: one entry per company on board.
@@ -479,6 +525,222 @@ async function loadExpectedLines(conn, container, supplierKey) {
         rows: rows.filter(o => o.supplier_group_key === supplierKey),
         skipped: skipped.filter(o => o.supplier_group_key === supplierKey),
     };
+}
+
+// ── The portal's supplier group (supplier portal) ────────────────────────
+// A portal submission's "company" is the set of supplier ids the uploader has
+// access to (jportal.pl_submissions.group_supplier_ids, written by the portal;
+// pl-results.js portalGroup resolves it to { supplierIds, names } with the
+// live suppliers.name of each id). It is NOT the staff grouping above
+// (groupFor / resolveSupplierNames, which share a portal_code — nothing
+// below calls them, directly or through loadContainerLines): a line is the
+// group's when the order's or the PO's supplier name is one of the group's
+// names, by nameKey.
+
+// A predicate: whether a line (LINE_COLS: supplier, po_supplier) belongs to
+// the group. A group with no live name owns nothing.
+function groupLineFilter(group) {
+    const keys = new Set((group?.names || []).map(nameKey).filter(Boolean));
+    return row => Boolean(row) && keys.size > 0 && (keys.has(nameKey(row.supplier)) || keys.has(nameKey(row.po_supplier)));
+}
+const lineInGroup = (group, row) => groupLineFilter(group)(row);
+
+// The group's lines in the container, untagged (queryContainerLines: no
+// staff grouping), plus its skipped (already booked) ones, and how many open
+// lines the container holds in all (containerLines: 0 means the container is
+// gone or empty; > 0 with no group line means a forced import). The portal
+// flow's loadExpectedLines.
+async function loadGroupLines(conn, container, group) {
+    const { rows, skipped } = await queryContainerLines(conn, container);
+    const mine = groupLineFilter(group);
+    const q = r => ({ ...r, quantity: Number(r.quantity) || 0 });
+    return { rows: rows.filter(mine).map(q), skipped: skipped.filter(mine).map(q), containerLines: rows.length };
+}
+
+/**
+ * The containers a portal group's packing list could belong to, with the
+ * group's lines in each, for the matcher (src/lib/pl-match.js). Booked
+ * containers and open drafts holding LIVE-status lines under the group's
+ * names (an open draft: closed_reason NULL, the line not booked yet,
+ * allocated > 0). Every line loaded is under one of the group's names and
+ * then kept only when lineInGroup says so (by nameKey) — the same rows
+ * loadGroupLines gives for the container; other suppliers' lines are never
+ * read.
+ *   group: { supplierIds, names } (pl-results.js portalGroup).
+ *   evidence: { productCodes, poNumbers, printedNumbers, replacesContainer }
+ *     (pl-match evidenceFromExtraction, plus the resolved container the
+ *     replaced submission was filed in, or null).
+ * When the document prints product codes, only containers holding one of
+ * them stay; if that leaves nothing the full list is used (codeFilterFallback)
+ * so misread codes and suppliers' own codes still get a no_code chance. A
+ * container with a printed box or reference hit, or the replaced filing, is
+ * always kept (pinned). The list is capped at CANDIDATE_CAP, deterministically:
+ * pinned first, then by shared product codes, shared PO numbers, key.
+ * → { group, candidates: [{ key, container, lines, boxNumbers, reservedRef,
+ *     pinned, sharedCodes, sharedPos }], knownBoxes, evidence,
+ *     codeFilterFallback, capCut, totalContainers }
+ */
+async function loadSupplierCandidates(conn, group, evidence = {}) {
+    group = { supplierIds: [...(group?.supplierIds || [])], names: uniq(group?.names || []) };
+    const wantCodes = new Set((evidence.productCodes || []).map(baseJf).filter(Boolean));
+    const wantPos = new Set((evidence.poNumbers || []).map(norm).filter(Boolean));
+    const printed = uniq((evidence.printedNumbers || []).map(PM.normBox));
+    const validPrinted = printed.filter(PM.iso6346Valid);
+    const printedRefs = new Set(uniq((evidence.printedNumbers || []).map(PM.normRef)));
+    const replacesKey = evidence.replacesContainer ? PM.containerKey(evidence.replacesContainer) : null;
+    const out = {
+        group, candidates: [], knownBoxes: [],
+        evidence: { productCodes: [...wantCodes], poNumbers: [...wantPos], printedNumbers: printed, validPrintedNumbers: validPrinted, replacesContainerKey: replacesKey },
+        codeFilterFallback: false, capCut: false, totalContainers: 0,
+    };
+    if (!group.names.length) return out;
+    const names = group.names;
+
+    // 1. Booked containers with a live line of the group's, then every line
+    //    of the group's in them (status aside, as loadExpectedLines reads them).
+    const [bookedRefs] = await conn.query(
+        `SELECT DISTINCT o.container_number AS ref
+           FROM orders o
+           LEFT JOIN purchase_orders po ON po.id = o.purchase_order_id
+          WHERE o.deleted_at IS NULL AND o.status IN (?)
+            AND o.container_number IS NOT NULL AND TRIM(o.container_number) <> ''
+            AND (o.supplier IN (?) OR po.supplier IN (?))`,
+        [LIVE_STATUSES, names, names]
+    );
+    let bookedLines = [];
+    if (bookedRefs.length) {
+        [bookedLines] = await conn.query(
+            `SELECT ${LINE_COLS}, o.quantity AS quantity, NULL AS allocation_id
+               FROM orders o
+               LEFT JOIN purchase_orders po ON po.id = o.purchase_order_id
+              WHERE o.deleted_at IS NULL AND o.container_number IN (?)
+                AND (o.supplier IN (?) OR po.supplier IN (?))
+              ORDER BY o.jf_code, o.po_number, o.id`,
+            [bookedRefs.map(r => r.ref), names, names]
+        );
+    }
+
+    // 2. Open drafts with a live, still-open allocation of the group's, then
+    //    every open allocation line of the group's in them.
+    const [drafts] = await conn.query(
+        `SELECT dca.draft_container_name AS name, MIN(dc.id) AS draft_id
+           FROM draft_container_allocations dca
+           JOIN orders o ON o.id = dca.order_id AND o.deleted_at IS NULL
+           LEFT JOIN purchase_orders po ON po.id = o.purchase_order_id
+           LEFT JOIN draft_containers dc ON dc.name = dca.draft_container_name
+          WHERE o.status IN (?) AND dca.allocated > 0 AND ${OPEN_LINE}
+            AND (dc.id IS NULL OR dc.closed_reason IS NULL)
+            AND (o.supplier IN (?) OR po.supplier IN (?))
+          GROUP BY dca.draft_container_name`,
+        [LIVE_STATUSES, names, names]
+    );
+    let draftLines = [];
+    if (drafts.length) {
+        [draftLines] = await conn.query(
+            `SELECT ${LINE_COLS}, dca.allocated AS quantity, dca.id AS allocation_id, dca.draft_container_name AS draft_name
+               FROM draft_container_allocations dca
+               JOIN orders o ON o.id = dca.order_id AND o.deleted_at IS NULL
+               LEFT JOIN purchase_orders po ON po.id = o.purchase_order_id
+              WHERE dca.draft_container_name IN (?) AND ${OPEN_LINE}
+                AND (o.supplier IN (?) OR po.supplier IN (?))
+              ORDER BY o.jf_code, o.po_number, o.id`,
+            [drafts.map(d => d.name), names, names]
+        );
+    }
+
+    // 3. Exactly the group, by the same rule as loadGroupLines (the SQL above
+    //    matched the names exactly; nameKey ignores case and spacing).
+    const tag = r => ({ ...r, quantity: Number(r.quantity) || 0 });
+    const mine = groupLineFilter(group);
+
+    const byKey = new Map();
+    const add = (container, line) => {
+        const key = PM.containerKey(container);
+        let c = byKey.get(key);
+        if (!c) {
+            c = { key, container, lines: [], boxNumbers: [], reservedRef: container.containerNumber ?? null, pinned: { box: false, ref: false, replaces: false }, sharedCodes: 0, sharedPos: 0 };
+            byKey.set(key, c);
+        }
+        if (line) c.lines.push(line);
+        return c;
+    };
+    for (const r of bookedLines.map(tag).filter(mine)) add(bookedContainer(String(r.container_number).trim()), r);
+    const draftIds = new Map(drafts.map(d => [d.name, d.draft_id != null ? Number(d.draft_id) : null]));
+    for (const r of draftLines.map(tag).filter(mine)) {
+        const draftName = r.draft_name;
+        const { draft_name: _dn, ...line } = r;
+        const c = add({
+            kind: 'draft', draftId: draftIds.get(draftName) ?? null, draftName,
+            containerNumber: S.parseNameHint(draftName)?.reference ?? null, lineCount: 0, units: 0, label: draftName,
+        }, line);
+        c.container.lineCount += 1;
+        c.container.units += line.quantity;
+    }
+
+    // The replaced submission's filing, when it still holds lines of the group's.
+    if (replacesKey && !byKey.has(replacesKey)) {
+        const { rows } = await loadGroupLines(conn, evidence.replacesContainer, group);
+        if (rows.length) {
+            const c = add(evidence.replacesContainer, null);
+            c.lines = rows;
+        }
+    }
+
+    // 4. Box numbers per booked container, and which printed numbers orders know.
+    const bookedKeys = [...byKey.values()].filter(c => c.container.kind === 'booked');
+    if (bookedKeys.length) {
+        const [boxes] = await conn.query(
+            `SELECT container_number AS ref, TRIM(external_container_number) AS box
+               FROM orders
+              WHERE deleted_at IS NULL AND container_number IN (?)
+                AND external_container_number IS NOT NULL AND TRIM(external_container_number) <> ''
+              GROUP BY container_number, box`,
+            [bookedKeys.map(c => c.container.containerNumber)]
+        );
+        for (const b of boxes) {
+            const c = byKey.get(PM.containerKey(bookedContainer(String(b.ref).trim())));
+            if (c) c.boxNumbers.push(PM.normBox(b.box));
+        }
+    }
+    if (validPrinted.length) {
+        const [known] = await conn.query(
+            `SELECT DISTINCT UPPER(TRIM(external_container_number)) AS box
+               FROM orders
+              WHERE deleted_at IS NULL AND UPPER(TRIM(external_container_number)) IN (?)`,
+            [validPrinted]
+        );
+        out.knownBoxes = uniq(known.map(k => PM.normBox(k.box)));
+    }
+
+    // 5. Evidence per candidate, the code filter and the cap.
+    const all = [...byKey.values()];
+    for (const c of all) {
+        c.boxNumbers = uniq(c.boxNumbers).sort();   // stable, so an unchanged result hashes the same (pl-results.js)
+        c.pinned.box = validPrinted.some(n => c.boxNumbers.includes(n));
+        c.pinned.ref = Boolean(c.reservedRef) && printedRefs.has(PM.normRef(c.reservedRef));
+        c.pinned.replaces = c.key === replacesKey;
+        const codes = new Set(c.lines.map(l => baseJf(l.jf_code)).filter(Boolean));
+        const pos = new Set(c.lines.map(l => norm(l.po_number)).filter(Boolean));
+        c.sharedCodes = [...codes].filter(k => wantCodes.has(k)).length;
+        c.sharedPos = [...pos].filter(k => wantPos.has(k)).length;
+    }
+    out.totalContainers = all.length;
+    const isPinned = c => c.pinned.box || c.pinned.ref || c.pinned.replaces;
+    let kept = all;
+    if (wantCodes.size) {
+        const sharing = all.filter(c => c.sharedCodes > 0);
+        if (sharing.length) kept = all.filter(c => c.sharedCodes > 0 || isPinned(c));
+        else out.codeFilterFallback = true;
+    }
+    kept.sort((a, b) =>
+        (isPinned(b) ? 1 : 0) - (isPinned(a) ? 1 : 0)
+        || b.sharedCodes - a.sharedCodes
+        || b.sharedPos - a.sharedPos
+        || String(a.key).localeCompare(String(b.key))
+    );
+    out.capCut = kept.length > CANDIDATE_CAP;
+    out.candidates = kept.slice(0, CANDIDATE_CAP);
+    return out;
 }
 
 // ── Where the rest is ────────────────────────────────────────────────────
@@ -992,10 +1254,12 @@ function describeContainer(c) {
 /**
  * Compare the supplier's documents ([{ packingListId, filename, extracted }],
  * or one `extracted`) with its lines in the container. Sign-offs, if given,
- * are laid over the result (see applySignOffs).
+ * are laid over the result (see applySignOffs). `expected` ({ rows, skipped },
+ * loadGroupLines' shape) replaces the staff load for the portal flow, whose
+ * group is not a supplierKey.
  */
-async function buildComparison(conn, { container, supplierKey, documents, extracted, signOffs }) {
-    const { rows, skipped } = await loadExpectedLines(conn, container, supplierKey);
+async function buildComparison(conn, { container, supplierKey, expected = null, documents, extracted, signOffs }) {
+    const { rows, skipped } = expected || await loadExpectedLines(conn, container, supplierKey);
     const docs = documents || [{ packingListId: null, filename: null, extracted }];
     const comparison = compareDocuments(rows, docs);
     applySignOffs(comparison, signOffs || []);
@@ -1010,8 +1274,12 @@ async function buildComparison(conn, { container, supplierKey, documents, extrac
 }
 
 // ── The model call ───────────────────────────────────────────────────────
-/** Reads one packing list. Returns { parsed, modelUsed, usage }. */
-async function readPackingList({ s3Key, bytes, contentType, model }) {
+/** Reads one packing list. Returns { parsed, modelUsed, usage }.
+ *  `deadline` (epoch ms, a Lambda's remaining time) bounds the retries and
+ *  skips the fallback model when less than FALLBACK_MIN_MS would be left for
+ *  it. A failure carries the last model error as `cause`
+ *  (lib/gemini-retry.js classifyGeminiError reads it). */
+async function readPackingList({ s3Key, bytes, contentType, model, deadline = null }) {
     if (!process.env.GEMINI_API_KEY) {
         const err = new Error('GEMINI_API_KEY is not configured.');
         err.code = 'NOT_CONFIGURED';
@@ -1029,6 +1297,10 @@ async function readPackingList({ s3Key, bytes, contentType, model }) {
     const models = [...new Set([model || GEMINI_MODEL_DEFAULT, FALLBACK_MODEL])];
     let lastErr;
     for (const modelId of models) {
+        if (lastErr && deadline != null && deadline - Date.now() < FALLBACK_MIN_MS) {
+            log.warn('[packing-list-check] no time left for the fallback model', { modelId, remainingMs: deadline - Date.now() });
+            break;
+        }
         try {
             const response = await withGeminiRetry(`packing-list(${modelId})`, () => ai.models.generateContent({
                 model: modelId,
@@ -1044,7 +1316,7 @@ async function readPackingList({ s3Key, bytes, contentType, model }) {
                     responseMimeType: 'application/json',
                     responseSchema: RESPONSE_SCHEMA,
                 },
-            }));
+            }), 5, { deadline });
             let parsed;
             try { parsed = JSON.parse(response?.text || ''); }
             catch {
@@ -1064,10 +1336,56 @@ async function readPackingList({ s3Key, bytes, contentType, model }) {
     }
     const err = new Error(`Gemini call failed: ${lastErr?.message ?? 'unknown error'}`);
     err.code = lastErr?.code === 'MODEL_NO_JSON' ? 'MODEL_NO_JSON' : 'MODEL_CALL_FAILED';
+    err.cause = lastErr;
     throw err;
 }
 
 // ── Orchestration ────────────────────────────────────────────────────────
+/**
+ * Store what a packing list says (`parsed`, the model's reading) and its
+ * comparison on the row: the write half of runPackingListCheck, also used by
+ * the portal import, which reuses the extraction the supplier's check stored
+ * instead of reading the file again. The row's snapshot is what THIS document
+ * alone says at reading time; the live view (packing-review.js) pools every
+ * active document for the supplier and lays the sign-offs over it. Throws
+ * CONTAINER_EMPTY when the row's draft has no lines and no booked container
+ * was found for it. → { ok: true, summary }
+ */
+async function storeAnalysis(conn, { id, row, parsed, modelUsed, userEmail = null }) {
+    const container = await resolveStoredContainer(conn, row);
+    if (container.kind === 'draft' && !container.lineCount) {
+        throw Object.assign(new Error(`Draft ${container.draftName} has no lines and no booked container was found for it.`), { code: 'CONTAINER_EMPTY' });
+    }
+    const p = parsed;
+    if (!Array.isArray(p.lines)) p.lines = [];
+    const comparison = await buildComparison(conn, {
+        container, supplierKey: row.supplier_key,
+        documents: [{ packingListId: id, filename: row.filename, extracted: p }],
+    });
+    await conn.query(
+        `UPDATE packing_lists
+            SET status = 'succeeded', error_message = NULL, analyzed_at = NOW(),
+                model_used = ?, invoice_number = ?, document_date = ?, supplier_printed = ?,
+                row_count = ?, discrepancy_count = ?, verdict = ?, extract_json = ?, comparison_json = ?
+          WHERE id = ?`,
+        [
+            modelUsed,
+            p.invoiceNumber ? String(p.invoiceNumber).slice(0, 100) : null,
+            p.documentDate ? String(p.documentDate).slice(0, 32) : null,
+            p.supplierName ? String(p.supplierName).slice(0, 255) : null,
+            p.lines.length, comparison.summary.discrepancyCount, comparison.summary.verdict,
+            JSON.stringify(p), JSON.stringify(comparison),
+            id,
+        ]
+    );
+    await recordAudit(conn, {
+        entityType: 'packing_list', entityId: id, action: 'packing_list_analyzed', before: null,
+        after: { modelUsed, rows: p.lines.length, ...comparison.summary, extractionOk: comparison.extractionCheck.ok },
+        userEmail,
+    });
+    return { ok: true, summary: comparison.summary };
+}
+
 /** Read one uploaded packing list and store what it says plus the comparison.
  *  Owns its own connections; never throws — a failure lands on the row. */
 async function runPackingListCheck(pool, { id, userEmail = null, model = null } = {}) {
@@ -1109,40 +1427,7 @@ async function runPackingListCheck(pool, { id, userEmail = null, model = null } 
     let writeError = null;
     const conn = await pool.getConnection();
     try {
-        const container = await resolveStoredContainer(conn, row);
-        if (container.kind === 'draft' && !container.lineCount) {
-            throw Object.assign(new Error(`Draft ${container.draftName} has no lines and no booked container was found for it.`), { code: 'CONTAINER_EMPTY' });
-        }
-        // The row's snapshot is what THIS document alone says at reading time;
-        // the live view (packing-review.js) pools every active document for
-        // the supplier and lays the sign-offs over it.
-        const comparison = await buildComparison(conn, {
-            container, supplierKey: row.supplier_key,
-            documents: [{ packingListId: id, filename: row.filename, extracted: read.parsed }],
-        });
-        const p = read.parsed;
-        await conn.query(
-            `UPDATE packing_lists
-                SET status = 'succeeded', error_message = NULL, analyzed_at = NOW(),
-                    model_used = ?, invoice_number = ?, document_date = ?, supplier_printed = ?,
-                    row_count = ?, discrepancy_count = ?, verdict = ?, extract_json = ?, comparison_json = ?
-              WHERE id = ?`,
-            [
-                read.modelUsed,
-                p.invoiceNumber ? String(p.invoiceNumber).slice(0, 100) : null,
-                p.documentDate ? String(p.documentDate).slice(0, 32) : null,
-                p.supplierName ? String(p.supplierName).slice(0, 255) : null,
-                p.lines.length, comparison.summary.discrepancyCount, comparison.summary.verdict,
-                JSON.stringify(p), JSON.stringify(comparison),
-                id,
-            ]
-        );
-        await recordAudit(conn, {
-            entityType: 'packing_list', entityId: id, action: 'packing_list_analyzed', before: null,
-            after: { modelUsed: read.modelUsed, rows: p.lines.length, ...comparison.summary, extractionOk: comparison.extractionCheck.ok },
-            userEmail,
-        });
-        return { ok: true, summary: comparison.summary };
+        return await storeAnalysis(conn, { id, row, parsed: read.parsed, modelUsed: read.modelUsed, userEmail });
     } catch (e) {
         log.error('[packing-list-check] compare/write failed', { id, error: e.message });
         writeError = e;
@@ -1168,11 +1453,24 @@ module.exports = {
     describeContainer,
     parseTypedReference,
     resolveContainer,
+    resolveContainerForRequest,
     resolveStoredContainer,
     resolveSupplierChoice,
+    resolveSupplierNames,
+    groupFor,
+    loadContainerLines,
+    queryContainerLines,
     loadContainerSuppliers,
     loadExpectedLines,
+    nameKey,
+    lineInGroup,
+    groupLineFilter,
+    loadGroupLines,
+    loadSupplierCandidates,
+    LIVE_STATUSES,
+    CANDIDATE_CAP,
     findPlacements,
     readPackingList,
+    storeAnalysis,
     runPackingListCheck,
 };

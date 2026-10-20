@@ -20,6 +20,7 @@ const { makeBookShipment } = require('./shipment-book');
 const { makeTransitionShipment } = require('./shipment-stage');
 const rename = require('./shipment-rename');
 const { SplitError } = require('./order-split');
+const PL = require('./pl-results');
 
 const { ShipmentError } = S;
 
@@ -651,10 +652,11 @@ function registerShipmentRoutes(app, deps) {
         try {
             await ready();
             const id = idParam(req);
+            let closedDraft = null;
             await withConnection(conn => inTransaction(conn, async () => {
                 const ship = await lockLive(conn, id);
                 if (S.isOpenStage(ship.stage)) {
-                    await cancelOpen(conn, ship, { userEmail: req.userEmail, reason: 'deleted' });
+                    ({ closedDraft } = await cancelOpen(conn, ship, { userEmail: req.userEmail, reason: 'deleted' }));
                     await conn.query(`UPDATE shipments SET deleted_at = NOW() WHERE id = ?`, [ship.id]);
                 } else if (ship.stage === 'CANCELLED' || ship.stage === 'BOOKED') {
                     if (ship.stage === 'BOOKED') {
@@ -678,6 +680,15 @@ function registerShipmentRoutes(app, deps) {
                     userEmail: req.userEmail,
                 });
             }));
+            // A deleted draft: portal packing lists imported into it go back
+            // to staff Pending. After the commit, best effort.
+            if (closedDraft) {
+                try {
+                    await withConnection(conn => PL.syncPortalResultsForDraft(conn, { draftId: closedDraft.id, draftName: closedDraft.name }));
+                } catch (e) {
+                    log.warn('[DELETE /shipments/:id] portal sync failed', { draft: closedDraft, error: e.message });
+                }
+            }
             res.json({ ok: true, id });
         } catch (error) {
             sendError(res, error, '[DELETE /shipments/:id]');
@@ -791,6 +802,15 @@ function registerShipmentRoutes(app, deps) {
                 shipmentId: id, stage: b.stage, note: b.note, force: b.force === true, etd: b.etd,
                 isAdmin: req.userType === 'admin', userEmail: req.userEmail,
             })));
+            // A cancelled draft: portal packing lists imported into it go back
+            // to staff Pending. After the commit, best effort.
+            if (r.closedDraft) {
+                try {
+                    await withConnection(conn => PL.syncPortalResultsForDraft(conn, { draftId: r.closedDraft.id, draftName: r.closedDraft.name }));
+                } catch (e) {
+                    log.warn('[POST /shipments/:id/transition] portal sync failed', { draft: r.closedDraft, error: e.message });
+                }
+            }
             const detail = await withConnection(conn => shipmentDetail(conn, id));
             res.json({ ...r, shipment: detail });
         } catch (error) {

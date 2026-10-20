@@ -54,6 +54,7 @@ const { registerPaymentExtraRoutes } = require('../services/payment-extra-routes
 const { registerPaymentAlertRoutes } = require('../services/payment-alert-routes');
 const { registerPoChangeRequestRoutes } = require('../services/po-change-request-routes');
 const { registerPiSubmissionRoutes } = require('../services/pi-submission-routes');
+const { registerPlSubmissionRoutes } = require('../services/pl-submission-routes');
 // Bank-detail verification on portal PIs: the positive payment gate (isPayable).
 const bankVerification = require('../lib/bank-verification');
 const { registerPaymentDueDateRoutes } = require('../services/payment-due-date-routes');
@@ -2323,6 +2324,17 @@ app.post('/api/v1/draft-containers/close', async (req, res) => {
         });
         if (result.invalid) return res.status(400).json({ error: 'name and reason are required.' });
         if (result.notFound) return res.status(404).json({ error: `Draft container "${name.trim()}" not found.` });
+        // A deleted draft: supplier-portal packing lists imported into it go
+        // back to staff Pending (pl-results.js). After the commit, best effort;
+        // 'converted' needs nothing — the lists follow the draft into its
+        // booked container.
+        if (reason === 'deleted' && !result.alreadyClosed) {
+            try {
+                await require('../services/pl-results').syncPortalResultsForDraft(pool, { draftId: result.id, draftName: result.name });
+            } catch (e) {
+                log.warn('[POST /draft-containers/close] portal sync failed', { draft: result.name, error: e.message });
+            }
+        }
         res.json({ ok: true, id: result.id, name: result.name, reason, deleted: result.deleted, alreadyClosed: !!result.alreadyClosed });
     } catch (error) {
         log.error('[POST /draft-containers/close]', error);
@@ -11896,6 +11908,25 @@ registerPiSubmissionRoutes(app, {
     loadPoForCheck,
     recordAudit,
     getEmailTemplate, renderTemplate,
+    log,
+});
+
+// ── Supplier-portal packing lists (/api/v1/pl-submissions) ───────────────
+// Packing lists suppliers uploaded through the supplier portal
+// (jportal.pl_submissions), read and matched to a container by the plCheck
+// Lambda, confirmed and imported into the packing-list check (or sent back)
+// here. Frontend guide: docs/pl-submissions-frontend.md.
+registerPlSubmissionRoutes(app, {
+    withConnection,
+    pool,
+    ready: async () => {
+        await auditLogSchemaReady;
+        await shipmentsSchemaReady;
+    },
+    s3,
+    poBucket: PO_BUCKET,
+    publicS3Url,
+    recordAudit,
     log,
 });
 
