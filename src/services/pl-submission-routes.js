@@ -27,12 +27,10 @@
 //      group must hold a live line there (packing-list-check.js lineInGroup),
 //      or 422 SUPPLIER_NOT_ON_CONTAINER unless `force` (which leaves the
 //      supplier's page with container null until lines are allocated). The
-//      packing list is filed under supplier_key 's:<supplier_id>' (the lowest
-//      granted id the portal stored) and the row's supplier_name — never a
-//      key of the staff grouping (groupFor / resolveSupplierNames, which share
-//      a portal_code), so the staff container check may list it under a
-//      different supplier entry than the container's lines until that
-//      grouping moves off portal_code too;
+//      packing list is filed under the company of the order lines it matches
+//      there (pl-results.js filingCompany: a login may hold more than one
+//      company), with that company's key — the one the staff container check
+//      groups those lines under — and name;
 //   2. outside any transaction: GetObject (IfMatch the ETag plCheck pinned),
 //      size and magic bytes, PutObject into the PO bucket at
 //      packing-lists/<uuid>/<name> (not CopyObject: that needs tagging
@@ -515,6 +513,31 @@ function registerPlSubmissionRoutes(app, deps) {
                         }
                     }
                 }
+                // No corrected-upload link: a packing list of this supplier's
+                // already on file in the suggested shipment with the same
+                // invoice number is almost always this same list sent again.
+                // Pre-selected, so Import replaces it rather than filing a
+                // second copy (the pooled check counts it once either way).
+                if (!defaultReplacesId && row.invoice_number && row.suggested_kind && !PL.groupGone(group)) {
+                    try {
+                        const r = await P.resolveContainerForRequest(conn, {
+                            containerNumber: row.suggested_kind === 'booked' ? row.suggested_container_number : undefined,
+                            draftContainerId: row.suggested_kind === 'draft' ? row.suggested_draft_id : undefined,
+                        });
+                        if (r.container) {
+                            const inv = String(row.invoice_number).replace(/\s+/g, '').toLowerCase();
+                            const company = await PL.filingCompany(conn, { group, container: r.container, extracted, supplierId: row.supplier_id });
+                            const { packingLists } = await PL.groupPool(conn, r.container, company);
+                            const same = packingLists.find(p => String(p.invoice_number || '').replace(/\s+/g, '').toLowerCase() === inv);
+                            if (same) {
+                                defaultReplacesId = Number(same.id);
+                                defaultContainer = containerJson(r.container);
+                            }
+                        }
+                    } catch (e) {
+                        log.warn('[GET /pl-submissions/:id] could not look for a same-invoice filing', { id, error: e.message });
+                    }
+                }
                 const [auditRows] = await conn.query(
                     `SELECT action, user_email, created_at, after_json FROM audit_log
                       WHERE entity_type = 'pl_submission' AND entity_id = ? ORDER BY created_at, id`,
@@ -567,8 +590,10 @@ function registerPlSubmissionRoutes(app, deps) {
     // The full staff comparison this document would give in that container:
     // pooled with the supplier's packing lists already on file there (minus
     // the one replacesId names), sign-offs applied, with `elsewhere`. A draft
-    // is followed through renames and bookings (container.followedFrom).
-    // 200 { container, comparison, packingLists, duplicateInvoices, onBoard }
+    // is followed through renames and bookings (container.followedFrom). The
+    // supplier is the company Import would file it under there
+    // (pl-results.js filingCompany): supplierKey and supplierName.
+    // 200 { supplierKey, supplierName, container, comparison, packingLists, duplicateInvoices, onBoard }
     // 400 BAD_FIELD · 404 NOT_FOUND | CONTAINER_NOT_FOUND · 409 AMBIGUOUS_CONTAINER
     // 422 CONTAINER_EMPTY | SUPPLIER_NOT_FOUND
     app.get('/api/v1/pl-submissions/:id(\\d+)/preview', async (req, res) => {
@@ -582,20 +607,21 @@ function registerPlSubmissionRoutes(app, deps) {
             const out = await withConnection(async (conn) => {
                 const row = await readRow(conn, id);
                 if (!row) return { fail: { status: 404, code: 'NOT_FOUND', error: `Packing-list submission ${id} not found.` } };
-                const supplierKey = supplierKeyOf(row);
                 const group = await groupOf(conn, row);
                 if (PL.groupGone(group)) return { fail: SUPPLIER_NOT_FOUND(row) };
                 const r = await P.resolveContainerForRequest(conn, { containerNumber: req.query.containerNumber, draftContainerId: req.query.draftContainerId });
                 if (r.fail) return { fail: { status: r.fail.status, code: r.fail.code, error: r.fail.error, extra: r.fail.payload || {} } };
                 const container = r.container;
                 const extracted = parseJson(row.extract_json);
+                const company = await PL.filingCompany(conn, { group, container, extracted, supplierId: row.supplier_id });
                 const { comparison, pool } = await PL.pooledComparison(conn, {
-                    container, group,
+                    container, group: company,
                     extraDocument: extracted ? { packingListId: null, filename: row.filename, extracted } : null,
                     excludePackingListIds: replacesId ? [replacesId] : [],
                 });
                 return {
-                    supplierKey,
+                    supplierKey: company.key,
+                    supplierName: company.name,
                     container: P.describeContainer(container),
                     comparison,
                     packingLists: pool.packingLists.map(R.packingListToJson),
@@ -635,7 +661,8 @@ function registerPlSubmissionRoutes(app, deps) {
 
             // The gates, on plain reads: the row, the supplier group, the
             // container and whether the group is on board. → { fail } or what
-            // was found, with the supplier_key the packing list gets.
+            // was found, with the company the packing list is filed under
+            // (pl-results.js filingCompany: its supplier_key and name).
             const gates = async (conn, row) => {
                 const refusal = stateRefusal(row, id, body.rowVersion);
                 if (refusal) return { fail: refusal };
@@ -646,7 +673,10 @@ function registerPlSubmissionRoutes(app, deps) {
                 const r = await P.resolveContainerForRequest(conn, { containerNumber: body.containerNumber, draftContainerId: body.draftContainerId });
                 if (r.fail) return { fail: { status: r.fail.status, code: r.fail.code, error: r.fail.error, extra: r.fail.payload || {} } };
                 const container = r.container;
-                const { rows: mine } = await P.loadGroupLines(conn, container, group);
+                // Of the group's companies, the one whose lines there it
+                // matches; one with lines there whenever the group has any.
+                const company = await PL.filingCompany(conn, { group, container, extracted: parseJson(row.extract_json), supplierId: row.supplier_id });
+                const { rows: mine } = await P.loadGroupLines(conn, container, company);
                 const onBoard = mine.length > 0;
                 // A group with nothing in the container would make every row
                 // "not expected" — almost always the wrong container.
@@ -657,7 +687,7 @@ function registerPlSubmissionRoutes(app, deps) {
                         extra: { suppliers: await containerSuppliersByName(conn, container) },
                     } };
                 }
-                return { group, supplierKey: supplierKeyOf(row), container, onBoard, supplierName: row.supplier_name };
+                return { group, company, supplierKey: company.key, container, onBoard, supplierName: company.name || row.supplier_name };
             };
 
             // 1. Plain reads.
@@ -774,8 +804,13 @@ function registerPlSubmissionRoutes(app, deps) {
                 }
 
                 if (body.replacesId != null) {
+                    // The version it replaces may sit under another of the
+                    // company's keys (an import from before filings followed
+                    // the lines' company): supersede checks it under its own.
+                    const [old] = await conn.query(`SELECT supplier_key FROM packing_lists WHERE id = ?`, [body.replacesId]);
+                    const oldKey = old.length && PL.groupKeys(g.company).includes(old[0].supplier_key) ? old[0].supplier_key : supplierKey;
                     try {
-                        await R.supersede(conn, { container, supplierKey, oldId: body.replacesId, newId: packingListId, userEmail: req.userEmail });
+                        await R.supersede(conn, { container, supplierKey: oldKey, oldId: body.replacesId, newId: packingListId, userEmail: req.userEmail });
                     } catch (e) {
                         if (!(e instanceof R.ReviewError)) throw e;
                         return { fail: { status: e.status, code: e.code, error: e.message, extra: e.payload || {} } };
@@ -803,7 +838,7 @@ function registerPlSubmissionRoutes(app, deps) {
                     before: { status: 'submitted', rowVersion: body.rowVersion },
                     after: {
                         status: 'imported', packingListId, container: P.describeContainer(container), onBoard: g.onBoard, force: body.force,
-                        supplierKey, groupSupplierIds: g.group.supplierIds,
+                        supplierKey, supplierName, companySupplierIds: g.company.supplierIds, groupSupplierIds: g.group.supplierIds,
                         replacesId: body.replacesId, refiledPackingListId: refiledId, extractionReused: analysed, note: body.note,
                         suggested: L.containerFromColumns(lockedRow, 'suggested'), matchConfidence: lockedRow.match_confidence || null, matchReason: lockedRow.match_reason || null,
                     },

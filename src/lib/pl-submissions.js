@@ -186,7 +186,7 @@ function toSupplierExtraction(extracted) {
 /**
  * A comparison (packing-list-check.js buildComparison, pooled over the
  * supplier's documents in the container) reduced to what the supplier may
- * see. Stripped: skippedLines, fingerprint, lineKey, matchMethod, sign-offs
+ * see. Stripped: skippedLines, inactiveLines, fingerprint, lineKey, matchMethod, sign-offs
  * except `accepted`, order / allocation / packing-list ids, orderQuantity,
  * order status, the container's draftContainerId and followedFrom.
  * `elsewhere` keeps only placements whose order is in the uploader's group
@@ -214,8 +214,10 @@ function toSupplierComparison(comparison, { groupOrderIds = new Set() } = {}) {
         printedTotalCartons: c.extractionCheck.printedTotalCartons ?? null, sumOfRowsCartons: c.extractionCheck.sumOfRowsCartons ?? null,
         ok: c.extractionCheck.ok !== false,
     } : null;
+    // `mine`: the supplier's own file (the one checked, or this row's filing).
+    // duplicateInvoices: each counted once (packing-list-check.js onePerInvoice).
     const documents = (Array.isArray(c.documents) ? c.documents : []).filter(isObj).map(d => ({
-        filename: d.filename ?? null, invoiceNumber: d.invoiceNumber ?? null, rows: num(d.rows),
+        filename: d.filename ?? null, invoiceNumber: d.invoiceNumber ?? null, rows: num(d.rows), mine: d.mine === true,
         printedTotalQuantity: d.printedTotalQuantity ?? null, sumOfRowsQuantity: d.sumOfRowsQuantity ?? null,
         printedTotalCartons: d.printedTotalCartons ?? null, sumOfRowsCartons: d.sumOfRowsCartons ?? null,
         ok: d.ok !== false,

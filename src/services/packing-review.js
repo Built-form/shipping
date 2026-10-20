@@ -265,21 +265,18 @@ async function buildSupplierCheck(conn, container, supplierKey, { rows = null } 
     const active = mine.filter(r => r.superseded_by_id == null);
     const superseded = mine.filter(r => r.superseded_by_id != null);
     const readable = active.filter(r => r.status === 'succeeded' && r.extract_json);
-    const documents = readable.map(r => ({ packingListId: r.id, filename: r.filename, extracted: parseJson(r.extract_json) }));
+    // The same invoice twice is almost always a re-upload that should have
+    // been a replacement: it is counted once (the newest), and reported so
+    // staff can replace or delete the other.
+    const { documents, duplicateInvoices } = P.onePerInvoice(readable.map(r => ({
+        packingListId: r.id, filename: r.filename, invoiceNumber: r.invoice_number || null, extracted: parseJson(r.extract_json),
+    })));
     const signOffs = await loadSignOffs(conn, container, supplierKey);
 
     let comparison = null;
     if (documents.length) {
         comparison = await P.buildComparison(conn, { container, supplierKey, documents, signOffs });
-        // The same invoice twice is almost always a re-upload that should
-        // have been a replacement: its rows would be counted twice.
-        const seen = new Map();
-        for (const r of readable) {
-            const inv = (r.invoice_number || '').trim().toLowerCase();
-            if (!inv) continue;
-            if (seen.has(inv)) comparison.duplicateInvoices = [...(comparison.duplicateInvoices || []), { invoiceNumber: r.invoice_number, packingListIds: [seen.get(inv), r.id] }];
-            else seen.set(inv, r.id);
-        }
+        if (duplicateInvoices.length) comparison.duplicateInvoices = duplicateInvoices;
     }
     return {
         supplierKey,

@@ -379,7 +379,9 @@ test('candidates_json keeps the top 5, ordered by score then key', () => {
 
 // ── The loader (fake connection) ───────────────────────────────────────────
 // Booked lines: [{ ref, box?, ...order columns }]. Draft lines: [{ name, draftId, ...}].
-function fakeLoaderConn({ groupRows, bookedLines = [], draftLines = [], knownBoxes = [] }) {
+// companyOf: supplier id → the lowest id sharing its portal_code (the staff
+// grouping, which groupCompanies goes through); the first row's id otherwise.
+function fakeLoaderConn({ groupRows, bookedLines = [], draftLines = [], knownBoxes = [], companyOf = {} }) {
     const statements = [];
     const names = new Set(groupRows.map(r => r.name));
     const mine = r => names.has(r.supplier) || names.has(r.po_supplier);
@@ -388,6 +390,9 @@ function fakeLoaderConn({ groupRows, bookedLines = [], draftLines = [], knownBox
         async query(sql, params = []) {
             const s = sql.replace(/\s+/g, ' ').trim();
             statements.push({ s, params });
+            if (/^SELECT .* FROM orders o LEFT JOIN purchase_orders po ON po\.id = o\.purchase_order_id WHERE o\.deleted_at IS NULL AND o\.container_number = \?/.test(s)) {
+                return [bookedLines.filter(r => r.ref === params[0]).map(({ ref, box, ...o }) => ({ ...o, container_number: ref }))];
+            }
             if (/^SELECT DISTINCT o\.container_number AS ref/.test(s)) {
                 const live = new Set(params[0]);
                 return [[...new Set(bookedLines.filter(r => mine(r) && live.has(r.status)).map(r => r.ref))].map(ref => ({ ref }))];
@@ -407,7 +412,7 @@ function fakeLoaderConn({ groupRows, bookedLines = [], draftLines = [], knownBox
                 return [draftLines.filter(r => mine(r) && want.has(r.name)).map(({ name, draftId, ...o }) => ({ ...o, draft_name: name, container_number: null }))];
             }
             if (/^SELECT s\.name, \(SELECT MIN\(s2\.id\)/.test(s)) {
-                return [groupRows.filter(g => params[0].includes(g.name)).map(g => ({ name: g.name, group_id: groupRows[0].id, id: g.id }))];
+                return [groupRows.filter(g => params[0].includes(g.name)).map(g => ({ name: g.name, group_id: companyOf[g.id] ?? groupRows[0].id, id: g.id }))];
             }
             if (/^SELECT container_number AS ref, TRIM\(external_container_number\) AS box/.test(s)) {
                 const refs = new Set(params[0]);
@@ -565,4 +570,87 @@ test('suggestContainer: loader + comparisons + decision, with the log fields', a
     } finally {
         log.info = orig;
     }
+});
+
+// ── The company (a login holding more than one) ────────────────────────────
+test('nameWords / sameCompanyName: accents, punctuation and legal forms do not count', () => {
+    assert.deepEqual(PM.nameWords('MEDOFFICE SAĞLIK ENDÜSTRİ A.Ş.'), ['medoffice', 'saglik', 'endustri']);
+    assert.deepEqual(PM.nameWords('Suzhou Sunmed Co.,Ltd.'), ['suzhou', 'sunmed']);
+    assert.equal(PM.sameCompanyName('MEDOFFICE SAĞLIK ENDÜSTRİ A.Ş.', 'Medoffice Saglik Endustri A.S.'), true);
+    assert.equal(PM.sameCompanyName('SUZHOU SUNMED CO., LTD.', 'SUNMED'), true, 'the shorter name within the longer');
+    assert.equal(PM.sameCompanyName('SUZHOU SUNMED CO., LTD.', 'Medoffice Saglik Endustri A.S.'), false);
+    assert.equal(PM.sameCompanyName(null, 'SUNMED'), false);
+    assert.equal(PM.sameCompanyName('Co., Ltd.', 'SUNMED'), false, 'nothing but legal forms names no one');
+});
+
+test('pickCompany: the lines decide, the printed name breaks a tie, nothing to go on is null', () => {
+    const sunmed = { id: 2, names: ['Suzhou Sunmed Co.,Ltd.', 'SUNMED'] };
+    const medoffice = { id: 9, names: ['Medoffice Saglik Endustri A.S.'] };
+    const pick = (a, b, printedName = null) => PM.pickCompany({ companies: [{ ...sunmed, best: a }, { ...medoffice, best: b }], printedName })?.id ?? null;
+    assert.equal(pick(0, 0.45), 9, 'the company whose lines it fits');
+    assert.equal(pick(0.6, 0.45, 'MEDOFFICE SAĞLIK ENDÜSTRİ A.Ş.'), 2, 'the lines outweigh the printed name');
+    assert.equal(pick(0.45, 0.45, 'MEDOFFICE SAĞLIK ENDÜSTRİ A.Ş.'), 9, 'a tie goes to the printed name');
+    assert.equal(pick(0.45, 0.45), null, 'a tie with no name between them');
+    assert.equal(pick(0, 0, 'SUZHOU SUNMED CO., LTD.'), 2, 'no line anywhere: the printed name alone');
+    assert.equal(pick(0, 0, 'JFA MEDICAL LTD'), null);
+    assert.equal(PM.pickCompany({ companies: [{ ...sunmed, best: 0 }] }).id, 2, 'one company is that company');
+    assert.equal(PM.pickCompany({ companies: [] }), null);
+});
+
+// Acme (ids 1 and 7, one portal_code) and Medco (id 9) on one login.
+const TWO = [{ id: 1, name: 'Acme' }, { id: 7, name: 'Acme Ltd' }, { id: 9, name: 'Medco Saglik A.S.' }];
+const TWO_PG = { supplierIds: [1, 7, 9], names: TWO.map(g => g.name), suppliers: TWO };
+const TWO_COMPANIES = { 1: 1, 7: 1, 9: 9 };
+const twoCompanyLines = () => [
+    line('324'),
+    line('324', { id: 2, jf_code: 'JF0002', po_number: 'PO_00002J', quantity: 300 }),
+    line('326', { id: 3, jf_code: 'JF0230', po_number: 'MEDCO-13', quantity: 5454, supplier: 'Medco Saglik A.S.', po_supplier: 'Medco Saglik A.S.' }),
+];
+// No product code and no PO: the rows only line up by quantity.
+const medcoDoc = () => extracted([row({ jfCode: null, poNumber: null, quantity: 5454, cartons: 140 })], { supplierName: 'MEDCO SAĞLIK A.Ş.' });
+
+test('groupCompanies: the ids split by portal_code, keyed and named by the lowest', async () => {
+    const conn = fakeLoaderConn({ groupRows: TWO, companyOf: TWO_COMPANIES });
+    const companies = await PL.groupCompanies(conn, TWO_PG);
+    assert.deepEqual(companies.map(c => [c.key, c.name, c.supplierIds, c.names]), [
+        ['s:1', 'Acme', [1, 7], ['Acme', 'Acme Ltd']],
+        ['s:9', 'Medco Saglik A.S.', [9], ['Medco Saglik A.S.']],
+    ]);
+    assert.deepEqual(PL.groupKeys(companies[0]), ['s:1', 's:7']);
+    assert.equal(PL.companyForKey(companies, 's:7').key, 's:1', 'an older filing under a granted id');
+    assert.equal(PL.companyForKey(companies, 's:5'), null);
+    // An id whose code-mate is not granted: keyed by the lowest live id all the same.
+    const lone = await PL.groupCompanies(fakeLoaderConn({ groupRows: [{ id: 7, name: 'Acme Ltd' }], companyOf: { 7: 1 } }), { suppliers: [{ id: 7, name: 'Acme Ltd' }] });
+    assert.deepEqual(lone.map(c => [c.key, c.name]), [['s:1', 'Acme Ltd']]);
+    assert.deepEqual(PL.groupKeys(lone[0]), ['s:1', 's:7']);
+});
+
+test('suggestContainer: with two companies only the one the document fits is scored', async () => {
+    const conn = fakeLoaderConn({ groupRows: TWO, bookedLines: twoCompanyLines(), companyOf: TWO_COMPANIES });
+    const s = await PL.suggestContainer(conn, { group: TWO_PG, extracted: medcoDoc(), quiet: true });
+    assert.equal(s.company.key, 's:9');
+    assert.deepEqual(s.match.candidates.map(c => c.key), ['booked:326'], 'Acme’s containers are not candidates');
+    assert.equal(s.winnerContainer.containerNumber, '326');
+    assert.equal(s.logFields.company, 's:9');
+    assert.equal(s.logFields.companies, 2);
+    assert.equal(PL.shownCompany(TWO_PG, s.company).name, 'Medco Saglik A.S.');
+    // Acme's own list stays with Acme.
+    const acme = await PL.suggestContainer(fakeLoaderConn({ groupRows: TWO, bookedLines: twoCompanyLines(), companyOf: TWO_COMPANIES }), {
+        group: TWO_PG, extracted: extracted([row(), row({ jfCode: 'JF0002', poNumber: 'PO_00002J', quantity: 300 })]), quiet: true,
+    });
+    assert.equal(acme.company.key, 's:1');
+    assert.deepEqual(acme.match.candidates.map(c => c.key), ['booked:324']);
+    // One company: that company, and nothing named on the supplier's page.
+    const one = { supplierIds: [1, 7], names: ['Acme', 'Acme Ltd'], suppliers: TWO.slice(0, 2) };
+    const single = await PL.suggestContainer(fakeLoaderConn({ groupRows: TWO.slice(0, 2), bookedLines: twoCompanyLines(), companyOf: TWO_COMPANIES }), { group: one, extracted: extracted([row()]), quiet: true });
+    assert.equal(single.company.key, 's:1');
+    assert.equal(PL.shownCompany(one, single.company), null);
+});
+
+test('filingCompany: the company whose lines it fits in that container', async () => {
+    const conn = fakeLoaderConn({ groupRows: TWO, bookedLines: twoCompanyLines(), companyOf: TWO_COMPANIES });
+    assert.equal((await PL.filingCompany(conn, { group: TWO_PG, container: booked('326'), extracted: medcoDoc(), supplierId: 1 })).key, 's:9');
+    assert.equal((await PL.filingCompany(conn, { group: TWO_PG, container: booked('324'), extracted: medcoDoc(), supplierId: 1 })).key, 's:1', 'only Acme is on board there');
+    assert.equal((await PL.filingCompany(conn, { group: TWO_PG, container: booked('999'), extracted: medcoDoc(), supplierId: 1 })).key, 's:9', 'none on board: the printed name');
+    assert.equal((await PL.filingCompany(conn, { group: TWO_PG, container: booked('999'), extracted: null, supplierId: 7 })).key, 's:1', 'nothing to go on: the row’s supplier');
 });

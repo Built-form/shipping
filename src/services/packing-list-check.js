@@ -9,15 +9,18 @@
 // comparison happens here, in code, where it is deterministic and testable
 // (tools/test-packing-list-compare.js).
 //
-// "The container" is the line items IN that container — never the purchase
-// order. A PO is often split across containers, so the expected quantity is
-// this container's share only:
-//   booked — the live orders with container_number = ref. Packing a partial
+// "The container" is the ACTIVE line items IN that container — never the
+// purchase order. A PO is often split across containers, so the expected
+// quantity is this container's share only:
+//   booked — the orders with container_number = ref. Packing a partial
 //            quantity splits the order row, so orders.quantity already IS this
 //            container's share (container 324: 24 rows, 53,120 units).
 //   draft  — draft_container_allocations for that draft, at `allocated`. The
 //            order row still holds the whole line (or the remainder) and one
 //            order can sit in two drafts (45,000 in TAM 320 + 114,300 in 321).
+// Active: not deleted, and not INACTIVE_STATUSES (not in production yet, or
+// written off), which are left out and listed apart (inactiveLines). Arrived
+// and received lines stay: they travelled in it.
 // Both read the legacy tables (the source of truth on prod); the shipments
 // shadow is not used. Planned containers are not supported: a packing list
 // only exists once goods are packed.
@@ -27,10 +30,10 @@
 // one packing list. Groups are keyed 's:<lowest supplier id sharing the code>'
 // — never the code itself, which is the supplier-portal credential. A name with
 // no suppliers row falls back to 'n:<lower-cased name>'. (The supplier portal's
-// packing-list flow groups differently — by the supplier ids the uploader was
-// granted, see "The portal's supplier group" below — and files its packing
-// lists under 's:<lowest granted id>', which may differ from this grouping's
-// key until it moves off portal_code too.)
+// packing-list flow starts from the supplier ids the uploader was granted, see
+// "The portal's supplier group" below, splits them into companies by this same
+// key, and files its packing lists under the key of the company whose lines
+// they match — pl-results.js groupCompanies / filingCompany.)
 //
 // The pool has a single connection, so the model call happens with none held:
 // load, release, call Gemini, reacquire, write (same as shipment-payment-extract).
@@ -48,6 +51,11 @@ const PM = require('../lib/pl-match');
 // container for (src/lib/pl-match.js). Received or destroyed stock, and lines
 // not yet in production, are never candidates.
 const LIVE_STATUSES = ['IN_PRODUCTION', 'READY_FOR_QC', 'READY', 'CONSOLIDATED', 'ON_SEA', 'ON_AIR'];
+// A line on its way in no shipment: not in production yet (an allocation
+// planned ahead, which may well move), or written off. Never expected in a
+// container, whatever it is allocated to.
+const INACTIVE_STATUSES = ['SCHEDULED', 'PO_SENT', 'DESTROYED'];
+const isActiveLine = r => !INACTIVE_STATUSES.includes(r.status);
 const CANDIDATE_CAP = 60;
 // Skip the fallback model when less than this is left before the deadline.
 const FALLBACK_MIN_MS = 120 * 1000;
@@ -442,28 +450,30 @@ const LINE_COLS = `
            o.mfg_date, o.exp_date, o.status, o.supplier, o.container_number,
            o.quantity AS order_quantity, po.supplier AS po_supplier`;
 
-// Every line in the container, each tagged with its supplier group (groupFor),
-// with `quantity` = what THIS container should hold (see the header).
-// Returns { rows, skipped }: skipped are draft lines whose order is already
-// booked into a container (the gap between the legacy pack and close calls, or
-// a close that never ran) — counting them too would double-count those units.
+// Every active line in the container, each tagged with its supplier group
+// (groupFor), with `quantity` = what THIS container should hold (see the
+// header). Returns { rows, skipped, inactive }: skipped are draft lines whose
+// order is already booked into a container (the gap between the legacy pack
+// and close calls, or a close that never ran) — counting them too would
+// double-count those units; inactive are lines of INACTIVE_STATUSES.
 async function loadContainerLines(conn, container) {
-    const { rows, skipped } = await queryContainerLines(conn, container);
-    const resolve = await resolveSupplierNames(conn, [...rows, ...skipped].flatMap(r => [r.po_supplier, r.supplier]));
+    const { rows, skipped, inactive } = await queryContainerLines(conn, container);
+    const resolve = await resolveSupplierNames(conn, [...rows, ...skipped, ...inactive].flatMap(r => [r.po_supplier, r.supplier]));
     const tag = r => {
         const g = groupFor(resolve, r.po_supplier, r.supplier);
         return { ...r, quantity: Number(r.quantity) || 0, supplier_group_key: g.key, supplier_group_id: g.groupId };
     };
-    return { rows: rows.map(tag), skipped: skipped.map(tag) };
+    return { rows: rows.map(tag), skipped: skipped.map(tag), inactive: inactive.map(tag) };
 }
 
 // The container's lines as stored, untagged (the queries behind
-// loadContainerLines; the portal flow reads them without the staff grouping).
+// loadContainerLines; the portal flow reads them without the staff grouping),
+// split into { rows (active), skipped, inactive }.
 async function queryContainerLines(conn, container) {
-    let rows;
+    let all;
     const skipped = [];
     if (container.kind === 'booked') {
-        [rows] = await conn.query(
+        [all] = await conn.query(
             `SELECT ${LINE_COLS}, o.quantity AS quantity, NULL AS allocation_id
                FROM orders o
                LEFT JOIN purchase_orders po ON po.id = o.purchase_order_id
@@ -472,7 +482,7 @@ async function queryContainerLines(conn, container) {
             [container.containerNumber]
         );
     } else {
-        const [all] = await conn.query(
+        const [allocated] = await conn.query(
             `SELECT ${LINE_COLS}, dca.allocated AS quantity, dca.id AS allocation_id
                FROM draft_container_allocations dca
                JOIN orders o ON o.id = dca.order_id AND o.deleted_at IS NULL
@@ -481,13 +491,13 @@ async function queryContainerLines(conn, container) {
               ORDER BY o.jf_code, o.po_number, o.id`,
             [container.draftName]
         );
-        rows = [];
-        for (const r of all) {
+        all = [];
+        for (const r of allocated) {
             const cn = r.container_number && String(r.container_number).trim();
-            (cn ? skipped : rows).push(r);
+            (cn ? skipped : all).push(r);
         }
     }
-    return { rows, skipped };
+    return { rows: all.filter(isActiveLine), skipped, inactive: all.filter(r => !isActiveLine(r)) };
 }
 
 // The supplier picker for one container: one entry per company on board.
@@ -518,13 +528,12 @@ async function loadContainerSuppliers(conn, container) {
         .sort((a, b) => b.units - a.units);
 }
 
-// This supplier's lines in the container, plus its skipped (already booked) ones.
+// This supplier's active lines in the container, plus its skipped (already
+// booked) and inactive ones.
 async function loadExpectedLines(conn, container, supplierKey) {
-    const { rows, skipped } = await loadContainerLines(conn, container);
-    return {
-        rows: rows.filter(o => o.supplier_group_key === supplierKey),
-        skipped: skipped.filter(o => o.supplier_group_key === supplierKey),
-    };
+    const { rows, skipped, inactive } = await loadContainerLines(conn, container);
+    const mine = o => o.supplier_group_key === supplierKey;
+    return { rows: rows.filter(mine), skipped: skipped.filter(mine), inactive: inactive.filter(mine) };
 }
 
 // ── The portal's supplier group (supplier portal) ────────────────────────
@@ -535,7 +544,8 @@ async function loadExpectedLines(conn, container, supplierKey) {
 // (groupFor / resolveSupplierNames, which share a portal_code — nothing
 // below calls them, directly or through loadContainerLines): a line is the
 // group's when the order's or the PO's supplier name is one of the group's
-// names, by nameKey.
+// names, by nameKey. A company of the group (pl-results.js groupCompanies) has
+// the same shape and goes wherever a group goes.
 
 // A predicate: whether a line (LINE_COLS: supplier, po_supplier) belongs to
 // the group. A group with no live name owns nothing.
@@ -545,16 +555,19 @@ function groupLineFilter(group) {
 }
 const lineInGroup = (group, row) => groupLineFilter(group)(row);
 
-// The group's lines in the container, untagged (queryContainerLines: no
-// staff grouping), plus its skipped (already booked) ones, and how many open
-// lines the container holds in all (containerLines: 0 means the container is
-// gone or empty; > 0 with no group line means a forced import). The portal
-// flow's loadExpectedLines.
+// The group's active lines in the container, untagged (queryContainerLines:
+// no staff grouping), plus its skipped (already booked) and inactive ones, and
+// how many open lines the container holds in all, inactive ones included
+// (containerLines: 0 means the container is gone or empty; > 0 with no group
+// line means a forced import). The portal flow's loadExpectedLines.
 async function loadGroupLines(conn, container, group) {
-    const { rows, skipped } = await queryContainerLines(conn, container);
+    const { rows, skipped, inactive } = await queryContainerLines(conn, container);
     const mine = groupLineFilter(group);
     const q = r => ({ ...r, quantity: Number(r.quantity) || 0 });
-    return { rows: rows.filter(mine).map(q), skipped: skipped.filter(mine).map(q), containerLines: rows.length };
+    return {
+        rows: rows.filter(mine).map(q), skipped: skipped.filter(mine).map(q), inactive: inactive.filter(mine).map(q),
+        containerLines: rows.length + inactive.length,
+    };
 }
 
 /**
@@ -563,9 +576,9 @@ async function loadGroupLines(conn, container, group) {
  * containers and open drafts holding LIVE-status lines under the group's
  * names (an open draft: closed_reason NULL, the line not booked yet,
  * allocated > 0). Every line loaded is under one of the group's names and
- * then kept only when lineInGroup says so (by nameKey) — the same rows
- * loadGroupLines gives for the container; other suppliers' lines are never
- * read.
+ * then kept only when lineInGroup says so (by nameKey) and it is active — the
+ * same rows loadGroupLines gives for the container; other suppliers' lines
+ * are never read.
  *   group: { supplierIds, names } (pl-results.js portalGroup).
  *   evidence: { productCodes, poNumbers, printedNumbers, replacesContainer }
  *     (pl-match evidenceFromExtraction, plus the resolved container the
@@ -597,7 +610,8 @@ async function loadSupplierCandidates(conn, group, evidence = {}) {
     const names = group.names;
 
     // 1. Booked containers with a live line of the group's, then every line
-    //    of the group's in them (status aside, as loadExpectedLines reads them).
+    //    of the group's in them (kept in step 3 when active, as
+    //    loadGroupLines reads them).
     const [bookedRefs] = await conn.query(
         `SELECT DISTINCT o.container_number AS ref
            FROM orders o
@@ -648,10 +662,12 @@ async function loadSupplierCandidates(conn, group, evidence = {}) {
         );
     }
 
-    // 3. Exactly the group, by the same rule as loadGroupLines (the SQL above
-    //    matched the names exactly; nameKey ignores case and spacing).
+    // 3. Exactly the group's active lines, by the same rules as loadGroupLines
+    //    (the SQL above matched the names exactly; nameKey ignores case and
+    //    spacing).
     const tag = r => ({ ...r, quantity: Number(r.quantity) || 0 });
-    const mine = groupLineFilter(group);
+    const inGroup = groupLineFilter(group);
+    const mine = r => inGroup(r) && isActiveLine(r);
 
     const byKey = new Map();
     const add = (container, line) => {
@@ -981,13 +997,59 @@ function lineFingerprint(line) {
 }
 
 /**
+ * Pure: which of a supplier's documents to pool — one per invoice number. The
+ * same invoice twice is almost always the same list sent again (a re-upload
+ * that should have been a replacement), and pooling both would count every
+ * row twice. Kept: the supplier's own file (`mine`: the upload being checked,
+ * or a portal submission's own filing), else the newest (a document not on
+ * file yet, packingListId null, is newer than any that is). A document whose
+ * invoice number was not read is always kept.
+ *   documents: [{ packingListId, filename, extracted, invoiceNumber?, mine? }]
+ *     (invoiceNumber: the stored column, else the extraction's)
+ * → { documents (kept, in the order given), duplicateInvoices: [{ invoiceNumber,
+ *     packingListIds (the counted one first), countedPackingListId }] }
+ */
+function onePerInvoice(documents) {
+    const invoiceOf = d => d.invoiceNumber ?? d.extracted?.invoiceNumber ?? null;
+    const keyOf = d => String(invoiceOf(d) ?? '').replace(/\s+/g, '').toLowerCase();
+    const rank = d => [d.mine === true ? 1 : 0, d.packingListId == null ? Infinity : Number(d.packingListId)];
+    const before = (a, b) => {
+        const [am, ai] = rank(a);
+        const [bm, bi] = rank(b);
+        return am !== bm ? am > bm : ai > bi;
+    };
+    const groups = new Map();
+    for (const d of documents || []) {
+        const key = keyOf(d);
+        if (!key) continue;
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(d);
+    }
+    const dropped = new Set();
+    const duplicateInvoices = [];
+    for (const group of groups.values()) {
+        if (group.length < 2) continue;
+        const counted = group.reduce((best, d) => (before(d, best) ? d : best));
+        const rest = group.filter(d => d !== counted);
+        for (const d of rest) dropped.add(d);
+        duplicateInvoices.push({
+            invoiceNumber: invoiceOf(counted),
+            packingListIds: [counted, ...rest].map(d => d.packingListId ?? null),
+            countedPackingListId: counted.packingListId ?? null,
+        });
+    }
+    return { documents: (documents || []).filter(d => !dropped.has(d)), duplicateInvoices };
+}
+
+/**
  * Pure: expected order rows (LINE_COLS shape) × the documents on file for the
  * supplier → { summary, lines, documents, extractionCheck }.
  *
- * `documents` is [{ packingListId, filename, extracted }]. A supplier who ships
- * one container under two invoices sends two packing lists; their rows are
- * pooled and compared together, so neither shows the other's lines as
- * missing. Each packed row remembers which document it came from.
+ * `documents` is [{ packingListId, filename, extracted, mine? }], one per
+ * invoice (onePerInvoice). A supplier who ships one container under two
+ * invoices sends two packing lists; their rows are pooled and compared
+ * together, so neither shows the other's lines as missing. Each packed row
+ * remembers which document it came from.
  *
  * Grouping is by (base product code, PO). A row that finds no group with its
  * PO falls back to the same product code on any PO still unmatched, with a PO
@@ -1140,6 +1202,7 @@ function compareDocuments(expectedOrders, documents) {
         return {
             packingListId: d.packingListId ?? null,
             filename: d.filename ?? null,
+            mine: d.mine === true,
             invoiceNumber: d.extracted?.invoiceNumber ?? null,
             rows: rows.length,
             printedTotalQuantity: printedQty,
@@ -1254,12 +1317,12 @@ function describeContainer(c) {
 /**
  * Compare the supplier's documents ([{ packingListId, filename, extracted }],
  * or one `extracted`) with its lines in the container. Sign-offs, if given,
- * are laid over the result (see applySignOffs). `expected` ({ rows, skipped },
- * loadGroupLines' shape) replaces the staff load for the portal flow, whose
- * group is not a supplierKey.
+ * are laid over the result (see applySignOffs). `expected` ({ rows, skipped,
+ * inactive }, loadGroupLines' shape) replaces the staff load for the portal
+ * flow, whose group is not a supplierKey.
  */
 async function buildComparison(conn, { container, supplierKey, expected = null, documents, extracted, signOffs }) {
-    const { rows, skipped } = expected || await loadExpectedLines(conn, container, supplierKey);
+    const { rows, skipped, inactive = [] } = expected || await loadExpectedLines(conn, container, supplierKey);
     const docs = documents || [{ packingListId: null, filename: null, extracted }];
     const comparison = compareDocuments(rows, docs);
     applySignOffs(comparison, signOffs || []);
@@ -1269,6 +1332,11 @@ async function buildComparison(conn, { container, supplierKey, expected = null, 
     comparison.skippedLines = skipped.map(s => ({
         orderId: s.id, jfCode: s.jf_code, poNumber: s.po_number || null,
         allocated: s.quantity, bookedIn: String(s.container_number).trim(),
+    }));
+    // Lines allocated here but not on their way (INACTIVE_STATUSES): not
+    // expected, but staff may want to know they are still allocated.
+    comparison.inactiveLines = inactive.map(s => ({
+        orderId: s.id, jfCode: s.jf_code, poNumber: s.po_number || null, quantity: Number(s.quantity) || 0, status: s.status,
     }));
     return annotateElsewhere(conn, comparison, container);
 }
@@ -1446,6 +1514,7 @@ module.exports = {
     baseJf,
     norm,
     comparePackingList,
+    onePerInvoice,
     compareDocuments,
     applySignOffs,
     lineFingerprint,
@@ -1468,6 +1537,8 @@ module.exports = {
     loadGroupLines,
     loadSupplierCandidates,
     LIVE_STATUSES,
+    INACTIVE_STATUSES,
+    isActiveLine,
     CANDIDATE_CAP,
     findPlacements,
     readPackingList,

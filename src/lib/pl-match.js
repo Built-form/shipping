@@ -44,6 +44,12 @@
 //   7 none
 // Tune from data: every ratio is kept in candidates_json, and one structured
 // log line per run.
+//
+// A portal login may hold more than one company (Sunmed's three spellings and
+// Medoffice, say). A packing list is one company's, so the caller scores each
+// company's containers apart and pickCompany keeps the one whose order lines
+// the document fits best; the supplier name printed on it breaks a tie, and
+// decides alone when no line matches anywhere.
 
 // ── Constants (exported so they can be tuned) ────────────────────────────
 const METHOD_WEIGHT = { jf_po: 1, jf_only: 0.85, no_code: 0.5 };
@@ -331,6 +337,51 @@ function scoreCandidates({ candidates = [], printedNumbers = [], replacesContain
     return out;
 }
 
+// ── The company ──────────────────────────────────────────────────────────
+// Legal forms and filler, which say nothing about which company it is.
+const NAME_NOISE = new Set([
+    'co', 'company', 'ltd', 'limited', 'llc', 'inc', 'corp', 'corporation', 'plc', 'gmbh', 'srl', 'spa', 'sa', 'as',
+    'sti', 'san', 'tic', 've', 'pvt', 'the', 'and', 'of',
+]);
+
+// The words of a company name: accents dropped (Ş → s, İ → i, Ü → u), lower
+// case, punctuation as spaces, single letters and legal forms left out.
+// 'MEDOFFICE SAĞLIK ENDÜSTRİ A.Ş.' → ['medoffice', 'saglik', 'endustri'].
+function nameWords(name) {
+    const folded = String(name ?? '').normalize('NFKD').replace(/[̀-ͯ]/g, '').replace(/ı/g, 'i').toLowerCase();
+    return uniq(folded.split(/[^a-z0-9]+/).filter(w => w.length > 1 && !NAME_NOISE.has(w)));
+}
+
+// Whether a printed name and a supplier name are the same company: every word
+// of the shorter is among the longer's ('SUNMED' in 'SUZHOU SUNMED CO., LTD.').
+function sameCompanyName(printed, name) {
+    const a = nameWords(printed);
+    const b = nameWords(name);
+    if (!a.length || !b.length) return false;
+    const [short, long] = a.length <= b.length ? [a, b] : [b, a];
+    return short.every(w => long.includes(w));
+}
+
+/**
+ * Which of a login's companies a packing list is (see the header).
+ *   companies   — [{ id, names, best }]: best is what the document scores
+ *                 against that company's lines (its top candidate's score),
+ *                 0 when nothing matched;
+ *   printedName — extracted.supplierName.
+ * → the chosen entry; null when nothing tells them apart (no line matched
+ *   and the printed name names none or several, or two companies tie).
+ */
+function pickCompany({ companies = [], printedName = null } = {}) {
+    if (companies.length <= 1) return companies[0] ?? null;
+    const named = c => (c.names || []).some(n => sameCompanyName(printedName, n));
+    const best = c => Number(c.best) || 0;
+    const ranked = [...companies].sort((a, b) => best(b) - best(a) || (named(b) ? 1 : 0) - (named(a) ? 1 : 0));
+    const [top, second] = ranked;
+    if (best(top) > 0) return best(second) === best(top) && named(second) === named(top) ? null : top;
+    const byName = companies.filter(named);
+    return byName.length === 1 ? byName[0] : null;
+}
+
 // The structured log line's fields (the caller adds submissionId, capCut and
 // codeFilterFallback): CloudWatch Insights groups on these.
 function logFieldsOf(out, rule, candidateCount) {
@@ -367,4 +418,7 @@ module.exports = {
     ratiosOf,
     scoreOf,
     scoreCandidates,
+    nameWords,
+    sameCompanyName,
+    pickCompany,
 };

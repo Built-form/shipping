@@ -43,17 +43,26 @@
 // never written here; a legacy row with none is the group of its own
 // supplier_id. The group's names are the live suppliers.name of those ids,
 // and a container line is the group's when its order's or PO's supplier name
-// is one of them (packing-list-check.js lineInGroup). A portal import files
-// its packing list under supplier_key 's:<supplier_id>' (the lowest granted
-// id), and the group's documents are the packing_lists rows under
-// 's:<id>' for any id of the group. Nothing here touches the staff grouping
-// (groupFor / resolveSupplierNames, which share a portal_code).
+// is one of them (packing-list-check.js lineInGroup).
+//
+// The companies (groupCompanies): one login may hold more than one company
+// (Sunmed's three spellings and Medoffice). The group's ids are split the way
+// the staff check groups a container's lines — the ids sharing one
+// suppliers.portal_code are one company, keyed 's:<lowest live id sharing
+// it>' — and a packing list is one company's: the matcher scores each
+// company's containers apart and keeps the one whose order lines the document
+// fits (suggestContainer), and an import files it under the company whose
+// lines in the chosen container it fits (filingCompany), with that key and
+// name, so the staff container check finds it beside those lines. Each
+// company is group-shaped, and everything below takes one where it takes a
+// group. A company's documents are the packing_lists rows under its key or
+// 's:<id>' for any of its granted ids (the key portal imports used before).
 //
 // Supplier isolation: everything here is built from the uploader's group
 // only — expected lines are loadGroupLines for the container, pooled
-// documents only active packing_lists rows under the group's keys (plus the
-// row's own filing), sign-offs for those keys, and `elsewhere` only
-// placements whose order is the group's by name.
+// documents only active packing_lists rows under the group's (or company's)
+// keys (plus the row's own filing), sign-offs for those keys, and `elsewhere`
+// only placements whose order is the group's by name.
 //
 // The pool has one connection: callers taking `pool` acquire it per step and
 // never nest (syncPortalResults runs after the caller's commit).
@@ -115,8 +124,76 @@ async function portalGroup(conn, row) {
 const groupGone = group => !group || !group.names.length;
 
 // The packing_lists.supplier_key values of a group: 's:<id>' for each granted
-// id. A portal import files under the first (the row's supplier_id).
-const groupKeys = group => L.parseGroupSupplierIds({ group_supplier_ids: group?.supplierIds || [] }).map(id => `s:${id}`);
+// id, and a company's own key (groupCompanies) first.
+const groupKeys = group => [...new Set([
+    ...(group?.key ? [group.key] : []),
+    ...L.parseGroupSupplierIds({ group_supplier_ids: group?.supplierIds || [] }).map(id => `s:${id}`),
+])];
+
+// ── The companies ────────────────────────────────────────────────────────
+/**
+ * A group split into companies (see the header) by the staff grouping itself
+ * (packing-list-check.js resolveSupplierNames, today the ids sharing one
+ * suppliers.portal_code, keyed 's:<lowest live id sharing it>'), so the split
+ * and the filing key follow the staff check wherever it moves. A name it does
+ * not resolve is its own company. Each is group-shaped ({ supplierIds, names,
+ * suppliers }: its granted ids) plus { id, key, name }: name is that id's own
+ * name when it is granted, else the lowest granted id's. Lowest id first.
+ * → [{ id, key, name, supplierIds, names, suppliers }]
+ */
+async function groupCompanies(conn, group) {
+    const suppliers = group?.suppliers || [];
+    if (!suppliers.length) return [];
+    const resolve = await P.resolveSupplierNames(conn, suppliers.map(s => s.name));
+    const byId = new Map();
+    for (const s of suppliers) {
+        const id = Number(resolve.registered(s.name)?.groupId ?? s.id);
+        let c = byId.get(id);
+        if (!c) {
+            c = { id, key: `s:${id}`, name: null, supplierIds: [], names: [], suppliers: [] };
+            byId.set(id, c);
+        }
+        c.supplierIds.push(Number(s.id));
+        c.suppliers.push({ id: Number(s.id), name: s.name });
+        if (s.name && String(s.name).trim() && !c.names.includes(s.name)) c.names.push(s.name);
+    }
+    for (const c of byId.values()) c.name = (c.suppliers.find(s => s.id === c.id) || c.suppliers[0]).name ?? null;
+    return [...byId.values()].sort((a, b) => a.id - b.id);
+}
+
+// The company a packing list is filed under, by its supplier_key: the
+// company's own key, or 's:<id>' of one of its ids. Null when none.
+const companyForKey = (companies, key) => companies.find(c => groupKeys(c).includes(key)) || null;
+
+/**
+ * The company a packing list is filed under in one container (import,
+ * preview): of the group's companies with lines there, the one whose lines
+ * the document fits best (the matcher's score, pl-match pickCompany); then
+ * the most units there, then the lowest id. With none on board: the one the
+ * printed name names, else the one holding `supplierId` (the row's), else the
+ * first. Null only for a group with no live supplier.
+ */
+async function filingCompany(conn, { group, container, extracted = null, supplierId = null }) {
+    const companies = await groupCompanies(conn, group);
+    if (companies.length <= 1) return companies[0] || null;
+    const { rows } = await P.queryContainerLines(conn, container);
+    const docs = extracted ? [{ packingListId: null, filename: null, extracted }] : [];
+    const onBoard = [];
+    for (const c of companies) {
+        const lines = rows.filter(P.groupLineFilter(c)).map(r => ({ ...r, quantity: Number(r.quantity) || 0 }));
+        if (!lines.length) continue;
+        const best = docs.length ? PM.scoreOf({ ...PM.ratiosOf(P.compareDocuments(lines, docs)), boxHit: false, refHit: false, replacesHit: false }) : 0;
+        onBoard.push({ id: c.id, names: c.names, best, units: lines.reduce((s, l) => s + l.quantity, 0), company: c });
+    }
+    const printedName = extracted?.supplierName ?? null;
+    if (onBoard.length) {
+        const picked = PM.pickCompany({ companies: onBoard, printedName });
+        if (picked) return picked.company;
+        return [...onBoard].sort((a, b) => b.units - a.units || a.id - b.id)[0].company;
+    }
+    const named = PM.pickCompany({ companies: companies.map(c => ({ id: c.id, names: c.names, best: 0, company: c })), printedName });
+    return named?.company || companies.find(c => c.supplierIds.includes(Number(supplierId))) || companies[0];
+}
 
 // The group's lines there and the active packing lists filed under the
 // group's keys: what the supplier's result pools. `includePackingListIds`
@@ -156,31 +233,55 @@ async function replacesContainerFor(conn, row) {
 }
 
 /**
- * Score the candidate containers for one extraction and decide. Logs the
- * structured line CloudWatch Insights groups on (not with `quiet`: the staff
- * detail re-scores live, and that must not count as a check run).
+ * Score the candidate containers for one extraction and decide. With more
+ * than one company in the group, each company's containers are scored apart
+ * and the company the document fits is kept (pl-match pickCompany); when
+ * nothing tells them apart the whole group is scored as one, company null.
+ * Logs the structured line CloudWatch Insights groups on (not with `quiet`:
+ * the staff detail re-scores live, and that must not count as a check run).
  * → { match (pl-match scoreCandidates), winnerContainer, loaded
- *     (loadSupplierCandidates), logFields }
+ *     (loadSupplierCandidates), company (groupCompanies' entry, or null),
+ *     logFields }
  */
 async function suggestContainer(conn, { group, extracted, filename = null, replacesContainer = null, submissionId = null, quiet = false }) {
     const evidence = PM.evidenceFromExtraction(extracted);
-    const loaded = await P.loadSupplierCandidates(conn, group, { ...evidence, replacesContainer });
     const doc = { packingListId: null, filename, extracted };
-    const candidates = loaded.candidates.map(c => ({
-        key: c.key, container: c.container, boxNumbers: c.boxNumbers, reservedRef: c.reservedRef,
-        comparison: P.compareDocuments(c.lines, [doc]),
-    }));
-    const match = PM.scoreCandidates({
-        candidates, printedNumbers: evidence.printedNumbers,
-        replacesContainerKey: loaded.evidence.replacesContainerKey, foreignBoxes: loaded.knownBoxes,
-    });
+    const score = async (scope) => {
+        const loaded = await P.loadSupplierCandidates(conn, scope, { ...evidence, replacesContainer });
+        const candidates = loaded.candidates.map(c => ({
+            key: c.key, container: c.container, boxNumbers: c.boxNumbers, reservedRef: c.reservedRef,
+            comparison: P.compareDocuments(c.lines, [doc]),
+        }));
+        const match = PM.scoreCandidates({
+            candidates, printedNumbers: evidence.printedNumbers,
+            replacesContainerKey: loaded.evidence.replacesContainerKey, foreignBoxes: loaded.knownBoxes,
+        });
+        return { loaded, match };
+    };
+    const companies = await groupCompanies(conn, group);
+    let company = companies.length === 1 ? companies[0] : null;
+    let run = null;
+    if (companies.length > 1) {
+        const runs = [];
+        for (const c of companies) runs.push({ company: c, ...(await score(c)) });
+        const picked = PM.pickCompany({
+            companies: runs.map(r => ({ id: r.company.id, names: r.company.names, best: r.match.candidates[0]?.score ?? 0, run: r })),
+            printedName: extracted?.supplierName ?? null,
+        });
+        if (picked) {
+            run = picked.run;
+            company = run.company;
+        }
+    }
+    const { loaded, match } = run || await score(company || group);
     const winnerContainer = match.winner ? loaded.candidates.find(c => c.key === match.winner.key)?.container ?? null : null;
     const logFields = {
         submissionId, ...match.logFields,
         capCut: loaded.capCut, codeFilterFallback: loaded.codeFilterFallback, totalContainers: loaded.totalContainers,
+        company: company?.key ?? null, companies: companies.length,
     };
     if (!quiet) log.info('[pl-match] scored', logFields);
-    return { match, winnerContainer, loaded, logFields };
+    return { match, winnerContainer, loaded, company, logFields };
 }
 
 // The match column group from a suggestion, for the UPDATE and candidates_json
@@ -205,29 +306,29 @@ function matchColumns(s) {
 // Every active document on file for the container under the group's keys
 // (groupPool), plus the one being checked (a draft submission, not yet a
 // packing_lists row), pooled and compared with the sign-offs for those keys
-// laid over — what buildSupplierCheck does for one staff key.
+// laid over — what buildSupplierCheck does for one staff key. Each invoice
+// is counted once (P.onePerInvoice): the supplier's own file — the one being
+// checked, or an imported row's own filing — stands in for any other copy on
+// file, which is reported in duplicateInvoices rather than counted again.
 // excludePackingListIds: the staff preview of an import with
 // replacesId drops the version being replaced out of the pool;
 // includePackingListIds: an imported row's own filing, whatever its key.
 // → { comparison (null with nothing to compare), pool (groupPool) }
 async function pooledComparison(conn, { container, group, extraDocument = null, excludePackingListIds = [], includePackingListIds = [] }) {
     const pool = await groupPool(conn, container, group, { includePackingListIds, excludePackingListIds });
+    const own = new Set(uniqIds(includePackingListIds));
     const readable = pool.packingLists.filter(r => r.status === 'succeeded' && r.extract_json);
-    const documents = readable.map(r => ({ packingListId: r.id, filename: r.filename, extracted: parseJson(r.extract_json) }));
-    if (extraDocument) documents.push(extraDocument);
+    const onFile = readable.map(r => ({
+        packingListId: r.id, filename: r.filename, invoiceNumber: r.invoice_number || null,
+        extracted: parseJson(r.extract_json), mine: own.has(Number(r.id)),
+    }));
+    if (extraDocument) onFile.push({ ...extraDocument, mine: true });
+    const { documents, duplicateInvoices } = P.onePerInvoice(onFile);
     if (!documents.length) return { comparison: null, pool };
     const signOffs = [];
     for (const key of pool.signOffKeys) signOffs.push(...await R.loadSignOffs(conn, container, key));
     const comparison = await P.buildComparison(conn, { container, expected: pool.expected, documents, signOffs });
-    const seen = new Map();
-    const invoices = readable.map(r => ({ id: r.id, inv: r.invoice_number }));
-    if (extraDocument) invoices.push({ id: null, inv: extraDocument.extracted?.invoiceNumber ?? null });
-    for (const { id, inv: raw } of invoices) {
-        const inv = String(raw || '').trim().toLowerCase();
-        if (!inv) continue;
-        if (seen.has(inv)) comparison.duplicateInvoices = [...(comparison.duplicateInvoices || []), { invoiceNumber: raw, packingListIds: [seen.get(inv), id] }];
-        else seen.set(inv, id);
-    }
+    if (duplicateInvoices.length) comparison.duplicateInvoices = duplicateInvoices;
     return { comparison, pool };
 }
 
@@ -259,12 +360,19 @@ async function boxNumberFor(conn, container) {
     return rows[0]?.box || null;
 }
 
-// result_json (v:1): { v, state, container, extraction, ...the supplier-safe comparison }.
-async function buildResult(conn, { state, container, extraction, comparison, group }) {
+// The company the supplier's page names: only one that is part of a group
+// holding more than one, so a one-company login's result is unchanged.
+const shownCompany = (group, company) => (company && company.supplierIds.length < (group?.suppliers || []).length ? company : null);
+
+// result_json (v:1): { v, state, container, supplier?, extraction, ...the
+// supplier-safe comparison }. supplier: { name } of the company the packing
+// list was matched or filed as (shownCompany), one of the group's own names.
+async function buildResult(conn, { state, container, extraction, comparison, group, company = null }) {
     const out = {
         v: L.RESULT_VERSION,
         state,
         container: container ? { kind: container.kind, label: container.label ?? null, boxNumber: await boxNumberFor(conn, container) } : null,
+        ...(company?.name ? { supplier: { name: company.name } } : {}),
         extraction,
     };
     if (comparison) {
@@ -295,6 +403,7 @@ async function computeSupplierResult(conn, row) {
         if (groupGone(group)) return noop('supplier_not_found');
         const replacesContainer = await replacesContainerFor(conn, row);
         const s = await suggestContainer(conn, { group, extracted, filename: row.filename, replacesContainer, submissionId: Number(row.id) });
+        const scope = s.company || group;
         const extraction = L.toSupplierExtraction(extracted);
         let state = 'unmatched';
         let container = null;
@@ -303,10 +412,10 @@ async function computeSupplierResult(conn, row) {
             state = 'provisional';
             container = s.winnerContainer;
             ({ comparison } = await pooledComparison(conn, {
-                container, group, extraDocument: { packingListId: null, filename: row.filename, extracted },
+                container, group: scope, extraDocument: { packingListId: null, filename: row.filename, extracted },
             }));
         }
-        const result = await buildResult(conn, { state, container, extraction, comparison, group });
+        const result = await buildResult(conn, { state, container, extraction, comparison, group: scope, company: shownCompany(group, s.company) });
         return {
             kind: 'result', state, result, container,
             verdict: comparison?.summary?.verdict ?? null,
@@ -331,16 +440,29 @@ async function computeSupplierResult(conn, row) {
         }
         const group = await portalGroup(conn, row);
         const container = await P.resolveStoredContainer(conn, pl);
-        const lines = await P.loadGroupLines(conn, container, group);
+        // The company it was filed under (its supplier_key).
+        let company = companyForKey(await groupCompanies(conn, group), pl.supplier_key);
+        let lines = await P.loadGroupLines(conn, container, company || group);
+        if (company && !lines.rows.length && lines.containerLines) {
+            // Filed under the group's lowest id before imports looked at the
+            // lines' company: the group's lines there, as then.
+            const all = await P.loadGroupLines(conn, container, group);
+            if (all.rows.length) {
+                company = null;
+                lines = all;
+            }
+        }
+        const scope = company || group;
+        const shown = shownCompany(group, company);
         if (!lines.containerLines) return pending('container_gone');
         if (!lines.rows.length) {
             // A forced import: the group's lines aren't allocated here yet
             // (or the group has no live supplier at all).
-            const result = await buildResult(conn, { state: 'confirmed', container: null, extraction, comparison: null, group });
+            const result = await buildResult(conn, { state: 'confirmed', container: null, extraction, comparison: null, group: scope, company: shown });
             return { kind: 'result', state: 'confirmed', result, container: null, verdict: null, discrepancyCount: null };
         }
-        const { comparison } = await pooledComparison(conn, { container, group, includePackingListIds: [pl.id] });
-        const result = await buildResult(conn, { state: 'confirmed', container, extraction, comparison, group });
+        const { comparison } = await pooledComparison(conn, { container, group: scope, includePackingListIds: [pl.id] });
+        const result = await buildResult(conn, { state: 'confirmed', container, extraction, comparison, group: scope, company: shown });
         return {
             kind: 'result', state: 'confirmed', result, container,
             verdict: comparison?.summary?.verdict ?? null,
@@ -540,6 +662,10 @@ module.exports = {
     portalGroup,
     groupGone,
     groupKeys,
+    groupCompanies,
+    companyForKey,
+    filingCompany,
+    shownCompany,
     groupPool,
     replacesContainerFor,
     suggestContainer,

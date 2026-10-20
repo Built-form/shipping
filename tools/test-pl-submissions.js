@@ -203,12 +203,9 @@ const nowSql = () => new Date().toISOString().slice(0, 19).replace('T', ' ');
         const pl0 = imp.body.packingList?.id;
         const plRow0 = await plRow(pl0);
         check('the packing list reused the stored extraction: succeeded, no Gemini call', plRow0?.status === 'succeeded' && plRow0.model_used === 'fixture' && Number(plRow0.row_count) === rows.length, plRow0 && { status: plRow0.status, model: plRow0.model_used, error: plRow0.error_message });
-        check('…filed under s:<supplier_id> (the lowest granted id), with the row’s supplier_name', plRow0?.supplier_key === portalKey && plRow0.supplier_name === supplierName,
-            plRow0 && { supplier_key: plRow0.supplier_key, portalKey, supplier_name: plRow0.supplier_name, supplierName });
-        // The staff check groups by portal_code; it sees the group's lines only
-        // where its key for the company is the same 's:<id>' (accepted for now).
-        if (staffKey !== portalKey) skip('the staff check on the filing', `staff key ${staffKey} differs from ${portalKey}: the staff check files it under another entry`);
-        else check('…and the staff check (same key here) sees every line of the group: no discrepancy on a document built from them', Number(plRow0?.discrepancy_count ?? -1) === 0 && plRow0?.verdict === 'match',
+        check('…filed under the company’s key (the staff check’s for those lines), with its name', plRow0?.supplier_key === staffKey && plRow0.supplier_name === supplierName,
+            plRow0 && { supplier_key: plRow0.supplier_key, staffKey, supplier_name: plRow0.supplier_name, supplierName });
+        check('…and the staff check sees every line of the group: no discrepancy on a document built from them', Number(plRow0?.discrepancy_count ?? -1) === 0 && plRow0?.verdict === 'match',
             plRow0 && { verdict: plRow0.verdict, count: plRow0.discrepancy_count });
         let row0 = await H.readSubmission(pool, g0);
         check('the row: imported, packing_list_id, confirmed_*, group_supplier_ids untouched, result confirmed', row0.status === 'imported' && Number(row0.packing_list_id) === pl0 && row0.confirmed_kind === 'booked'
@@ -221,7 +218,7 @@ const nowSql = () => new Date().toISOString().slice(0, 19).replace('T', ' ');
         check('detail of an imported row → packingList, fileUrl from the PO bucket copy', dImp.packingList?.id === pl0 && typeof dImp.fileUrl === 'string' && dImp.fileUrl.includes(plRow0.s3_key.split('/')[1]), { packingList: dImp.packingList?.id, fileUrl: dImp.fileUrl });
         const again = await decide(g0, 'import', { containerNumber: ref });
         check('importing twice → 409 NOT_SUBMITTED with the packing list', again.status === 409 && again.body.code === 'NOT_SUBMITTED' && again.body.packingListId === pl0, again);
-        const listed = await call('GET', `/api/v1/packing-lists?containerNumber=${encodeURIComponent(ref)}&supplierKey=${encodeURIComponent(portalKey)}`);
+        const listed = await call('GET', `/api/v1/packing-lists?containerNumber=${encodeURIComponent(ref)}&supplierKey=${encodeURIComponent(staffKey)}`);
         check('GET /packing-lists shows it with source portal', listed.status === 200 && listed.body.data.some(p => p.id === pl0 && p.source === 'portal' && p.portalSubmissionId === g0), listed.body?.data?.slice(0, 3));
 
         console.log('\nTwo imports at once');
@@ -262,7 +259,7 @@ const nowSql = () => new Date().toISOString().slice(0, 19).replace('T', ' ');
             const resF = json(rowF.result_json);
             check('force → 200; the supplier’s result is confirmed with container null and no lines', forced.status === 200 && rowF.status === 'imported' && resF?.state === 'confirmed' && resF.container === null && !resF.lines, { status: forced.status, result: resF });
             const plF = await plRow(forced.body.packingList?.id);
-            check('…filed under s:<supplier_id> all the same', plF && plF.supplier_key === portalKey && plF.supplier_name === supplierName, plF && { supplier_key: plF.supplier_key, supplier_name: plF.supplier_name });
+            check('…filed under the company’s key all the same', plF && plF.supplier_key === staffKey && plF.supplier_name === supplierName, plF && { supplier_key: plF.supplier_key, supplier_name: plF.supplier_name });
             check('…audited with force', (await sql(`SELECT after_json FROM audit_log WHERE entity_type = 'pl_submission' AND entity_id = ? AND action = 'import'`, [f1]))
                 .some(r => json(r.after_json)?.force === true));
         }

@@ -7,6 +7,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
     comparePackingList, compareDocuments, applySignOffs, toMonth, parseDims, baseJf, parseTypedReference,
+    onePerInvoice, isActiveLine, INACTIVE_STATUSES, LIVE_STATUSES,
 } = require('../src/services/packing-list-check');
 const { approvalState } = require('../src/services/packing-review');
 
@@ -251,4 +252,39 @@ test('a row with no product code matches by PO, else by a unique quantity, with 
     );
     assert.equal(ambiguous.summary.notExpected, 1);
     assert.equal(ambiguous.summary.missingFromPackingList, 2);
+});
+
+test('the same invoice on file twice is counted once: the supplier\'s own file, else the newest', () => {
+    const doc = (packingListId, invoiceNumber, over = {}) => ({ packingListId, filename: `PL-${packingListId}.pdf`, extracted: pl([row()], { invoiceNumber }), ...over });
+
+    // A portal upload (not on file yet) of a list staff already filed: one copy counts, not two.
+    const upload = doc(null, '26/89165', { mine: true });
+    const once = onePerInvoice([doc(14, '26/89165'), upload]);
+    assert.deepEqual(once.documents, [upload]);
+    assert.deepEqual(once.duplicateInvoices, [{ invoiceNumber: '26/89165', packingListIds: [null, 14], countedPackingListId: null }]);
+    const pooled = compareDocuments([order()], once.documents);
+    assert.equal(pooled.summary.packedUnits, 100, 'not 200');
+    assert.equal(pooled.summary.verdict, 'match');
+    assert.equal(pooled.documents[0].mine, true);
+
+    // Staff duplicates: the newest stands; spacing and case do not make it a different invoice.
+    const staff = onePerInvoice([doc(20, 'INV 7'), doc(9, 'inv7'), doc(15, 'INV-8')]);
+    assert.deepEqual(staff.documents.map(d => d.packingListId), [20, 15]);
+    assert.deepEqual(staff.duplicateInvoices.map(d => d.packingListIds), [[20, 9]]);
+
+    // An imported row's own filing beats a newer copy; the stored column wins over the extraction.
+    const own = onePerInvoice([doc(30, null, { invoiceNumber: 'A-1' }), doc(12, 'A-1', { mine: true })]);
+    assert.deepEqual(own.documents.map(d => d.packingListId), [12]);
+
+    // Two invoices of one shipment, and lists with no invoice read, are all kept.
+    const kept = onePerInvoice([doc(1, 'A-1'), doc(2, 'A-2'), doc(3, null), doc(4, null)]);
+    assert.equal(kept.documents.length, 4);
+    assert.deepEqual(kept.duplicateInvoices, []);
+});
+
+test('active lines: not in production yet, or written off, are never expected', () => {
+    for (const status of INACTIVE_STATUSES) assert.equal(isActiveLine({ status }), false, status);
+    for (const status of [...LIVE_STATUSES, 'ARRIVED_AT_WAREHOUSE', 'IN_WAREHOUSE', 'PARTIALLY_RECEIVED', 'RECEIVED', 'MINTSOFT', null]) {
+        assert.equal(isActiveLine({ status }), true, String(status));
+    }
 });

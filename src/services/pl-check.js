@@ -37,7 +37,9 @@
 //      lib/gemini-retry.js classifyGeminiError (DOCUMENT_UNPROCESSABLE,
 //      MODEL_UNAVAILABLE, NOT_CONFIGURED, MODEL_NO_JSON).
 //   7. on one connection: where the replaced submission was filed, the
-//      candidates scored, the provisional pooled result for a confident
+//      candidates scored (each company's apart when the login holds several,
+//      pl-results.js suggestContainer; the result then is that company's
+//      lines and documents only), the provisional pooled result for a confident
 //      match ('unmatched' otherwise), and duplicateOf (another submitted or
 //      imported row of the supplier's with the same ETag — an early warning;
 //      the refusal is the portal's, at submit).
@@ -254,6 +256,8 @@ function createPlChecker({
                 const s = await PL.suggestContainer(conn, {
                     group, extracted, filename: row.filename, replacesContainer, submissionId: Number(row.id),
                 });
+                // The company the document was matched as, when the login holds several.
+                const scope = s.company || group;
                 const extraction = L.toSupplierExtraction(extracted);
                 let state = 'unmatched';
                 let container = null;
@@ -262,10 +266,10 @@ function createPlChecker({
                     state = 'provisional';
                     container = s.winnerContainer;
                     ({ comparison } = await PL.pooledComparison(conn, {
-                        container, group, extraDocument: { packingListId: null, filename: row.filename, extracted },
+                        container, group: scope, extraDocument: { packingListId: null, filename: row.filename, extracted },
                     }));
                 }
-                const result = await PL.buildResult(conn, { state, container, extraction, comparison, group });
+                const result = await PL.buildResult(conn, { state, container, extraction, comparison, group: scope, company: PL.shownCompany(group, s.company) });
                 const [dups] = etag ? await conn.query(
                     `SELECT id FROM ${jportalSchema()}.pl_submissions
                       WHERE supplier_id = ? AND s3_etag = ? AND status IN ('submitted', 'imported') AND id <> ?

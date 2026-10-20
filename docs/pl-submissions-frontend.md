@@ -44,7 +44,9 @@ ShipLine's **SUPPLIER PORTAL** tab, sub-tab **Packing lists**, Pending and Histo
   `fileExpiresAt`), the extraction, **what the supplier acknowledged** (`acknowledged`, or "supplier
   saw no result"), the ranked candidates with their evidence and the conflicts (`candidates`), the
   linked or previous packing list, and the replace choice to pre-select (`defaultReplacesId`,
-  `defaultContainer`).
+  `defaultContainer`): the imported version a corrected upload names, else a packing list of the
+  company's it would be filed as there already filed in the suggested shipment with the same invoice
+  number — almost always this same list sent again, so Import should replace it, not add a copy.
 - **Preview** — `GET /api/v1/pl-submissions/:id/preview?draftContainerId=129` (a picked candidate —
   always by `draftContainerId` for a draft, so it follows a rename or a booking; `containerNumber`
   for a booked one or a typed-in reference): the full staff comparison, pooled with the supplier's
@@ -102,6 +104,13 @@ If the live load fails, `live` is null and `liveError` says why — show the sto
   draft must be sent as `draftContainerId`: `followDraft` follows it through renames and bookings,
   and `container.followedFrom` says "now booked as 324".
 - `replacesId` drops that packing list out of the pool, as the import with it will.
+- Each invoice number is counted once (`packing-list-check.js onePerInvoice`): this submission
+  stands in for any copy with the same invoice already on file, which shows in
+  `duplicateInvoices` instead of doubling every row. The staff check counts the newest copy.
+- Expected lines are the container's **active** lines: `INACTIVE_STATUSES` (`SCHEDULED`,
+  `PO_SENT`, `DESTROYED`) are left out and listed in `comparison.inactiveLines`
+  (`{ orderId, jfCode, poNumber, quantity, status }`), as `skippedLines` lists draft lines booked
+  elsewhere. Arrived and received lines stay.
 - `onBoard: false` means the supplier's group has no live line there — no line whose order's or
   PO's supplier name is one of the group's names (the import will need `force`). `packingLists` are
   the active packing lists filed under the group's keys (`s:<id>` for each granted id: what the
@@ -122,8 +131,9 @@ If the live load fails, `live` is null and `liveError` says why — show the sto
   yet" (`container: null`) until lines are allocated — the next refresh shows the full result.
 - `note` (≤ 1000) is shown to the supplier.
 - What it does: copies the file into `PO_DOCS_BUCKET` (`packing-lists/<uuid>/<name>`), inserts the
-  `packing_lists` row (`source: 'portal'`, `portalSubmissionId`; its `supplierKey` is
-  `s:<supplierId>` and `supplierName` the row's `supplierName` — see "The supplier group"), **reuses
+  `packing_lists` row (`source: 'portal'`, `portalSubmissionId`; its `supplierKey` and
+  `supplierName` are the company of the order lines it matches there, as the preview shows them —
+  see "The supplier group"), **reuses
   the stored extraction** (`storeAnalysis`: the row is `succeeded` in the response), supersedes
   `replacesId`, marks the submission imported (`confirmed*`, `packingListId`). With no usable
   extraction (a `NO_ROWS` or failed check) the row is returned `processing` and the file is read
@@ -215,16 +225,17 @@ type PlSubmissionDetail = {
   fileUrl: string|null; fileExpiresAt: string|null;   // imported: the PO-bucket copy; else the portal object (null when gone)
   packingList: (PackingList & { deleted: boolean })|null;           // imported rows
   previousPackingList: (PackingList & { deleted: boolean })|null;   // after a return to Pending
-  defaultReplacesId: number|null; defaultContainer: PlContainer|null;   // the imported version it corrects, still live: pre-select both
+  defaultReplacesId: number|null; defaultContainer: PlContainer|null;   // the imported version it corrects, still live, else a same-invoice filing in the suggested shipment: pre-select both
   result: any|null;                // result_json as the supplier sees it (v:1)
   canImport: boolean;
   audit: { action: string; userEmail: string|null; createdAt: string; after: any }[];
 };
 type PlSubmissionPreview = {
-  supplierKey: string; container: PackingListContainer;   // describeContainer: { kind, containerNumber, draftContainerId, draftName, label, followedFrom? }
+  supplierKey: string; supplierName: string|null;          // the company Import files it under there (show this name, not the submission's)
+  container: PackingListContainer;                        // describeContainer: { kind, containerNumber, draftContainerId, draftName, label, followedFrom? }
   comparison: PackingListComparison|null;                 // the staff shape of docs/packing-lists-frontend.md §3, pooled, sign-offs applied; null when nothing can be compared
   packingLists: PackingList[];                            // the supplier's active documents there (replace candidates)
-  duplicateInvoices: { invoiceNumber: string; packingListIds: (number|null)[] }[];   // null = this submission
+  duplicateInvoices: { invoiceNumber: string; packingListIds: (number|null)[]; countedPackingListId: number|null }[];   // counted once (onePerInvoice): packingListIds[0] is the one counted; null = this submission
   onBoard: boolean; extractionUsable: boolean;
 };
 ```
@@ -269,7 +280,7 @@ result column groups.
 
 ## The supplier group
 
-`suppliers.portal_code` plays no part in this flow. The "company" behind a submission is **the set
+The group behind a submission is **the set
 of supplier ids the portal user has access to**, which the portal writes into
 `pl_submissions.group_supplier_ids` (a JSON array of ints, sorted) **at create**, together with
 `supplier_id` = the lowest of those ids and `supplier_name` = that row's live name. Shipping treats
@@ -285,27 +296,36 @@ the group of its own `supplier_id`.
   candidate loader (containers holding LIVE-status lines of any group name; the lines kept per
   candidate are the group's), the expected lines of every supplier-facing result, the import gate
   (`SUPPLIER_NOT_ON_CONTAINER`), the forced-import detection on refresh and the preview's `onBoard`.
-- **The filing.** On import the packing list gets `supplier_key = 's:' + supplier_id` (the lowest
-  granted id the portal stored) and `supplier_name` = the row's `supplier_name`. No lookup, no
-  staff grouping (the import audit records `supplierKey` and `groupSupplierIds`).
+- **The companies** (`pl-results.js groupCompanies`). One login may hold more than one company
+  (Sunmed's three spellings and Medoffice). The group's live ids are split by the staff
+  container check's own grouping of a container's lines (today: the ids sharing one `portal_code`
+  are one company, keyed `s:<lowest live id sharing the code>`; an id with no code is its own). A
+  packing list is one company's:
+  - **Matching** (`suggestContainer`): with more than one company, each company's containers are
+    scored apart and the company the document fits is kept (`pl-match.js pickCompany`: the best
+    top-candidate score; the printed `supplierName` breaks a tie and decides alone when no line
+    matches anywhere; nothing to tell them apart → the whole group, as before). The candidates,
+    the provisional result's expected lines and the pooled documents are then that company's.
+  - **Filing** (`filingCompany`): on import (and in the preview) the company whose lines in the
+    chosen container the document fits; with none on board, the one the printed name names, else
+    the one holding `supplier_id`. The packing list gets that company's key as `supplier_key` and
+    its name (that id's own name when granted) as `supplier_name`, so the staff container check
+    lists it beside those lines. The import audit records `supplierKey`, `supplierName`,
+    `companySupplierIds` and `groupSupplierIds`; the preview returns `supplierKey` and
+    `supplierName`.
+  - **The supplier's page**: when the login holds more than one company, `result_json.supplier =
+    { name }` names the company it was matched or filed as (`shownCompany`).
+  - An imported row's result follows the company of its `supplier_key`; a list filed before this
+    rule under `s:<lowest granted id>` whose company has no lines there falls back to the group's.
 - **Pooling** (`pooledComparison`): the active `packing_lists` rows in the container whose
-  `supplier_key` is `'s:' + <any id in group_supplier_ids>` (plus the row's own filing for an
-  imported row, and the document being checked for a provisional result); sign-offs are loaded for
-  those keys.
-- **Nothing in this flow calls the staff grouping** (`groupFor` / `resolveSupplierNames` /
-  `resolveSupplierChoice`, which share a `portal_code`), not even indirectly: the group's lines are
-  read untagged (`queryContainerLines`), and the `SUPPLIER_NOT_ON_CONTAINER` payload's `suppliers`
-  is built by supplier name (`s:<id>` of the live row carrying that exact name, else `n:<name>`),
-  not by the staff picker.
-- **Accepted limit, for now.** The staff container check (`packing-review.js` /
-  `packing-list-check.js`: the picker, `loadExpectedLines`, sign-offs, approvals) still groups the
-  container's lines by `portal_code` (`s:<lowest id sharing the code>`). Where that key differs
-  from `s:<lowest granted id>` — a company whose lowest-id row is not the one the portal user was
-  granted first, or whose rows do not share a code — a portal-imported list appears in the staff
-  check under a **different supplier entry** than the container's lines (its expected lines there
-  are empty, every row "not expected"), while the supplier's own page, which uses the group's
-  names, is right. This will be fixed when the staff grouping moves off `portal_code`; nothing in
-  the portal flow needs to change then.
+  `supplier_key` is the company's key or `'s:' + <any of its granted ids>` (the whole group's ids
+  when no company was decided), plus the row's own filing for an imported row, and the document
+  being checked for a provisional result; sign-offs are loaded for those keys.
+- **The staff grouping is used for the split only** (`groupCompanies` calls
+  `resolveSupplierNames`, so the split follows it when it moves off `portal_code`); line
+  membership stays by name, and the `SUPPLIER_NOT_ON_CONTAINER` payload's
+  `suppliers` is built by supplier name (`s:<id>` of the live row carrying that exact name, else
+  `n:<name>`), not by the staff picker.
 - **`/suppliers` and the list filter** key by `supplier_id` (the lowest granted id), so
   `supplierKey` is `s:<supplier_id>` with no lookup.
 

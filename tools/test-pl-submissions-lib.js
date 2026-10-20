@@ -137,12 +137,13 @@ const extracted = (lines, over = {}) => ({
 function staffComparison() {
     const c = compareDocuments(
         [order(), order({ id: 1142, jf_code: 'JF0002', po_number: 'PO_00002J', quantity: 100, allocation_id: 124 })],
-        [{ packingListId: 7, filename: 'PL-324.pdf', extracted: extracted([row(), row({ jfCode: 'JF0003', poNumber: 'PO_00003J', quantity: 20, cartons: 2 })]) }]
+        [{ packingListId: 7, filename: 'PL-324.pdf', mine: true, extracted: extracted([row(), row({ jfCode: 'JF0003', poNumber: 'PO_00003J', quantity: 20, cartons: 2 })]) }]
     );
     applySignOffs(c, [{ id: 5, lineKey: c.lines.find(l => l.jfCode === 'JF0002').lineKey, fingerprint: c.lines.find(l => l.jfCode === 'JF0002').fingerprint,
         signedByEmail: 'ops@jf.example', signedAt: '2026-09-02T10:00:00Z', note: 'fine' }]);
     c.container = { kind: 'booked', containerNumber: '324', draftContainerId: null, draftName: null, label: '324', followedFrom: { kind: 'draft', draftId: 129, draftName: 'DRAFT-SEA-260917-173825 - 328' } };
     c.skippedLines = [{ orderId: 9, jfCode: 'JF0009', poNumber: 'PO_00009J', allocated: 5, bookedIn: '323' }];
+    c.inactiveLines = [{ orderId: 10, jfCode: 'JF0010', poNumber: 'PO_00010J', quantity: 5, status: 'PO_SENT' }];
     c.duplicateInvoices = [{ invoiceNumber: 'INV-9', packingListIds: [7, 8] }];
     const mismatch = c.lines.find(l => l.jfCode === 'JF0001');
     mismatch.elsewhere = [
@@ -159,13 +160,13 @@ test('toSupplierComparison: leaks no ids, sign-off emails, fingerprints or the s
     const out = L.toSupplierComparison(c, { groupOrderIds: new Set([1141, 1142]) });
     const text = JSON.stringify(out);
     for (const forbidden of ['orderId', 'allocationId', 'fingerprint', 'lineKey', 'matchMethod', 'signOff', 'signedBy', 'ops@jf.example',
-        'orderQuantity', 'skippedLines', 'packingListId', 'draftContainerId', 'followedFrom', 'DRAFT-SEA-260917', '"status":"CONSOLIDATED"', '"orders":', '"rows":[', 'PLANNED-SEA', '1141', '1142', '2000']) {
+        'orderQuantity', 'skippedLines', 'inactiveLines', 'PO_SENT', 'packingListId', 'draftContainerId', 'followedFrom', 'DRAFT-SEA-260917', '"status":"CONSOLIDATED"', '"orders":', '"rows":[', 'PLANNED-SEA', '1141', '1142', '2000']) {
         assert.equal(text.includes(forbidden), false, `must not contain ${forbidden}`);
     }
     assert.equal(out.summary.verdict, 'differences');
     assert.equal(out.summary.signedOff, 1);
     assert.equal(out.extractionCheck.ok, false, 'the rows add up to 520, the document prints 500');
-    assert.deepEqual(out.documents, [{ filename: 'PL-324.pdf', invoiceNumber: 'INV-9', rows: 2, printedTotalQuantity: 500, sumOfRowsQuantity: 520, printedTotalCartons: 50, sumOfRowsCartons: 52, ok: false }]);
+    assert.deepEqual(out.documents, [{ filename: 'PL-324.pdf', invoiceNumber: 'INV-9', rows: 2, mine: true, printedTotalQuantity: 500, sumOfRowsQuantity: 520, printedTotalCartons: 50, sumOfRowsCartons: 52, ok: false }]);
     assert.deepEqual(out.duplicateInvoices, [{ invoiceNumber: 'INV-9', count: 2 }]);
     assert.equal(out.linesTruncated, false);
     const accepted = out.lines.find(l => l.jfCode === 'JF0002');
