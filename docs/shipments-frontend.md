@@ -251,10 +251,25 @@ renames and anything merged into it: `200 { data: [document], qaDocuments: [qa] 
 `GET /quality-assurance/documents`, plus `shipmentId`). A draft's documents stay
 with it through booking whatever number it is booked under: they are linked by
 shipment id, not by name. On an open draft the list also returns documents made
-under its name that were never linked (`shipmentId: null`); booking links them. `POST` (DRAFT only)
+under its name that were never linked (`shipmentId: null`); booking links them. `POST`
 takes the body of `POST /draft-containers/:name/generate` and produces exactly
 the same set (the per-supplier split and shared `batchId` included). Emailing
 stays on `POST /draft-container-documents/:id/email`.
+
+`POST` works on a DRAFT and on a booked shipment (`BOOKED`, `IN_TRANSIT`,
+`ARRIVED`, `CLOSED`), checked against the stored stage. A DRAFT quotes its
+allocations, as before. Booking deletes those allocations, so a booked
+shipment quotes its own live orders instead: every order whose
+`TRIM(container_number)` is the shipment's reference, at its quantity (a
+partial pack split the order, so the packed slice is its own row). The
+document's `draftContainerName` is the reference ('328', '121. Air Freight'),
+which is also the PDF's `Ref:` and the email subject's `{draftContainerName}`.
+Versions continue across every document of the shipment, its draft's included.
+The `document_generated` event, and the `document_sent` event of any later
+email, go to the shipment's history (`entityType: 'shipment'`), never the
+draft's: writing draft history reopens a closed draft. `409
+DOCUMENTS_NOT_ALLOWED` on PLANNED or CANCELLED (this replaces `NOT_A_DRAFT`) ·
+`422 NO_REFERENCE` for a booked shipment with no reference.
 
 ### `GET /shipments/:id/history`
 

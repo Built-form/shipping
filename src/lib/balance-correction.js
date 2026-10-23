@@ -14,8 +14,13 @@ const round2 = v => Math.round(v * 100) / 100;
 
 /** The record's new amount and split — null when there is nothing to change
  *  (no figure, or one not below the record's: a record is never raised here),
- *  or { error, code } when it would fall below what transfers already applied. */
-function correctBalance({ amount, applied = 0, balanceAmount, allocations = [] }) {
+ *  or { error, code } when it would fall below what transfers already applied.
+ *  `keepSplit`: the record is its invoice's total WITH extras paid on their own
+ *  lines (packaging…), often read with no PO behind them — what no PO carries
+ *  goes first and each PO keeps its share; only a split above the new figure
+ *  is scaled (Sunmed 123. Air Freight, 2026-10-19: scaling left 98.72 unsplit,
+ *  so the record could not settle, NOT_FULLY_ALLOCATED). */
+function correctBalance({ amount, applied = 0, balanceAmount, allocations = [], keepSplit = false }) {
     if (balanceAmount == null) return null;
     const next = round2(Number(balanceAmount));
     const current = round2(Number(amount));
@@ -23,7 +28,11 @@ function correctBalance({ amount, applied = 0, balanceAmount, allocations = [] }
     if (next < round2(applied) - EPS) {
         return { error: `${round2(applied)} is already applied to it — the balance cannot be ${next}.`, code: 'BALANCE_BELOW_APPLIED' };
     }
-    const factor = next / current;
+    const named = round2(allocations.reduce((s, a) => s + Number(a.amount), 0));
+    if (keepSplit && named <= next + EPS) {
+        return { amount: next, allocations: allocations.map(a => ({ ...a, amount: round2(Number(a.amount)) })) };
+    }
+    const factor = keepSplit && named > 0 ? next / named : next / current;
     const scaled = allocations.map(a => ({ ...a, amount: round2(Number(a.amount) * factor) }));
     // Rounding each share can leave a cent over or under: the largest takes it.
     const target = round2(allocations.reduce((s, a) => s + Number(a.amount), 0) * factor);

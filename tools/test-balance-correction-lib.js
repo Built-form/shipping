@@ -52,3 +52,34 @@ test('part paid before: down to the balance, never below what was already applie
     assert.equal(r.code, 'BALANCE_BELOW_APPLIED');
     assert.equal(r.amount, undefined);
 });
+
+// Sunmed 123. Air Freight (user, 2026-10-19: NOT_FULLY_ALLOCATED, 98.72 unallocated):
+// the record is the invoice TOTAL 2,477.68 = the goods split 780 / 345 / 1,249.68
+// (2,374.68) + packaging 103 tied to no PO — the packaging is an extra of its own.
+// Brought down to the goods with `keepSplit`, it drops what no PO carries and keeps
+// each PO's share, so it is fully split and settles. Scaling it left 98.72 unsplit.
+const sunmed = [{ purchaseOrderId: 272, amount: 780 }, { purchaseOrderId: 297, amount: 345 }, { purchaseOrderId: 324, amount: 1249.68 }];
+
+test('keepSplit: what no PO carries goes first; each PO keeps its share', () => {
+    const r = correctBalance({ amount: 2477.68, applied: 0, balanceAmount: 2374.68, allocations: sunmed, keepSplit: true });
+    assert.equal(r.amount, 2374.68);
+    assert.deepEqual(r.allocations.map(a => a.amount), [780, 345, 1249.68]);
+});
+
+test('keepSplit: the split itself above the balance still comes down, by its shares', () => {
+    // 125. Air Freight: 4,219.04 all named to one PO, packaging 84 inside it; down to 4,135.04.
+    const r = correctBalance({ amount: 4219.04, applied: 0, balanceAmount: 4135.04, allocations: [{ purchaseOrderId: 333, amount: 4219.04 }], keepSplit: true });
+    assert.deepEqual(r.allocations.map(a => a.amount), [4135.04]);
+});
+
+test('without keepSplit (a goods-total record): scaled, as before', () => {
+    const r = correctBalance({ amount: 2477.68, applied: 0, balanceAmount: 2374.68, allocations: sunmed });
+    assert.notDeepEqual(r.allocations.map(a => a.amount), [780, 345, 1249.68]);
+});
+
+test('keepSplit: a split below the new figure is never raised — what no PO carries just shrinks', () => {
+    // 2,500 with 2,300 named and 200 on no PO, brought to 2,400: the named 2,300 stays as it is.
+    const r = correctBalance({ amount: 2500, applied: 0, balanceAmount: 2400, allocations: [{ purchaseOrderId: 1, amount: 2300 }], keepSplit: true });
+    assert.equal(r.amount, 2400);
+    assert.deepEqual(r.allocations.map(a => a.amount), [2300]);
+});

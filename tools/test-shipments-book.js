@@ -210,6 +210,41 @@ async function run() {
     check('booked under a number unlike the draft name', r.status === 200 && r.data.reference === RD && r.data.name === s11.name, r.data);
     ids = await listed(s11.id);
     check('after booking: both documents are still listed under the booked shipment', ids.includes(linked) && ids.includes(unlinked), ids);
+
+    section('12b. A booked shipment generates its forwarder quote from its own orders');
+    const draftActions = async () => (await H.sql(
+        `SELECT al.action FROM audit_log al JOIN draft_containers dc ON dc.id = al.entity_id
+          WHERE al.entity_type = 'draft_container' AND dc.name = ? ORDER BY al.id`, [s11.name])).map(x => x.action);
+    const draftBefore = await draftActions();
+    r = await api.post(`/api/v1/shipments/${s11.id}/documents`, { type: 'forwarder-quote', comments: 'SHIPTEST — please disregard' });
+    check('201: lines found though booking deleted the allocations', r.status === 201 && r.data.fileSize > 0, r.data);
+    const gen = r.data;
+    check('labelled with the reference, linked to the shipment', gen.draftContainerName === RD && gen.shipmentId === s11.id, gen);
+    check('versions continue across the shipment (the draft-era forwarder quote was v1)', gen.version === 2, gen.version);
+    check('split run: one per-supplier copy for the one supplier', Array.isArray(gen.supplierDocuments) && gen.supplierDocuments.length === 1
+        && gen.supplierDocuments[0].supplier === 'Shiptest Supplier', gen.supplierDocuments);
+    ids = await listed(s11.id);
+    check('listed under the booked shipment', ids.includes(gen.documentId), ids);
+    const [reg11] = await H.sql(`SELECT closed_reason FROM draft_containers WHERE name = ?`, [s11.name]);
+    check('the converted draft stays closed', reg11 && reg11.closed_reason === 'converted', reg11);
+    check('no event lands in the draft history (no reopened, no document_generated)',
+        JSON.stringify(await draftActions()) === JSON.stringify(draftBefore), { before: draftBefore, after: await draftActions() });
+    const shipEvents = await H.sql(
+        `SELECT after_json FROM audit_log WHERE entity_type = 'shipment' AND entity_id = ? AND action = 'document_generated'`, [s11.id]);
+    check('one document_generated event on the shipment', shipEvents.length === 1, shipEvents.length);
+    r = await api.post(`/api/v1/shipments/${s11.id}/documents`, { type: 'supplier-quote', supplier: 'Nobody Ltd' });
+    check('a supplier with no orders in the container: 400', r.status === 400, r.data);
+    r = await api.post(`/api/v1/shipments/${s11.id}/documents`, { type: 'supplier-quote', supplier: 'shiptest supplier ', comments: 'SHIPTEST — please disregard' });
+    const rts = r.data;
+    check('request to send for a supplier on the container: 201, matched ignoring case and spaces',
+        r.status === 201 && rts.type === 'supplier-quote' && rts.shipmentId === s11.id && rts.draftContainerName === RD, rts);
+    check('its file is named request-to-send', typeof rts.url === 'string' && /\/request-to-send-[^/]+\.pdf$/.test(rts.url), rts.url);
+    // Left linked to the shipment: the closing verify must accept a booked
+    // shipment's own documents, which have no draft registry row.
+    const genIds = [gen.documentId, ...(gen.supplierDocuments || []).map(d => d.documentId), rts.documentId].filter(Boolean);
+    if (genIds.length) {
+        await H.sql(`UPDATE draft_container_documents SET deleted_at = NOW() WHERE id IN (${genIds.map(() => '?').join(',')})`, genIds);
+    }
     await H.sql(`UPDATE draft_container_documents SET deleted_at = NOW() WHERE id IN (?, ?)`, [linked, unlinked]);
 
     section('13. A number another open draft holds cannot be booked from under it');

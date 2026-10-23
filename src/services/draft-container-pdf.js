@@ -376,7 +376,8 @@ async function buildForwarderQuotePdf(draft, lines) {
 }
 
 // ── Supplier quote (detailed, landscape) ─────────────────────────────────
-// A near-copy of the forwarder quote, filtered upstream to a single supplier.
+// Titled "Request to send" on the page and in ShipLine (type stays
+// 'supplier-quote'). A near-copy of the forwarder quote, filtered upstream to a single supplier.
 // Deliberately duplicated rather than sharing the forwarder helpers: the two
 // templates are expected to diverge, so each owns its own layout/columns.
 
@@ -412,7 +413,7 @@ function sqCols() {
 }
 
 function drawSqHeaderBlock(doc, draft) {
-    doc.fillColor('#000').fontSize(18).font('Helvetica-Bold').text('SUPPLIER QUOTE REQUEST', 25, 30);
+    doc.fillColor('#000').fontSize(18).font('Helvetica-Bold').text('REQUEST TO SEND', 25, 30);
 
     doc.fontSize(9).font('Helvetica-Bold')
        .text('Ref:', 25, 60, { continued: true }).font('Helvetica').text(`   ${draft.name || ''}`);

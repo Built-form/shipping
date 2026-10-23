@@ -475,3 +475,69 @@ test('findOrCreateByReference: race-safe upsert that returns the live holder, qu
     await sync.findOrCreateByReference(conn, '121. Air Freight');
     assert.deepEqual(conn.calls[1].params.slice(0, 6), ['121. Air Freight', 121, null, 'AIR', 'reference', 0]);
 });
+
+test('documentSource: a draft quotes its allocations by name, a booked shipment its own orders by reference', () => {
+    assert.deepEqual(
+        S.documentSource({ stage: 'DRAFT', name: 'DRAFT-SEA-260917-173825 - 328', reference: null }),
+        { kind: 'draft', name: 'DRAFT-SEA-260917-173825 - 328', label: 'DRAFT-SEA-260917-173825 - 328' }
+    );
+    for (const stage of ['BOOKED', 'IN_TRANSIT', 'ARRIVED', 'CLOSED']) {
+        assert.deepEqual(
+            S.documentSource({ stage, name: 'DRAFT-SEA-260917-173825 - 328', reference: ' 328 ' }),
+            { kind: 'booked', reference: '328', label: '328' },
+            stage
+        );
+    }
+    assert.deepEqual(
+        S.documentSource({ stage: 'BOOKED', name: null, reference: '121. Air Freight' }),
+        { kind: 'booked', reference: '121. Air Freight', label: '121. Air Freight' },
+        'a container that was never a draft has no name'
+    );
+});
+
+test('documentSource: PLANNED and CANCELLED are refused, and a booked shipment needs its reference', () => {
+    for (const stage of ['PLANNED', 'CANCELLED']) {
+        assert.throws(() => S.documentSource({ stage, name: 'x', reference: null }),
+            e => e instanceof S.ShipmentError && e.status === 409 && e.code === 'DOCUMENTS_NOT_ALLOWED', stage);
+    }
+    assert.throws(() => S.documentSource({ stage: 'BOOKED', name: 'x', reference: '  ' }),
+        e => e instanceof S.ShipmentError && e.status === 422 && e.code === 'NO_REFERENCE');
+});
+
+test('documentLinkDrift: a booked shipment\'s own document (no draft registry row) is linked, not drift', async () => {
+    const conn = fakeConn(sql => {
+        if (sql.startsWith('SELECT id, source_draft_id, merged_into_id, stage FROM shipments')) {
+            return [[
+                { id: 50, source_draft_id: null, merged_into_id: null, stage: 'BOOKED' },
+                { id: 60, source_draft_id: 1, merged_into_id: null, stage: 'DRAFT' },
+                { id: 70, source_draft_id: null, merged_into_id: 50, stage: 'CANCELLED' },
+            ]];
+        }
+        if (sql.startsWith('SELECT id, shipment_id FROM draft_containers')) return [[{ id: 1, shipment_id: 60 }]];
+        if (sql.includes('FROM draft_container_documents d')) {
+            return [[
+                { id: 900, shipment_id: 50, registry_id: null }, // generated on booked 50, named by its reference
+                { id: 901, shipment_id: 60, registry_id: null }, // an open draft's document must have a registry row
+                { id: 902, shipment_id: 999, registry_id: null }, // no such shipment
+                { id: 903, shipment_id: 70, registry_id: null }, // merged into booked 50
+                { id: 904, shipment_id: 50, registry_id: 1 },    // a draft's document stamped onto an unrelated shipment
+                { id: 905, shipment_id: 60, registry_id: 1 },    // a draft's document on its own shipment
+            ]];
+        }
+        if (sql.includes('FROM quality_assurance_documents d')) return [[]];
+        throw new Error(`unexpected query: ${sql}`);
+    });
+    const drift = await sync.documentLinkDrift(conn);
+    assert.deepEqual(drift.map(d => d.id), [901, 902, 904]);
+});
+
+test('documentHistoryOwner: an open draft keeps its own history; booked and cancelled go to the shipment', () => {
+    // Draft history goes through ensureDraftRegistered, which reopens a closed
+    // draft: a document of a booked shipment must never write there.
+    assert.equal(S.documentHistoryOwner('DRAFT'), 'draft');
+    assert.equal(S.documentHistoryOwner('PLANNED'), 'draft');
+    assert.equal(S.documentHistoryOwner(null), 'draft', 'a document with no shipment keeps the legacy behaviour');
+    for (const stage of ['BOOKED', 'IN_TRANSIT', 'ARRIVED', 'CLOSED', 'CANCELLED']) {
+        assert.equal(S.documentHistoryOwner(stage), 'shipment', stage);
+    }
+});
