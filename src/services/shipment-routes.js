@@ -906,7 +906,10 @@ function registerShipmentRoutes(app, deps) {
 
     // Generate: the same document set the legacy generate route produces (the
     // per-supplier split, the shared batch id the email route attaches by, and
-    // the one document_generated event), then stamped with this shipment.
+    // the one document_generated event), then stamped with this shipment. A
+    // DRAFT quotes its allocations; a booked shipment (BOOKED to CLOSED) quotes
+    // its own orders by reference, labelled with that reference, and records the
+    // event on the shipment (S.documentSource).
     app.post('/api/v1/shipments/:id(\\d+)/documents', async (req, res) => {
         try {
             await ready();
@@ -927,11 +930,12 @@ function registerShipmentRoutes(app, deps) {
                 const [[ship]] = await conn.query(`SELECT * FROM shipments WHERE id = ?`, [id]);
                 if (!ship || ship.deleted_at) throw new ShipmentError(404, 'NOT_FOUND', `Shipment ${id} not found.`);
                 if (ship.merged_into_id) throw new ShipmentError(409, 'MERGED', `Shipment ${id} was merged into ${ship.merged_into_id}.`, { mergedIntoId: ship.merged_into_id });
-                if (ship.stage !== 'DRAFT') throw new ShipmentError(409, 'NOT_A_DRAFT', 'Documents are generated while the shipment is a DRAFT.');
+                const source = S.documentSource(ship);
                 const set = await generateDraftDocumentSet(conn, {
                     name: ship.name, docType, supplierName, comments, wantSplit, userEmail: req.userEmail,
+                    booked: source.kind === 'booked' ? { shipmentId: id, reference: source.reference } : null,
                 });
-                if (set.noLines) return { noLines: true, name: ship.name };
+                if (set.noLines) return { noLines: true, name: source.label };
                 const docIds = [set.main.documentId, ...(set.supplierDocuments || []).map(d => d.documentId)];
                 await conn.query(
                     `UPDATE draft_container_documents SET shipment_id = ? WHERE id IN (${docIds.map(() => '?').join(',')})`,

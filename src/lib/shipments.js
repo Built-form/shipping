@@ -349,6 +349,33 @@ class ShipmentError extends Error {
     }
 }
 
+// Where a shipment's quote documents read their lines from, and the label they
+// carry (the PDF's "Ref:", the stored draft_container_name, the email subject).
+// A DRAFT reads its allocations by name. A booked shipment reads its own live
+// orders by reference: booking deleted the draft's allocations
+// (draftAudit.closeDraft). PLANNED and CANCELLED have nothing to quote.
+// `ship` is a shipments row; its stage is the stored stage.
+function documentSource(ship) {
+    if (ship.stage === 'DRAFT') return { kind: 'draft', name: ship.name, label: ship.name };
+    if (isBookedStage(ship.stage)) {
+        const reference = clean(ship.reference);
+        if (!reference) {
+            throw new ShipmentError(422, 'NO_REFERENCE', `Shipment ${ship.id} is ${ship.stage} but has no reference to read its orders by.`);
+        }
+        return { kind: 'booked', reference, label: reference };
+    }
+    throw new ShipmentError(409, 'DOCUMENTS_NOT_ALLOWED',
+        `Documents are generated for a DRAFT or a booked shipment (this one is ${ship.stage}).`, { stage: ship.stage });
+}
+
+// Which history a quote document's events (generated, sent) belong to: the
+// draft's while its shipment is open or unknown, else the shipment's. Draft
+// history goes through draftAudit.ensureDraftRegistered, which reopens a closed
+// draft, so a booked or cancelled shipment's document must never write there.
+function documentHistoryOwner(stage) {
+    return stage == null || isOpenStage(stage) ? 'draft' : 'shipment';
+}
+
 // The compact entry GET /orders carries in its `shipments` side-map.
 function shipmentSummary(s) {
     return {
@@ -400,5 +427,7 @@ module.exports = {
     shipmentSummary,
     auditSnapshot,
     ShipmentError,
+    documentSource,
+    documentHistoryOwner,
     clean,
 };
