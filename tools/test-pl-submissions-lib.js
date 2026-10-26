@@ -22,8 +22,8 @@ const submitted = (over = {}) => ({
 });
 
 // ── Shared with PI ─────────────────────────────────────────────────────────
-test('re-exports PI’s claim rules, limits and helpers unchanged', () => {
-    for (const k of ['planEvent', 'claimWhere', 'sniffType', 'safeFilename', 'canDecide', 'parseJson', 'positiveInt', 'parseRowVersion', 'parseNote']) {
+test('re-exports PI’s limits and helpers unchanged', () => {
+    for (const k of ['sniffType', 'safeFilename', 'canDecide', 'parseJson', 'positiveInt', 'parseRowVersion', 'parseNote']) {
         assert.equal(L[k], PI[k], k);
     }
     for (const k of ['STALE_CHECK_SECONDS', 'MAX_CHECK_ATTEMPTS', 'RETRYABLE_CODES', 'MAX_FILE_BYTES', 'ALLOWED_TYPES', 'VISIBLE_STATUSES', 'DECIDED_STATUSES', 'DECIDER_ROLES']) {
@@ -31,6 +31,23 @@ test('re-exports PI’s claim rules, limits and helpers unchanged', () => {
     }
     assert.equal(L.canDecide('admin'), true);
     assert.equal(L.canDecide('readonly'), false);
+});
+
+test('the claim: PI’s rules, on a draft or a submitted row (sent as soon as its file arrives)', () => {
+    const NOW = Date.parse('2026-10-21T12:00:00Z');
+    const waiting = { status: 'draft', check_status: 'awaiting_upload', check_attempt: 0, created_at: new Date(NOW - 5e3) };
+    for (const source of ['event', 'direct']) {
+        assert.deepEqual(L.planEvent(source, waiting, NOW), PI.planEvent(source, waiting, NOW), source);
+        assert.deepEqual(L.planEvent(source, { ...waiting, status: 'submitted' }, NOW), PI.planEvent(source, waiting, NOW), `${source}, submitted`);
+        for (const status of ['imported', 'rejected', 'withdrawn', 'discarded']) {
+            assert.deepEqual(L.planEvent(source, { ...waiting, status }, NOW), { claim: false, reason: 'not_draft' }, `${source}, ${status}`);
+        }
+        const pl = L.claimWhere(source);
+        const pi = PI.claimWhere(source);
+        assert.deepEqual(pl.params, pi.params);
+        assert.equal(pl.sql, pi.sql.replace(`status = 'draft'`, `status IN ('draft', 'submitted')`));
+    }
+    assert.equal(L.planEvent('direct', null, NOW).claim, false);
 });
 
 // ── Keys and triggers ──────────────────────────────────────────────────────

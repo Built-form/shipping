@@ -64,6 +64,16 @@ const FALLBACK_MIN_MS = 120 * 1000;
 // 3.8 Flash is the default, Pro the fallback. Env override for retuning.
 const GEMINI_MODEL_DEFAULT = process.env.PACKING_LIST_GEMINI_MODEL || 'gemini-3.8-flash';
 const FALLBACK_MODEL = 'gemini-3.1-pro-preview';
+// Service tier of the read (ai.google.dev/gemini-api/docs/priority-inference). At the
+// default (standard) tier the same two-row test list took 49–172 s and a share of calls
+// came back 503 "high demand"; at `priority` it took 10–13 s. Priority costs about
+// twice the standard rate, on a few thousand tokens per check. Google may still serve a
+// priority request as standard under load: the response header says which, and it is
+// logged. Env override PACKING_LIST_GEMINI_TIER: `standard`, `flex`, `priority`,
+// or empty to send no tier.
+const GEMINI_TIER = process.env.PACKING_LIST_GEMINI_TIER === undefined
+    ? 'priority'
+    : process.env.PACKING_LIST_GEMINI_TIER.trim();
 
 // ── Prompt + schema ──────────────────────────────────────────────────────
 const SYSTEM_INSTRUCTION = `You read supplier PACKING LISTS for a UK medical-supplies importer and return structured JSON. The document is a PDF or image, often several pages, printed from a spreadsheet, sometimes bilingual (Chinese/English).
@@ -1342,7 +1352,8 @@ async function buildComparison(conn, { container, supplierKey, expected = null, 
 }
 
 // ── The model call ───────────────────────────────────────────────────────
-/** Reads one packing list. Returns { parsed, modelUsed, usage }.
+/** Reads one packing list. Returns { parsed, modelUsed, usage, servedTier }
+ *  (servedTier: the tier Google served, from the x-gemini-service-tier header, or null).
  *  `deadline` (epoch ms, a Lambda's remaining time) bounds the retries and
  *  skips the fallback model when less than FALLBACK_MIN_MS would be left for
  *  it. A failure carries the last model error as `cause`
@@ -1370,6 +1381,7 @@ async function readPackingList({ s3Key, bytes, contentType, model, deadline = nu
             break;
         }
         try {
+            const startedAt = Date.now();
             const response = await withGeminiRetry(`packing-list(${modelId})`, () => ai.models.generateContent({
                 model: modelId,
                 contents: [
@@ -1383,8 +1395,14 @@ async function readPackingList({ s3Key, bytes, contentType, model, deadline = nu
                     systemInstruction: SYSTEM_INSTRUCTION,
                     responseMimeType: 'application/json',
                     responseSchema: RESPONSE_SCHEMA,
+                    ...(GEMINI_TIER ? { serviceTier: GEMINI_TIER } : {}),
                 },
             }), 5, { deadline });
+            const servedTier = response?.sdkHttpResponse?.headers?.['x-gemini-service-tier'] ?? null;
+            log.info('[packing-list-check] read', {
+                modelId, ms: Date.now() - startedAt, tier: servedTier, requestedTier: GEMINI_TIER || null,
+                tokens: response?.usageMetadata?.totalTokenCount ?? null,
+            });
             let parsed;
             try { parsed = JSON.parse(response?.text || ''); }
             catch {
@@ -1396,7 +1414,7 @@ async function readPackingList({ s3Key, bytes, contentType, model, deadline = nu
                 throw err;
             }
             if (!Array.isArray(parsed.lines)) parsed.lines = [];
-            return { parsed, modelUsed: modelId, usage: response?.usageMetadata ?? null };
+            return { parsed, modelUsed: modelId, usage: response?.usageMetadata ?? null, servedTier };
         } catch (e) {
             lastErr = e;
             log.warn('[packing-list-check] model failed, trying the next', { modelId, error: String(e.message || '').slice(0, 160) });

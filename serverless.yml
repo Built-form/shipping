@@ -115,12 +115,13 @@ provider:
     # updated by /api/v1/po-change-requests and /api/v1/pi-submissions (and the
     # piCheck Lambda). The DB login needs SELECT + UPDATE on
     # <schema>.po_change_requests, and SELECT + the column-level UPDATE in
-    # docs/pi-submissions-frontend.md on <schema>.pi_submissions.
+    # docs/pi-submissions-frontend.md on <schema>.pi_submissions (likewise
+    # docs/pl- and docs/ci-submissions-frontend.md for pl_ and ci_submissions).
     JPORTAL_DB_SCHEMA: ${self:custom.secrets.JPORTAL_DB_SCHEMA, 'jportal'}
-    # Supplier-uploaded proforma invoices (pi/*) and packing lists (pl/*): the
-    # supplier portal's private bucket (owned by the portal's stack). piCheck /
-    # plCheck read the uploads; an import copies one into PO_DOCS_BUCKET. Read
-    # only: no tagging, no delete.
+    # Supplier-uploaded proforma invoices (pi/*), packing lists (pl/*) and
+    # commercial invoices (ci/*): the supplier portal's private bucket (owned
+    # by the portal's stack). piCheck / plCheck / ciCheck read the uploads; an
+    # import copies one into PO_DOCS_BUCKET. Read only: no tagging, no delete.
     PI_UPLOADS_BUCKET: jportal-pi-uploads-${self:custom.envName}
     # The supplier portal's base URL, for the link in the PI decision emails
     # (blank = no link). PI_NOTIFY_REDIRECT_TO (test only): send every PI
@@ -182,16 +183,17 @@ provider:
             - s3:GetObject
           Resource:
             - arn:aws:s3:::shipping-purchase-orders-${sls:stage}/*
-        # The supplier portal's PI (pi/*) and packing-list (pl/*) uploads (its
-        # bucket, its stack): read only. ListBucket only so a missing object
-        # answers 404, not 403 — piCheck / plCheck tell "not uploaded yet"
-        # from "denied" by it.
+        # The supplier portal's PI (pi/*), packing-list (pl/*) and
+        # commercial-invoice (ci/*) uploads (its bucket, its stack): read only.
+        # ListBucket only so a missing object answers 404, not 403 — piCheck /
+        # plCheck / ciCheck tell "not uploaded yet" from "denied" by it.
         - Effect: Allow
           Action:
             - s3:GetObject
           Resource:
             - arn:aws:s3:::jportal-pi-uploads-${self:custom.envName}/pi/*
             - arn:aws:s3:::jportal-pi-uploads-${self:custom.envName}/pl/*
+            - arn:aws:s3:::jportal-pi-uploads-${self:custom.envName}/ci/*
         - Effect: Allow
           Action:
             - s3:ListBucket
@@ -508,6 +510,13 @@ functions:
   # Idempotent (dedup on front_status_imports.source_ref); a keyword pre-filter +
   # per-run Gemini cap bound cost. 1024 MB + concurrency 1 mirror qcFrontImport;
   # inherits the 900s provider timeout for the per-message Gemini calls.
+  #
+  # DISABLED 2026-10-21: ops no longer uses the "Daisy" suggestions. Hard-coded
+  # false like importAsanaOrders, deliberately outside the schedulesEnabled gate,
+  # so a deploy never re-arms it; the live rule was switched off in EventBridge
+  # the same day. Turning it back on means changing the enabled line below (+ a
+  # deploy). qcFrontImport and frontEmailIndex stay on. Manual runs still work
+  # via aws lambda invoke.
   frontStatusImport:
     handler: src/handlers/front-status-import.handler
     memorySize: 1024
@@ -515,7 +524,7 @@ functions:
     events:
       - schedule:
           rate: rate(1 hour)
-          enabled: ${self:custom.schedulesEnabled.${sls:stage}, false}
+          enabled: false
 
   # ── Front email → order indexer (hourly) ──
   # Walks recent Front conversations (ALL senders), matches known order
@@ -618,6 +627,40 @@ functions:
     memorySize: 512
     reservedConcurrency: 5
     maximumRetryAttempts: 1
+
+  # ── Supplier-portal commercial-invoice check ──
+  # Reads a commercial invoice a supplier uploaded through the supplier portal
+  # (no shipment: suppliers do not know ours) with the balance-invoice
+  # reader's prompt and schema, and suggests which of the supplier's booked
+  # shipments it belongs to — for staff only, in jportal.ci_submissions
+  # (src/services/ci-check.js); staff import it on the shipment in ShipLine.
+  # Same wiring as plCheck: this stack's EventBridge rule on the portal bucket
+  # (prefix ci/), plus the portal's direct async invoke by this explicit name
+  # (its deploy.sh checks jportal-ci-check-<env>). 300 s under the claim's
+  # STALE_CHECK_SECONDS (600); concurrency 3 caps Gemini spend (nobody waits
+  # on it: staff review later); one async retry only helps a failure before
+  # the claim. Staff re-reads run in ordersApi, not here. Alarm: resources.
+  ciCheck:
+    handler: src/handlers/ci-check.handler
+    name: jportal-ci-check-${self:custom.envName}
+    timeout: 300
+    memorySize: 1024
+    reservedConcurrency: 3
+    maximumRetryAttempts: 1
+    events:
+      - eventBridge:
+          pattern:
+            source:
+              - aws.s3
+            detail-type:
+              - Object Created
+            detail:
+              bucket:
+                name:
+                  - jportal-pi-uploads-${self:custom.envName}
+              object:
+                key:
+                  - prefix: 'ci/'
 
   # ── Daily alerts generator (nightly) ──
   # Aggregates the day's container ETAs + supplier ready dates into the
@@ -875,6 +918,29 @@ resources:
         Dimensions:
           - Name: FunctionName
             Value: jportal-pl-refresh-${self:custom.envName}
+        Statistic: Sum
+        Period: 300
+        EvaluationPeriods: 1
+        Threshold: 0
+        ComparisonOperator: GreaterThanThreshold
+        TreatMissingData: notBreaching
+        AlarmActions: !If [HasAlertsTopic, ['${self:custom.alertsTopicArn}'], !Ref 'AWS::NoValue']
+
+    # ── Supplier-portal commercial-invoice alarm (ciCheck) ──
+    # Errors only: nobody waits on a run (staff review the queue later, and a
+    # failed or missing read shows there with "Read again"), so throttling and
+    # duration just delay a suggestion. Errors > 0: run() threw — a failure to
+    # write the failed row itself, or a crash before the claim.
+    CiCheckErrorsAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: jportal-ci-check-${self:custom.envName}-errors
+        AlarmDescription: The supplier-portal commercial-invoice check (ciCheck) threw. Check its log group.
+        Namespace: AWS/Lambda
+        MetricName: Errors
+        Dimensions:
+          - Name: FunctionName
+            Value: jportal-ci-check-${self:custom.envName}
         Statistic: Sum
         Period: 300
         EvaluationPeriods: 1

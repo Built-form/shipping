@@ -21,12 +21,17 @@ reuses the stored extraction — no second Gemini read — into the existing pac
 with the live pooled check, kept current by the `plRefresh` Lambda on every page open. No email.
 
 ```
-portal:   draft ──submit──▶ submitted ──withdraw──▶ withdrawn
+portal:   draft ──sent on upload──▶ submitted ──withdraw──▶ withdrawn
             │                   │ ▲
             └─discard─▶ discarded │ │ returned to Pending (its packing list or container deleted)
 shipping:                       ├─┼──import──▶ imported   (packing_lists row, source 'portal')
                                 └──reject───▶ rejected   (note shown to the supplier)
 ```
+
+The portal sends a packing list to staff **as soon as its file arrives**, before the check
+finishes (a draft only stays a draft when that send is refused, e.g. the same file already sent).
+So a submitted row may still be `checkStatus: pending` for a minute or two; plCheck writes its
+result onto the submitted row, and Import reads the file again when there is no usable extraction.
 
 **Staff always confirm the container.** The matcher only suggests one; nothing reaches
 `packing_lists` without an Import. Drafts and discarded rows are never shown to staff.
@@ -211,7 +216,7 @@ type PlCandidate = {               // one scored container (pl-match.js scoreCan
   conflicts: string[];                             // the conflict codes this candidate is part of
 };
 type PlConflict = { code: string; message: string; candidates: string[]; boxNumbers?: string[] };   // the matcher's top-level list
-type PlAcknowledged = { sawNoResult: true } | { sawNoResult: false; suggestedLabel: string|null; confidence: PlMatchConfidence|null; reason: PlMatchReason|null };
+type PlAcknowledged = { sentOnUpload: true } | { sawNoResult: true } | { sawNoResult: false; suggestedLabel: string|null; confidence: PlMatchConfidence|null; reason: PlMatchReason|null };
 
 type PlSubmissionDetail = {
   submission: PlSubmission;
@@ -240,7 +245,9 @@ type PlSubmissionPreview = {
 };
 ```
 
-`acknowledged` is inferred: the portal asks for an acknowledgement only for a confident suggestion
+`acknowledged` is inferred. `{ sentOnUpload: true }` when the row was sent before its check finished
+(`submitted_at` at or before `checked_at`, or no check yet): the usual case now, with nothing
+acknowledged and any note optional. For older rows: the portal asked for an acknowledgement only for a confident suggestion
 with differences (or printed totals that do not add up), and the one way such a row arrives with
 `warningsAcknowledged: false` is the portal's group gate, which showed the supplier no result (the
 gate's answer is in jportal's own audit, not on the row). `audit` actions: `check_succeeded`,
@@ -371,7 +378,9 @@ that excludes the other supplier on the container).
   on the bucket (so a missing object answers 404). No tagging, no delete.
 - Function `plCheck`, named **`jportal-pl-check-<env>`**, 300 s, 1024 MB, reserved concurrency 5, one
   async retry, its EventBridge rule on the portal bucket with prefix `pl/`, the provider VPC and env
-  (`GEMINI_API_KEY`, `PACKING_LIST_GEMINI_MODEL`).
+  (`GEMINI_API_KEY`, `PACKING_LIST_GEMINI_MODEL`, `PACKING_LIST_GEMINI_TIER` — the read is sent at
+  Gemini's `priority` service tier unless this says otherwise; see `GEMINI_TIER` in
+  src/services/packing-list-check.js).
 - Function `plRefresh`, named **`jportal-pl-refresh-<env>`**, 60 s, 512 MB, reserved concurrency 5,
   database only (no S3, no Gemini), so a batch of checks never holds up page opens.
 - Alarms (`resources`): `jportal-pl-check-<env>-errors`, `-throttles`, `-duration-p99` (> 270 s) and

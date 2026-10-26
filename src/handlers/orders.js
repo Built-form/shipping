@@ -55,6 +55,7 @@ const { registerPaymentAlertRoutes } = require('../services/payment-alert-routes
 const { registerPoChangeRequestRoutes } = require('../services/po-change-request-routes');
 const { registerPiSubmissionRoutes } = require('../services/pi-submission-routes');
 const { registerPlSubmissionRoutes } = require('../services/pl-submission-routes');
+const { registerCiSubmissionRoutes } = require('../services/ci-submission-routes');
 // Bank-detail verification on portal PIs: the positive payment gate (isPayable).
 const bankVerification = require('../lib/bank-verification');
 const { registerPaymentDueDateRoutes } = require('../services/payment-due-date-routes');
@@ -11927,6 +11928,28 @@ registerPlSubmissionRoutes(app, {
     poBucket: PO_BUCKET,
     publicS3Url,
     recordAudit,
+    log,
+});
+
+// ── Supplier-portal commercial invoices (/api/v1/ci-submissions) ──────────
+// Invoices suppliers uploaded through the supplier portal with no shipment
+// (jportal.ci_submissions), read by the ciCheck Lambda, which suggests one of
+// the supplier's shipments; imported here on the shipment staff confirm (a
+// shipment payment document, read as an emailed invoice uploaded above is) or
+// rejected. Frontend guide: docs/ci-submissions-frontend.md.
+registerCiSubmissionRoutes(app, {
+    withConnection,
+    pool,
+    ready: async () => {
+        await auditLogSchemaReady;
+        await shipmentsSchemaReady;
+        await shipmentPaymentsSchemaReady;
+    },
+    s3,
+    poBucket: PO_BUCKET,
+    publicS3Url,
+    shipmentPaymentDocumentRowToJson,
+    runShipmentPaymentExtraction,
     log,
 });
 

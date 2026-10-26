@@ -21,7 +21,9 @@
 // Steps:
 //   1. parse the trigger; read the row; planEvent decides whether to try.
 //   2. direct only: HeadObject. A missing object stops here, no attempt used.
-//   3. claim: one guarded UPDATE (status draft, attempts < 3, claimable state)
+//   3. claim: one guarded UPDATE (status draft or submitted — the portal sends
+//      a packing list to staff as soon as its file arrives, so the check
+//      usually runs on a submitted row — attempts < 3, claimable state)
 //      → pending, attempt + 1. No row changed: someone else has it; stop.
 //      STALE_CHECK_SECONDS (600) is well above this function's 300 s timeout.
 //   4. GetObject. Missing after the claim: back to awaiting_upload with the
@@ -99,7 +101,7 @@ function createPlChecker({
                     extract_json = COALESCE(?, extract_json), row_count = COALESCE(?, row_count),
                     invoice_number = COALESCE(?, invoice_number),
                     row_version = row_version + 1
-              WHERE id = ? AND check_attempt = ? AND check_status = 'pending' AND status = 'draft'`,
+              WHERE id = ? AND check_attempt = ? AND check_status = 'pending' AND ${L.CHECKABLE_SQL}`,
             [
                 code, String(message || code).slice(0, 1000),
                 read ? String(read.modelUsed || '').slice(0, 64) || null : null,
@@ -208,7 +210,7 @@ function createPlChecker({
                     `UPDATE ${jportalSchema()}.pl_submissions
                         SET check_status = 'awaiting_upload', check_attempt = check_attempt - 1, check_started_at = NULL,
                             row_version = row_version + 1
-                      WHERE id = ? AND check_attempt = ? AND check_status = 'pending' AND status = 'draft'`,
+                      WHERE id = ? AND check_attempt = ? AND check_status = 'pending' AND ${L.CHECKABLE_SQL}`,
                     [row.id, attempt]
                 ));
                 return { outcome: 'released', submissionId: Number(row.id), reason: isMissing(e) ? 'file_missing' : 'fetch_failed' };
@@ -223,7 +225,7 @@ function createPlChecker({
             }
             const pinned = await withConn(conn => conn.query(
                 `UPDATE ${jportalSchema()}.pl_submissions SET s3_etag = ?, file_size = ?, row_version = row_version + 1
-                  WHERE id = ? AND check_attempt = ? AND check_status = 'pending' AND status = 'draft'`,
+                  WHERE id = ? AND check_attempt = ? AND check_status = 'pending' AND ${L.CHECKABLE_SQL}`,
                 [etag, bytes.length, row.id, attempt]
             ));
             if (pinned[0].affectedRows !== 1) return { outcome: 'skipped', submissionId: Number(row.id), reason: 'claim_lost' };
@@ -296,7 +298,7 @@ function createPlChecker({
                         suggested_kind = ?, suggested_container_number = ?, suggested_draft_id = ?, suggested_label = ?,
                         verdict = ?, discrepancy_count = ?, result_json = ?, result_state = ?, result_at = UTC_TIMESTAMP(),
                         row_version = row_version + 1
-                  WHERE id = ? AND check_attempt = ? AND check_status = 'pending' AND status = 'draft'`,
+                  WHERE id = ? AND check_attempt = ? AND check_status = 'pending' AND ${L.CHECKABLE_SQL}`,
                 [
                     String(read.modelUsed || '').slice(0, 64) || null,
                     u.promptTokenCount ?? null, u.candidatesTokenCount ?? null, u.totalTokenCount ?? null,

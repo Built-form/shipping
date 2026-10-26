@@ -629,6 +629,16 @@ function qcSectionOf(context) {
 
 function promptFor(context) {
     const s = context.shipment;
+    if (!s && context.portalUpload) {
+        // Sent by the supplier through the supplier portal with no shipment
+        // (src/services/ci-check.js): what it prints is how we find the box.
+        return [
+            '## Context',
+            'The supplier uploaded this document through our supplier portal as their commercial invoice — the invoice for goods being shipped to us, usually a balance invoice. We do not know yet which shipment it is for, and no purchase orders are listed here: copy every container number, bill-of-lading number and purchase-order reference exactly as printed, so we can find the shipment. Read it as it is.',
+            '',
+            ...qcSectionOf(context),
+        ].join('\n');
+    }
     if (!s) {
         // An invoice on the supplier alone bills QC units (they belong to no
         // container, user 2026-09-29); anything else there is a proof of payment.
@@ -691,21 +701,25 @@ function noPaymentReason({ documentKind, hasShipment, invoiceKind }) {
     return 'checked';
 }
 
-/** Runs the model over one document. Returns { parsed, modelUsed, usage }. */
-async function readDocument({ s3Key, contentType, context, model }) {
+/** Runs the model over one document. Returns { parsed, modelUsed, usage }.
+ *  `bytes` (a Buffer), when given, is read instead of fetching `s3Key` from
+ *  the PO bucket: the supplier portal's uploads live in the portal's bucket. */
+async function readDocument({ s3Key, contentType, context, model, bytes: given = null }) {
     if (!process.env.GEMINI_API_KEY) {
         const err = new Error('GEMINI_API_KEY is not configured.');
         err.code = 'NOT_CONFIGURED';
         throw err;
     }
-    let bytes;
-    try {
-        bytes = await fetchInvoicePdf(s3Key);
-    } catch (e) {
-        const err = new Error(`Could not read the uploaded document: ${e.message}`);
-        err.code = 'PDF_FETCH_FAILED';
-        err.cause = e;
-        throw err;
+    let bytes = given;
+    if (!bytes) {
+        try {
+            bytes = await fetchInvoicePdf(s3Key);
+        } catch (e) {
+            const err = new Error(`Could not read the uploaded document: ${e.message}`);
+            err.code = 'PDF_FETCH_FAILED';
+            err.cause = e;
+            throw err;
+        }
     }
     const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
     const promptText = [SYSTEM_INSTRUCTION, '', promptFor(context)].join('\n');

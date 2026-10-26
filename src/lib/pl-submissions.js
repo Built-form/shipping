@@ -8,7 +8,8 @@
 // prompt (packing-list-check.js readPackingList), suggests a container
 // (src/lib/pl-match.js) and writes a supplier-safe result; plRefresh
 // (src/services/pl-results.js) recomputes that result whenever the supplier
-// opens the page. The supplier sends it; staff confirm the container and
+// opens the page. The portal sends it to staff as soon as the file arrives,
+// while the check is still running; staff confirm the container and
 // import it into the existing packing-list check, or ask for a correction
 // (src/services/pl-submission-routes.js).
 //
@@ -29,9 +30,31 @@ const PI = require('./pi-submissions');
 const {
     STALE_CHECK_SECONDS, MAX_CHECK_ATTEMPTS, RETRYABLE_CODES, MAX_FILE_BYTES, ALLOWED_TYPES,
     CHECK_STATUSES, VISIBLE_STATUSES, DECIDED_STATUSES, DECIDER_ROLES,
-    canDecide, sniffType, safeFilename, planEvent, claimWhere, parseJson,
+    canDecide, sniffType, safeFilename, parseJson,
     positiveInt, parseRowVersion, parseNote, escapeHtml,
 } = PI;
+
+// ── The claim ────────────────────────────────────────────────────────────────
+// Unlike a PI, a packing list is sent to staff the moment its file arrives
+// (jportal's `uploaded`), so its check usually runs on a `submitted` row: the
+// claim and every write after it accept a draft or a submitted row. Once staff
+// decide (imported, rejected) or it is withdrawn, the check writes nothing.
+const CHECKABLE_STATUSES = ['draft', 'submitted'];
+const CHECKABLE_SQL = `status IN ('draft', 'submitted')`;
+
+// PI's planEvent, with a submitted row planned as a draft would be.
+function planEvent(source, row, now) {
+    if (row && row.status === 'submitted') return PI.planEvent(source, { ...row, status: 'draft' }, now);
+    return PI.planEvent(source, row, now);
+}
+
+// PI's claimWhere, with the status condition widened to CHECKABLE_SQL.
+function claimWhere(source) {
+    const guard = PI.claimWhere(source);
+    const sql = guard.sql.replace(`status = 'draft'`, CHECKABLE_SQL);
+    if (sql === guard.sql) throw new Error('pl-submissions: PI claimWhere no longer starts with the draft condition');
+    return { ...guard, sql };
+}
 
 const PL_KEY_RE = /^pl\/[0-9a-f-]{36}\.(pdf|png|jpg)$/;
 const isPlKey = key => typeof key === 'string' && PL_KEY_RE.test(key);
@@ -440,6 +463,8 @@ module.exports = {
     parseNote,
     escapeHtml,
     // PL's own
+    CHECKABLE_STATUSES,
+    CHECKABLE_SQL,
     PL_KEY_RE,
     STATUSES,
     CONFIDENCES,

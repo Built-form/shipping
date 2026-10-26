@@ -131,8 +131,15 @@ function candidateToJson(c) {
  * group gate, which showed the supplier no result (the gate's answer is in
  * jportal's own audit, not on the row — this is the inference). Null when the
  * check never succeeded (the supplier saw the failure and wrote a note).
+ *
+ * Since the portal sends a packing list as soon as its file arrives, most rows
+ * are sent before their check finishes: { sentOnUpload: true }, nothing
+ * acknowledged (the supplier may add a note afterwards).
  */
 function acknowledgedOf(row) {
+    const sent = row.submitted_at_iso || null;
+    const checked = row.checked_at_iso || null;
+    if (sent && (!checked || sent <= checked)) return { sentOnUpload: true };
     if (row.check_status !== 'succeeded') return null;
     const result = parseJson(row.result_json);
     const confident = row.match_confidence === 'confident';
