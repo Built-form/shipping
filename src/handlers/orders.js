@@ -2575,19 +2575,46 @@ app.delete('/api/v1/planned-containers/:id', async (req, res) => {
 // down with the PO PDF block. That's fine — route handlers close over the
 // module scope, so by the time a request fires those bindings exist.
 
-// Aggregates allocations for one draft into PDF-ready lines. CBM per line is
+// The rows a quote document is built from, as FROM / WHERE / ORDER BY parts
+// that yield `allocated` per row. A draft name reads that draft's allocations
+// (legacy truth while it is open). { reference } reads a booked container's own
+// live orders at their quantities (legacy truth is TRIM(orders.container_number)):
+// booking deleted the draft's allocations, and a partial pack split the order so
+// the packed slice is its own row. See lib/shipments.js documentSource.
+function quoteLineSource(source) {
+    if (source && typeof source === 'object') {
+        return {
+            allocated: 'o.quantity AS allocated',
+            from: 'orders o',
+            where: 'o.deleted_at IS NULL AND TRIM(o.container_number) = ?',
+            orderBy: 'o.id ASC',
+            params: [source.reference],
+        };
+    }
+    return {
+        allocated: 'dca.allocated',
+        from: `draft_container_allocations dca
+           INNER JOIN orders o ON o.id = dca.order_id AND o.deleted_at IS NULL`,
+        where: 'dca.draft_container_name = ?',
+        orderBy: 'dca.id ASC',
+        params: [source],
+    };
+}
+
+// Aggregates allocations for one draft (or a booked container's orders, see
+// quoteLineSource) into PDF-ready lines. CBM per line is
 // cbm_per_unit × allocated when available; falls back to a proportional
 // slice of order_cbm. Cartons are computed from units_per_carton.
-async function loadDraftForPdf(conn, draftName) {
+async function loadDraftForPdf(conn, source) {
+    const src = quoteLineSource(source);
     const [rows] = await conn.query(
-        `SELECT dca.allocated, dca.draft_container_name,
+        `SELECT ${src.allocated},
                 o.id AS order_id, o.jf_code, o.asin, o.product_name, o.quantity,
                 o.cbm_per_unit, o.order_cbm, o.units_per_carton, o.port, o.lot_number
-           FROM draft_container_allocations dca
-           INNER JOIN orders o ON o.id = dca.order_id AND o.deleted_at IS NULL
-          WHERE dca.draft_container_name = ?
-          ORDER BY dca.id ASC`,
-        [draftName]
+           FROM ${src.from}
+          WHERE ${src.where}
+          ORDER BY ${src.orderBy}`,
+        src.params
     );
 
     const originPorts = [...new Set(rows.map(r => r.port).filter(Boolean))];
@@ -2620,18 +2647,19 @@ async function loadDraftForPdf(conn, draftName) {
 // with carton weight/dimensions. Source precedence: the spec frozen on the
 // order row at create time (so a regenerated quote reproduces the original
 // numbers even after jfpro.products changes), then the live product_carton_sizes
-// view (joined by jf_code), then unit-weight × units-per-carton.
-async function loadForwarderQuoteForPdf(conn, draftName, supplierName = null) {
+// view (joined by jf_code), then unit-weight × units-per-carton. `source` is a
+// draft name or a booked container's { reference } (quoteLineSource).
+async function loadForwarderQuoteForPdf(conn, source, supplierName = null) {
+    const src = quoteLineSource(source);
     const [allRows] = await conn.query(
-        `SELECT dca.allocated,
+        `SELECT ${src.allocated},
                 o.jf_code, o.asin, o.product_name, o.supplier, o.port, o.po_number,
                 o.units_per_carton, o.lot_number,
                 o.carton_weight, o.carton_height, o.carton_width, o.carton_depth, o.carton_cbm
-           FROM draft_container_allocations dca
-           INNER JOIN orders o ON o.id = dca.order_id AND o.deleted_at IS NULL
-          WHERE dca.draft_container_name = ?
-          ORDER BY dca.id ASC`,
-        [draftName]
+           FROM ${src.from}
+          WHERE ${src.where}
+          ORDER BY ${src.orderBy}`,
+        src.params
     );
     // For supplier-quote, keep only rows whose order supplier matches the
     // requested one (orders store supplier as free text; compare trimmed/casefold).
@@ -2720,16 +2748,16 @@ async function buildDraftDocumentCsv(conn, doc) {
 // trimmed and de-duplicated case-insensitively so we don't emit two near-identical
 // per-supplier PDFs for "Acme" vs "acme". Blank suppliers are skipped — a file
 // can't be named after a nameless supplier; those lines still appear in the main
-// forwarder PDF.
-async function loadDraftSuppliers(conn, draftName) {
+// forwarder PDF. `source` is a draft name or a booked container's { reference }.
+async function loadDraftSuppliers(conn, source) {
+    const src = quoteLineSource(source);
     const [rows] = await conn.query(
         `SELECT DISTINCT TRIM(o.supplier) AS supplier
-           FROM draft_container_allocations dca
-           INNER JOIN orders o ON o.id = dca.order_id AND o.deleted_at IS NULL
-          WHERE dca.draft_container_name = ?
+           FROM ${src.from}
+          WHERE ${src.where}
             AND o.supplier IS NOT NULL AND TRIM(o.supplier) <> ''
           ORDER BY supplier ASC`,
-        [draftName]
+        src.params
     );
     const seen = new Set();
     const out = [];
@@ -2748,10 +2776,15 @@ async function loadDraftSuppliers(conn, draftName) {
 // supplier-quote), returning its DB record. Extracted from the generate route so
 // the route can produce a main forwarder PDF plus one per-supplier PDF in a single
 // request. Returns { noLines: true } when the (filtered) draft has no lines.
-async function generateDraftDocument(conn, { name, docType, supplierName, comments, generatedByEmail, batchId = null }) {
+// `booked` = { shipmentId, reference } for a booked container: its lines come
+// from its own orders, `name` is its reference, the row carries its shipment id
+// and versions continue across all of that shipment's documents (its draft's
+// included), so a rename does not restart them at v1.
+async function generateDraftDocument(conn, { name, docType, supplierName, comments, generatedByEmail, batchId = null, booked = null }) {
+    const source = booked ? { reference: booked.reference } : name;
     const { lines, originPorts } = docType === 'quote'
-        ? await loadDraftForPdf(conn, name)
-        : await loadForwarderQuoteForPdf(conn, name, supplierName);
+        ? await loadDraftForPdf(conn, source)
+        : await loadForwarderQuoteForPdf(conn, source, supplierName);
     if (!lines.length) return { noLines: true };
 
     const draftMeta = { name, date: new Date(), originPorts, comments: comments || '', supplier: supplierName };
@@ -2768,14 +2801,15 @@ async function generateDraftDocument(conn, { name, docType, supplierName, commen
     }
 
     // Versions are sequenced per (draft, type, supplier) so each flavour — and
-    // each supplier within supplier-quote — has its own v1, v2, …
+    // each supplier within supplier-quote — has its own v1, v2, … (per shipment
+    // instead of per draft name for a booked container).
     const [versionRows] = await conn.query(
         `SELECT COALESCE(MAX(version), 0) AS max_version
            FROM draft_container_documents
-          WHERE draft_container_name = ? AND type = ?
+          WHERE ${booked ? 'shipment_id = ?' : 'draft_container_name = ?'} AND type = ?
             AND ((supplier IS NULL AND ? IS NULL) OR supplier = ?)
             AND deleted_at IS NULL`,
-        [name, docType, supplierName, supplierName]
+        [booked ? booked.shipmentId : name, docType, supplierName, supplierName]
     );
     const version = Number(versionRows[0].max_version) + 1;
     const safeName = name.replace(/[^A-Za-z0-9._-]/g, '_');
@@ -2784,9 +2818,12 @@ async function generateDraftDocument(conn, { name, docType, supplierName, commen
     // copy) carries the supplier name stripped to a–z so it doesn't collide with
     // the combined PDF or the other suppliers' copies.
     const supplierSlug = supplierName ? (supplierName.replace(/[^A-Za-z]/g, '') || 'supplier') : null;
+    // The file name the email attaches: a supplier-quote is titled "Request to
+    // send" on the page, so its file says so too (the type stays supplier-quote).
+    const filePrefix = docType === 'supplier-quote' ? 'request-to-send' : docType;
     const fileBase = supplierSlug
-        ? `${docType}-${supplierSlug}-${safeName}-v${version}`
-        : `${docType}-${safeName}-v${version}`;
+        ? `${filePrefix}-${supplierSlug}-${safeName}-v${version}`
+        : `${filePrefix}-${safeName}-v${version}`;
     const s3Key = `draft-containers/${token}/${fileBase}.pdf`;
     const publicUrl = publicS3Url(s3Key);
     // CSV sibling, same key prefix so it lives next to the PDF in S3.
@@ -2813,10 +2850,11 @@ async function generateDraftDocument(conn, { name, docType, supplierName, commen
     const [insertResult] = await conn.query(
         `INSERT INTO draft_container_documents
             (draft_container_name, version, type, supplier, s3_key, public_url, file_size,
-             csv_s3_key, csv_public_url, csv_file_size, generated_by_email, batch_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             csv_s3_key, csv_public_url, csv_file_size, generated_by_email, batch_id, shipment_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [name, version, docType, supplierName, s3Key, publicUrl, pdfBuffer.length,
-         csvS3Key, csvPublicUrl, csvBuffer.length, generatedByEmail || null, batchId]
+         csvS3Key, csvPublicUrl, csvBuffer.length, generatedByEmail || null, batchId,
+         booked ? booked.shipmentId : null]
     );
     return {
         documentId: insertResult.insertId,
@@ -2850,10 +2888,14 @@ function draftNameFromPath(raw) {
 // can attach the whole set. Extracted from the generate route below so POST
 // /shipments/:id/documents produces exactly the same set. Returns { noLines }
 // or { main, batchId, supplierDocuments?, failedSuppliers? }.
-async function generateDraftDocumentSet(conn, { name, docType, supplierName, comments, wantSplit, userEmail }) {
+// `booked` = { shipmentId, reference } generates for a booked container instead
+// (see generateDraftDocument); its event goes to the shipment's history, never
+// the draft's: ensureDraftRegistered would reopen the converted draft.
+async function generateDraftDocumentSet(conn, { name, docType, supplierName, comments, wantSplit, userEmail, booked = null }) {
+    if (booked) name = booked.reference;
     const batchId = wantSplit ? uuidv4() : null;
     const main = await generateDraftDocument(conn, {
-        name, docType, supplierName, comments, generatedByEmail: userEmail, batchId,
+        name, docType, supplierName, comments, generatedByEmail: userEmail, batchId, booked,
     });
     if (main.noLines) return { noLines: true };
 
@@ -2862,14 +2904,14 @@ async function generateDraftDocumentSet(conn, { name, docType, supplierName, com
         // One PDF per supplier, best-effort: a single supplier failing (or
         // having no lines after filtering) must not lose the main PDF or the
         // other suppliers. Collect outcomes for the response.
-        const suppliers = await loadDraftSuppliers(conn, name);
+        const suppliers = await loadDraftSuppliers(conn, booked ? { reference: booked.reference } : name);
         const supplierDocuments = [];
         const failedSuppliers = [];
         for (const s of suppliers) {
             try {
                 const doc = await generateDraftDocument(conn, {
                     name, docType: 'forwarder-quote', supplierName: s,
-                    comments, generatedByEmail: userEmail, batchId,
+                    comments, generatedByEmail: userEmail, batchId, booked,
                 });
                 if (!doc.noLines) supplierDocuments.push(doc);
             } catch (err) {
@@ -2882,19 +2924,26 @@ async function generateDraftDocumentSet(conn, { name, docType, supplierName, com
 
     // One event per generate run (a split run lists its per-supplier copies
     // inside the event rather than becoming N rows).
+    const event = {
+        documentId: main.documentId, type: docType, supplier: supplierName, version: main.version,
+        url: main.url, csvUrl: main.csvUrl, batchId,
+        comments: comments ? String(comments).slice(0, 500) : null,
+        supplierDocuments: (out.supplierDocuments || []).map(d => ({
+            documentId: d.documentId, supplier: d.supplier, version: d.version, url: d.url, csvUrl: d.csvUrl,
+        })),
+        failedSuppliers: out.failedSuppliers || [],
+    };
+    if (booked) {
+        await recordAudit(conn, {
+            entityType: 'shipment', entityId: booked.shipmentId, action: 'document_generated',
+            before: null, after: { reference: booked.reference, ...event }, userEmail,
+        });
+        return out;
+    }
     const reg = await draftAudit.ensureDraftRegistered(conn, name, userEmail);
     await draftAudit.recordDraftAudit(conn, {
         draftId: reg.id, action: 'document_generated',
-        after: {
-            draftName: reg.name,
-            documentId: main.documentId, type: docType, supplier: supplierName, version: main.version,
-            url: main.url, csvUrl: main.csvUrl, batchId,
-            comments: comments ? String(comments).slice(0, 500) : null,
-            supplierDocuments: (out.supplierDocuments || []).map(d => ({
-                documentId: d.documentId, supplier: d.supplier, version: d.version, url: d.url, csvUrl: d.csvUrl,
-            })),
-            failedSuppliers: out.failedSuppliers || [],
-        },
+        after: { draftName: reg.name, ...event },
         userEmail,
     });
     return out;
@@ -3084,7 +3133,7 @@ app.post('/api/v1/draft-container-documents/:id/email', async (req, res) => {
 
         const result = await withConnection(async (conn) => {
             const [docRows] = await conn.query(
-                `SELECT id, draft_container_name, version, s3_key, public_url, file_size, csv_s3_key, type, supplier, batch_id
+                `SELECT id, draft_container_name, version, s3_key, public_url, file_size, csv_s3_key, type, supplier, batch_id, shipment_id
                    FROM draft_container_documents
                   WHERE id = ? AND deleted_at IS NULL`,
                 [id]
@@ -3219,22 +3268,35 @@ app.post('/api/v1/draft-container-documents/:id/email', async (req, res) => {
             const sentAt = sentRow[0]?.sent_at?.toISOString?.() ?? sentRow[0]?.sent_at ?? null;
             await linkReceiptToSend(conn, receiptToken, 'draft_container_document_sends', primarySendId);
 
-            // One email = one draft event, listing every PDF it carried.
-            const reg = await draftAudit.ensureDraftRegistered(conn, doc.draft_container_name, req.userEmail);
-            await draftAudit.recordDraftAudit(conn, {
-                draftId: reg.id, action: 'document_sent',
-                after: {
-                    draftName: reg.name,
-                    documentId: doc.id, type: doc.type || 'quote', supplier: doc.supplier || null, version: doc.version,
-                    sendId: primarySendId, sentTo: toAddresses, subject: finalSubject,
-                    frontMessageUid, frontConversationId, receiptToken,
-                    attachments: attachments.map(a => ({
-                        documentId: a.doc.id, type: a.doc.type || 'quote', supplier: a.doc.supplier || null,
-                        version: a.doc.version, filename: a.pdf.filename, csvFilename: a.csv ? a.csv.filename : null,
-                    })),
-                },
-                userEmail: req.userEmail,
-            });
+            // One email = one event, listing every PDF it carried: in the draft's
+            // history while the document's shipment is open, else the shipment's
+            // (ensureDraftRegistered would reopen a converted draft).
+            const sentEvent = {
+                documentId: doc.id, type: doc.type || 'quote', supplier: doc.supplier || null, version: doc.version,
+                sendId: primarySendId, sentTo: toAddresses, subject: finalSubject,
+                frontMessageUid, frontConversationId, receiptToken,
+                attachments: attachments.map(a => ({
+                    documentId: a.doc.id, type: a.doc.type || 'quote', supplier: a.doc.supplier || null,
+                    version: a.doc.version, filename: a.pdf.filename, csvFilename: a.csv ? a.csv.filename : null,
+                })),
+            };
+            const [[owner]] = doc.shipment_id
+                ? await conn.query(`SELECT id, stage FROM shipments WHERE id = ?`, [doc.shipment_id])
+                : [[null]];
+            if (shipmentsLib.documentHistoryOwner(owner ? owner.stage : null) === 'shipment') {
+                await recordAudit(conn, {
+                    entityType: 'shipment', entityId: owner.id, action: 'document_sent',
+                    before: null, after: { draftContainerName: doc.draft_container_name, ...sentEvent },
+                    userEmail: req.userEmail,
+                });
+            } else {
+                const reg = await draftAudit.ensureDraftRegistered(conn, doc.draft_container_name, req.userEmail);
+                await draftAudit.recordDraftAudit(conn, {
+                    draftId: reg.id, action: 'document_sent',
+                    after: { draftName: reg.name, ...sentEvent },
+                    userEmail: req.userEmail,
+                });
+            }
 
             return {
                 ok: true,
@@ -10850,6 +10912,8 @@ function parseSupplierPaymentBody(body, { partial = false } = {}) {
                 const ba = Number(entry.balanceAmount);
                 if (!Number.isFinite(ba) || ba <= 0) return { error: 'lines[].balanceAmount must be a number above 0.', code: 'BAD_LINES' };
                 line.balanceAmount = Math.round(ba * 100) / 100;
+                // The record is the invoice total with extras paid on their own lines: keep its split.
+                if (entry.balanceKeepSplit === true) line.balanceKeepSplit = true;
             }
             if (kind === 'container_balance') {
                 // The balance to record: the projected figure (default: what
@@ -10962,7 +11026,7 @@ async function correctBalanceRecords(conn, { lines, userEmail, excludePaymentId 
         const before = await loadShipmentPaymentById(conn, l.id);
         if (!before || (before.status !== 'pending' && before.status !== 'arranged')) continue;
         const fixed = correctBalance({
-            amount: before.amount, applied: applied.get(`balance:${l.id}`) || 0, balanceAmount: l.balanceAmount,
+            amount: before.amount, applied: applied.get(`balance:${l.id}`) || 0, balanceAmount: l.balanceAmount, keepSplit: !!l.balanceKeepSplit,
             allocations: before.allocations.map(a => ({ purchaseOrderId: a.purchaseOrderId, poRef: a.poRef, amount: a.amount, source: a.source })),
         });
         if (!fixed) continue;

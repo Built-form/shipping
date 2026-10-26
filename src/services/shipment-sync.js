@@ -1778,11 +1778,20 @@ async function verifyAll(conn, { fix = false, userEmail = null } = {}) {
 
 // Every stamped document must point at a shipment that is, or was, linked to
 // its registry row: the registry's current pointer, a shipment sourced from
-// the row, or anything those were merged into.
+// the row, or anything those were merged into. A document with no registry row
+// at all was generated on a booked shipment (POST /shipments/:id/documents
+// names it by the reference, which is no draft's name): it is linked when the
+// shipment it was stamped with, or the one that was merged into, is not open.
 async function documentLinkDrift(conn) {
-    const [shipRows] = await conn.query(`SELECT id, source_draft_id, merged_into_id FROM shipments`);
+    const [shipRows] = await conn.query(`SELECT id, source_draft_id, merged_into_id, stage FROM shipments`);
     const [regRows] = await conn.query(`SELECT id, shipment_id FROM draft_containers`);
     const mergedInto = new Map(shipRows.map(s => [s.id, s.merged_into_id]));
+    const stageOf = new Map(shipRows.map(s => [s.id, s.stage]));
+    const survivorOf = (id) => {
+        const seen = new Set();
+        while (mergedInto.get(id) && !seen.has(id)) { seen.add(id); id = mergedInto.get(id); }
+        return id;
+    };
     const bySource = new Map();
     for (const s of shipRows) {
         if (s.source_draft_id == null) continue;
@@ -1812,6 +1821,10 @@ async function documentLinkDrift(conn) {
         for (const d of docs) {
             const l = d.registry_id != null ? linked.get(d.registry_id) : null;
             if (l && l.set.has(d.shipment_id)) continue;
+            if (d.registry_id == null) {
+                const owner = survivorOf(d.shipment_id);
+                if (stageOf.has(owner) && !S.isOpenStage(stageOf.get(owner))) continue;
+            }
             out.push({ kind, id: d.id, shipmentId: d.shipment_id, registryId: d.registry_id ?? null, registryShipmentId: l ? l.pointer : null });
         }
     }
@@ -1854,6 +1867,7 @@ module.exports = {
     referenceIsFree,
     backfillAll,
     verifyAll,
+    documentLinkDrift,
     mostFrequent,
     intIds,
 };
