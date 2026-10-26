@@ -18,6 +18,7 @@ const {
 // Mintsoft receiving path (see src/services/order-receive.js).
 const { ORDER_SELECT, parseDates, formatDate, formatDateTime, normalizeExpiry, receiptToJson, rowToOrder } = require('../lib/order-shape');
 const { recordAudit } = require('../lib/audit');
+const { pdfLineSnapshot, parseLinesJson } = require('../lib/po-line-snapshot');
 // Draft-container registry + event writer: every draft mutation lands in
 // audit_log as entity_type 'draft_container' against a stable registry id, so
 // a draft's history outlives renames, conversion and deletion.
@@ -6177,6 +6178,9 @@ async function loadPoForPdf(conn, po) {
             quantity: Number(r.quantity || 0),
             unitPrice: r.unit_price != null ? Number(r.unit_price) : 0,
         })),
+        // What this PDF was printed from, saved with the document so ShipLine
+        // can flag lines changed since (src/lib/po-line-snapshot.js).
+        snapshot: pdfLineSnapshot(lineRows, 'generate'),
     };
 }
 
@@ -6191,7 +6195,7 @@ app.post('/api/v1/purchase-orders/:id/generate', async (req, res) => {
             if (!existingRows.length) return { notFound: true };
             const po = rowToPurchaseOrder(existingRows[0]);
 
-            const { po: pdfPo, lines } = await loadPoForPdf(conn, po);
+            const { po: pdfPo, lines, snapshot } = await loadPoForPdf(conn, po);
             if (!lines.length) return { noLines: true };
 
             const pdfBuffer = await buildPoPdf(pdfPo, lines);
@@ -6216,12 +6220,27 @@ app.post('/api/v1/purchase-orders/:id/generate', async (req, res) => {
                 ContentDisposition: `inline; filename="${safePoNumber}-v${version}.pdf"`,
             }));
 
-            const [insertResult] = await conn.query(
-                `INSERT INTO purchase_order_documents
-                    (purchase_order_id, version, s3_key, public_url, file_size, generated_by_email)
-                 VALUES (?, ?, ?, ?, ?, ?)`,
-                [id, version, s3Key, publicUrl, pdfBuffer.length, req.userEmail || null]
-            );
+            const docValues = [id, version, s3Key, publicUrl, pdfBuffer.length, req.userEmail || null];
+            let insertResult;
+            try {
+                [insertResult] = await conn.query(
+                    `INSERT INTO purchase_order_documents
+                        (purchase_order_id, version, s3_key, public_url, file_size, generated_by_email, lines_json)
+                     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+                    [...docValues, JSON.stringify(snapshot)]
+                );
+            } catch (err) {
+                // lines_json migration (2026-10-26_10) not applied here yet:
+                // the PDF still saves, it just has no baseline for change flags.
+                if (err.code !== 'ER_BAD_FIELD_ERROR') throw err;
+                log.warn('[POST /purchase-orders/:id/generate] lines_json column missing; saved without a line snapshot');
+                [insertResult] = await conn.query(
+                    `INSERT INTO purchase_order_documents
+                        (purchase_order_id, version, s3_key, public_url, file_size, generated_by_email)
+                     VALUES (?, ?, ?, ?, ?, ?)`,
+                    docValues
+                );
+            }
             return {
                 documentId: insertResult.insertId,
                 version,
@@ -6268,9 +6287,10 @@ app.get('/api/v1/purchase-orders/:id/documents', async (req, res) => {
         await purchaseOrdersSchemaReady;
         const { id } = req.params;
         const { docs, sendsByDoc } = await withConnection(async (conn) => {
+            // SELECT * so lines_json is read when the column exists and this
+            // still answers before its migration is applied.
             const [r] = await conn.query(
-                `SELECT id, purchase_order_id, version, s3_key, public_url, file_size,
-                        generated_by_email, generated_at
+                `SELECT *
                  FROM purchase_order_documents
                  WHERE purchase_order_id = ?
                  ORDER BY version DESC`,
@@ -6307,6 +6327,7 @@ app.get('/api/v1/purchase-orders/:id/documents', async (req, res) => {
                 generatedByEmail: r.generated_by_email || null,
                 generatedAt: r.generated_at?.toISOString?.() ?? r.generated_at,
                 sends: (sendsByDoc.get(r.id) || []).map(sendRowToJson),
+                lines: parseLinesJson(r.lines_json),
             })),
         });
     } catch (error) {
@@ -7777,10 +7798,10 @@ async function loadPurchaseOrdersForOrders(conn, orders) {
 
     // Documents (+ their email sends). A document is only ever soft-deleted
     // together with its PO, and deleted POs are already excluded above, so
-    // there is no deleted_at filter here.
+    // there is no deleted_at filter here. SELECT * so lines_json is read when
+    // the column exists and GET /orders never fails before its migration.
     const [docRows] = await conn.query(
-        `SELECT id, purchase_order_id, version, s3_key, public_url, file_size,
-                generated_by_email, generated_at
+        `SELECT *
            FROM purchase_order_documents
           WHERE purchase_order_id IN (${ph})
           ORDER BY version DESC`,
@@ -7856,6 +7877,10 @@ async function loadPurchaseOrdersForOrders(conn, orders) {
             generatedByEmail: d.generated_by_email || null,
             generatedAt: d.generated_at?.toISOString?.() ?? d.generated_at,
             sends: (docSends.get(d.id) || []).map(sendRowToJson),
+            // Line snapshot on the newest version only (rows arrive version
+            // DESC): it is the only baseline ShipLine compares against, and
+            // this payload is polled every few seconds.
+            ...(b.documents.length === 0 ? { lines: parseLinesJson(d.lines_json) } : {}),
         });
     }
     for (const r of invRows) {
