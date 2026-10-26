@@ -422,3 +422,183 @@ test('two POs printed on one line: the first printed wins; goods lines are untou
     const swapped = compareInvoiceToContainer({ extract: { ...QC_INVOICE, lines: [{ ...qcLine(null, 'JF0938_FQC', 62, 2.27), description: 'PO_00333J (was SUNMED-93)' }] }, context: THREE_POS, supplierName: SUPPLIER });
     assert.deepEqual(swapped.qcLines.map(l => [l.poNumber, l.issues.length > 0]), [['PO_00333J', true]]);
 });
+
+// ── One product on several lines (user, 2026-10-26) ──────────────────────
+// Sunmed's invoice 26/89138 for container 313 bills the full cartons and the
+// partial carton of one product on two lines (JF0119: 1,500 + 15); the box
+// holds one line of 1,515. Checked one line against one, in printed order,
+// the 15 was taken for the PO's last unbilled product (JF0147, "quantity 15 on
+// the invoice") and JF0147's own line was called "not in the box". The lines
+// of one product are added up and compared as one, on either side, whatever
+// order they are printed in, and a line is never checked against another
+// product the box holds.
+const SPLIT_CTX = {
+    shipment: { reference: '313' }, shipmentCurrency: 'USD',
+    purchaseOrders: [{
+        id: 298, poNumber: 'PO_00298J', supplier: SUPPLIER, supplierKey: KEY, currency: 'USD', valueInShipment: 3002.91, deposit: null,
+        lines: [
+            { jfCode: 'JF0234', productName: 'Wound dressing', quantity: 2130, unitPrice: 0.38 },
+            { jfCode: 'JF0119', productName: 'Butterfly closure', quantity: 1515, unitPrice: 0.61 },
+            { jfCode: 'JF0147', productName: 'Adhesive strip', quantity: 1548, unitPrice: 0.82 },
+        ],
+    }],
+};
+const sl = (jfCode, qty, unitPrice, more = {}) => ({ poRef: 'PO_00298J', jfCode, piRef: null, sku: null, description: null, qty, unitPrice, amount: Math.round(qty * unitPrice * 100) / 100, ...more });
+const SPLIT_LINES = [sl('JF0234', 2100, 0.38), sl('JF0234', 30, 0.38), sl('JF0119', 1500, 0.61), sl('JF0119', 15, 0.61), sl('JF0147', 1548, 0.82)];
+const SPLIT_CI = { documentKind: 'balance_invoice', currency: 'USD', totalAmount: 3002.91, amountDueNow: null, depositDeducted: null, lines: SPLIT_LINES };
+// The invoice's total is what its lines add up to.
+const splitCheck = (lines, context = SPLIT_CTX) => compareInvoiceToContainer({
+    extract: { ...SPLIT_CI, totalAmount: Math.round(lines.reduce((a, l) => a + l.amount, 0) * 100) / 100, lines }, context, supplierName: SUPPLIER,
+});
+const summaryOf = c => ({
+    verdict: c.verdict,
+    lines: c.lines.map(l => [l.poNumber, l.jfCode, l.ourQty, l.invoiceQty, l.ourTotal, l.invoiceTotal, l.issues]),
+    missing: c.missingOurLines.map(l => [l.poNumber, l.jfCode, l.qty]),
+    extra: c.extraInvoiceLines.map(l => [l.jfCode, l.qty]),
+});
+
+test('one product billed on two invoice lines (full cartons + a partial carton) is added up: matches', () => {
+    const c = splitCheck(SPLIT_LINES);
+    assert.deepEqual(summaryOf(c), {
+        verdict: 'match',
+        lines: [
+            ['PO_00298J', 'JF0234', 2130, 2130, 809.4, 809.4, []],
+            ['PO_00298J', 'JF0119', 1515, 1515, 924.15, 924.15, []],
+            ['PO_00298J', 'JF0147', 1548, 1548, 1269.36, 1269.36, []],
+        ],
+        missing: [],
+        extra: [],
+    });
+    assert.equal(c.matchedLines, 3);
+    assert.equal(c.invoiceLinesMatched, 5);
+});
+
+test('the order the invoice lines are printed in changes nothing', () => {
+    const want = summaryOf(splitCheck(SPLIT_LINES));
+    const [a, b, d, e, f] = SPLIT_LINES;
+    for (const order of [[f, a, b, d, e], [e, d, f, b, a], [b, f, e, a, d]]) {
+        assert.deepEqual(summaryOf(splitCheck(order)), want);
+    }
+    // A real difference reads the same whatever the order.
+    const off = [a, b, d, sl('JF0119', 20, 0.61), f];
+    const wantOff = summaryOf(splitCheck(off));
+    assert.deepEqual(summaryOf(splitCheck([...off].reverse())), wantOff);
+});
+
+test('one product on two lines in the box (a split order row) against one invoice line: matches', () => {
+    const ctx = { ...SPLIT_CTX, purchaseOrders: [{ ...SPLIT_CTX.purchaseOrders[0], lines: [
+        { jfCode: 'JF0234', productName: 'Wound dressing', quantity: 2130, unitPrice: 0.38 },
+        { jfCode: 'JF0119', productName: 'Butterfly closure', quantity: 1500, unitPrice: 0.61 },
+        { jfCode: 'JF0147', productName: 'Adhesive strip', quantity: 1548, unitPrice: 0.82 },
+        { jfCode: 'JF0119', productName: 'Butterfly closure', quantity: 15, unitPrice: 0.61 },
+    ] }] };
+    const c = splitCheck([sl('JF0234', 2130, 0.38), sl('JF0119', 1515, 0.61), sl('JF0147', 1548, 0.82)], ctx);
+    assert.equal(c.verdict, 'match');
+    assert.deepEqual(c.lines.map(l => [l.jfCode, l.ourQty, l.ourRows, l.invoiceQty, l.issues]), [
+        ['JF0234', 2130, 1, 2130, []],
+        ['JF0119', 1515, 2, 1515, []],
+        ['JF0147', 1548, 1, 1548, []],
+    ]);
+    assert.deepEqual(c.missingOurLines, []);
+    // Not billed at all: missing once, for both rows.
+    const unbilled = splitCheck([sl('JF0234', 2130, 0.38), sl('JF0147', 1548, 0.82)], ctx);
+    assert.deepEqual(unbilled.missingOurLines.map(l => [l.jfCode, l.qty, l.total]), [['JF0119', 1515, 924.15]]);
+});
+
+test('a QC unit none of the supplier\'s QC lines takes is still never taken for the goods it samples', () => {
+    const c = compareInvoiceToContainer({
+        extract: { ...QC_INVOICE, lines: [{ ...qcLine('PO_00306J', 'JF1001_FQC', 10, 2.5), description: 'A' }] },
+        context: CONTEXT, supplierName: SUPPLIER,
+    });
+    assert.equal(c.matchedLines, 0);
+    assert.deepEqual(c.extraInvoiceLines.map(l => l.jfCode), ['JF1001_FQC']);
+});
+
+test('a split line that does not add up: one difference, in the invoice\'s own figures', () => {
+    const c = splitCheck([sl('JF0234', 2130, 0.38), sl('JF0119', 15, 0.61), sl('JF0119', 1500, 0.61), sl('JF0119', 20, 0.61), sl('JF0147', 1548, 0.82)]);
+    assert.equal(c.verdict, 'differs');
+    assert.deepEqual(c.lines.find(l => l.jfCode === 'JF0119').issues, [
+        'quantity 1,500 + 20 + 15 = 1,535 on the invoice, 1,515 in the container',
+        'line total 936.35 on the invoice, 924.15 in the container',
+    ]);
+    assert.deepEqual(c.missingOurLines, []);
+    assert.deepEqual(c.extraInvoiceLines, []);
+});
+
+test('a line whose code is in the box is never checked against another product', () => {
+    // JF0147 is not billed: it is missing — the second JF0119 line is not "JF0147, quantity 15".
+    const c = splitCheck([sl('JF0234', 2130, 0.38), sl('JF0119', 1500, 0.61), sl('JF0119', 15, 0.61)]);
+    assert.equal(c.verdict, 'differs');
+    assert.deepEqual(c.lines.map(l => [l.jfCode, l.invoiceQty, l.issues]), [['JF0234', 2130, []], ['JF0119', 1515, []]]);
+    assert.deepEqual(c.missingOurLines.map(l => [l.jfCode, l.qty, l.total]), [['JF0147', 1548, 1269.36]]);
+    assert.deepEqual(c.extraInvoiceLines, []);
+});
+
+test('each checked line carries the invoice lines it was checked against, as printed, and how they were matched', () => {
+    const c = splitCheck([
+        sl('JF0234', 2130, 0.38),
+        sl('JF0119', 1500, 0.61), sl(null, 15, 0.61, { description: 'Butterfly closure' }),
+        // No code of ours, no name of ours: the PO's one product left, and the only line left.
+        sl(null, 1548, 0.61, { sku: 'SM-147', description: 'ADH STRIP 10CM' }),
+    ]);
+    const jf0119 = c.lines.find(l => l.jfCode === 'JF0119');
+    assert.deepEqual(jf0119.invoiceRows.map(r => [r.jfCode, r.description, r.qty, r.matchedBy]), [['JF0119', null, 1500, 'code'], [null, 'Butterfly closure', 15, 'description']]);
+    const jf0147 = c.lines.find(l => l.jfCode === 'JF0147');
+    assert.deepEqual(jf0147.invoiceRows.map(r => [r.sku, r.description, r.qty, r.unitPrice, r.matchedBy]), [['SM-147', 'ADH STRIP 10CM', 1548, 0.61, 'only_line']]);
+    assert.deepEqual(jf0147.issues, ['unit price 0.61 on the invoice, 0.82 on the PO', 'line total 944.28 on the invoice, 1269.36 in the container']);
+});
+
+test('the supplier\'s own code on two lines with no code of ours: added up, then matched as one', () => {
+    const c = splitCheck([
+        sl('JF0234', 2130, 0.38), sl('JF0119', 1515, 0.61),
+        sl(null, 1500, 0.82, { sku: 'SM-147' }), sl(null, 48, 0.82, { sku: 'SM-147' }),
+    ]);
+    assert.equal(c.verdict, 'match');
+    assert.deepEqual(c.lines.find(l => l.jfCode === 'JF0147').invoiceRows.map(r => [r.qty, r.matchedBy]), [[1500, 'only_line'], [48, 'only_line']]);
+});
+
+// The reader sometimes lists a charge among the goods (TEST read 22, invoice
+// 26/89138: "printing plate charges JF0880", 120, no quantity, no price). It
+// carries our code, but it is not goods: added to JF0880 it would read as a
+// line-total difference on the bandages.
+test('a line with an amount but no quantity and no price is never added to a product, even with our code on it', () => {
+    const c = splitCheck([...SPLIT_LINES, { ...sl('JF0147', 0, 0), qty: null, unitPrice: null, amount: 120, description: 'printing plate charges JF0147' }]);
+    assert.deepEqual(c.lines.find(l => l.jfCode === 'JF0147').issues, []);
+    assert.deepEqual(c.extraInvoiceLines.map(l => [l.jfCode, l.qty, l.amount]), [['JF0147', null, 120]]);
+    // Nor taken for the PO's one unbilled product.
+    const alone = splitCheck([...SPLIT_LINES.slice(0, 4), { ...sl(null, 0, 0), qty: null, unitPrice: null, amount: 120, description: 'printing plate charges' }]);
+    assert.deepEqual(alone.missingOurLines.map(l => l.jfCode), ['JF0147']);
+    assert.equal(alone.extraInvoiceLines.length, 1);
+});
+
+test('two unknown lines left on a PO with one product unbilled: no guess by elimination; a quantity that fits places one', () => {
+    const c = splitCheck([
+        sl('JF0234', 2130, 0.38), sl('JF0119', 1515, 0.61),
+        sl(null, 1548, 0.82, { sku: 'SM-147' }), sl(null, 10, 1, { sku: 'SM-999' }),
+    ]);
+    assert.deepEqual(c.lines.find(l => l.jfCode === 'JF0147').invoiceRows.map(r => [r.sku, r.matchedBy]), [['SM-147', 'quantity']]);
+    assert.deepEqual(c.extraInvoiceLines.map(l => [l.sku, l.qty]), [['SM-999', 10]]);
+    assert.equal(c.verdict, 'differs');
+});
+
+test('a code of ours billed under another of the supplier\'s POs in the box: checked against it, the PO said', () => {
+    const ctx = { ...SPLIT_CTX, purchaseOrders: [
+        { ...SPLIT_CTX.purchaseOrders[0], lines: SPLIT_CTX.purchaseOrders[0].lines.filter(l => l.jfCode !== 'JF0119') },
+        { id: 305, poNumber: 'PO_00305J', supplier: SUPPLIER, supplierKey: KEY, currency: 'USD', valueInShipment: 924.15, deposit: null, lines: [SPLIT_CTX.purchaseOrders[0].lines[1]] },
+    ] };
+    const c = splitCheck(SPLIT_LINES, ctx);
+    assert.equal(c.verdict, 'differs');
+    const jf0119 = c.lines.find(l => l.jfCode === 'JF0119');
+    assert.deepEqual([jf0119.poNumber, jf0119.ourQty, jf0119.invoiceQty, jf0119.issues], ['PO_00305J', 1515, 1515, ['billed under PO_00298J on the invoice, in the container under PO_00305J']]);
+    assert.deepEqual(c.extraInvoiceLines, []);
+    assert.deepEqual(c.missingOurLines, []);
+    // No PO on the line and the code on two POs: checked against both together.
+    const both = { ...ctx, purchaseOrders: ctx.purchaseOrders.map(p => (p.id === 298 ? { ...p, lines: [...p.lines, { jfCode: 'JF0119', productName: 'Butterfly closure', quantity: 100, unitPrice: 0.61 }] } : p)) };
+    const n = splitCheck([sl('JF0234', 2130, 0.38), sl('JF0147', 1548, 0.82), { ...sl('JF0119', 1615, 0.61), poRef: null }], both);
+    const jf = n.lines.find(l => l.jfCode === 'JF0119');
+    assert.deepEqual([jf.poNumber, jf.ourQty, jf.issues], ['PO_00298J, PO_00305J', 1615, []]);
+    assert.equal(n.verdict, 'match');
+    // One of them billed by a line naming its PO: the line with no PO goes to the other.
+    const f = splitCheck([sl('JF0234', 2130, 0.38), sl('JF0147', 1548, 0.82), sl('JF0119', 100, 0.61), { ...sl('JF0119', 1515, 0.61), poRef: null }], both);
+    assert.deepEqual(f.lines.filter(l => l.jfCode === 'JF0119').map(l => [l.poNumber, l.ourQty, l.invoiceQty, l.issues]), [['PO_00298J', 100, 100, []], ['PO_00305J', 1515, 1515, []]]);
+});

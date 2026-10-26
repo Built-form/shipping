@@ -413,6 +413,12 @@ function assessFit({ extract, shipment, supplierName, memberPos, qcPos = [], amo
 const LINE_PRICE_EPS = 0.005;
 const LINE_TOTAL_EPS = 0.5;
 const descKey = v => String(v ?? '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+const numOrNull = v => (v == null || v === '' || !Number.isFinite(Number(v)) ? null : Number(v));
+// A figure for several lines: their sum, or null when any of them is unknown.
+const sumOrNull = vals => (vals.length && vals.every(v => v != null) ? Math.round(vals.reduce((a, v) => a + v, 0) * 100) / 100 : null);
+// The price several lines share, or null when they differ or one is unknown.
+const sameOrNull = vals => (vals.length && vals.every(v => v != null && Math.abs(v - vals[0]) <= LINE_PRICE_EPS) ? vals[0] : null);
+const fmtQty = n => n.toLocaleString('en-GB');
 
 // QC sample units — our codes ending _FQC — never travel. The supplier bills
 // them on their own invoice or beside the goods, often for several POs at once
@@ -450,18 +456,40 @@ function compareInvoiceToContainer({ extract, context, supplierName }) {
                 poId: po.id, poNumber: po.poNumber, jfCode: l.jfCode || null, productName: l.productName || null,
                 qty: l.quantity != null ? Number(l.quantity) : null, unitPrice: l.unitPrice != null ? Number(l.unitPrice) : null,
                 total: l.quantity != null && l.unitPrice != null ? Math.round(Number(l.quantity) * Number(l.unitPrice) * 100) / 100 : null,
-                matched: false,
             });
         }
     }
     const goodsOnBoard = Math.round(ours.reduce((a, l) => a + (l.total || 0), 0) * 100) / 100;
 
-    // Match each invoice line: our code first, then the PO plus the product
-    // name, then a PO that has only one line left.
+    // Our goods, one group per product per PO, in the order the box lists
+    // them: packing part of a quantity splits the order row, so one product
+    // can sit on several rows of the box. Keyed by our code; a row with no
+    // code by its name.
+    const groups = [];
+    const groupAt = new Map();
+    ours.forEach((l, i) => {
+        const code = norm(l.jfCode);
+        const groupKey = `${l.poId}|${code || `name:${descKey(l.productName) || i}`}`;
+        let g = groupAt.get(groupKey);
+        if (!g) {
+            g = { index: groups.length, poId: l.poId, poNumber: l.poNumber, code, jfCode: l.jfCode, productName: l.productName, desc: descKey(l.productName), rows: [], invoiceRows: [] };
+            groupAt.set(groupKey, g);
+            groups.push(g);
+        }
+        g.rows.push(l);
+    });
+    const groupsByCode = new Map();
+    for (const g of groups) {
+        if (!g.code) continue;
+        if (!groupsByCode.has(g.code)) groupsByCode.set(g.code, []);
+        groupsByCode.get(g.code).push(g);
+    }
+
     const lines = [];
     const qcLines = [];
     const extra = [];
-    // Quantity, unit price and line total against ours, in the words the page shows.
+    // A QC line's quantity, unit price and line total against ours, in the
+    // words the page shows (goods lines are added up first: see below).
     const issuesOf = (raw, hit, where) => {
         const issues = [];
         const invQty = raw.qty != null ? Number(raw.qty) : null;
@@ -472,60 +500,190 @@ function compareInvoiceToContainer({ extract, context, supplierName }) {
         if (invTotal != null && hit.total != null && Math.abs(invTotal - hit.total) > LINE_TOTAL_EPS) issues.push(`line total ${invTotal.toFixed(2)} on the invoice, ${hit.total.toFixed(2)} ${where}`);
         return { issues, invQty, invPrice, invTotal };
     };
-    for (const raw of extract.lines || []) {
-        const po = raw.poRef ? matchPoRef(raw.poRef, index) : null;
-        const code = norm(raw.jfCode || raw.sku);
-        const qcCode = isQcCode(code);
-        const desc = descKey(raw.description);
-        const candidates = ours.filter(l => !l.matched && (!po || l.poId === po.id));
-        // An _FQC line on board is goods, found by its code only: a QC unit
-        // is never taken for the goods it samples by name.
-        let hit = code ? candidates.find(l => norm(l.jfCode) === code) : null;
-        if (!hit && desc && !qcCode) hit = candidates.find(l => descKey(l.productName) === desc);
-        if (!hit && po && candidates.length === 1 && !qcCode) hit = candidates[0];
-        if (!hit && qcCode) {
-            // A QC unit: on the PO printed on the line — the document's own
-            // word, which outranks the model's poRef (2026-10-01: the model set
-            // every line of invoice 26/89132 to PO_00333J while the lines print
-            // SUNMED-93 and SUNMED-96) — else the model's poRef; else, with the
-            // same code on several of this supplier's POs, the one whose
-            // quantity is the invoice's, else the one with goods in this box,
-            // else the newest. A model-named PO whose quantity differs gives way
-            // to the one other PO carrying exactly the invoice's quantity.
-            const printed = poRefInText(`${raw.description ?? ''} ${raw.sku ?? ''}`, qcIndex);
-            const named = printed ? matchPoRef(printed, qcIndex) : raw.poRef ? matchPoRef(raw.poRef, qcIndex) : null;
-            const withCode = qcOurs.filter(l => !l.matched && norm(l.jfCode) === code);
-            const invQty = raw.qty != null ? Number(raw.qty) : null;
-            let found = withCode;
-            if (printed || raw.poRef) {
-                const onNamed = named ? withCode.filter(l => l.poId === named.id) : [];
-                const exact = invQty != null ? withCode.filter(l => l.qty === invQty) : [];
-                found = !printed && onNamed.length && !onNamed.some(l => l.qty === invQty) && exact.length === 1 ? exact : onNamed;
-            }
-            const byQty = invQty != null ? found.filter(l => l.qty === invQty) : [];
-            const pool = byQty.length ? byQty : found;
-            const qhit = pool.find(l => onBoardPoIds.has(l.poId)) ?? pool.sort((a, b) => b.poId - a.poId)[0];
-            if (qhit) {
-                qhit.matched = true;
-                const { issues, invQty, invPrice, invTotal } = issuesOf(raw, qhit, 'on the PO');
-                qcLines.push({
-                    poId: qhit.poId, poNumber: qhit.poNumber, jfCode: qhit.jfCode, productName: qhit.productName,
-                    ourQty: qhit.qty, invoiceQty: invQty, ourUnitPrice: qhit.unitPrice, invoiceUnitPrice: invPrice, ourTotal: qhit.total, invoiceTotal: invTotal,
-                    issues,
-                });
-                continue;
-            }
+    // A QC unit: on the PO printed on the line — the document's own word,
+    // which outranks the model's poRef (2026-10-01: the model set every line
+    // of invoice 26/89132 to PO_00333J while the lines print SUNMED-93 and
+    // SUNMED-96) — else the model's poRef; else, with the same code on several
+    // of this supplier's POs, the one whose quantity is the invoice's, else
+    // the one with goods in this box, else the newest. A model-named PO whose
+    // quantity differs gives way to the one other PO carrying exactly the
+    // invoice's quantity. False when none of the supplier's QC lines fits.
+    const matchQcUnit = (raw, code) => {
+        const printed = poRefInText(`${raw.description ?? ''} ${raw.sku ?? ''}`, qcIndex);
+        const named = printed ? matchPoRef(printed, qcIndex) : raw.poRef ? matchPoRef(raw.poRef, qcIndex) : null;
+        const withCode = qcOurs.filter(l => !l.matched && norm(l.jfCode) === code);
+        const invQty = raw.qty != null ? Number(raw.qty) : null;
+        let found = withCode;
+        if (printed || raw.poRef) {
+            const onNamed = named ? withCode.filter(l => l.poId === named.id) : [];
+            const exact = invQty != null ? withCode.filter(l => l.qty === invQty) : [];
+            found = !printed && onNamed.length && !onNamed.some(l => l.qty === invQty) && exact.length === 1 ? exact : onNamed;
         }
-        if (!hit) {
-            extra.push({ poRef: raw.poRef ?? null, jfCode: raw.jfCode ?? null, sku: raw.sku ?? null, description: raw.description ?? null, qty: raw.qty ?? null, unitPrice: raw.unitPrice ?? null, amount: raw.amount ?? null });
-            continue;
-        }
-        hit.matched = true;
-        const { issues, invQty, invPrice, invTotal } = issuesOf(raw, hit, 'in the container');
-        lines.push({
-            poNumber: hit.poNumber, jfCode: hit.jfCode, productName: hit.productName,
-            ourQty: hit.qty, invoiceQty: invQty, ourUnitPrice: hit.unitPrice, invoiceUnitPrice: invPrice, ourTotal: hit.total, invoiceTotal: invTotal,
+        const byQty = invQty != null ? found.filter(l => l.qty === invQty) : [];
+        const pool = byQty.length ? byQty : found;
+        const qhit = pool.find(l => onBoardPoIds.has(l.poId)) ?? pool.sort((a, b) => b.poId - a.poId)[0];
+        if (!qhit) return false;
+        qhit.matched = true;
+        const { issues, invPrice, invTotal } = issuesOf(raw, qhit, 'on the PO');
+        qcLines.push({
+            poId: qhit.poId, poNumber: qhit.poNumber, jfCode: qhit.jfCode, productName: qhit.productName,
+            ourQty: qhit.qty, invoiceQty: invQty, ourUnitPrice: qhit.unitPrice, invoiceUnitPrice: invPrice, ourTotal: qhit.total, invoiceTotal: invTotal,
             issues,
+        });
+        return true;
+    };
+
+    // Each goods line on the invoice is tied to the group(s) it bills. A
+    // supplier bills the full cartons and the part carton of one product on
+    // two lines, and we hold one product on two rows: the lines tied to a
+    // product are added up and compared with all of its rows. Every step reads
+    // only the line and what the box holds, never what an earlier line took,
+    // so the order the lines are printed in changes nothing.
+    const link = (row, targets, matchedBy) => {
+        row.groups = targets;
+        row.matchedBy = matchedBy;
+        for (const g of targets) g.invoiceRows.push(row);
+    };
+    const unplaced = [];
+    const byCodeElsewhere = [];
+    (extract.lines || []).forEach((raw, at) => {
+        const row = { raw, at, po: raw.poRef ? matchPoRef(raw.poRef, index) : null, groups: [], matchedBy: null };
+        // An amount with no quantity and no price is a charge the reader put
+        // among the goods ("printing plate charges JF0880"), not goods: never
+        // added to a product, even one whose code it prints.
+        if (numOrNull(raw.qty) == null && numOrNull(raw.unitPrice) == null) {
+            row.charge = true;
+            unplaced.push(row);
+            return;
+        }
+        // 1. Our code, when the box holds it: on the PO the line names, else
+        //    (below) wherever this supplier has it. A line carrying a code the
+        //    box holds is never checked against another product.
+        const known = [norm(raw.jfCode), norm(raw.sku)].find(c => c && groupsByCode.has(c));
+        if (known) {
+            const onPo = row.po ? groupsByCode.get(known).find(g => g.poId === row.po.id) : null;
+            if (onPo) link(row, [onPo], 'code');
+            else byCodeElsewhere.push({ row, code: known });
+            return;
+        }
+        // A QC unit (an _FQC code not on board) is matched to the QC lines
+        // only — never taken for the goods it samples, by name or otherwise.
+        const code = norm(raw.jfCode || raw.sku);
+        if (isQcCode(code)) {
+            if (!matchQcUnit(raw, code)) unplaced.push(row);
+            return;
+        }
+        unplaced.push(row);
+    });
+    // The line names another PO, or none: the groups with that code the
+    // lines naming them leave free (all of them if none is free). Several
+    // groups are checked together, as one.
+    const claimedByCode = new Set(groups.filter(g => g.invoiceRows.length));
+    for (const { row, code } of byCodeElsewhere) {
+        const all = groupsByCode.get(code);
+        const free = all.filter(g => !claimedByCode.has(g));
+        link(row, free.length ? free : all, row.po ? 'code_other_po' : 'code');
+    }
+
+    // 2. Goods lines with no code of ours, bunched by what identifies them on
+    //    the invoice (their code, else the supplier's, else the description)
+    //    on the PO they name, so a product split over two lines is placed as one.
+    const bunches = new Map();
+    for (const row of unplaced) {
+        if (row.charge || isQcCode(norm(row.raw.jfCode || row.raw.sku))) continue;
+        const id = norm(row.raw.jfCode) || norm(row.raw.sku) || descKey(row.raw.description) || `line:${row.at}`;
+        const bunchKey = `${row.po ? row.po.id : '-'}|${id}`;
+        if (!bunches.has(bunchKey)) bunches.set(bunchKey, { po: row.po, rows: [] });
+        bunches.get(bunchKey).rows.push(row);
+    }
+    const scopeOf = b => (b.po ? groups.filter(g => g.poId === b.po.id) : groups);
+    const placeAll = (b, targets, matchedBy) => { for (const row of b.rows) link(row, targets, matchedBy); b.placed = true; };
+    const open = () => [...bunches.values()].filter(b => !b.placed);
+    // 2a. Our product name.
+    for (const b of open()) {
+        const descs = new Set(b.rows.map(r => descKey(r.raw.description)).filter(Boolean));
+        const hits = descs.size ? scopeOf(b).filter(g => g.desc && descs.has(g.desc)) : [];
+        if (hits.length === 1) placeAll(b, hits, 'description');
+    }
+    // 2b. The PO's one product nothing bills, for the PO's one bunch left.
+    let billed = new Set(groups.filter(g => g.invoiceRows.length));
+    const left = open();
+    for (const b of left) {
+        if (!b.po) continue;
+        const free = groups.filter(g => g.poId === b.po.id && !billed.has(g));
+        if (free.length === 1 && left.filter(o => o.po && o.po.id === b.po.id).length === 1) placeAll(b, free, 'only_line');
+    }
+    // 2c. The one product nothing bills whose quantity is the bunch's — taken
+    //     only when no other bunch points at it too.
+    billed = new Set(groups.filter(g => g.invoiceRows.length));
+    const byQty = new Map();
+    for (const b of open()) {
+        const qty = sumOrNull(b.rows.map(r => numOrNull(r.raw.qty)));
+        if (!(qty > 0)) continue;
+        const hits = scopeOf(b).filter(g => !billed.has(g) && sumOrNull(g.rows.map(l => l.qty)) === qty);
+        if (hits.length !== 1) continue;
+        if (!byQty.has(hits[0])) byQty.set(hits[0], []);
+        byQty.get(hits[0]).push(b);
+    }
+    for (const [g, bs] of byQty) if (bs.length === 1) placeAll(bs[0], [g], 'quantity');
+
+    // Not placed: on the invoice, not in the box.
+    for (const row of unplaced.filter(r => !r.groups.length).sort((a, b) => a.at - b.at)) {
+        const raw = row.raw;
+        extra.push({ poRef: raw.poRef ?? null, jfCode: raw.jfCode ?? null, sku: raw.sku ?? null, description: raw.description ?? null, qty: raw.qty ?? null, unitPrice: raw.unitPrice ?? null, amount: raw.amount ?? null });
+    }
+
+    // Groups tied together by one line are checked as one; in box order.
+    const parent = groups.map((_, i) => i);
+    const root = i => (parent[i] === i ? i : (parent[i] = root(parent[i])));
+    for (const g of groups) for (const row of g.invoiceRows) parent[root(row.groups[0].index)] = root(g.index);
+    const units = new Map();
+    for (const g of groups) {
+        if (!g.invoiceRows.length) continue;
+        const r = root(g.index);
+        if (!units.has(r)) units.set(r, { groups: [], rows: new Set() });
+        units.get(r).groups.push(g);
+        for (const row of g.invoiceRows) units.get(r).rows.add(row);
+    }
+    let invoiceLinesMatched = 0;
+    for (const unit of units.values()) {
+        const rows = [...unit.rows].sort((a, b) => a.at - b.at);
+        invoiceLinesMatched += rows.length;
+        const ourRows = unit.groups.flatMap(g => g.rows);
+        const poNumber = [...new Set(unit.groups.map(g => g.poNumber))].join(', ');
+        const ourQty = sumOrNull(ourRows.map(l => l.qty));
+        const ourTotal = sumOrNull(ourRows.map(l => l.total));
+        const ourUnitPrice = sameOrNull(ourRows.map(l => l.unitPrice));
+        const invQtys = rows.map(r => numOrNull(r.raw.qty));
+        const invPrices = rows.map(r => numOrNull(r.raw.unitPrice));
+        const invoiceQty = sumOrNull(invQtys);
+        const invoiceTotal = sumOrNull(rows.map(r => numOrNull(r.raw.amount)));
+        const issues = [];
+        if (invoiceQty != null && ourQty != null && invoiceQty !== ourQty) {
+            const parts = invQtys.length > 1 ? `${[...invQtys].sort((a, b) => b - a).map(fmtQty).join(' + ')} = ${fmtQty(invoiceQty)}` : fmtQty(invoiceQty);
+            issues.push(`quantity ${parts} on the invoice, ${fmtQty(ourQty)} in the container`);
+        }
+        if (ourUnitPrice != null) {
+            for (const p of [...new Set(invPrices.filter(p => p != null && Math.abs(p - ourUnitPrice) > LINE_PRICE_EPS))].sort((a, b) => a - b)) {
+                issues.push(`unit price ${p} on the invoice, ${ourUnitPrice} on the PO`);
+            }
+        }
+        if (invoiceTotal != null && ourTotal != null && Math.abs(invoiceTotal - ourTotal) > LINE_TOTAL_EPS) {
+            issues.push(`line total ${invoiceTotal.toFixed(2)} on the invoice, ${ourTotal.toFixed(2)} in the container`);
+        }
+        for (const ref of new Set(rows.filter(r => r.matchedBy === 'code_other_po').map(r => String(r.raw.poRef)))) {
+            issues.push(`billed under ${ref} on the invoice, in the container under ${poNumber}`);
+        }
+        lines.push({
+            poNumber, jfCode: unit.groups[0].jfCode, productName: unit.groups[0].productName,
+            ourQty, invoiceQty, ourUnitPrice, invoiceUnitPrice: sameOrNull(invPrices), ourTotal, invoiceTotal,
+            issues,
+            // How many rows of the box, and the invoice's own lines as printed.
+            ourRows: ourRows.length,
+            invoiceRows: rows.map(r => ({
+                poRef: r.raw.poRef ?? null, jfCode: r.raw.jfCode ?? null, sku: r.raw.sku ?? null, description: r.raw.description ?? null,
+                qty: numOrNull(r.raw.qty), unitPrice: numOrNull(r.raw.unitPrice), amount: numOrNull(r.raw.amount), matchedBy: r.matchedBy,
+            })),
         });
     }
     // What it bills: goods (matched, or strangers that are not QC units), QC units, or both.
@@ -538,7 +696,10 @@ function compareInvoiceToContainer({ extract, context, supplierName }) {
     const qcBilled = Math.round([...(extract.lines || [])].filter(raw => isQcCode(raw.jfCode || raw.sku)).reduce((a, raw) => a + lineAmountOf(raw), 0) * 100) / 100;
     // A QC units invoice does not bill the goods: none of them is missing.
     const missing = billsGoods
-        ? ours.filter(l => !l.matched).map(l => ({ poNumber: l.poNumber, jfCode: l.jfCode, productName: l.productName, qty: l.qty, total: l.total }))
+        ? groups.filter(g => !g.invoiceRows.length).map(g => ({
+            poNumber: g.poNumber, jfCode: g.jfCode, productName: g.productName,
+            qty: sumOrNull(g.rows.map(l => l.qty)), total: sumOrNull(g.rows.map(l => l.total)),
+        }))
         : [];
 
     // What the balance should be. The deposit on file (a deposit PI's
@@ -595,7 +756,7 @@ function compareInvoiceToContainer({ extract, context, supplierName }) {
     return {
         verdict,
         invoiceKind,
-        matchedLines: lines.length, lines, missingOurLines: missing, extraInvoiceLines: extra,
+        matchedLines: lines.length, invoiceLinesMatched, lines, missingOurLines: missing, extraInvoiceLines: extra,
         qcLines, qcOurTotal, qcInvoiceTotal, qcBilled,
         goodsOnBoard, invoiceGoods,
         depositBasis, depositExpected, expectedBalance, invoiceBalance, balanceDelta, balanceTolerance,
