@@ -19,6 +19,8 @@ const {
 const { ORDER_SELECT, parseDates, formatDate, formatDateTime, normalizeExpiry, receiptToJson, rowToOrder } = require('../lib/order-shape');
 const { recordAudit } = require('../lib/audit');
 const { pdfLineSnapshot, parseLinesJson } = require('../lib/po-line-snapshot');
+const { quoteLineSource } = require('../lib/quote-line-source');
+const { requestLinesSnapshot } = require('../lib/request-to-send-drift');
 // Draft-container registry + event writer: every draft mutation lands in
 // audit_log as entity_type 'draft_container' against a stable registry id, so
 // a draft's history outlives renames, conversion and deletion.
@@ -2576,31 +2578,9 @@ app.delete('/api/v1/planned-containers/:id', async (req, res) => {
 // down with the PO PDF block. That's fine — route handlers close over the
 // module scope, so by the time a request fires those bindings exist.
 
-// The rows a quote document is built from, as FROM / WHERE / ORDER BY parts
-// that yield `allocated` per row. A draft name reads that draft's allocations
-// (legacy truth while it is open). { reference } reads a booked container's own
-// live orders at their quantities (legacy truth is TRIM(orders.container_number)):
-// booking deleted the draft's allocations, and a partial pack split the order so
-// the packed slice is its own row. See lib/shipments.js documentSource.
-function quoteLineSource(source) {
-    if (source && typeof source === 'object') {
-        return {
-            allocated: 'o.quantity AS allocated',
-            from: 'orders o',
-            where: 'o.deleted_at IS NULL AND TRIM(o.container_number) = ?',
-            orderBy: 'o.id ASC',
-            params: [source.reference],
-        };
-    }
-    return {
-        allocated: 'dca.allocated',
-        from: `draft_container_allocations dca
-           INNER JOIN orders o ON o.id = dca.order_id AND o.deleted_at IS NULL`,
-        where: 'dca.draft_container_name = ?',
-        orderBy: 'dca.id ASC',
-        params: [source],
-    };
-}
+// quoteLineSource (the rows a quote document is built from: a draft's
+// allocations, or a booked container's orders by reference) lives in
+// src/lib/quote-line-source.js, shared with the Request to send status.
 
 // Aggregates allocations for one draft (or a booked container's orders, see
 // quoteLineSource) into PDF-ready lines. CBM per line is
@@ -2848,15 +2828,38 @@ async function generateDraftDocument(conn, { name, docType, supplierName, commen
         ContentDisposition: `attachment; filename="${fileBase}.csv"`,
     }));
 
-    const [insertResult] = await conn.query(
-        `INSERT INTO draft_container_documents
-            (draft_container_name, version, type, supplier, s3_key, public_url, file_size,
-             csv_s3_key, csv_public_url, csv_file_size, generated_by_email, batch_id, shipment_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [name, version, docType, supplierName, s3Key, publicUrl, pdfBuffer.length,
-         csvS3Key, csvPublicUrl, csvBuffer.length, generatedByEmail || null, batchId,
-         booked ? booked.shipmentId : null]
-    );
+    const docValues = [name, version, docType, supplierName, s3Key, publicUrl, pdfBuffer.length,
+        csvS3Key, csvPublicUrl, csvBuffer.length, generatedByEmail || null, batchId,
+        booked ? booked.shipmentId : null];
+    let insertResult;
+    if (docType === 'supplier-quote') {
+        // A Request to send keeps the lines it printed so the app can flag it
+        // stale when the supplier's part of the container changes
+        // (src/lib/request-to-send-drift.js).
+        try {
+            [insertResult] = await conn.query(
+                `INSERT INTO draft_container_documents
+                    (draft_container_name, version, type, supplier, s3_key, public_url, file_size,
+                     csv_s3_key, csv_public_url, csv_file_size, generated_by_email, batch_id, shipment_id, lines_json)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                [...docValues, JSON.stringify(requestLinesSnapshot(lines, 'generate'))]
+            );
+        } catch (err) {
+            // lines_json migration (2026-10-26_20) not applied here yet: the
+            // document still saves, it just has no baseline for the stale flag.
+            if (err.code !== 'ER_BAD_FIELD_ERROR') throw err;
+            log.warn('[generateDraftDocument] lines_json column missing; saved without a line snapshot');
+        }
+    }
+    if (!insertResult) {
+        [insertResult] = await conn.query(
+            `INSERT INTO draft_container_documents
+                (draft_container_name, version, type, supplier, s3_key, public_url, file_size,
+                 csv_s3_key, csv_public_url, csv_file_size, generated_by_email, batch_id, shipment_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            docValues
+        );
+    }
     return {
         documentId: insertResult.insertId,
         draftContainerName: name,
