@@ -424,6 +424,9 @@ const fmtQty = n => n.toLocaleString('en-GB');
 // them on their own invoice or beside the goods, often for several POs at once
 // (user, 2026-09-29: they are paid with the box the invoice is uploaded on).
 const isQcCode = v => /FQC$/.test(norm(v));
+// How suppliers word a line that bills QC units ("BY INSPECTION …", "QC
+// samples"). ShipLine's qcUnits.ts QC_WORDING reads the same: keep them in step.
+const QC_WORDING = /\bby\s+insp|\binspection\b|\bQC\b|\bsamples?\b/i;
 const lineAmountOf = raw => {
     const amount = Number(raw.amount);
     if (raw.amount != null && Number.isFinite(amount)) return amount;
@@ -546,6 +549,7 @@ function compareInvoiceToContainer({ extract, context, supplierName }) {
     };
     const unplaced = [];
     const byCodeElsewhere = [];
+    const heldQc = [];
     (extract.lines || []).forEach((raw, at) => {
         const row = { raw, at, po: raw.poRef ? matchPoRef(raw.poRef, index) : null, groups: [], matchedBy: null };
         // An amount with no quantity and no price is a charge the reader put
@@ -567,10 +571,13 @@ function compareInvoiceToContainer({ extract, context, supplierName }) {
             return;
         }
         // A QC unit (an _FQC code not on board) is matched to the QC lines
-        // only — never taken for the goods it samples, by name or otherwise.
+        // only — never taken for the goods it samples by name. Matched below,
+        // in the order printed: one whose product IS in the box may turn out
+        // to be its goods, once every line coded as that product is tied to it.
         const code = norm(raw.jfCode || raw.sku);
         if (isQcCode(code)) {
-            if (!matchQcUnit(raw, code)) unplaced.push(row);
+            const base = code.replace(/FQC$/, '');
+            heldQc.push({ row, code, base: groupsByCode.has(base) ? base : null });
             return;
         }
         unplaced.push(row);
@@ -583,6 +590,36 @@ function compareInvoiceToContainer({ extract, context, supplierName }) {
         const all = groupsByCode.get(code);
         const free = all.filter(g => !claimedByCode.has(g));
         link(row, free.length ? free : all, row.po ? 'code_other_po' : 'code');
+    }
+
+    // Lines coded as QC units whose product is in the box (user, 2026-10-27:
+    // INV-26_89131 bills JF1402 as 4,992 + 24, the box holds 5,016, and the
+    // reader — shown JF1402_FQC × 24 on the PO — coded the 24 as QC units).
+    // Goods when nothing on them says QC and the box adds up only with them:
+    // what is already tied to the product, plus these lines, is exactly the
+    // box's quantity. Else QC units, as before, in the order printed.
+    const heldFor = new Map();
+    for (const h of heldQc) {
+        if (!h.base) continue;
+        const all = groupsByCode.get(h.base);
+        const g = (h.row.po ? all.find(x => x.poId === h.row.po.id) : null) ?? (all.length === 1 ? all[0] : null);
+        if (!g) continue;
+        if (!heldFor.has(g)) heldFor.set(g, []);
+        heldFor.get(g).push(h);
+    }
+    const qcAsGoods = new Set();
+    for (const [g, held] of heldFor) {
+        const tiedQtys = g.invoiceRows.map(r => numOrNull(r.raw.qty));
+        const tied = tiedQtys.length ? sumOrNull(tiedQtys) : 0;
+        const heldQty = sumOrNull(held.map(h => numOrNull(h.row.raw.qty)));
+        const box = sumOrNull(g.rows.map(l => l.qty));
+        const worded = held.some(h => QC_WORDING.test(`${h.row.raw.description ?? ''} ${h.row.raw.sku ?? ''}`));
+        if (worded || tied == null || heldQty == null || box == null || Math.abs(tied + heldQty - box) > 1e-9) continue;
+        for (const h of held) { link(h.row, [g], 'qc_code_goods'); qcAsGoods.add(h.row.at); }
+    }
+    for (const h of [...heldQc].sort((a, b) => a.row.at - b.row.at)) {
+        if (qcAsGoods.has(h.row.at)) continue;
+        if (!matchQcUnit(h.row.raw, h.code)) unplaced.push(h.row);
     }
 
     // 2. Goods lines with no code of ours, bunched by what identifies them on
@@ -693,7 +730,8 @@ function compareInvoiceToContainer({ extract, context, supplierName }) {
     const invoiceKind = billsGoods && billsQc ? 'goods_and_qc' : billsQc ? 'qc' : 'goods';
     const qcOurTotal = Math.round(qcLines.reduce((a, l) => a + (l.ourTotal || 0), 0) * 100) / 100;
     const qcInvoiceTotal = Math.round(qcLines.reduce((a, l) => a + (l.invoiceTotal ?? 0), 0) * 100) / 100;
-    const qcBilled = Math.round([...(extract.lines || [])].filter(raw => isQcCode(raw.jfCode || raw.sku)).reduce((a, raw) => a + lineAmountOf(raw), 0) * 100) / 100;
+    // Lines coded as QC units but taken as the box's goods (above) are goods money.
+    const qcBilled = Math.round([...(extract.lines || [])].filter((raw, at) => isQcCode(raw.jfCode || raw.sku) && !qcAsGoods.has(at)).reduce((a, raw) => a + lineAmountOf(raw), 0) * 100) / 100;
     // A QC units invoice does not bill the goods: none of them is missing.
     const missing = billsGoods
         ? groups.filter(g => !g.invoiceRows.length).map(g => ({
@@ -774,6 +812,7 @@ function qcSectionOf(context) {
     const lines = [
         '## QC sample units on this supplier\'s purchase orders',
         'They never travel in a container. If the document bills them, list each as a line with its _FQC code as jfCode and its PO as poRef.',
+        'Use an _FQC code only when the document says the line bills QC or inspection units (e.g. "BY INSPECTION", "QC"). A small second line of a product (a part carton) is goods, with the product\'s own code, even when its quantity equals a QC unit listed below.',
         'poRef is the purchase order number printed on that line (often inside its description, e.g. "SUNMED-93" or "PO_00299J"), copied exactly as printed when it is one of the purchase orders below — never a different one, even if another lists the same product.',
     ];
     const byPo = new Map();

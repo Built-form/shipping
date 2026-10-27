@@ -602,3 +602,57 @@ test('a code of ours billed under another of the supplier\'s POs in the box: che
     const f = splitCheck([sl('JF0234', 2130, 0.38), sl('JF0147', 1548, 0.82), sl('JF0119', 100, 0.61), { ...sl('JF0119', 1515, 0.61), poRef: null }], both);
     assert.deepEqual(f.lines.filter(l => l.jfCode === 'JF0119').map(l => [l.poNumber, l.ourQty, l.invoiceQty, l.issues]), [['PO_00298J', 100, 100, []], ['PO_00305J', 1515, 1515, []]]);
 });
+
+// ── A part carton the reader codes as QC units (user, 2026-10-27) ────────
+// Sunmed's INV-26_89131 for box 314 bills JF1402 on two lines, 4,992 + 24;
+// the box holds 5,016. PO_00333J also carries JF1402_FQC × 24 (destroyed QC
+// units, owed on their own). The reader is shown that QC unit and coded the
+// 24 as JF1402_FQC: the check took it for the QC units and called the box
+// short by 24. A line coded _FQC whose product is in the box, with no QC
+// wording, is goods when the box only adds up with it.
+const BOX_314 = {
+    shipment: { reference: '314' }, shipmentCurrency: 'USD',
+    purchaseOrders: [{
+        id: 333, poNumber: 'PO_00333J', supplier: SUPPLIER, supplierKey: KEY, currency: 'USD', valueInShipment: 12540, deposit: null,
+        lines: [{ jfCode: 'JF1402', productName: 'CUTI-ADH-10x15-50', quantity: 5016, unitPrice: 2.5 }],
+    }],
+    qcLines: [qc(333, 'PO_00333J', 'JF1402_FQC', 24, 2.5)],
+};
+const l314 = (jfCode, qty, more = {}) => ({ poRef: 'PO_00333J', jfCode, piRef: null, sku: 'CUTI-ADH-10x15-50', description: 'Cutiderm Adhesive Wound Dressing 10 x 15cm - Pack of 50', qty, unitPrice: 2.5, amount: Math.round(qty * 2.5 * 100) / 100, ...more });
+const check314 = (lines, context = BOX_314) => compareInvoiceToContainer({
+    extract: { documentKind: 'balance_invoice', currency: 'USD', totalAmount: Math.round(lines.reduce((a, l) => a + l.amount, 0) * 100) / 100, amountDueNow: null, depositDeducted: null, lines },
+    context, supplierName: SUPPLIER,
+});
+
+test('a part carton coded as QC units, its product in the box and the box adding up only with it: goods', () => {
+    const c = check314([l314('JF1402', 4992), l314('JF1402_FQC', 24)]);
+    assert.equal(c.verdict, 'match');
+    assert.deepEqual(c.qcLines, []);
+    assert.deepEqual(c.lines.map(l => [l.jfCode, l.invoiceQty, l.ourQty, l.issues]), [['JF1402', 5016, 5016, []]]);
+    assert.deepEqual(c.lines[0].invoiceRows.map(r => [r.jfCode, r.qty, r.matchedBy]), [['JF1402', 4992, 'code'], ['JF1402_FQC', 24, 'qc_code_goods']]);
+    // Its money is goods money, not QC units'.
+    assert.deepEqual([c.qcBilled, c.invoiceGoods, c.goodsDelta, c.invoiceKind], [0, 12540, 0, 'goods']);
+    // Printed the other way round: the same.
+    const r = check314([l314('JF1402_FQC', 24), l314('JF1402', 4992)]);
+    assert.deepEqual([r.verdict, r.qcLines.length, r.lines[0].invoiceQty], ['match', 0, 5016]);
+});
+
+test('the box holds only the goods: the line coded as QC units bills the QC units, as before', () => {
+    const ctx = { ...BOX_314, purchaseOrders: [{ ...BOX_314.purchaseOrders[0], lines: [{ ...BOX_314.purchaseOrders[0].lines[0], quantity: 4992 }] }] };
+    const c = check314([l314('JF1402', 4992), l314('JF1402_FQC', 24)], ctx);
+    assert.equal(c.verdict, 'match');
+    assert.deepEqual(c.qcLines.map(l => [l.poNumber, l.jfCode, l.ourQty, l.invoiceQty, l.issues]), [['PO_00333J', 'JF1402_FQC', 24, 24, []]]);
+    assert.deepEqual(c.lines.map(l => [l.jfCode, l.invoiceQty, l.ourQty]), [['JF1402', 4992, 4992]]);
+});
+
+test('a line that says it bills inspection units stays QC units, even when the box would add up with it', () => {
+    const c = check314([l314('JF1402', 4992), l314('JF1402_FQC', 24, { description: 'BY INSPECTION Cutiderm Adhesive Wound Dressing 10 x 15cm' })]);
+    assert.deepEqual(c.qcLines.map(l => [l.jfCode, l.invoiceQty]), [['JF1402_FQC', 24]]);
+    assert.deepEqual(c.lines.map(l => [l.jfCode, l.invoiceQty, l.ourQty]), [['JF1402', 4992, 5016]]);
+    assert.equal(c.verdict, 'differs');
+});
+
+test('the reader is told a part carton is goods, whatever QC unit has its quantity', () => {
+    const p = promptFor(BOX_314);
+    assert.match(p, /Use an _FQC code only when the document says the line bills QC or inspection units/);
+});
