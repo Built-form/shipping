@@ -7,7 +7,6 @@ const axios = require('axios');
 const { getPool } = require('../db');
 const log = require('../lib/logger');
 const { ensureSupplierPortalCodes } = require('../lib/portal-code');
-const { jportalSchema } = require('../lib/jportal');
 const { getProductsByJfCode, createAsn, receiveAsnItems } = require('../services/mintsoft');
 const { snapshotJfCode } = require('./mintsoft-snapshot');
 const {
@@ -5744,6 +5743,35 @@ function rowToPurchaseOrder(row) {
     };
 }
 
+// The supplier's "deposit payment received" tick from the portal, written into
+// po_deposit_receipts beside the PO (docs/po-deposit-receipts.md). Given PO
+// objects, one query attaches { ...po, supplierDepositReceipt: { receivedOn,
+// email } | null } — the date the supplier ticked (UTC) and who did. Tolerant
+// like the transfers: the table not there yet hides the tick, nothing else.
+async function attachSupplierDepositReceipts(conn, pos) {
+    if (!pos.length) return [];
+    const byPo = new Map();
+    try {
+        const [rows] = await conn.query(
+            `SELECT purchase_order_id, received_on, confirmed_by_email
+               FROM po_deposit_receipts
+              WHERE purchase_order_id IN (${pos.map(() => '?').join(',')}) AND received_on IS NOT NULL`,
+            pos.map(p => Number(p.id))
+        );
+        for (const r of rows) {
+            byPo.set(Number(r.purchase_order_id), {
+                receivedOn: r.received_on instanceof Date
+                    ? r.received_on.toISOString().slice(0, 10)
+                    : String(r.received_on).slice(0, 10),
+                email: r.confirmed_by_email || null,
+            });
+        }
+    } catch (e) {
+        if (e.errno !== 1146) throw e;
+    }
+    return pos.map(p => ({ ...p, supplierDepositReceipt: byPo.get(Number(p.id)) ?? null }));
+}
+
 // Given a list of PO objects (post rowToPurchaseOrder), fetch the relevant
 // companies in one query and attach { ...po, company: { ... } | null }.
 async function attachCompanies(conn, pos) {
@@ -5913,7 +5941,7 @@ app.get('/api/v1/purchase-orders', async (req, res) => {
         await purchaseOrdersSchemaReady;
         const data = await withConnection(async (conn) => {
             const [rows] = await conn.query('SELECT * FROM purchase_orders WHERE deleted_at IS NULL ORDER BY created_at DESC');
-            const pos = rows.map(rowToPurchaseOrder);
+            const pos = await attachSupplierDepositReceipts(conn, rows.map(rowToPurchaseOrder));
             return attachCompanies(conn, pos);
         });
         res.json({ data });
@@ -5930,7 +5958,7 @@ app.get('/api/v1/purchase-orders/:id', async (req, res) => {
         const result = await withConnection(async (conn) => {
             const [rows] = await conn.query('SELECT * FROM purchase_orders WHERE id = ? AND deleted_at IS NULL', [id]);
             if (!rows.length) return null;
-            const [poWithCo] = await attachCompanies(conn, [rowToPurchaseOrder(rows[0])]);
+            const [poWithCo] = await attachCompanies(conn, await attachSupplierDepositReceipts(conn, [rowToPurchaseOrder(rows[0])]));
             const [orders] = await conn.query(`${ORDER_SELECT} AND orders.purchase_order_id = ?`, [id]);
             return { po: poWithCo, orders: orders.map(rowToOrder) };
         });
@@ -8025,27 +8053,9 @@ app.get('/api/v1/purchase-orders/:id/payments', async (req, res) => {
                 if (e.errno !== 1146) throw e;
             }
             // The supplier's own "payment received" tick from the portal
-            // (jportal.po_deposit_receipts; docs/po-deposit-receipts.md). Tolerant like
-            // the transfers: a missing table or grant hides the tick, nothing else.
-            let supplierDepositReceipt = null;
-            try {
-                const [receipts] = await conn.query(
-                    `SELECT received_on, confirmed_by_email FROM ${jportalSchema()}.po_deposit_receipts
-                      WHERE purchase_order_id = ? AND received_on IS NOT NULL`,
-                    [Number(id)],
-                );
-                if (receipts.length) {
-                    supplierDepositReceipt = {
-                        receivedOn: receipts[0].received_on instanceof Date
-                            ? receipts[0].received_on.toISOString().slice(0, 10)
-                            : String(receipts[0].received_on).slice(0, 10),
-                        email: receipts[0].confirmed_by_email || null,
-                    };
-                }
-            } catch (e) {
-                if (e.errno !== 1146 && e.errno !== 1142 && e.errno !== 1143) throw e;
-            }
-            return { rows: r, transfers, supplierDepositReceipt };
+            // (po_deposit_receipts; docs/po-deposit-receipts.md).
+            const [withReceipt] = await attachSupplierDepositReceipts(conn, [{ id: Number(id) }]);
+            return { rows: r, transfers, supplierDepositReceipt: withReceipt.supplierDepositReceipt };
         });
         res.json({ data: rows.map(paymentRowToJson), transfers, supplierDepositReceipt });
     } catch (error) {
