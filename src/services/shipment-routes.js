@@ -21,6 +21,7 @@ const { makeTransitionShipment } = require('./shipment-stage');
 const rename = require('./shipment-rename');
 const { SplitError } = require('./order-split');
 const PL = require('./pl-results');
+const { requestDriftForShipment, requestToSendStatus } = require('./request-to-send-status');
 
 const { ShipmentError } = S;
 
@@ -836,12 +837,14 @@ function registerShipmentRoutes(app, deps) {
                 const openDraft = row.stage === 'DRAFT' && !row.deleted_at && !row.merged_into_id && S.clean(row.name);
                 const byName = openDraft ? ' OR (shipment_id IS NULL AND draft_container_name = ?)' : '';
                 const params = openDraft ? [...ids, row.name] : ids;
+                // SELECT * so lines_json (Request to send snapshot) is read when the
+                // column exists and this still answers before its migration.
                 const [docs] = await conn.query(
-                    `SELECT id, draft_container_name, version, type, supplier, s3_key, public_url, file_size,
-                            csv_s3_key, csv_public_url, csv_file_size, batch_id, generated_by_email, generated_at, shipment_id
+                    `SELECT *
                        FROM draft_container_documents
                       WHERE (shipment_id IN (${idPh})${byName}) AND deleted_at IS NULL
                       ORDER BY type ASC, generated_at DESC, id DESC`, params);
+                const drift = await requestDriftForShipment(conn, row, docs);
                 const [qa] = await conn.query(
                     `SELECT id, ref, version, draft_container_name, order_ids, qc_units, s3_key, public_url, file_size,
                             csv_s3_key, csv_public_url, csv_file_size, comments, generated_by_email, generated_at, shipment_id
@@ -850,7 +853,7 @@ function registerShipmentRoutes(app, deps) {
                       ORDER BY generated_at DESC, id DESC`, params);
                 const docSends = await sendsFor(conn, 'draft_container_document_sends', 'draft_container_document_id', docs.map(d => d.id));
                 const qaSends = await sendsFor(conn, 'quality_assurance_document_sends', 'quality_assurance_document_id', qa.map(d => d.id));
-                return { docs, qa, docSends, qaSends };
+                return { docs, qa, docSends, qaSends, drift };
             });
             if (!out) return res.status(404).json({ error: `Shipment ${id} not found.` });
             const parseJson = v => (typeof v === 'string' ? JSON.parse(v) : v);
@@ -870,6 +873,9 @@ function registerShipmentRoutes(app, deps) {
                     generatedByEmail: r.generated_by_email || null,
                     generatedAt: r.generated_at?.toISOString?.() ?? r.generated_at,
                     sends: (out.docSends.get(r.id) || []).map(sendToJson),
+                    // Each supplier's latest Request to send only: { stale,
+                    // changes, baseline }, or null when it has no line snapshot.
+                    ...(out.drift.has(r.id) ? { drift: out.drift.get(r.id) } : {}),
                 })),
                 qaDocuments: out.qa.map(r => {
                     const orderIds = parseJson(r.order_ids) || [];
@@ -895,6 +901,18 @@ function registerShipmentRoutes(app, deps) {
             });
         } catch (error) {
             sendError(res, error, '[GET /shipments/:id/documents]');
+        }
+    });
+
+    // Stale Requests to send across every live shipment, for the container cards
+    // (draft cards, manifest cards). Stale suppliers only; empty when none.
+    app.get('/api/v1/request-to-send/status', async (req, res) => {
+        try {
+            await ready();
+            const data = await withConnection(conn => requestToSendStatus(conn));
+            res.json({ data });
+        } catch (error) {
+            sendError(res, error, '[GET /request-to-send/status]');
         }
     });
 
