@@ -1,9 +1,9 @@
 'use strict';
 
 // Lambda jportal-deposit-received-<env>: a supplier confirmed on the portal that the
-// deposit payment for a purchase order arrived (jportal.po_deposit_receipts,
-// received_on NOT NULL). Invoked directly, async, by jportal with { purchaseOrderId },
-// fire-and-forget after the portal's own commit.
+// deposit payment for a purchase order arrived (po_deposit_receipts in this schema,
+// written by the portal; received_on NOT NULL). Invoked directly, async, by jportal
+// with { purchaseOrderId }, fire-and-forget after the portal's own commit.
 //
 // It moves the PO's live lines that have not started production — status SCHEDULED or
 // PO_SENT — into IN_PRODUCTION, exactly as an operator's move in ShipLine is written:
@@ -18,7 +18,6 @@
 require('dotenv').config();
 const log = require('../lib/logger');
 const { getPool } = require('../db');
-const { jportalSchema } = require('../lib/jportal');
 const { recordAudit } = require('../lib/audit');
 
 // The statuses before production (order-transitions levels 0 and 1).
@@ -35,7 +34,7 @@ async function handler(event) {
     const conn = await pool.getConnection();
     try {
         const [receipts] = await conn.query(
-            `SELECT received_on, confirmed_by_email FROM ${jportalSchema()}.po_deposit_receipts
+            `SELECT received_on, confirmed_by_email FROM po_deposit_receipts
               WHERE purchase_order_id = ? AND received_on IS NOT NULL`,
             [purchaseOrderId],
         );
