@@ -7,6 +7,7 @@ const axios = require('axios');
 const { getPool } = require('../db');
 const log = require('../lib/logger');
 const { ensureSupplierPortalCodes } = require('../lib/portal-code');
+const { jportalSchema } = require('../lib/jportal');
 const { getProductsByJfCode, createAsn, receiveAsnItems } = require('../services/mintsoft');
 const { snapshotJfCode } = require('./mintsoft-snapshot');
 const {
@@ -7999,7 +8000,7 @@ app.get('/api/v1/purchase-orders/:id/payments', async (req, res) => {
     try {
         await purchaseOrdersSchemaReady;
         const { id } = req.params;
-        const { rows, transfers } = await withConnection(async (conn) => {
+        const { rows, transfers, supplierDepositReceipt } = await withConnection(async (conn) => {
             const [r] = await conn.query(
                 `SELECT id, purchase_order_id, filename, s3_key, public_url, content_type,
                         file_size, notes, uploaded_by_email, uploaded_at
@@ -8023,9 +8024,30 @@ app.get('/api/v1/purchase-orders/:id/payments', async (req, res) => {
             } catch (e) {
                 if (e.errno !== 1146) throw e;
             }
-            return { rows: r, transfers };
+            // The supplier's own "payment received" tick from the portal
+            // (jportal.po_deposit_receipts; docs/po-deposit-receipts.md). Tolerant like
+            // the transfers: a missing table or grant hides the tick, nothing else.
+            let supplierDepositReceipt = null;
+            try {
+                const [receipts] = await conn.query(
+                    `SELECT received_on, confirmed_by_email FROM ${jportalSchema()}.po_deposit_receipts
+                      WHERE purchase_order_id = ? AND received_on IS NOT NULL`,
+                    [Number(id)],
+                );
+                if (receipts.length) {
+                    supplierDepositReceipt = {
+                        receivedOn: receipts[0].received_on instanceof Date
+                            ? receipts[0].received_on.toISOString().slice(0, 10)
+                            : String(receipts[0].received_on).slice(0, 10),
+                        email: receipts[0].confirmed_by_email || null,
+                    };
+                }
+            } catch (e) {
+                if (e.errno !== 1146 && e.errno !== 1142 && e.errno !== 1143) throw e;
+            }
+            return { rows: r, transfers, supplierDepositReceipt };
         });
-        res.json({ data: rows.map(paymentRowToJson), transfers });
+        res.json({ data: rows.map(paymentRowToJson), transfers, supplierDepositReceipt });
     } catch (error) {
         log.error('[GET /purchase-orders/:id/payments]', error);
         res.status(500).json({ error: 'An internal error occurred.' });

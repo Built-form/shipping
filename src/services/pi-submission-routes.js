@@ -43,6 +43,7 @@ const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const { v4: uuidv4 } = require('uuid');
 const L = require('../lib/pi-submissions');
 const bank = require('../lib/bank-verification');
+const { loadBankReference } = require('./bank-reference');
 const { jportalSchema, PO_SUPPLIER_IS } = require('../lib/jportal');
 const { recordAuditStrict } = require('../lib/audit');
 const { sendFrontMessage } = require('./front-send');
@@ -110,60 +111,51 @@ function registerPiSubmissionRoutes(app, deps) {
     };
 
     /**
-     * The supplier's "previous" bank details: the newest payment row of
-     * another live PI of theirs — verified rows first (their
-     * bank_verified_json), then legacy PIs with bank fields. Portal PIs are
-     * theirs through pi_submission_id → pi_submissions.supplier_id; legacy
-     * (staff-uploaded) ones through the PO's supplier name, the exact match
-     * jportal uses (purchase_orders.company_id is the buyer, not the supplier).
-     * → { invoiceId, poNumber, verifiedAt, details } or null.
+     * The supplier's reference bank details (src/services/bank-reference.js):
+     * JFPro's accounts on file first, else the newest payment row of another
+     * live PI of theirs ("the last PO"). → the loader's shape, or null.
      */
     const previousBank = async (conn, row, cache = null) => {
         const exclude = row.imported_invoice_id != null ? Number(row.imported_invoice_id) : 0;
         const cacheKey = `${row.supplier_id}:${exclude}`;
         if (cache && cache.has(cacheKey)) return cache.get(cacheKey);
-        const [names] = await conn.query(`SELECT name FROM suppliers WHERE id = ? AND deleted_at IS NULL LIMIT 1`, [row.supplier_id]);
-        const supplierName = names.length ? names[0].name : row.supplier_name;
-        const [rows] = await conn.query(
-            `SELECT p.*, po.po_number
-               FROM purchase_order_invoice_payments p
-               JOIN purchase_order_invoices i ON i.id = p.purchase_order_invoice_id AND i.deleted_at IS NULL
-               JOIN purchase_orders po ON po.id = p.purchase_order_id AND po.deleted_at IS NULL
-               LEFT JOIN ${jportalSchema()}.pi_submissions ps ON ps.id = i.pi_submission_id
-              WHERE p.purchase_order_invoice_id <> ?
-                AND ((i.pi_submission_id IS NOT NULL AND ps.supplier_id = ? AND p.bank_verification_status = 'verified')
-                  OR (i.pi_submission_id IS NULL AND ${PO_SUPPLIER_IS}
-                      AND (p.bank_verification_status = 'verified'
-                           OR COALESCE(NULLIF(p.beneficiary_name, ''), NULLIF(p.bank_name, ''), NULLIF(p.account_number, ''),
-                                       NULLIF(p.iban, ''), NULLIF(p.swift_bic, ''), NULLIF(p.intermediary_bank, '')) IS NOT NULL)))
-              ORDER BY COALESCE(p.bank_verification_status = 'verified', 0) DESC,
-                       COALESCE(p.bank_verified_at, p.updated_at) DESC, p.id DESC
-              LIMIT 1`,
-            [exclude, row.supplier_id, supplierName]
-        );
-        let out = null;
-        if (rows.length) {
-            const p = rows[0];
-            const verified = p.bank_verification_status === bank.VERIFIED;
-            out = {
-                invoiceId: Number(p.purchase_order_invoice_id),
-                poNumber: p.po_number || null,
-                verifiedAt: verified ? iso(p.bank_verified_at) : null,
-                details: (verified && bank.parseVerifiedJson(p.bank_verified_json)) || bank.bankDetailsOf(p, { fromRow: true }),
-            };
-        }
+        const out = await loadBankReference(conn, {
+            supplierId: row.supplier_id,
+            fallbackName: row.supplier_name,
+            excludeInvoiceId: exclude,
+        });
         if (cache) cache.set(cacheKey, out);
         return out;
     };
 
+    // The reference as the API shows it beside the comparison.
+    const referenceToJson = ref => (ref ? {
+        source: ref.source,
+        label: ref.label || null,
+        invoiceId: ref.invoiceId ?? null,
+        poNumber: ref.poNumber ?? null,
+        verifiedAt: ref.verifiedAt ?? null,
+        details: ref.details,
+    } : null);
+
     // The bank gate's view of a submission: `not_checked` when the check is
-    // unusable, else compareBankDetails(previous, the details the check read).
+    // unusable, else the details the check read against every reference
+    // candidate (a JFPro supplier can hold one account per currency; matching
+    // any of them is a match). `previous` keeps its name for the API.
     const bankCheckFor = async (conn, row, usability, cache = null) => {
-        const previous = await previousBank(conn, row, cache);
-        if (!usability.usable) return { state: 'not_checked', fields: [], current: null, previous };
+        const reference = await previousBank(conn, row, cache);
+        const previous = referenceToJson(reference);
+        if (!usability.usable) return { state: 'not_checked', fields: [], current: null, previous, source: previous ? previous.source : null };
         const current = bank.bankDetailsOf(usability.result.paymentTerms);
-        const cmp = bank.compareBankDetails(previous ? previous.details : null, current);
-        return { state: cmp.state, fields: cmp.fields, current, previous };
+        const cmp = bank.bestBankComparison(reference ? reference.candidates.map(c => c.details) : [], current);
+        const matched = cmp.referenceIndex != null && reference ? reference.candidates[cmp.referenceIndex] : null;
+        return {
+            state: cmp.state,
+            fields: cmp.fields,
+            current,
+            previous: previous && matched ? { ...previous, label: matched.label || previous.label, details: matched.details } : previous,
+            source: previous ? previous.source : null,
+        };
     };
 
     // The submission as the list shows it. `po` (loadPoForCheck output, or

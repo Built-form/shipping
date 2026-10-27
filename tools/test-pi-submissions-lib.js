@@ -172,6 +172,25 @@ test('compareBankDetails: the four states', () => {
     ]);
 });
 
+test('bestBankComparison: any matching reference is a match; changed reports the closest', () => {
+    // No references at all, or none with details: no_history.
+    assert.equal(B.bestBankComparison([], BANK).state, 'no_history');
+    assert.equal(B.bestBankComparison([{ bankAddress: 'only an address' }], BANK).state, 'no_history');
+    // Nothing read off the PI: not_extracted, whatever the references.
+    assert.deepEqual(B.bestBankComparison([BANK], null), { state: 'not_extracted', fields: [], referenceIndex: null });
+    // A second JFPro account (another currency) matching is a match, and says which.
+    const other = { ...BANK, accountNumber: '111-222', swiftBic: 'CHASUS33' };
+    const m = B.bestBankComparison([other, BANK], BANK);
+    assert.deepEqual(m, { state: 'unchanged', fields: [], referenceIndex: 1 });
+    // Nothing matches: changed, against the reference with the FEWEST differing
+    // fields — one wrong digit, not a wall of fields from the wrong account.
+    const oneOff = { ...BANK, accountNumber: '123-456-780' };
+    const ch = B.bestBankComparison([other, BANK], oneOff);
+    assert.equal(ch.state, 'changed');
+    assert.equal(ch.referenceIndex, 1);
+    assert.deepEqual(ch.fields, [{ field: 'accountNumber', previous: '123-456-789', now: '123-456-780' }]);
+});
+
 test('isPayable: portal PIs need a verified payment row; others are not affected', () => {
     assert.equal(B.isPayable({ invoice: { pi_submission_id: null }, payment: null }), true);
     assert.equal(B.isPayable({ invoice: { pi_submission_id: null }, payment: { bank_verification_status: 'needs_verification' } }), true);

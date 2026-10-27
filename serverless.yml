@@ -662,6 +662,19 @@ functions:
                 key:
                   - prefix: 'ci/'
 
+  # ── Supplier confirmed a deposit arrived (supplier portal) ──
+  # Invoked directly, async, by jportal with { purchaseOrderId } when a supplier ticks
+  # "payment received" on a PO whose deposit staff recorded. Moves the PO's SCHEDULED /
+  # PO_SENT lines into IN_PRODUCTION with the usual audit rows; a no-op otherwise.
+  # No events: the portal's invoke is the only trigger.
+  depositReceived:
+    handler: src/handlers/deposit-received.handler
+    name: jportal-deposit-received-${self:custom.envName}
+    timeout: 60
+    memorySize: 512
+    reservedConcurrency: 2
+    maximumRetryAttempts: 1
+
   # ── Daily alerts generator (nightly) ──
   # Aggregates the day's container ETAs + supplier ready dates into the
   # daily_alerts table for the Shipsline slide-out alert window. Runs at 04:00

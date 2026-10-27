@@ -38,6 +38,8 @@ const L = require('../lib/pi-submissions');
 const { jportalSchema, PO_SUPPLIER_IS } = require('../lib/jportal');
 const { recordAudit } = require('../lib/audit');
 const { classifyGeminiError } = require('../lib/gemini-retry');
+const { bestBankComparison } = require('../lib/bank-verification');
+const { loadBankReference } = require('./bank-reference');
 const poCheck = require('./po-invoice-check');
 const log = require('../lib/logger');
 
@@ -219,16 +221,38 @@ function createPiChecker({
             const v = L.validateCheckResult(out.result);
             if (!v.ok) return await fail(row, attempt, 'MODEL_BAD_OUTPUT', `Model output failed the shape check: ${v.reason}`, poSnapshot);
 
+            // 6b. The bank details the PI claims, against the supplier's reference
+            // (JFPro first, else their last PO — src/services/bank-reference.js).
+            // Stored with the result so the portal can show the supplier the verdict
+            // (never the details) the moment the check lands; ShipLine recomputes it
+            // live at review. Best-effort: a reference that cannot be read leaves the
+            // verdict NULL rather than failing the check.
+            let bankVerdict = null;
+            let bankSource = null;
+            try {
+                const reference = await withConn(conn => loadBankReference(conn, {
+                    supplierId: row.supplier_id,
+                    fallbackName: row.supplier_name,
+                }));
+                const cmp = bestBankComparison(reference ? reference.candidates.map(c => c.details) : [], (out.result || {}).paymentTerms);
+                bankVerdict = cmp.state;
+                bankSource = reference ? reference.source : null;
+            } catch (e) {
+                log.warn('[pi-check] bank reference unavailable', { submissionId: row.id, error: e.message });
+            }
+
             // 7. The result.
             const u = out.usage || {};
             const [done] = await withConn(conn => conn.query(
                 `UPDATE ${jportalSchema()}.pi_submissions
                     SET check_status = 'succeeded', verdict = ?, discrepancy_count = ?, result_json = ?, po_snapshot_json = ?,
+                        bank_verdict = ?, bank_source = ?,
                         model_used = ?, input_tokens = ?, output_tokens = ?, total_tokens = ?,
                         error_code = NULL, error_message = NULL, checked_at = UTC_TIMESTAMP(), row_version = row_version + 1
                   WHERE id = ? AND check_attempt = ? AND check_status = 'pending' AND status = 'draft'`,
                 [
                     v.verdict, v.discrepancyCount, JSON.stringify(out.result), JSON.stringify(poSnapshot),
+                    bankVerdict, bankSource,
                     String(out.model || '').slice(0, 64) || null,
                     u.promptTokenCount ?? null, u.candidatesTokenCount ?? null, u.totalTokenCount ?? null,
                     row.id, attempt,

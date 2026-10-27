@@ -120,6 +120,38 @@ function compareBankDetails(previous, current) {
     return { state: fields.length ? 'changed' : 'unchanged', fields };
 }
 
+/**
+ * The details on a PI against SEVERAL references (a supplier can hold more
+ * than one account in JFPro — one per currency, say). Same states as
+ * compareBankDetails: `unchanged` when ANY reference matches (referenceIndex
+ * says which); `changed` reports the closest reference's differing fields,
+ * so one wrong digit is one changed field, not a wall of them.
+ *   references: BankDetails[] (empty / detail-less entries are skipped)
+ *   current:    BankDetails or the model's paymentTerms
+ * → { state, fields, referenceIndex: index into `references` or null }
+ */
+function bestBankComparison(references, current) {
+    const cur = bankDetailsOf(current);
+    if (!bankFingerprint(cur)) return { state: 'not_extracted', fields: [], referenceIndex: null };
+    const refs = (Array.isArray(references) ? references : [])
+        .map((r, i) => ({ details: bankDetailsOf(r), i }))
+        .filter((r) => bankFingerprint(r.details));
+    if (!refs.length) {
+        return {
+            state: 'no_history',
+            fields: COMPARED_FIELDS.filter(k => cur[k] !== null).map(k => ({ field: k, previous: null, now: cur[k] })),
+            referenceIndex: null,
+        };
+    }
+    let best = null;
+    for (const r of refs) {
+        const cmp = compareBankDetails(r.details, cur);
+        if (cmp.state === 'unchanged') return { state: 'unchanged', fields: [], referenceIndex: r.i };
+        if (!best || cmp.fields.length < best.cmp.fields.length) best = { cmp, i: r.i };
+    }
+    return { state: 'changed', fields: best.cmp.fields, referenceIndex: best.i };
+}
+
 // The status a payment row ends with, given the fingerprint of the details on
 // it and the fingerprint someone verified.
 function statusFor(fingerprint, verifiedFingerprint) {
@@ -208,6 +240,7 @@ module.exports = {
     normaliseBank,
     bankFingerprint,
     compareBankDetails,
+    bestBankComparison,
     statusFor,
     isPayable,
     parseVerifiedJson,
