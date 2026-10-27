@@ -652,7 +652,80 @@ test('a line that says it bills inspection units stays QC units, even when the b
     assert.equal(c.verdict, 'differs');
 });
 
-test('the reader is told a part carton is goods, whatever QC unit has its quantity', () => {
+// The prompt line above first said a part carton is goods "with the
+// product's own code"; the next read of INV-26_89131 then coded box 314's
+// in-box QC rows (JF0197_FQC × 45, JF0140_FQC × 40) as plain JF0197 / JF0140
+// (user, 2026-10-27). It now speaks of the not-shipped QC list only.
+test('the reader is told not to take a QC unit from the list for a line just because the quantities agree', () => {
     const p = promptFor(BOX_314);
-    assert.match(p, /Use an _FQC code only when the document says the line bills QC or inspection units/);
+    assert.match(p, /Use a code from this list only when the document says the line bills QC or inspection units/);
+    assert.doesNotMatch(p, /with the product's own code/);
+});
+
+// ── A product and its QC units both in the box (user, 2026-10-27) ────────
+// Box 314 holds JF0197 4,500 and JF0197_FQC 45 on PO_00297J (QC units that
+// travel). The invoice prints the product twice, 4,500 + 45, and never our
+// _FQC code: the reader's code for the 45 is a guess either way. The box's
+// two rows settle it — by quantity, only when that makes both exact.
+const FAMILY_CTX = {
+    shipment: { reference: '314' }, shipmentCurrency: 'USD',
+    purchaseOrders: [{
+        id: 297, poNumber: 'PO_00297J', supplier: SUPPLIER, supplierKey: KEY, currency: 'USD', valueInShipment: 3863.25, deposit: null,
+        lines: [
+            { jfCode: 'JF0197', productName: 'BNCF-WH3-12', quantity: 4500, unitPrice: 0.85 },
+            { jfCode: 'JF0197_FQC', productName: 'BNCF-WH3-12', quantity: 45, unitPrice: 0.85 },
+        ],
+    }],
+    qcLines: [],
+};
+const fl = (jfCode, qty) => ({ poRef: 'PO_00297J', jfCode, piRef: null, sku: 'JF0197', description: 'CONFORMING BANDAGE 7.5CMX4M BOX OF 12 ROLLS', qty, unitPrice: 0.85, amount: Math.round(qty * 0.85 * 100) / 100 });
+const familyCheck = (lines, context = FAMILY_CTX) => compareInvoiceToContainer({
+    extract: { documentKind: 'balance_invoice', currency: 'USD', totalAmount: Math.round(lines.reduce((a, l) => a + l.amount, 0) * 100) / 100, amountDueNow: null, depositDeducted: null, lines },
+    context, supplierName: SUPPLIER,
+});
+const familyOf = c => c.lines.map(l => [l.jfCode, l.invoiceQty, l.ourQty, l.issues.length, (l.invoiceRows || []).map(r => r.matchedBy)]);
+
+test('the small line coded as the product, the box holding it on the product\'s QC row: moved there by quantity', () => {
+    const c = familyCheck([fl('JF0197', 4500), fl('JF0197', 45)]);
+    assert.equal(c.verdict, 'match');
+    assert.deepEqual(familyOf(c), [['JF0197', 4500, 4500, 0, ['code']], ['JF0197_FQC', 45, 45, 0, ['box_qty']]]);
+    assert.deepEqual(c.missingOurLines, []);
+    // Printed the other way round: the same.
+    assert.deepEqual(familyOf(familyCheck([fl('JF0197', 45), fl('JF0197', 4500)])), familyOf(c));
+});
+
+test('coded as the box has them: left as coded', () => {
+    const c = familyCheck([fl('JF0197', 4500), fl('JF0197_FQC', 45)]);
+    assert.equal(c.verdict, 'match');
+    assert.deepEqual(familyOf(c), [['JF0197', 4500, 4500, 0, ['code']], ['JF0197_FQC', 45, 45, 0, ['code']]]);
+    // In-box QC rows are goods: their money is not taken out of the goods.
+    assert.deepEqual([c.qcBilled, c.goodsDelta], [0, 0]);
+});
+
+test('no move makes the box exact (a real shortfall): left as coded, the difference shown', () => {
+    const c = familyCheck([fl('JF0197', 4500), fl('JF0197', 40)]);
+    assert.equal(c.verdict, 'differs');
+    assert.deepEqual(familyOf(c), [['JF0197', 4540, 4500, 2, ['code', 'code']]]);
+    assert.deepEqual(c.missingOurLines.map(l => [l.jfCode, l.qty]), [['JF0197_FQC', 45]]);
+});
+
+test('two ways to make the box exact: the one that moves fewest lines', () => {
+    // Box 50 + 50; the invoice 50, 25, 25, all coded as the product: moving the
+    // 50 is one move, moving both 25s is two.
+    const ctx = { ...FAMILY_CTX, purchaseOrders: [{ ...FAMILY_CTX.purchaseOrders[0], lines: FAMILY_CTX.purchaseOrders[0].lines.map(l => ({ ...l, quantity: 50 })) }] };
+    const c = familyCheck([fl('JF0197', 50), fl('JF0197', 25), fl('JF0197', 25)], ctx);
+    assert.equal(c.verdict, 'match');
+    assert.deepEqual(c.lines.map(l => [l.jfCode, (l.invoiceRows || []).map(r => [r.qty, r.matchedBy])]), [['JF0197', [[25, 'code'], [25, 'code']]], ['JF0197_FQC', [[50, 'box_qty']]]]);
+});
+
+test('lines of one quantity on both rows: the later-printed line moves, whatever the order', () => {
+    const ctx = { ...FAMILY_CTX, purchaseOrders: [{ ...FAMILY_CTX.purchaseOrders[0], lines: FAMILY_CTX.purchaseOrders[0].lines.map(l => ({ ...l, quantity: 45 })) }] };
+    const a = { ...fl('JF0197', 45), description: 'FIRST LINE' };
+    const b = { ...fl('JF0197', 45), description: 'SECOND LINE' };
+    const moved = c => c.lines.find(l => l.jfCode === 'JF0197_FQC').invoiceRows.map(r => [r.description, r.matchedBy]);
+    const c = familyCheck([a, b], ctx);
+    assert.equal(c.verdict, 'match');
+    assert.deepEqual(familyOf(c), [['JF0197', 45, 45, 0, ['code']], ['JF0197_FQC', 45, 45, 0, ['box_qty']]]);
+    assert.deepEqual(moved(c), [['SECOND LINE', 'box_qty']]);
+    assert.deepEqual(moved(familyCheck([b, a], ctx)), [['FIRST LINE', 'box_qty']]);
 });

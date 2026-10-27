@@ -550,8 +550,10 @@ function compareInvoiceToContainer({ extract, context, supplierName }) {
     const unplaced = [];
     const byCodeElsewhere = [];
     const heldQc = [];
+    const allRows = [];
     (extract.lines || []).forEach((raw, at) => {
         const row = { raw, at, po: raw.poRef ? matchPoRef(raw.poRef, index) : null, groups: [], matchedBy: null };
+        allRows.push(row);
         // An amount with no quantity and no price is a charge the reader put
         // among the goods ("printing plate charges JF0880"), not goods: never
         // added to a product, even one whose code it prints.
@@ -620,6 +622,49 @@ function compareInvoiceToContainer({ extract, context, supplierName }) {
     for (const h of [...heldQc].sort((a, b) => a.row.at - b.row.at)) {
         if (qcAsGoods.has(h.row.at)) continue;
         if (!matchQcUnit(h.row.raw, h.code)) unplaced.push(h.row);
+    }
+
+    // A product and its QC units both in the box, on one PO (user,
+    // 2026-10-27: box 314 holds JF0197 4,500 and JF0197_FQC 45). The invoice
+    // never prints our _FQC codes, so the reader's code for the small line is
+    // a guess either way. When the lines as coded do not add up to the box's
+    // rows, and moving lines between those rows makes every one exact, they
+    // are moved: the fewest moves; between equals (lines of one quantity, the
+    // same figures either way) the later-printed line moves. Else as coded.
+    const families = new Map();
+    for (const g of groups) {
+        if (!g.code) continue;
+        const famKey = `${g.poId}|${g.code.replace(/FQC$/, '')}`;
+        if (!families.has(famKey)) families.set(famKey, []);
+        families.get(famKey).push(g);
+    }
+    for (const fam of families.values()) {
+        if (fam.length < 2 || fam.length > 3) continue;
+        // Lines tied to several groups at once (a code on two POs) are not this case.
+        if (fam.some(g => g.invoiceRows.some(r => r.groups.length !== 1))) continue;
+        const famRows = [...new Set(fam.flatMap(g => g.invoiceRows))].sort((a, b) => a.at - b.at);
+        if (!famRows.length || famRows.length > 8) continue;
+        const qtys = famRows.map(r => numOrNull(r.raw.qty));
+        const boxQtys = fam.map(g => sumOrNull(g.rows.map(l => l.qty)));
+        if (qtys.some(v => v == null) || boxQtys.some(v => v == null)) continue;
+        const exact = assign => fam.every((_, gi) => Math.abs(famRows.reduce((a, _r, ri) => a + (assign[ri] === gi ? qtys[ri] : 0), 0) - boxQtys[gi]) < 1e-9);
+        const coded = famRows.map(r => fam.indexOf(r.groups[0]));
+        if (exact(coded)) continue;
+        let best = null;
+        for (let n = 0; n < fam.length ** famRows.length; n++) {
+            const assign = famRows.map((_, i) => Math.floor(n / fam.length ** i) % fam.length);
+            if (!exact(assign)) continue;
+            const moved = assign.map((gi, i) => (gi !== coded[i] ? i : -1)).filter(i => i >= 0);
+            const lateness = moved.reduce((a, i) => a + i, 0);
+            if (!best || moved.length < best.moved.length || (moved.length === best.moved.length && lateness > best.lateness)) best = { assign, moved, lateness };
+        }
+        if (!best) continue;
+        for (const i of best.moved) {
+            const row = famRows[i];
+            const from = row.groups[0];
+            from.invoiceRows = from.invoiceRows.filter(r => r !== row);
+            link(row, [fam[best.assign[i]]], 'box_qty');
+        }
     }
 
     // 2. Goods lines with no code of ours, bunched by what identifies them on
@@ -730,8 +775,11 @@ function compareInvoiceToContainer({ extract, context, supplierName }) {
     const invoiceKind = billsGoods && billsQc ? 'goods_and_qc' : billsQc ? 'qc' : 'goods';
     const qcOurTotal = Math.round(qcLines.reduce((a, l) => a + (l.ourTotal || 0), 0) * 100) / 100;
     const qcInvoiceTotal = Math.round(qcLines.reduce((a, l) => a + (l.invoiceTotal ?? 0), 0) * 100) / 100;
-    // Lines coded as QC units but taken as the box's goods (above) are goods money.
-    const qcBilled = Math.round([...(extract.lines || [])].filter((raw, at) => isQcCode(raw.jfCode || raw.sku) && !qcAsGoods.has(at)).reduce((a, raw) => a + lineAmountOf(raw), 0) * 100) / 100;
+    // QC money is what lines coded as QC units bill when they are not the
+    // box's own rows: one tied to a row of the box (an _FQC row that travels,
+    // or a part carton taken as goods, above) is goods money.
+    const onBoxAt = new Set(allRows.filter(r => r.groups.length).map(r => r.at));
+    const qcBilled = Math.round([...(extract.lines || [])].filter((raw, at) => isQcCode(raw.jfCode || raw.sku) && !onBoxAt.has(at)).reduce((a, raw) => a + lineAmountOf(raw), 0) * 100) / 100;
     // A QC units invoice does not bill the goods: none of them is missing.
     const missing = billsGoods
         ? groups.filter(g => !g.invoiceRows.length).map(g => ({
@@ -812,7 +860,7 @@ function qcSectionOf(context) {
     const lines = [
         '## QC sample units on this supplier\'s purchase orders',
         'They never travel in a container. If the document bills them, list each as a line with its _FQC code as jfCode and its PO as poRef.',
-        'Use an _FQC code only when the document says the line bills QC or inspection units (e.g. "BY INSPECTION", "QC"). A small second line of a product (a part carton) is goods, with the product\'s own code, even when its quantity equals a QC unit listed below.',
+        'Use a code from this list only when the document says the line bills QC or inspection units (e.g. "BY INSPECTION", "QC") — never just because a line\'s quantity equals one listed here.',
         'poRef is the purchase order number printed on that line (often inside its description, e.g. "SUNMED-93" or "PO_00299J"), copied exactly as printed when it is one of the purchase orders below — never a different one, even if another lists the same product.',
     ];
     const byPo = new Map();
