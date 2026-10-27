@@ -8,6 +8,20 @@ Routes: `src/services/pi-submission-routes.js` · rules: `src/lib/pi-submissions
 (TEST stage) · data: `jportal.pi_submissions`, owned by the supplier portal (the `portal`
 repo; its README §11 "Proforma invoice uploads" is the other half of this contract).
 
+**Bank verdict at check time** (`bank_verdict` / `bank_source` on the row, written with the
+result): the check compares the bank details it read off the PI against the supplier's
+reference — the live accounts on file in **JFPro** (`jfpro.supplier_bank_accounts` /
+`_versions`, matching ANY live account's newest version is a match) first, else the
+supplier's **last PO's** details (the previous-bank rule below), via
+`src/services/bank-reference.js` + `bestBankComparison`. Verdicts: `unchanged` / `changed` /
+`no_history` (nothing on file in either source — ShipLine highlights this to staff) /
+`not_extracted`; `bank_source` is `jfpro` or `last_po`. The portal shows the supplier the
+verdict only, never any details. ShipLine's own `bankCheck` recomputes the comparison live
+at review time from the same loader, so a JFPro change after the check shows up there; the
+stored verdict is the supplier's view. Shipping's login needs SELECT on the two jfpro
+tables for this (and the check-group UPDATE grant below gained the two columns); with no
+jfpro access the loader falls back to the last PO and logs a warning.
+
 Suppliers upload their proforma invoice (PI) in the supplier portal, from the PO's page.
 Shipping's `piCheck` Lambda checks it against the PO with **the same Gemini prompt, schema
 and PO loader as a staff upload** and writes the result back to the row. The supplier sees
@@ -298,6 +312,7 @@ but never creates or deletes its rows:
 ```sql
 GRANT SELECT ON jportal.pi_submissions TO '<shipping login>'@'%';
 GRANT UPDATE (check_status, check_attempt, check_started_at, verdict, discrepancy_count, result_json,
+              bank_verdict, bank_source,
               po_snapshot_json, model_used, input_tokens, output_tokens, total_tokens, error_code,
               error_message, checked_at, s3_etag, file_size,
               status, decided_by, decided_at, decided_note, imported_invoice_id, notified_at, notify_error,
