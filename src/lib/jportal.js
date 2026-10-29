@@ -30,4 +30,14 @@ const SUPPLIER_NAME_MATCH = `CONVERT(s.name USING utf8mb4) COLLATE utf8mb4_0900_
 const PO_SUPPLIER_IS = `CONVERT(po.supplier USING utf8mb4) COLLATE utf8mb4_0900_bin
                       = CONVERT(? USING utf8mb4) COLLATE utf8mb4_0900_bin`;
 
-module.exports = { jportalSchema, SUPPLIER_NAME_MATCH, PO_SUPPLIER_IS };
+// MySQL errnos meaning "that schema / table is not there for this login":
+// 1049 unknown database, 1142 table command denied, 1143 column command
+// denied, 1146 no such table. A source another app owns (jportal, jfpro) that
+// answers with one of these is absent in this environment, not broken. Moved
+// here from src/services/bank-reference.js; also used by the QC availability
+// routes (src/services/qc-availability-routes.js).
+const SOURCE_MISSING = new Set([1049, 1142, 1143, 1146]);
+
+const isSourceMissing = err => Boolean(err) && SOURCE_MISSING.has(err.errno);
+
+module.exports = { jportalSchema, SUPPLIER_NAME_MATCH, PO_SUPPLIER_IS, SOURCE_MISSING, isSourceMissing };

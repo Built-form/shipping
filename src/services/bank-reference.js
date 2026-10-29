@@ -21,11 +21,10 @@
 // an environment without JFPro degrades instead of failing the check.
 
 const bank = require('../lib/bank-verification');
-const { jportalSchema, PO_SUPPLIER_IS } = require('../lib/jportal');
+// SOURCE_MISSING: schema or table absent, or no grant — this source has
+// nothing to say.
+const { jportalSchema, PO_SUPPLIER_IS, SOURCE_MISSING } = require('../lib/jportal');
 const log = require('../lib/logger');
-
-// Schema or table absent, or no grant: this source has nothing to say.
-const SOURCE_MISSING = new Set([1049, 1142, 1143, 1146]);
 
 const iso = (v) => (v instanceof Date ? v.toISOString() : v ? String(v) : null);
 

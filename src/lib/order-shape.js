@@ -24,7 +24,12 @@ const ORDER_SELECT = `
              WHERE order_id = orders.id) AS draft_container_names,
            (SELECT JSON_ARRAYAGG(planned_container_name)
               FROM planned_container_allocations
-             WHERE order_id = orders.id) AS planned_container_names
+             WHERE order_id = orders.id) AS planned_container_names,
+           (SELECT JSON_ARRAYAGG(l.visit_id)
+              FROM qc_visit_lines l
+              JOIN qc_visits v ON v.id = l.visit_id
+             WHERE l.order_id = orders.id
+               AND v.status IN ('DRAFT','PROPOSED','CONFIRMED')) AS qc_visit_ids
     FROM orders
     WHERE orders.deleted_at IS NULL
 `;
@@ -114,6 +119,14 @@ function rowToOrder(row) {
             ? JSON.parse(row.planned_container_names)
             : row.planned_container_names;
     }
+    // Open (DRAFT/PROPOSED/CONFIRMED) QC visits this line is booked on — a
+    // derived read only; the visit never writes to the order.
+    let qcVisitIds = [];
+    if (row.qc_visit_ids) {
+        qcVisitIds = (typeof row.qc_visit_ids === 'string'
+            ? JSON.parse(row.qc_visit_ids)
+            : row.qc_visit_ids).map(Number);
+    }
     return {
         id: row.id,
         jfCode: row.jf_code || null,
@@ -167,6 +180,7 @@ function rowToOrder(row) {
         estimatedReadyDate: formatDate(row.estimated_ready_date),
         artworkConfirmedDate: formatDate(row.artwork_confirmed_date),
         shipmentId: row.shipment_id ?? null,
+        qcVisitIds,
     };
 }
 

@@ -2,8 +2,8 @@
 
 // Frozen-shape check for the shipments rollout: every key the legacy read
 // routes returned before the change must come back byte-for-byte the same.
-// Only two additive keys are allowed: `shipmentId` on each order and the
-// top-level `shipments` side-map on GET /orders. Also asserts that no order
+// Only these additive keys are allowed: `shipmentId` and `qcVisitIds` on each
+// order and the top-level `shipments` side-map on GET /orders. Also asserts that no order
 // audit row carries a shipmentId key.
 //
 //   1. against the PREVIOUS code (e.g. a worktree at the last deploy tag):
@@ -31,7 +31,8 @@ const ENDPOINTS = [
     '/api/v1/draft-container-registry',
     '/api/v1/containers',
 ];
-const ALLOWED_ORDER_KEYS = new Set(['shipmentId']);
+// qcVisitIds: open QC visits the line is on (QC visits, phase 4) — additive.
+const ALLOWED_ORDER_KEYS = new Set(['shipmentId', 'qcVisitIds']);
 const ALLOWED_TOP_KEYS = { '/api/v1/orders': new Set(['shipments']) };
 
 const api = axios.create({ baseURL: BASE, validateStatus: () => true, maxContentLength: Infinity, maxBodyLength: Infinity });

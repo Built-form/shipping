@@ -108,6 +108,10 @@ provider:
     SHIPSGO_API_KEY: ${self:custom.secrets.SHIPSGO_API_KEY}
     MAKE_PO_SENT_WEBHOOK_URL: ${self:custom.secrets.MAKE_PO_SENT_WEBHOOK_URL, ''}
     PO_DOCS_BUCKET: shipping-purchase-orders-${sls:stage}
+    # JFPRO's documents bucket (owned by the JFPRO stack, same region): the QC
+    # inspection kit documents (src/services/qc-kit-routes.js presigns links,
+    # qc-visit-comms-routes.js attaches them to the inspector email). Read only.
+    JFPRO_DOCS_BUCKET: jfpro-documents-${sls:stage}
     FRONT_API_TOKEN: ${self:custom.secrets.FRONT_API_TOKEN, ''}
     FRONT_CHANNEL_ID: ${self:custom.secrets.FRONT_CHANNEL_ID, ''}
     GEMINI_API_KEY: ${self:custom.secrets.GEMINI_API_KEY, ''}
@@ -124,8 +128,10 @@ provider:
     # import copies one into PO_DOCS_BUCKET. Read only: no tagging, no delete.
     PI_UPLOADS_BUCKET: jportal-pi-uploads-${self:custom.envName}
     # The supplier portal's base URL, for the link in the PI decision emails
-    # (blank = no link). PI_NOTIFY_REDIRECT_TO (test only): send every PI
-    # decision email there instead of to the supplier.
+    # (blank = no link) and the host of the QC visit availability links
+    # (<url>/availability/<token>; blank = availability links off, see
+    # docs/qc-availability.md). PI_NOTIFY_REDIRECT_TO (test only): send every
+    # PI decision email there instead of to the supplier.
     SUPPLIER_PORTAL_URL: ${self:custom.secrets.SUPPLIER_PORTAL_URL, ''}
     PI_NOTIFY_REDIRECT_TO: ${self:custom.secrets.PI_NOTIFY_REDIRECT_TO, ''}
     # Email receipt confirmation: optional static page (e.g. an S3-hosted
@@ -199,6 +205,13 @@ provider:
             - s3:ListBucket
           Resource:
             - arn:aws:s3:::jportal-pi-uploads-${self:custom.envName}
+        # JFPRO's documents bucket (its stack): the QC inspection kit documents
+        # (JFPRO_DOCS_BUCKET). Read only: presigned links and email attachments.
+        - Effect: Allow
+          Action:
+            - s3:GetObject
+          Resource:
+            - arn:aws:s3:::jfpro-documents-${sls:stage}/*
         # Nightly live→test S3 mirror (s3-sync-live-to-test.js; its schedule is
         # enabled in the TEST stack only): list both sides, read live, write
         # test. Bucket names are literal because the pairing is fixed regardless
@@ -311,7 +324,7 @@ functions:
   # External suppliers (no Google login) set the estimated ready date on their
   # own PO lines. They authenticate with just their PO number + a per-supplier
   # access code (suppliers.portal_code) — no supplier picker. Isolated in its
-  # own handler so the public surface is just these two routes; the code is
+  # own handler so the public surface is just the routes below; the code is
   # checked inside the handler, not by API Gateway. Low concurrency caps abuse.
   supplierPortalApi:
     handler: src/handlers/supplier-portal.handler
@@ -322,6 +335,13 @@ functions:
           method: POST
       - httpApi:
           path: /api/v1/portal/po-ready-date
+          method: POST
+      # QC visit slot confirmation (docs/qc-visit-portal.md).
+      - httpApi:
+          path: /api/v1/portal/qc-visit-lookup
+          method: POST
+      - httpApi:
+          path: /api/v1/portal/qc-visit
           method: POST
 
   # ── Carton-scan receiving (PUBLIC — no authorizer) ──
@@ -754,6 +774,8 @@ resources:
       DependsOn:
         - HttpApiRoutePostApiV1PortalPoDashlookup
         - HttpApiRoutePostApiV1PortalPoDashreadyDashdate
+        - HttpApiRoutePostApiV1PortalQcDashvisitDashlookup
+        - HttpApiRoutePostApiV1PortalQcDashvisit
         - HttpApiRouteGetApiV1ConfirmDashreceiptTokenVar
         - HttpApiRoutePostApiV1ConfirmDashreceiptTokenVar
         - HttpApiRoutePostApiV1ScanLookup
@@ -767,6 +789,12 @@ resources:
             ThrottlingRateLimit: 5
             ThrottlingBurstLimit: 10
           'POST /api/v1/portal/po-ready-date':
+            ThrottlingRateLimit: 5
+            ThrottlingBurstLimit: 10
+          'POST /api/v1/portal/qc-visit-lookup':
+            ThrottlingRateLimit: 5
+            ThrottlingBurstLimit: 10
+          'POST /api/v1/portal/qc-visit':
             ThrottlingRateLimit: 5
             ThrottlingBurstLimit: 10
           # Public confirm-receipt open (GET) + confirm (POST). Token is
@@ -843,6 +871,14 @@ resources:
               Principal: '*'
               Action: s3:GetObject
               Resource: !Sub '${PurchaseOrderDocsBucket.Arn}/*'
+            - Effect: Deny
+              Principal: '*'
+              Action: s3:GetObject
+              Resource:
+                - !Sub '${PurchaseOrderDocsBucket.Arn}/qc-visits/*'
+              Condition:
+                StringEquals:
+                  'aws:PrincipalType': Anonymous
 
     # ── Supplier-portal packing-list alarms (plCheck / plRefresh) ──
     # A supplier is waiting on each of these runs, and nothing else watches

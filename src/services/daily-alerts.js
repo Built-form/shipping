@@ -14,6 +14,9 @@
 //   • missing_data       — an in-transit order missing LOT / MFG / EXP
 //   • arrived_unreceived — arrived at warehouse, units not booked into Mintsoft
 //   • shipment_late      — delivery slot passed or carrier ETA slipped ≥ 2 days
+//   • qc_visit           — QC visit nags (unconfirmed, due soon, completion due,
+//                          PO shrank, line left stage, ready but unvisited);
+//                          pure builder in src/lib/qc-alerts.js
 // Retired (kept only so old rows auto-resolve): supplier_ready_date, qc_pending.
 //
 // LIFECYCLE (the important part). Each logical condition maps to ONE alert via
@@ -34,6 +37,8 @@
 const { formatDate } = require('../lib/order-shape');
 const { recordAudit } = require('../lib/audit');
 const log = require('./../lib/logger');
+const { buildQcVisitAlerts } = require('../lib/qc-alerts');
+const { OPEN_STATUSES, CANDIDATE_ORDER_STATUSES, chinaToday } = require('../lib/qc-visits');
 
 const ALERT_STATUSES = new Set(['pending', 'snoozed', 'dismissed', 'resolved', 'all']);
 const ACTIONS = new Set(['snooze', 'dismiss', 'restore']);
@@ -59,6 +64,7 @@ const IN_TRANSIT_STATUSES = ['CONSOLIDATED', 'ON_SEA', 'ON_AIR'];
 // generateDailyAlerts.
 const GENERATED_TYPES = [
     'container_eta', 'missing_data', 'arrived_unreceived', 'shipment_late',
+    'qc_visit',
 ];
 
 // Retired types: no longer generated, but STILL owned by the auto-resolve sweep
@@ -366,6 +372,57 @@ async function buildShipmentLateAlerts(conn, today) {
     return alerts;
 }
 
+// ── QC visits ───────────────────────────────────────────────────────────────
+// Loads every open visit (DRAFT/PROPOSED/CONFIRMED), its lines, the orders those
+// lines point at (deleted ones included — the builder flags them) and every live
+// order in a candidate status, then hands them to the pure builder in
+// src/lib/qc-alerts.js. `qcToday` is the China calendar day: visit dates are
+// China dates.
+async function loadQcVisitAlertInputs(conn) {
+    const openPh = OPEN_STATUSES.map(() => '?').join(', ');
+    const [visits] = await conn.query(
+        `SELECT id, ref, status, supplier_name, factory_label, factory_city, inspector_name,
+                visit_date, TIME_FORMAT(window_start, '%H:%i') AS window_start,
+                TIME_FORMAT(window_end, '%H:%i') AS window_end,
+                proposed_at, factory_confirmed_at, inspector_confirmed_at
+           FROM qc_visits
+          WHERE status IN (${openPh})
+          ORDER BY id ASC`,
+        OPEN_STATUSES
+    );
+    let lines = [];
+    if (visits.length) {
+        const vPh = visits.map(() => '?').join(', ');
+        [lines] = await conn.query(
+            `SELECT visit_id, order_id, quantity_to_inspect, po_quantity_snapshot, sample_method
+               FROM qc_visit_lines
+              WHERE visit_id IN (${vPh})`,
+            visits.map((v) => v.id)
+        );
+    }
+    const candPh = CANDIDATE_ORDER_STATUSES.map(() => '?').join(', ');
+    const lineOrderIds = [...new Set(lines.map((l) => Number(l.order_id)))];
+    const params = [...CANDIDATE_ORDER_STATUSES];
+    let onLines = '';
+    if (lineOrderIds.length) {
+        onLines = ` OR id IN (${lineOrderIds.map(() => '?').join(', ')})`;
+        params.push(...lineOrderIds);
+    }
+    const [orders] = await conn.query(
+        `SELECT id, jf_code, product_name, po_number, purchase_order_id, supplier, status,
+                quantity, deleted_at
+           FROM orders
+          WHERE (deleted_at IS NULL AND status IN (${candPh}))${onLines}`,
+        params
+    );
+    return { visits, lines, orders };
+}
+
+async function buildQcVisitDailyAlerts(conn, qcToday) {
+    const inputs = await loadQcVisitAlertInputs(conn);
+    return buildQcVisitAlerts({ ...inputs, today: qcToday });
+}
+
 // Upsert one alert per condition. INSERT ... ON DUPLICATE KEY UPDATE refreshes
 // the display fields of the existing row (so the surfaced ETA / ready date stays
 // current) and stamps last_seen_at = this run, WITHOUT touching the user's
@@ -400,7 +457,7 @@ async function upsertAlerts(conn, alerts, runTs) {
 }
 
 // ── Generation (called by the nightly Lambda) ───────────────────────────────
-async function generateDailyAlerts(pool, { today = londonToday() } = {}) {
+async function generateDailyAlerts(pool, { today = londonToday(), qcToday = chinaToday() } = {}) {
     const conn = await pool.getConnection();
     try {
         // Single DB-clock timestamp marks this run; rows not stamped with it are
@@ -413,9 +470,11 @@ async function generateDailyAlerts(pool, { today = londonToday() } = {}) {
         const missingAlerts = await buildMissingDataAlerts(conn, today);
         const arrivedAlerts = await buildArrivedUnreceivedAlerts(conn, today);
         const lateAlerts = await buildShipmentLateAlerts(conn, today);
+        const qcVisitAlerts = await buildQcVisitDailyAlerts(conn, qcToday);
         const all = [
             ...containerAlerts, ...missingAlerts,
             ...arrivedAlerts, ...lateAlerts,
+            ...qcVisitAlerts,
         ];
         const { created, refreshed } = await upsertAlerts(conn, all, runTs);
 
@@ -428,6 +487,7 @@ async function generateDailyAlerts(pool, { today = londonToday() } = {}) {
             missing_data: missingAlerts.length,
             arrived_unreceived: arrivedAlerts.length,
             shipment_late: lateAlerts.length,
+            qc_visit: qcVisitAlerts.length,
         };
         const managedPh = MANAGED_TYPES.map(() => '?').join(', ');
         const [pendingByType] = await conn.query(
@@ -468,6 +528,7 @@ async function generateDailyAlerts(pool, { today = londonToday() } = {}) {
                 missingData: missingAlerts.length,
                 arrivedUnreceived: arrivedAlerts.length,
                 shipmentLate: lateAlerts.length,
+                qcVisit: qcVisitAlerts.length,
             },
             created,
             refreshed,

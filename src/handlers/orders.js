@@ -52,6 +52,10 @@ const shipmentSync = require('../services/shipment-sync');
 const { registerShipmentRoutes } = require('../services/shipment-routes');
 const { registerPackingListRoutes } = require('../services/packing-list-routes');
 const { registerContainerPhotoRoutes } = require('../services/container-photo-routes');
+const { registerQcVisitRoutes } = require('../services/qc-visit-routes');
+const { registerQcKitRoutes } = require('../services/qc-kit-routes');
+const { registerQcVisitCommsRoutes } = require('../services/qc-visit-comms-routes');
+const { registerQcAvailabilityRoutes } = require('../services/qc-availability-routes');
 const { registerPaymentReviewRoutes } = require('../services/payment-review-routes');
 const { registerPaymentExtraRoutes } = require('../services/payment-extra-routes');
 const { registerPaymentAlertRoutes } = require('../services/payment-alert-routes');
@@ -11955,6 +11959,29 @@ registerContainerPhotoRoutes(app, {
     auditLogSchemaReady,
     log,
 });
+
+// ── QC visits (/api/v1/qc-visits, /qc-factories, /qc-inspectors, /qc-kits) ─
+// Arranging a factory QC visit in China: lines and quantities, factory,
+// inspector, date and both parties' confirmations; the products' inspection
+// kits, read from JFPRO (QA documents, stage "China Agent — factory QC");
+// the factory / inspector emails and ICS. Same deps for all three; each
+// ignores what it does not need.
+const qcVisitDeps = {
+    withConnection,
+    s3,
+    poBucket: PO_BUCKET,
+    jfproDocsBucket: process.env.JFPRO_DOCS_BUCKET,
+    recordAudit,
+    auditLogSchemaReady,
+    log,
+    getEmailTemplate,
+    renderTemplate,
+};
+registerQcVisitRoutes(app, qcVisitDeps);
+registerQcKitRoutes(app, qcVisitDeps);
+registerQcVisitCommsRoutes(app, qcVisitDeps);
+// Availability links in the supplier portal (jportal schema): docs/qc-availability.md.
+registerQcAvailabilityRoutes(app, qcVisitDeps);
 
 // ── Payment sign-offs (/api/v1/payment-reviews, /api/v1/payment-assignees) ─
 // Two people sign off each payment on ShipLine's Payments flow page; one
