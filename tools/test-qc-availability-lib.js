@@ -121,17 +121,17 @@ test('validateLinkInput: the window must not have ended on the China day (15:59 
 
 // ── token, URL, state ───────────────────────────────────────────────────────
 
-test('newToken: 48 lowercase hex characters, unique', () => {
+test('newToken: 5 lowercase base36 characters', () => {
     const a = A.newToken();
     const b = A.newToken();
-    assert.match(a, /^[a-f0-9]{48}$/);
+    assert.match(a, /^[a-z0-9]{5}$/);
     assert.notEqual(a, b);
 });
 
 test('linkUrl: trailing slashes dropped; no portal URL → null', () => {
-    assert.equal(A.linkUrl('https://portal.example.com/', 'abc'), 'https://portal.example.com/availability/abc');
-    assert.equal(A.linkUrl('https://portal.example.com///', 'abc'), 'https://portal.example.com/availability/abc');
-    assert.equal(A.linkUrl('https://portal.example.com', 'abc'), 'https://portal.example.com/availability/abc');
+    assert.equal(A.linkUrl('https://portal.example.com/', 'abc'), 'https://portal.example.com/a/abc');
+    assert.equal(A.linkUrl('https://portal.example.com///', 'abc'), 'https://portal.example.com/a/abc');
+    assert.equal(A.linkUrl('https://portal.example.com', 'abc'), 'https://portal.example.com/a/abc');
     assert.equal(A.linkUrl('', 'abc'), null);
     assert.equal(A.linkUrl(undefined, 'abc'), null);
     assert.equal(A.linkUrl('   ', 'abc'), null);
@@ -160,7 +160,7 @@ test('linkToJson: the contract shape; url only while open or answered; never the
         'expiresAt', 'id', 'noneAvailable', 'party', 'preferredLang', 'proposedDate', 'recipientName', 'revokeReason',
         'revokedAt', 'state', 'url', 'windowEndDate', 'windowStartDate',
     ]);
-    assert.equal(j.url, `${portalUrl}/availability/${'a'.repeat(48)}`);
+    assert.equal(j.url, `${portalUrl}/a/${'a'.repeat(48)}`);
     assert.equal(j.state, 'open');
     assert.equal(j.availableDays, null);
     assert.equal(j.noneAvailable, false);
@@ -495,7 +495,7 @@ test('createOrReuseLink: supersedes the open link and inserts a snapshot; audit 
     assert.deepEqual(out.supersededIds, [3]);
     const sqls = conn.calls.map(c => c.sql);
     assert.match(sqls[1], /SET revoked_at = CURRENT_TIMESTAMP, revoke_reason = 'superseded', row_version = row_version \+ 1/);
-    assert.match(inserted[0], /^[a-f0-9]{48}$/);
+    assert.match(inserted[0], /^[a-z0-9]{5}$/);
     assert.deepEqual(inserted.slice(1), [
         7, 'QCV_00007', 'inspector', 'Mr Wang', null, 'Acme Co., Ltd.', 'Plant 2', 'Dongguan',
         '2026-11-12', '2026-11-12', '2026-11-20', 'en', 30, 'ops@example.com',
@@ -542,7 +542,7 @@ test('emailAvailabilityLink: preview creates nothing; send reuses or creates in 
 
     const existing = fakeConn(() => [[link({ id: 5 })]]);
     const p = await R.emailAvailabilityLink(existing, visit(), 'factory', { portalUrl, now: NOW });
-    assert.equal(p.url, `${portalUrl}/availability/${'a'.repeat(48)}`);
+    assert.equal(p.url, `${portalUrl}/a/${'a'.repeat(48)}`);
 
     let inserted;
     const send = fakeConn((sql, params) => {
@@ -557,7 +557,7 @@ test('emailAvailabilityLink: preview creates nothing; send reuses or creates in 
         create: true, to: ['li@example.com', 'x@example.com'], portalUrl, now: NOW,
     });
     assert.equal(s.created, true);
-    assert.equal(s.url, `${portalUrl}/availability/${inserted[0]}`);
+    assert.equal(s.url, `${portalUrl}/a/${inserted[0]}`);
     assert.equal(inserted[4], 'Ms Li');
     assert.equal(inserted[5], 'li@example.com');
     assert.equal(inserted[11], '2026-11-17', 'default window');
@@ -647,7 +647,7 @@ test('cancel: an expired but answered link is revoked, so collate stops showing 
 
 test('appendAvailabilityHtml / Text: an older availability URL in the body becomes the current one', () => {
     const oldUrl = `https://portal.example.com/availability/${'b'.repeat(48)}`;
-    const newUrl = `https://portal.example.com/availability/${'c'.repeat(48)}`;
+    const newUrl = `https://portal.example.com/a/${'c'.repeat(5)}`;
     const html = `<p>Hi</p><p>Tick here:<br><a href="${oldUrl}">${oldUrl}</a></p>`;
     const out = A.appendAvailabilityHtml(html, newUrl, 'factory');
     assert.equal(out, `<p>Hi</p><p>Tick here:<br><a href="${newUrl}">${newUrl}</a></p>`, 'replaced in place, nothing appended');

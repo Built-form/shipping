@@ -202,16 +202,28 @@ function validateLinkInput(body, visit, today) {
 
 // ── token, URL, state, JSON ─────────────────────────────────────────────────
 
-// 48 hex characters (the email-receipt recipe). No '.', so the portal's
-// CloudFront SPA rewrite serves the page.
+// 5 lower-case base36 characters (~60 million codes), short enough to type
+// from a phone. Lower case only: the token column's collation is case-insensitive.
+// No '.', so the portal's CloudFront SPA rewrite serves the page. Older links
+// carry 48 hex characters; jportal accepts both.
+const TOKEN_ALPHABET = 'abcdefghijklmnopqrstuvwxyz0123456789';
+const TOKEN_LENGTH = 5;
 function newToken() {
-    return crypto.randomBytes(24).toString('hex');
+    let out = '';
+    while (out.length < TOKEN_LENGTH) {
+        for (const b of crypto.randomBytes(TOKEN_LENGTH)) {
+            // 252 = 7 * 36: reject the top bytes so every character is uniform.
+            if (b < 252 && out.length < TOKEN_LENGTH) out += TOKEN_ALPHABET[b % 36];
+        }
+    }
+    return out;
 }
 
+// `/a/<token>`: the short form of jportal's `/availability/<token>` page.
 function linkUrl(portalUrl, token) {
     const base = String(portalUrl || '').trim().replace(/\/+$/, '');
     if (!base || !token) return null;
-    return `${base}/availability/${token}`;
+    return `${base}/a/${token}`;
 }
 
 /**
@@ -418,8 +430,9 @@ const hasUrl = (s, url) => typeof s === 'string' && !!url && (s.includes(url) ||
 
 // Any availability link in a body (with its scheme and host when present):
 // a posted body may carry an older link (a preview taken before the link was
-// superseded or revoked).
-const LINK_RE = /(?:https?:\/\/[^\s"'<>]*?)?\/availability\/[a-f0-9]{48}(?![a-f0-9])/g;
+// superseded or revoked). Both forms: `/a/<5 base36>` and the older
+// `/availability/<48 hex>`.
+const LINK_RE = /(?:https?:\/\/[^\s"'<>]*?)?\/(?:a\/[a-z0-9]{5}(?![a-z0-9])|availability\/[a-f0-9]{48}(?![a-f0-9]))/g;
 
 // Every availability link in `body` replaced by `replacement` (the current
 // URL, HTML-escaped for an HTML body).

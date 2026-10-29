@@ -164,21 +164,33 @@ async function createOrReuseLink(conn, visit, party, opts = {}) {
                 [supersededIds]
             );
         }
-        const [ins] = await conn.query(
-            `INSERT INTO ${table()}
-                (token, visit_id, visit_ref, party, recipient_name, recipient_email,
-                 supplier_name, factory_label, factory_city,
-                 proposed_date, window_start_date, window_end_date, preferred_lang,
-                 expires_at, created_by_email, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP + INTERVAL ? DAY, ?, CURRENT_TIMESTAMP)`,
-            [
-                A.newToken(), Number(visit.id), String(visit.ref || QV.formatRef(visit.id)).slice(0, 16), cols.party,
-                cols.recipient_name, cols.recipient_email,
-                clip(visit.supplier_name, 255), clip(visit.factory_label, 100), clip(visit.factory_city, 100),
-                cols.proposed_date, cols.window_start_date, cols.window_end_date, cols.preferred_lang,
-                cols.expiresInDays, clip(userEmail, 255),
-            ]
-        );
+        // Tokens are short (5 characters), so a clash with uniq_token is
+        // possible: draw a fresh one and try again. A duplicate-key error
+        // rolls back only the statement, not the transaction.
+        let ins;
+        for (let attempt = 1; ; attempt++) {
+            try {
+                [ins] = await conn.query(
+                    `INSERT INTO ${table()}
+                        (token, visit_id, visit_ref, party, recipient_name, recipient_email,
+                         supplier_name, factory_label, factory_city,
+                         proposed_date, window_start_date, window_end_date, preferred_lang,
+                         expires_at, created_by_email, created_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP + INTERVAL ? DAY, ?, CURRENT_TIMESTAMP)`,
+                    [
+                        A.newToken(), Number(visit.id), String(visit.ref || QV.formatRef(visit.id)).slice(0, 16), cols.party,
+                        cols.recipient_name, cols.recipient_email,
+                        clip(visit.supplier_name, 255), clip(visit.factory_label, 100), clip(visit.factory_city, 100),
+                        cols.proposed_date, cols.window_start_date, cols.window_end_date, cols.preferred_lang,
+                        cols.expiresInDays, clip(userEmail, 255),
+                    ]
+                );
+                break;
+            } catch (err) {
+                if (err && err.code === 'ER_DUP_ENTRY' && attempt < 5) continue;
+                throw err;
+            }
+        }
         const row = await loadLinkRow(conn, ins.insertId);
         if (recordAudit) {
             // Never the token: the audit log is readable by every staff user.
