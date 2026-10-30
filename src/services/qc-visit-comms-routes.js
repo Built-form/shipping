@@ -193,6 +193,29 @@ function linesHtml(lines) {
         + '</ul>';
 }
 
+// The products list as a spreadsheet (what {lines} lists, one row a line), for
+// inspectors who want it in Excel. A UTF-8 BOM so Excel reads Chinese product
+// names correctly; CRLF rows. A line printed without its PO number (linesFor)
+// has an empty PO cell.
+const CSV_HEADER = ['JF Code', 'Product', 'PO Number', 'Units', 'Sample', 'Note'];
+function csvCell(v) {
+    const s = v == null ? '' : String(v);
+    // A leading = + - @ would run as a formula in Excel.
+    const safe = /^[=+\-@]/.test(s) ? `'${s}` : s;
+    return /[",\r\n]/.test(safe) ? `"${safe.replace(/"/g, '""')}"` : safe;
+}
+function linesCsv(lines) {
+    const rows = lines.map(l => [
+        str(l.jf_code),
+        str(l.product_name),
+        l.hide_po ? '' : str(l.po_number),
+        Number(l.quantity_to_inspect) || 0,
+        l.sample_method === 'destructive' ? 'Destructive' : '',
+        l.moved_in_label ? 'Moved in' : '',
+    ]);
+    return '﻿' + [CSV_HEADER, ...rows].map(r => r.map(csvCell).join(',')).join('\r\n') + '\r\n';
+}
+
 // Values for the template tokens. `text` is for the subject (plain text);
 // `html` is for the body (escaped; {lines} is an HTML list).
 function buildVars(visit, lines) {
@@ -454,9 +477,39 @@ function registerQcVisitCommsRoutes(app, deps) {
         }
     });
 
+    // GET /api/v1/qc-visits/:id/products.csv?audience=inspector|factory
+    // The products list as a CSV (`<ref>-products.csv`), the same rows the
+    // email's {lines} prints for that audience (default inspector: every PO
+    // number shown) and the same file attachProductList sends.
+    app.get('/api/v1/qc-visits/:id(\\d+)/products.csv', async (req, res) => {
+        try {
+            const id = visitIdOf(req);
+            const audience = req.query.audience == null || req.query.audience === '' ? 'inspector' : String(req.query.audience);
+            if (!AUDIENCES.includes(audience)) return fail(res, 400, 'audience must be factory or inspector.', 'BAD_FIELD', { field: 'audience' });
+            const out = await withConnection(async (conn) => {
+                const visit = await loadVisit(conn, id);
+                if (!visit) return null;
+                return {
+                    csv: linesCsv(linesFor(visit, await loadLines(conn, id), audience)),
+                    ref: visit.ref || QV.formatRef(visit.id),
+                };
+            });
+            if (!out) return fail(res, 404, `QC visit ${id} not found.`, 'NOT_FOUND');
+            res.set('Content-Type', 'text/csv; charset=utf-8');
+            res.set('Content-Disposition', `attachment; filename="${safeFile(out.ref)}-products.csv"`);
+            res.status(200).send(out.csv);
+        } catch (error) {
+            log.error('[GET /qc-visits/:id/products.csv]', error);
+            res.status(500).json({ error: 'An internal error occurred.' });
+        }
+    });
+
     // POST /api/v1/qc-visits/:id/email
     // Body: { audience, kind?='proposal', to[], subject?, body?,
-    //         attachKitFiles?, attachIcs?, attachQaDocumentId?, includeAvailabilityLink? }
+    //         attachKitFiles?, attachIcs?, attachQaDocumentId?, includeAvailabilityLink?,
+    //         attachProductList? }
+    // attachProductList (proposals only): the products list as
+    // `<ref>-products.csv`, the rows that audience's {lines} shows.
     // attachBrief, sent by older clients, is ignored (there is no brief).
     // includeAvailabilityLink (proposals only): reuse the party's open
     // availability link or create one (default window, recipient to[0]) before
@@ -493,6 +546,7 @@ function registerQcVisitCommsRoutes(app, deps) {
             const attachKitFiles = kind === 'proposal' && audience === 'inspector' && b.attachKitFiles === true;
             const attachIcs = b.attachIcs !== false; // CONTRACT-GAP: default not specified; the invite is on unless turned off
             const includeAvailability = kind === 'proposal' && b.includeAvailabilityLink === true;
+            const attachProductList = kind === 'proposal' && b.attachProductList === true;
 
             if (!process.env.FRONT_API_TOKEN || !process.env.FRONT_CHANNEL_ID) {
                 return fail(res, 500, 'Front is not configured (FRONT_API_TOKEN, FRONT_CHANNEL_ID).', 'FRONT_NOT_CONFIGURED');
@@ -577,6 +631,12 @@ function registerQcVisitCommsRoutes(app, deps) {
                         });
                         usedBytes += bytes.length;
                     }
+                }
+
+                if (attachProductList) {
+                    const bytes = Buffer.from(linesCsv(shownLines), 'utf8');
+                    attachments.push({ bytes, filename: `${safeFile(ref)}-products.csv`, type: 'text/csv; charset=utf-8' });
+                    usedBytes += bytes.length;
                 }
 
                 const sentKitDocuments = [];
