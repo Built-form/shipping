@@ -305,6 +305,25 @@ newest 80 in the prompt) and gives each billed one its `_FQC` code. Then:
 Re-read an older QC invoice to get these fields; a re-read never changes a
 balance.
 
+**Uploaded on the supplier alone (2026-11-02).** Only "Upload QC invoice"
+files a `balance_invoice` with no shipment, so the upload place decides: the
+read is always checked, and `invoiceKind` is always `qc`, whatever the reader
+calls the document and whether or not the supplier has QC units on file. A
+proof of payment goes up as a `remittance` and is not affected. Suppliers
+rarely print our `_FQC` codes: Longbow's 20261030-1 prints "EYE WASH
+00346J-JF1099", 300 pieces at 0.08, against JF1099_FQC × 10 at 2.40. A line
+not coded as a QC unit is matched on the PO it names, in this order, each
+step over every line before the next:
+
+1. its code (ours or the supplier's) with `_FQC`;
+2. if it carries no code of the supplier's QC units: the one unit left whose
+   total is the line's amount;
+3. likewise: the PO's one unit left, when it is the PO's one line still open.
+
+A line coded as a product its PO has no unit for is left in
+`extraInvoiceLines`. `qcBilled` is every line but a charge. Quantity and
+price differences (pieces against packs) are still listed in `issues`.
+
 **Does it belong here? — `fit`.** Every read is compared with the shipment and
 the supplier it was uploaded against:
 
@@ -416,6 +435,29 @@ the ones each transfer pays.
 - **The line's fields:** `label` is "PO_X QC units JF0208" (no `_FQC`),
   `poNumber`, `purchaseOrderId`, and `targetAmount` (the value).
 - **open-items does not list QC units.** The page passes its own.
+
+**`repackaged` lines (2026-11-02).** A `repackaged` line points at `orders.id`
+of one order line with status `REPACKAGED` ("Combined / Repackaged": goods
+combined into, or repackaged as, another product at the factory). Those goods
+never ship, so no container balance pays them: the page owes their balance from
+the day they were marked (`dates.repackaged`) and the user ticks them line by
+line in Record payment, exactly like a QC unit.
+- **What is owed is the page's:** balance % × value, less what the
+  `repackaged` lines already apply.
+- **The server does no more than this:**
+  - the line's order must have status `REPACKAGED`, else `422 NOT_REPACKAGED`;
+  - its PO must be in the transfer's currency, else `422 CURRENCY_MISMATCH`;
+  - the amount must be above 0;
+  - `repackaged` lines across live transfers never add up to more than the
+    line's value (qty × unit price), else `422 OVER_APPLIED`. No cap when the
+    line has no price.
+- **Nothing is flipped**, as for `qc`.
+- **The line's fields:** `label` is "PO_X combined / repackaged JF0208",
+  `poNumber`, `purchaseOrderId`, and `targetAmount` (the value).
+- **open-items does not list them.** The page passes its own.
+- **Trap:** a line moved back out of `REPACKAGED` (admin) keeps the money
+  already applied to it, but new `repackaged` lines on it are refused, and the
+  page no longer counts that money.
 
 **`paidWith` on a `pi` line (2026-10-19).** A `pi` line names a PI, not a
 container, so the page used to guess which box a part payment of a 100 % PI

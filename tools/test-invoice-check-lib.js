@@ -325,13 +325,20 @@ test('the reader is told the supplier\'s QC units, newest PO first; no section w
 // QC units belong to no container (user, 2026-09-29): their invoice is
 // uploaded on the supplier (the Payments page's QC tab) and read and checked
 // all the same. A proof of payment on the supplier stays as it was.
-test('which reads are checked line by line: any invoice on a container; on the supplier alone, one when the supplier has QC units', () => {
-    assert.equal(shouldCheck({ documentKind: 'balance_invoice', hasShipment: true, hasQcLines: false }), true);
-    assert.equal(shouldCheck({ documentKind: 'deposit_invoice', hasShipment: true, hasQcLines: false }), true);
-    assert.equal(shouldCheck({ documentKind: 'balance_invoice', hasShipment: false, hasQcLines: true }), true);
-    assert.equal(shouldCheck({ documentKind: 'balance_invoice', hasShipment: false, hasQcLines: false }), false);
-    assert.equal(shouldCheck({ documentKind: 'remittance', hasShipment: false, hasQcLines: true }), false);
-    assert.equal(shouldCheck({ documentKind: 'other', hasShipment: true, hasQcLines: true }), false);
+// Since 2026-11-02 (user) the upload place decides: an invoice uploaded on the
+// supplier alone came through "Upload QC invoice", so it is checked as one —
+// read as a balance or a deposit invoice, and whether or not the supplier has
+// QC units on file (none: every line is said unmatched). It once needed the
+// supplier to have QC units.
+test('which reads are checked line by line: any invoice on a container; on the supplier alone, any invoice uploaded as a QC invoice', () => {
+    assert.equal(shouldCheck({ documentKind: 'balance_invoice', hasShipment: true, qcUpload: false }), true);
+    assert.equal(shouldCheck({ documentKind: 'deposit_invoice', hasShipment: true, qcUpload: false }), true);
+    assert.equal(shouldCheck({ documentKind: 'balance_invoice', hasShipment: false, qcUpload: true }), true);
+    assert.equal(shouldCheck({ documentKind: 'deposit_invoice', hasShipment: false, qcUpload: true }), true);
+    assert.equal(shouldCheck({ documentKind: 'balance_invoice', hasShipment: false, qcUpload: false }), false);
+    assert.equal(shouldCheck({ documentKind: 'remittance', hasShipment: false, qcUpload: true }), false);
+    assert.equal(shouldCheck({ documentKind: 'other', hasShipment: false, qcUpload: true }), false);
+    assert.equal(shouldCheck({ documentKind: 'other', hasShipment: true, qcUpload: false }), false);
 });
 
 test('what a read says it made: a QC invoice on the supplier is checked, never "needs its container"', () => {
@@ -348,6 +355,137 @@ test('the reader is told a supplier upload is a QC invoice, with the supplier\'s
     assert.match(p, /- PO_00306J: JF1001_FQC/);
     assert.doesNotMatch(p, /remittance advice/);
     assert.match(promptFor({ shipment: null, shipmentCurrency: null, purchaseOrders: [] }), /remittance advice/);
+});
+
+// ── The upload place decides (user, 2026-11-02) ──────────────────────────
+// Longbow's invoice 20261030-1 (USD 134), uploaded twice on prod through
+// "Upload QC invoice" (documents 219 and 221). It bills the three QC units of
+// PO_00346J / PO_00379J to the cent, but prints the products as the supplier
+// knows them ("EYE WASH 00346J-JF1099"), in pieces at a price per piece — never
+// our _FQC code, never "QC". Both reads came back as a goods invoice with
+// every line unmatched, and the page then listed it nowhere. Uploaded on the
+// supplier, it is a QC invoice: each line is matched to the PO it names by
+// product code, else by its amount, else as that PO's one unit left.
+const LONGBOW = 'Longbow First Aid Products Co.,Ltd.';
+const LONGBOW_UPLOAD = {
+    shipment: null, shipmentCurrency: null, purchaseOrders: [], qcUpload: true,
+    qcLines: [
+        qc(346, 'PO_00346J', 'JF1099_FQC', 10, 2.4, LONGBOW),
+        qc(379, 'PO_00379J', 'JF0894_FQC', 50, 1.72, LONGBOW),
+        qc(379, 'PO_00379J', 'JF1444_FQC', 10, 2.4, LONGBOW),
+    ],
+};
+const pieceLine = (poRef, jfCode, sku, description, qty, unitPrice, amount) => ({ poRef, jfCode, sku, description, qty, unitPrice, amount });
+// As document 221 was read: our product code (no _FQC), the supplier's own sku.
+const READ_221 = {
+    documentKind: 'balance_invoice', currency: 'USD', totalAmount: 134, amountDueNow: null, depositDeducted: null,
+    lines: [
+        pieceLine('PO_00346J', 'JF1099', null, 'EYE WASH 00346J-JF1099', 300, 0.08, 24),
+        pieceLine('PO_00379J', 'JF0894', 'JK0894', 'BURN GEL 00379J-JK0894', 1000, 0.086, 86),
+        pieceLine('PO_00379J', 'JF1444', 'JK1444', 'EYE WASH 00379J-JK1444', 300, 0.08, 24),
+    ],
+};
+// As document 219 was read: no code at all.
+const READ_219 = {
+    ...READ_221,
+    lines: [
+        pieceLine('PO_00346J', null, null, 'EYE WASH', 300, 0.08, 24),
+        pieceLine('PO_00379J', null, null, 'BURN GEL', 1000, 0.086, 86),
+        pieceLine('PO_00379J', null, null, 'EYE WASH', 300, 0.08, 24),
+    ],
+};
+const qcRow = l => [l.poNumber, l.jfCode, l.ourTotal, l.invoiceTotal];
+
+test('a QC invoice uploaded on the supplier, lines coded with the product\'s own code: each is that product\'s QC unit on the PO it names (document 221)', () => {
+    const c = compareInvoiceToContainer({ extract: READ_221, context: LONGBOW_UPLOAD, supplierName: LONGBOW });
+    assert.equal(c.invoiceKind, 'qc');
+    assert.deepEqual(c.qcLines.map(qcRow), [
+        ['PO_00346J', 'JF1099_FQC', 24, 24],
+        ['PO_00379J', 'JF0894_FQC', 86, 86],
+        ['PO_00379J', 'JF1444_FQC', 24, 24],
+    ]);
+    assert.deepEqual(c.extraInvoiceLines, []);
+    assert.equal(c.qcInvoiceTotal, 134);
+    assert.equal(c.qcBilled, 134);
+    // Pieces at a price per piece against packs on the PO: said, as for goods.
+    assert.deepEqual(c.qcLines[0].issues, ['quantity 300 on the invoice, 10 on the PO', 'unit price 0.08 on the invoice, 2.4 on the PO']);
+    assert.equal(c.verdict, 'differs');
+    assert.equal(noPaymentReason({ documentKind: 'balance_invoice', hasShipment: false, invoiceKind: c.invoiceKind }), 'checked');
+});
+
+test('a QC invoice uploaded on the supplier with no code on its lines: the QC unit on the PO it names whose total is the line\'s (document 219)', () => {
+    const c = compareInvoiceToContainer({ extract: READ_219, context: LONGBOW_UPLOAD, supplierName: LONGBOW });
+    assert.equal(c.invoiceKind, 'qc');
+    assert.deepEqual(c.qcLines.map(qcRow), [
+        ['PO_00346J', 'JF1099_FQC', 24, 24],
+        ['PO_00379J', 'JF0894_FQC', 86, 86],
+        ['PO_00379J', 'JF1444_FQC', 24, 24],
+    ]);
+    assert.deepEqual(c.extraInvoiceLines, []);
+});
+
+test('the same reads uploaded on a box are still goods: only the upload place makes them QC units', () => {
+    const onBox = { ...LONGBOW_UPLOAD, shipment: { reference: '343' }, qcUpload: false };
+    const c = compareInvoiceToContainer({ extract: READ_221, context: onBox, supplierName: LONGBOW });
+    assert.equal(c.invoiceKind, 'goods');
+    assert.deepEqual(c.qcLines, []);
+    assert.equal(c.extraInvoiceLines.length, 3);
+});
+
+test('no code, and the amount fits no unit: the PO\'s one QC unit left, for the PO\'s one line left — its total said', () => {
+    const extract = { ...READ_219, totalAmount: 30, lines: [pieceLine('PO_00346J', null, null, 'EYE WASH', 300, 0.1, 30)] };
+    const c = compareInvoiceToContainer({ extract, context: LONGBOW_UPLOAD, supplierName: LONGBOW });
+    assert.deepEqual(c.qcLines.map(qcRow), [['PO_00346J', 'JF1099_FQC', 24, 30]]);
+    assert.deepEqual(c.qcLines[0].issues, ['quantity 300 on the invoice, 10 on the PO', 'unit price 0.1 on the invoice, 2.4 on the PO', 'line total 30.00 on the invoice, 24.00 on the PO']);
+});
+
+test('no code, two units on the PO with the line\'s amount: no guess — the line is left unmatched, the invoice still QC', () => {
+    const twins = { ...LONGBOW_UPLOAD, qcLines: [qc(400, 'PO_00400J', 'JF2001_FQC', 10, 2.4, LONGBOW), qc(400, 'PO_00400J', 'JF2002_FQC', 10, 2.4, LONGBOW)] };
+    const extract = { ...READ_219, totalAmount: 24, lines: [pieceLine('PO_00400J', null, null, 'EYE WASH', 300, 0.08, 24)] };
+    const c = compareInvoiceToContainer({ extract, context: twins, supplierName: LONGBOW });
+    assert.equal(c.invoiceKind, 'qc');
+    assert.deepEqual(c.qcLines, []);
+    assert.equal(c.extraInvoiceLines.length, 1);
+});
+
+test('two lines with no code on a PO with one unit left: neither is taken by elimination', () => {
+    const extract = { ...READ_219, totalAmount: 60, lines: [pieceLine('PO_00346J', null, null, 'EYE WASH', 300, 0.1, 30), pieceLine('PO_00346J', null, null, 'EYE WASH', 300, 0.1, 30)] };
+    const c = compareInvoiceToContainer({ extract, context: LONGBOW_UPLOAD, supplierName: LONGBOW });
+    assert.deepEqual(c.qcLines, []);
+    assert.equal(c.extraInvoiceLines.length, 2);
+});
+
+test('a line coded as a product the PO it names has no QC unit for: left unmatched, never taken by amount or elimination', () => {
+    const extract = { ...READ_219, totalAmount: 24, lines: [pieceLine('PO_00346J', 'JF0894', null, 'BURN GEL', 300, 0.08, 24)] };
+    const c = compareInvoiceToContainer({ extract, context: LONGBOW_UPLOAD, supplierName: LONGBOW });
+    assert.deepEqual(c.qcLines, []);
+    assert.equal(c.extraInvoiceLines.length, 1);
+});
+
+test('a QC invoice uploaded on the supplier where nothing matches: still QC — its lines unmatched, never goods or "needs its container"', () => {
+    // 86.00 is JF0894_FQC's total on PO_00379J to the cent, but the line names
+    // a PO that is not this supplier's: nothing of another PO is taken.
+    const extract = { ...READ_219, totalAmount: 86, lines: [pieceLine('PO_00999J', null, null, 'BURN GEL', 1000, 0.086, 86)] };
+    const c = compareInvoiceToContainer({ extract, context: LONGBOW_UPLOAD, supplierName: LONGBOW });
+    assert.equal(c.invoiceKind, 'qc');
+    assert.deepEqual(c.qcLines, []);
+    assert.equal(c.extraInvoiceLines.length, 1);
+    assert.equal(c.qcBilled, 86);
+    assert.equal(c.verdict, 'unverified');
+    const none = compareInvoiceToContainer({ extract, context: { ...LONGBOW_UPLOAD, qcLines: [] }, supplierName: LONGBOW });
+    assert.equal(none.invoiceKind, 'qc');
+    assert.equal(none.extraInvoiceLines.length, 1);
+});
+
+test('the reader is told every line of a supplier upload bills QC units, whatever the supplier calls them', () => {
+    const p = promptFor(LONGBOW_UPLOAD);
+    assert.match(p, /Every line on this document bills QC units/);
+    assert.ok(p.includes('- PO_00379J: JF0894_FQC JF0894 × 50 @ 1.72; JF1444_FQC JF1444 × 10 @ 2.4'));
+    assert.doesNotMatch(p, /Use a code from this list only when the document says/);
+    // A supplier with no QC units on file: still a QC invoice, not "most likely a remittance".
+    const bare = promptFor({ ...LONGBOW_UPLOAD, qcLines: [] });
+    assert.match(bare, /invoice for QC sample units/);
+    assert.doesNotMatch(bare, /remittance advice/);
 });
 
 // A QC code on two of the supplier's POs with no poRef read (user, 2026-09-30:

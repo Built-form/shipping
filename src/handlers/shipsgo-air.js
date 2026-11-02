@@ -15,7 +15,7 @@ const { getShipmentByAwb, parseAirShipment } = require('../services/shipsgo');
 // shipments still in transit.
 const SETTLED_STATUSES = [
     'ARRIVED_AT_WAREHOUSE', 'RECEIVED', 'PARTIALLY_RECEIVED',
-    'IN_WAREHOUSE', 'MINTSOFT', 'DESTROYED',
+    'IN_WAREHOUSE', 'MINTSOFT', 'DESTROYED', 'REPACKAGED',
 ];
 
 async function getDistinctAwbNumbers(conn) {

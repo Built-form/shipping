@@ -46,14 +46,15 @@ const DEFAULT_SNOOZE_DAYS = 2;
 
 // Real order statuses observed in the data (the canonical pipeline):
 //   SCHEDULED · PO_SENT · IN_PRODUCTION · READY_FOR_QC · READY ·
-//   CONSOLIDATED · ON_SEA · ON_AIR · ARRIVED_AT_WAREHOUSE · RECEIVED · DESTROYED
+//   CONSOLIDATED · ON_SEA · ON_AIR · ARRIVED_AT_WAREHOUSE · RECEIVED · DESTROYED ·
+//   REPACKAGED (combined / repackaged at the factory; never ships)
 // (Legacy names IN_WAREHOUSE / MINTSOFT / PARTIALLY_RECEIVED don't occur but are
 // kept in exclusion lists for forward-compat.)
 
 // Container-ETA condition is "live" until the goods reach the warehouse / are
 // received. Exclude the arrived/terminal statuses (an order here is no longer
 // "arriving").
-const ETA_EXCLUDED_STATUSES = ['ARRIVED_AT_WAREHOUSE', 'RECEIVED', 'DESTROYED', 'IN_WAREHOUSE', 'MINTSOFT', 'PARTIALLY_RECEIVED'];
+const ETA_EXCLUDED_STATUSES = ['ARRIVED_AT_WAREHOUSE', 'RECEIVED', 'DESTROYED', 'REPACKAGED', 'IN_WAREHOUSE', 'MINTSOFT', 'PARTIALLY_RECEIVED'];
 
 // In-transit stages used by the missing-data and shipment-late builders.
 const IN_TRANSIT_STATUSES = ['CONSOLIDATED', 'ON_SEA', 'ON_AIR'];

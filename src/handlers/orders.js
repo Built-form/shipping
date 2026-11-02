@@ -399,6 +399,7 @@ const STATUS_DATE_KEY = {
     IN_WAREHOUSE: 'received_by_warehouse',
     RECEIVED: 'received',
     PARTIALLY_RECEIVED: 'received',
+    REPACKAGED: 'repackaged',
 };
 
 const ALL_STATUSES = [
@@ -10654,7 +10655,12 @@ const { groupDeliveredAir, attachBalances, findPaidClash } = require('../lib/del
 // ones a transfer pays. What is owed on one is the page's (it knows the
 // terms); the server only caps the money at the line's value. Nothing is
 // flipped: paid is what the lines add up to.
-const SUPPLIER_PAYMENT_LINE_KINDS = ['balance', 'pi', 'po_deposit', 'extra', 'qc'];
+// 'repackaged' = one order line marked REPACKAGED ("Combined / Repackaged",
+// user 2026-11-02): goods combined into, or repackaged as, another product at
+// the factory. They never ship, so no container balance will pay them; the
+// page owes their balance from the day they were marked and the user ticks
+// them line by line, exactly like a QC unit (cap = the line's value, nothing flipped).
+const SUPPLIER_PAYMENT_LINE_KINDS = ['balance', 'pi', 'po_deposit', 'extra', 'qc', 'repackaged'];
 // A fourth kind exists on the way in only: 'container_balance' names a
 // shipment whose balance nobody has recorded yet (the page projects it from
 // the goods on board). Saving records that balance — split across the
@@ -10854,6 +10860,26 @@ async function loadSupplierPaymentTargets(conn, lines) {
                 purchaseOrderId: r.purchase_order_id, poNumber: r.po_number, paymentType: null,
                 shipmentId: null, shipmentReference: null, invoiceNumber: null,
                 isQcUnit: !!code,
+            });
+        }
+    }
+    const repackagedIds = idsOf('repackaged');
+    if (repackagedIds.length) {
+        const [rows] = await conn.query(
+            `SELECT o.id, o.jf_code, o.asin, o.quantity, o.unit_price, o.status, o.purchase_order_id, po.po_number, po.supplier, po.currency
+               FROM orders o JOIN purchase_orders po ON po.id = o.purchase_order_id AND po.deleted_at IS NULL
+              WHERE o.id IN (${repackagedIds.map(() => '?').join(',')}) AND o.deleted_at IS NULL`, repackagedIds
+        );
+        for (const r of rows) {
+            const value = r.quantity != null && r.unit_price != null ? Math.round(Number(r.quantity) * Number(r.unit_price) * 100) / 100 : null;
+            out.set(`repackaged:${r.id}`, {
+                // amount: the line's value — the most any transfers can put on it.
+                kind: 'repackaged', id: r.id, amount: value, currency: (r.currency || '').toUpperCase() || null, status: null,
+                supplier: r.supplier, supplierKey: shipmentPaymentsService.supplierKey(r.supplier), settledBy: null,
+                label: `${r.po_number} combined / repackaged ${String(r.jf_code || r.asin || '').trim()}`,
+                purchaseOrderId: r.purchase_order_id, poNumber: r.po_number, paymentType: null,
+                shipmentId: null, shipmentReference: null, invoiceNumber: null,
+                isRepackaged: r.status === 'REPACKAGED',
             });
         }
     }
@@ -11122,6 +11148,9 @@ async function checkSupplierPaymentLines(conn, { lines, currency, amount, suppli
         if (t.kind === 'qc' && !t.isQcUnit) {
             return { fail: { status: 422, error: `Order line ${l.id} on ${t.poNumber} is goods, not a QC unit — pay it with its container or PI.`, code: 'NOT_QC_UNIT', payload: { kind: 'qc', id: l.id } } };
         }
+        if (t.kind === 'repackaged' && !t.isRepackaged) {
+            return { fail: { status: 422, error: `${t.label} is not marked Combined / Repackaged — pay it with its container or PI.`, code: 'NOT_REPACKAGED', payload: { kind: 'repackaged', id: l.id } } };
+        }
         if (t.currency && currency && t.currency !== currency) {
             return { fail: { status: 422, error: `${t.label} is in ${t.currency}; this transfer is in ${currency}.`, code: 'CURRENCY_MISMATCH', payload: { kind: l.kind, id: l.id, targetCurrency: t.currency } } };
         }
@@ -11201,9 +11230,11 @@ async function lockSupplierPaymentTargets(conn, { paymentId = null, lines }) {
         const [rows] = await conn.query(`SELECT id FROM supplier_payments WHERE id = ? AND deleted_at IS NULL FOR UPDATE`, [paymentId]);
         paymentLive = rows.length > 0;
     }
-    const order = [['container_balance', 'shipments'], ['balance', 'shipment_payments'], ['pi', 'purchase_order_invoice_payments'], ['extra', 'payment_extras'], ['qc', 'orders']];
+    // QC units and repackaged lines are both order lines: one sorted lock on orders.
+    const order = [['container_balance', 'shipments'], ['balance', 'shipment_payments'], ['pi', 'purchase_order_invoice_payments'], ['extra', 'payment_extras'], ['qc|repackaged', 'orders']];
     for (const [kind, table] of order) {
-        const ids = [...new Set(lines.filter(l => l.kind === kind).map(l => Number(l.id)))].filter(Number.isInteger).sort((a, b) => a - b);
+        const kinds = kind.split('|');
+        const ids = [...new Set(lines.filter(l => kinds.includes(l.kind)).map(l => Number(l.id)))].filter(Number.isInteger).sort((a, b) => a - b);
         if (!ids.length) continue;
         try {
             await conn.query(`SELECT id FROM ${table} WHERE id IN (${ids.map(() => '?').join(',')}) ORDER BY id FOR UPDATE`, ids);

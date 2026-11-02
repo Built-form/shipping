@@ -113,7 +113,7 @@ If the live load fails, `live` is null and `liveError` says why — show the sto
   stands in for any copy with the same invoice already on file, which shows in
   `duplicateInvoices` instead of doubling every row. The staff check counts the newest copy.
 - Expected lines are the container's **active** lines: `INACTIVE_STATUSES` (`SCHEDULED`,
-  `PO_SENT`, `DESTROYED`) are left out and listed in `comparison.inactiveLines`
+  `PO_SENT`, `DESTROYED`, `REPACKAGED`) are left out and listed in `comparison.inactiveLines`
   (`{ orderId, jfCode, poNumber, quantity, status }`), as `skippedLines` lists draft lines booked
   elsewhere. Arrived and received lines stay.
 - `onBoard: false` means the supplier's group has no live line there — no line whose order's or

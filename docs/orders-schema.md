@@ -95,6 +95,7 @@ not when it was learned) live in flat columns. See "Scalar date columns" below.
 | `consolidated` | `PATCH /:id/status` to `CONSOLIDATED`, `POST /:id/split`, `POST /containers/pack`, `PATCH /containers/:cn/status` | now() |
 | `delivered` | `PATCH /:id/status` to `DELIVERED` | now() |
 | `completed` | `PATCH /:id/status` to `COMPLETED` | now() |
+| `repackaged` | `PATCH /:id/status` or `PUT /:id` to `REPACKAGED` | now() — the day its balance falls due on the Payments page |
 | `received_by_warehouse` | `POST /api/v1/orders/:id/receive` | now(), set before Mintsoft call |
 | `received` | `POST /api/v1/orders/:id/receive` | now(), set after Mintsoft success |
 | `asn_id` | `POST /api/v1/orders/:id/receive` | Mintsoft ASN id (integer, not a date — historical key) |
