@@ -56,6 +56,7 @@ const { registerQcVisitRoutes } = require('../services/qc-visit-routes');
 const { registerQcKitRoutes } = require('../services/qc-kit-routes');
 const { registerQcVisitCommsRoutes } = require('../services/qc-visit-comms-routes');
 const { registerQcAvailabilityRoutes } = require('../services/qc-availability-routes');
+const { registerQcScheduleRoutes } = require('../services/qc-schedule-routes');
 const { registerPaymentReviewRoutes } = require('../services/payment-review-routes');
 const { registerPaymentExtraRoutes } = require('../services/payment-extra-routes');
 const { registerPaymentAlertRoutes } = require('../services/payment-alert-routes');
@@ -11982,6 +11983,8 @@ registerQcKitRoutes(app, qcVisitDeps);
 registerQcVisitCommsRoutes(app, qcVisitDeps);
 // Availability links in the supplier portal (jportal schema): docs/qc-availability.md.
 registerQcAvailabilityRoutes(app, qcVisitDeps);
+// The inspector's no-login schedule page link: docs/qc-schedule-link.md.
+registerQcScheduleRoutes(app, qcVisitDeps);
 
 // ── Payment sign-offs (/api/v1/payment-reviews, /api/v1/payment-assignees) ─
 // Two people sign off each payment on ShipLine's Payments flow page; one

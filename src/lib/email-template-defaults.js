@@ -29,9 +29,14 @@
 // supplier-portal link, docs/qc-availability.md) when the proposal is sent
 // with "Include availability link", and nothing otherwise; a template without
 // the token still gets the paragraph appended, so stored templates seeded
-// before it existed keep working.
+// before it existed keep working. {scheduleLink} is the same for the
+// inspector's no-login schedule page (docs/qc-schedule-link.md: every product
+// with its QC documents and files), when sent with "Include schedule link".
+// qc_visit_update tells either party the products changed since the last
+// email; its {changes} is an HTML list of the added, removed and changed lines
+// (seeded by 2026-11-03_11_qc_visit_update_template.js).
 
-const QC_VISIT_TOKENS = '{ref} {supplier} {factory} {factoryAddress} {factoryContact} {visitDate} {window} {windowUk} {inspector} {inspectorCompany} {lines} {productionState} {reportDeadline} {escalation} {availabilityLink}';
+const QC_VISIT_TOKENS = '{ref} {supplier} {factory} {factoryAddress} {factoryContact} {visitDate} {window} {windowUk} {inspector} {inspectorCompany} {lines} {productionState} {reportDeadline} {escalation} {availabilityLink} {scheduleLink}';
 
 const DEFAULT_EMAIL_TEMPLATES = [
     {
@@ -163,12 +168,13 @@ const DEFAULT_EMAIL_TEMPLATES = [
         key: 'qc_visit_inspector',
         name: 'QC visit – inspector assignment',
         category: 'QC Visit',
-        description: `Emailed to the inspector with the calendar invite and the products' inspection kit documents attached: each product's current China factory QC documents in JFPRO (QA documents, stage "China Agent — factory QC"). Needs no manual fields. Tokens: ${QC_VISIT_TOKENS}.`,
+        description: `Emailed to the inspector with the calendar invite and a link to the schedule page ({scheduleLink}): every product to inspect with its current China factory QC documents in JFPRO (QA documents, stage "China Agent — factory QC") and the visit's own files. The documents can still be attached instead. Needs no manual fields. Tokens: ${QC_VISIT_TOKENS}.`,
         subject: 'QC inspection assignment {ref} – {factory}, {visitDate}',
         bodyHtml: [
             '<div style="font-family:Helvetica,Arial,sans-serif;font-size:14px;color:#222;line-height:1.5;">',
             '<p>Hello {inspector},</p>',
-            '<p>Please carry out the inspection below for us. The inspection documents for these products are attached: please follow them.</p>',
+            '<p>Please carry out the inspection below for us, following the QC documents for each product.</p>',
+            '{scheduleLink}',
             '<p><strong>Reference:</strong> {ref}<br>',
             '<strong>Date:</strong> {visitDate}<br>',
             '<strong>Time:</strong> {window}<br>',
@@ -205,12 +211,35 @@ const DEFAULT_EMAIL_TEMPLATES = [
             '</div>',
         ].join(''),
     },
+    {
+        key: 'qc_visit_update',
+        name: 'QC visit – products updated',
+        category: 'QC Visit',
+        description: `Emailed to the factory or the inspector when the products of a QC visit changed after an earlier email: {changes} lists what was added, removed or changed since that party's last email, {lines} the full list now. The inspector's copy can carry the schedule link. Tokens: ${QC_VISIT_TOKENS} {changes}.`,
+        subject: 'Updated: QC inspection {ref} – products changed',
+        bodyHtml: [
+            '<div style="font-family:Helvetica,Arial,sans-serif;font-size:14px;color:#222;line-height:1.5;">',
+            '<p>Hello,</p>',
+            '<p>The products for quality inspection <strong>{ref}</strong> ({visitDate}, {window}) at {factory} have changed since our last email.</p>',
+            '<p><strong>What changed:</strong></p>',
+            '{changes}',
+            '<p><strong>Products to inspect now:</strong></p>',
+            '{lines}',
+            '{scheduleLink}',
+            '<p>Please reply to confirm you have seen this update.</p>',
+            '<p>您好，</p>',
+            '<p>验货 <strong>{ref}</strong>（{visitDate}，{window}，{factory}）的产品自我们上次邮件后有变更，变更内容及现需验货的产品清单见上文。请回复确认已收到此更新。</p>',
+            '<p>Kind Regards,<br>Operations Team.<br>JFA Medical Ltd.</p>',
+            '</div>',
+        ].join(''),
+    },
 ];
 
 // The templates the supplier-portal PI decision email uses (seeded by their own migration).
 const SUPPLIER_PI_TEMPLATE_KEYS = ['supplier_pi_imported', 'supplier_pi_rejected'];
 
 // The QC visit emails (seeded by 2026-10-28_31_seed_qc_visit_templates.js).
-const QC_VISIT_TEMPLATE_KEYS = ['qc_visit_factory', 'qc_visit_inspector', 'qc_visit_cancel'];
+// qc_visit_update arrived later, seeded by 2026-11-03_11_qc_visit_update_template.js.
+const QC_VISIT_TEMPLATE_KEYS = ['qc_visit_factory', 'qc_visit_inspector', 'qc_visit_cancel', 'qc_visit_update'];
 
 module.exports = { DEFAULT_EMAIL_TEMPLATES, SUPPLIER_PI_TEMPLATE_KEYS, QC_VISIT_TEMPLATE_KEYS };

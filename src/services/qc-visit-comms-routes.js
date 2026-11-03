@@ -2,8 +2,14 @@
 
 // /api/v1/qc-visits/:id/{sends,email-preview,email,ics} — emailing a QC visit
 // to the factory (date proposal) or the inspector (assignment with the
-// products' QC documents), the cancellation email to either, and the visit's
-// calendar file.
+// products' QC documents), the cancellation email to either, the "products
+// changed" update email to either, and the visit's calendar file.
+//
+// Schedule link (docs/qc-schedule-link.md): an inspector proposal or update
+// can carry the visit's no-login schedule page link ({scheduleLink}) instead
+// of the kit documents as attachments. Every proposal / update stores the
+// lines it listed (qc_visit_sends.lines_snapshot_json); the update email's
+// {changes} lists what changed since the audience's previous one.
 //
 // Sending mirrors POST /api/v1/quality-assurance-documents/:id/email in
 // orders.js: the subject/body come from an email template (qc_visit_factory,
@@ -28,6 +34,8 @@ const A = require('../lib/qc-availability');
 // "Include availability link" on proposals (docs/qc-availability.md).
 const { emailAvailabilityLink, availabilityEnabled, AvailabilityFail } = require('./qc-availability-routes');
 const { buildIcs } = require('../lib/ics');
+const S = require('../lib/qc-schedule');
+const { getOrCreateLink, liveLinkOf, sendChanges } = require('./qc-schedule-routes');
 const {
     apiBaseUrlFromReq,
     createEmailReceipt,
@@ -37,7 +45,11 @@ const {
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const AUDIENCES = ['factory', 'inspector'];
-const KINDS = ['proposal', 'cancel'];
+// update: "the products changed since our last email" ({changes}).
+const KINDS = ['proposal', 'update', 'cancel'];
+// The kinds that list the lines (and so store a snapshot and may carry the
+// schedule link, kit files and the products CSV).
+const LINE_KINDS = ['proposal', 'update'];
 const MAX_RECIPIENTS = 20;
 // Total size of everything attached to one email. The QA PDF and the .ics
 // always go; kit documents fill what is left and the rest are skipped (listed
@@ -52,6 +64,7 @@ const TEMPLATE_KEYS = {
     factory: 'qc_visit_factory',
     inspector: 'qc_visit_inspector',
     cancel: 'qc_visit_cancel',
+    update: 'qc_visit_update',
 };
 
 const iso = v => v?.toISOString?.() ?? v ?? null;
@@ -281,11 +294,15 @@ function icsContent(visit, lines, { sequence, cancel, organizerEmail, attendees 
 // ── Rows → JSON ─────────────────────────────────────────────────────────────
 
 function sendToJson(r) {
+    const snapshot = S.parseSnapshot(r.lines_snapshot_json);
     return {
         id: r.id,
         audience: r.audience,
         kind: r.kind || 'proposal',
         kitDocuments: KD.kitDocumentsFromJson(r.kit_documents_json),
+        scheduleLinkId: r.schedule_link_id == null ? null : Number(r.schedule_link_id),
+        // The lines the email listed (null: sent before snapshots, or a cancellation).
+        lineCount: snapshot ? snapshot.length : null,
         sentTo: parseJsonArray(r.sent_to).map(String),
         subject: r.subject || null,
         frontMessageUid: r.front_message_uid || null,
@@ -310,8 +327,8 @@ function registerQcVisitCommsRoutes(app, deps) {
 
     async function loadLines(conn, visitId) {
         const [rows] = await conn.query(
-            `SELECT l.id, l.order_id, l.quantity_to_inspect, l.sample_method,
-                    o.jf_code, o.product_name, o.po_number, o.supplier
+            `SELECT l.id, l.order_id, l.quantity_to_inspect, l.sample_method, l.note,
+                    o.jf_code, o.product_name, o.po_number, o.lot_number, o.supplier
                FROM qc_visit_lines l
                LEFT JOIN orders o ON o.id = l.order_id
               WHERE l.visit_id = ?
@@ -336,24 +353,53 @@ function registerQcVisitCommsRoutes(app, deps) {
         return KD.kitDocumentsToSend(codes, rows);
     }
 
+    // What changed in the lines since the audience's last proposal / update
+    // email, filtered for the audience (the factory never sees another
+    // supplier's PO number). null when that party was never emailed or the
+    // email predates snapshots.
+    async function changesFor(conn, visit, rawLines, audience) {
+        const all = await sendChanges(conn, visit.id, rawLines);
+        const c = all[audience];
+        if (!c || !c.comparable) return null;
+        const host = QV.normSupplier(visit.supplier_name || '');
+        const f = l => S.lineForAudience(l, audience, host, QV.normSupplier);
+        return { ...c, added: c.added.map(f), removed: c.removed.map(f), changed: c.changed.map(f) };
+    }
+
     // availabilityUrl: the availability link this email carries (null: none);
     // availabilityPlaceholder: render the "will be created when sent" text
-    // instead (preview of a link that does not exist yet).
-    async function renderEmail(conn, visit, lines, audience, kind, { availabilityUrl = null, availabilityPlaceholder = false } = {}) {
-        const key = kind === 'cancel' ? TEMPLATE_KEYS.cancel : TEMPLATE_KEYS[audience];
+    // instead (preview of a link that does not exist yet). scheduleUrl /
+    // schedulePlaceholder: the same for the schedule link. changes: the
+    // update email's diff (changesFor).
+    async function renderEmail(conn, visit, lines, audience, kind, {
+        availabilityUrl = null, availabilityPlaceholder = false,
+        scheduleUrl = null, schedulePlaceholder = false, changes = null,
+    } = {}) {
+        const key = kind === 'proposal' ? TEMPLATE_KEYS[audience] : TEMPLATE_KEYS[kind];
         const tpl = await getEmailTemplate(conn, key);
         const vars = buildVars(visit, lines);
-        // {availabilityLink}: '' when the email carries no link, so the token
-        // never prints literally.
+        // {availabilityLink} / {scheduleLink} / {changes}: '' when the email
+        // carries none, so the token never prints literally.
         const av = A.availabilityVars(availabilityUrl, audience, { placeholder: availabilityPlaceholder });
         vars.text.availabilityLink = av.text;
         vars.html.availabilityLink = av.html;
+        const sl = S.scheduleLinkVars(scheduleUrl, { placeholder: schedulePlaceholder });
+        vars.text.scheduleLink = sl.text;
+        vars.html.scheduleLink = sl.html;
+        vars.text.changes = kind === 'update' ? S.changesText(changes) : '';
+        vars.html.changes = kind === 'update' ? S.changesHtml(changes) : '';
         const fallbackSubject = kind === 'cancel'
             ? `Cancelled: QC inspection ${vars.text.ref}`
-            : `QC inspection ${vars.text.ref}`;
+            : kind === 'update' ? `Updated: QC inspection ${vars.text.ref}` : `QC inspection ${vars.text.ref}`;
+        let body = renderTemplate(tpl.bodyHtml, vars.html) || '';
+        // A template without the token (an ops-edited one) still gets the link.
+        if (scheduleUrl) body = S.appendScheduleLinkHtml(body, scheduleUrl);
+        else if (schedulePlaceholder && !body.includes(S.SCHEDULE_PLACEHOLDER) && !body.includes(esc(S.SCHEDULE_PLACEHOLDER))) {
+            body = `${body}${S.scheduleLinkHtml(null)}`;
+        }
         return {
             subject: renderTemplate(tpl.subject, vars.text) || fallbackSubject,
-            body: renderTemplate(tpl.bodyHtml, vars.html) || '',
+            body,
             vars,
         };
     }
@@ -391,28 +437,38 @@ function registerQcVisitCommsRoutes(app, deps) {
         }
     });
 
-    // GET /api/v1/qc-visits/:id/email-preview?audience=factory|inspector&kind=proposal|cancel
-    //     [&includeAvailabilityLink=1]
+    // GET /api/v1/qc-visits/:id/email-preview?audience=factory|inspector&kind=proposal|update|cancel
+    //     [&includeAvailabilityLink=1][&includeScheduleLink=1]
     // The template rendered for this visit, the suggested recipients, and
     // availabilityEnabled (SUPPLIER_PORTAL_URL is set and, for a proposal, the
     // jportal table is reachable; availabilityUnavailable: true when it is
     // missing). With
     // includeAvailabilityLink (1/true/yes; proposals only) the body carries the
     // party's open availability link, or the placeholder when sending would
-    // create one. The preview never creates a link.
+    // create one. includeScheduleLink (inspector proposals and updates) does
+    // the same for the schedule link; scheduleLinkUrl is the live link (null
+    // when sending would create it). For kind update, changes is what the
+    // {changes} list shows (null: no earlier email to compare with). The
+    // preview never creates a link.
     app.get('/api/v1/qc-visits/:id(\\d+)/email-preview', async (req, res) => {
         try {
             const id = visitIdOf(req);
             const audience = String(req.query.audience || '');
             const kind = String(req.query.kind || 'proposal');
             if (!AUDIENCES.includes(audience)) return fail(res, 400, 'audience must be factory or inspector.', 'BAD_FIELD', { field: 'audience' });
-            if (!KINDS.includes(kind)) return fail(res, 400, 'kind must be proposal or cancel.', 'BAD_FIELD', { field: 'kind' });
-            const includeAvailability = kind === 'proposal'
-                && ['1', 'true', 'yes'].includes(String(req.query.includeAvailabilityLink || '').toLowerCase());
+            if (!KINDS.includes(kind)) return fail(res, 400, 'kind must be proposal, update or cancel.', 'BAD_FIELD', { field: 'kind' });
+            const yes = v => ['1', 'true', 'yes'].includes(String(v || '').toLowerCase());
+            const includeAvailability = kind === 'proposal' && yes(req.query.includeAvailabilityLink);
+            const scheduleAllowed = audience === 'inspector' && LINE_KINDS.includes(kind);
+            const includeSchedule = scheduleAllowed && yes(req.query.includeScheduleLink);
             const out = await withConnection(async (conn) => {
                 const visit = await loadVisit(conn, id);
                 if (!visit) return null;
-                const lines = linesFor(visit, await loadLines(conn, id), audience);
+                const rawLines = await loadLines(conn, id);
+                const lines = linesFor(visit, rawLines, audience);
+                const changes = kind === 'update' ? await changesFor(conn, visit, rawLines, audience) : null;
+                const liveSchedule = scheduleAllowed ? await liveLinkOf(conn, id, 'inspector') : null;
+                const scheduleLinkUrl = liveSchedule ? S.scheduleUrl(apiBaseUrlFromReq(req), liveSchedule.token) : null;
                 // Proposals always look the link up (read-only) so that
                 // availabilityEnabled is false when the portal URL is unset or
                 // the jportal table is missing, ticked or not; nothing about
@@ -422,12 +478,18 @@ function registerQcVisitCommsRoutes(app, deps) {
                 const av = includeAvailability && look && look.enabled ? look : null;
                 const rendered = await renderEmail(conn, visit, lines, audience, kind, {
                     availabilityUrl: av ? av.url : null, availabilityPlaceholder: !!av && !av.url,
+                    scheduleUrl: includeSchedule ? scheduleLinkUrl : null,
+                    schedulePlaceholder: includeSchedule && !scheduleLinkUrl,
+                    changes,
                 });
                 const body = av ? A.appendAvailabilityHtml(rendered.body, av.url, audience) : rendered.body;
                 return {
                     subject: rendered.subject, body, to: suggestedTo(visit, audience),
                     availabilityEnabled: enabled,
                     ...(look && look.unavailable ? { availabilityUnavailable: true } : {}),
+                    scheduleLinkAllowed: scheduleAllowed,
+                    scheduleLinkUrl,
+                    ...(kind === 'update' ? { changes } : {}),
                 };
             });
             if (!out) return fail(res, 404, `QC visit ${id} not found.`, 'NOT_FOUND');
@@ -507,8 +569,18 @@ function registerQcVisitCommsRoutes(app, deps) {
     // POST /api/v1/qc-visits/:id/email
     // Body: { audience, kind?='proposal', to[], subject?, body?,
     //         attachKitFiles?, attachIcs?, attachQaDocumentId?, includeAvailabilityLink?,
-    //         attachProductList? }
-    // attachProductList (proposals only): the products list as
+    //         attachProductList?, includeScheduleLink? }
+    // kind 'update': the "products changed since our last email" email
+    // (template qc_visit_update, {changes}); sent like a proposal, needs no
+    // date, never moves the visit.
+    // includeScheduleLink (inspector proposals and updates): reuse the visit's
+    // schedule link or create it, before anything is fetched or sent, and put
+    // it in the body ({scheduleLink}, or appended). The kit documents then
+    // need not be attached (attachKitFiles stays separate).
+    // Every proposal / update records the lines it listed
+    // (lines_snapshot_json) so the next update, the ShipLine banner and the
+    // schedule page can say what changed since.
+    // attachProductList (proposals and updates): the products list as
     // `<ref>-products.csv`, the rows that audience's {lines} shows.
     // attachBrief, sent by older clients, is ignored (there is no brief).
     // includeAvailabilityLink (proposals only): reuse the party's open
@@ -525,7 +597,7 @@ function registerQcVisitCommsRoutes(app, deps) {
             const audience = String(b.audience || '');
             const kind = b.kind == null ? 'proposal' : String(b.kind);
             if (!AUDIENCES.includes(audience)) return fail(res, 400, 'audience must be factory or inspector.', 'BAD_FIELD', { field: 'audience' });
-            if (!KINDS.includes(kind)) return fail(res, 400, 'kind must be proposal or cancel.', 'BAD_FIELD', { field: 'kind' });
+            if (!KINDS.includes(kind)) return fail(res, 400, 'kind must be proposal, update or cancel.', 'BAD_FIELD', { field: 'kind' });
             const toAddresses = [...new Set((Array.isArray(b.to) ? b.to : [b.to])
                 .filter(x => typeof x === 'string')
                 .map(x => x.trim())
@@ -541,12 +613,14 @@ function registerQcVisitCommsRoutes(app, deps) {
                 if (!Number.isInteger(qaDocId) || qaDocId <= 0) return fail(res, 400, 'attachQaDocumentId must be a document id.', 'BAD_FIELD', { field: 'attachQaDocumentId' });
             }
             // A cancellation carries only the calendar cancellation (and a QA
-            // document if asked); the kit documents belong to proposals, and
-            // only the inspector's.
-            const attachKitFiles = kind === 'proposal' && audience === 'inspector' && b.attachKitFiles === true;
+            // document if asked); the kit documents and the schedule link
+            // belong to the inspector's proposals and updates.
+            const lineKind = LINE_KINDS.includes(kind);
+            const attachKitFiles = lineKind && audience === 'inspector' && b.attachKitFiles === true;
+            const includeSchedule = lineKind && audience === 'inspector' && b.includeScheduleLink === true;
             const attachIcs = b.attachIcs !== false; // CONTRACT-GAP: default not specified; the invite is on unless turned off
             const includeAvailability = kind === 'proposal' && b.includeAvailabilityLink === true;
-            const attachProductList = kind === 'proposal' && b.attachProductList === true;
+            const attachProductList = lineKind && b.attachProductList === true;
 
             if (!process.env.FRONT_API_TOKEN || !process.env.FRONT_CHANNEL_ID) {
                 return fail(res, 500, 'Front is not configured (FRONT_API_TOKEN, FRONT_CHANNEL_ID).', 'FRONT_NOT_CONFIGURED');
@@ -559,7 +633,7 @@ function registerQcVisitCommsRoutes(app, deps) {
                 if (!visit) return { status: 404, error: `QC visit ${id} not found.`, code: 'NOT_FOUND' };
 
                 const terminal = (QV.TERMINAL_STATUSES || ['COMPLETED', 'CANCELLED']).includes(visit.status);
-                if (kind === 'proposal' && terminal) {
+                if (lineKind && terminal) {
                     return { status: 409, error: `This visit is ${String(visit.status).toLowerCase()}.`, code: 'TERMINAL' };
                 }
                 if (kind === 'cancel' && visit.status !== 'CANCELLED') {
@@ -584,10 +658,18 @@ function registerQcVisitCommsRoutes(app, deps) {
                         throw e;
                     }
                 }
+                // The schedule link likewise, in its own transaction.
+                let schedule = null;
+                if (includeSchedule) {
+                    const got = await getOrCreateLink(conn, id, 'inspector', { userEmail: req.userEmail || null, recordAudit, via: 'email' });
+                    if (!got) return { status: 404, error: `QC visit ${id} not found.`, code: 'NOT_FOUND' };
+                    schedule = { linkId: Number(got.row.id), url: S.scheduleUrl(apiBaseUrlFromReq(req), got.row.token) };
+                }
 
                 const ref = visit.ref || QV.formatRef(visit.id);
                 const lines = await loadLines(conn, id);
                 const shownLines = linesFor(visit, lines, audience);
+                const changes = kind === 'update' ? await changesFor(conn, visit, lines, audience) : null;
                 const attachments = [];   // { bytes, filename, type }
                 const skippedAttachments = [];
                 let usedBytes = 0;
@@ -669,6 +751,8 @@ function registerQcVisitCommsRoutes(app, deps) {
 
                 const rendered = await renderEmail(conn, visit, shownLines, audience, kind, {
                     availabilityUrl: availability ? availability.url : null,
+                    scheduleUrl: schedule ? schedule.url : null,
+                    changes,
                 });
                 // One line (no header injection), at most 255 characters; stored the same.
                 const finalSubject = String((typeof b.subject === 'string' && b.subject.trim()) ? b.subject : rendered.subject)
@@ -681,6 +765,11 @@ function registerQcVisitCommsRoutes(app, deps) {
                 htmlBody = availability
                     ? A.appendAvailabilityHtml(htmlBody, availability.url, audience)
                     : A.stripAvailabilityPlaceholderHtml(htmlBody);
+                // The schedule link the same way: placeholder or older link →
+                // the URL, absent → appended; without it, no placeholder.
+                htmlBody = schedule
+                    ? S.appendScheduleLinkHtml(htmlBody, schedule.url)
+                    : S.stripSchedulePlaceholderHtml(htmlBody);
 
                 const receiptToken = await createEmailReceipt(conn, {
                     emailType: 'qc_visit', sentTo: toAddresses, subject: finalSubject,
@@ -726,12 +815,18 @@ function registerQcVisitCommsRoutes(app, deps) {
                 // would get it twice. Log it and answer 201 with recorded: false.
                 let send;
                 try {
+                    // The snapshot is of every line (PO numbers included), not
+                    // the audience's view: diffs match by orderId and are
+                    // filtered for the audience when shown.
                     const [ins] = await conn.query(
                         `INSERT INTO qc_visit_sends
-                            (visit_id, audience, kind, sent_to, kit_documents_json, subject, front_message_uid, front_conversation_id, sent_by_email)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                            (visit_id, audience, kind, sent_to, kit_documents_json, lines_snapshot_json, schedule_link_id,
+                             subject, front_message_uid, front_conversation_id, sent_by_email)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
                         [id, audience, kind, JSON.stringify(toAddresses),
                             sentKitDocuments.length ? JSON.stringify(sentKitDocuments) : null,
+                            lineKind ? JSON.stringify(S.linesSnapshot(lines)) : null,
+                            schedule ? schedule.linkId : null,
                             finalSubject, frontMessageUid, frontConversationId, req.userEmail || null]
                     );
                     await linkReceiptToSend(conn, receiptToken, 'qc_visit_sends', ins.insertId);
@@ -746,6 +841,7 @@ function registerQcVisitCommsRoutes(app, deps) {
                         ok: true,
                         send: {
                             id: null, audience, kind, kitDocuments: sentKitDocuments.length ? sentKitDocuments : null,
+                            scheduleLinkId: schedule ? schedule.linkId : null, lineCount: lineKind ? lines.length : null,
                             sentTo: toAddresses, subject: finalSubject, frontMessageUid, frontConversationId,
                             sentByEmail: req.userEmail || null, sentAt: new Date().toISOString(),
                             attachments: attachedNames, skippedAttachments,
@@ -764,6 +860,8 @@ function registerQcVisitCommsRoutes(app, deps) {
                         kitDocuments: send.kitDocuments, attachments: attachedNames, skippedAttachments,
                         frontMessageUid, frontConversationId,
                         ...(availability ? { availabilityLinkId: availability.linkId } : {}),
+                        ...(schedule ? { scheduleLinkId: schedule.linkId } : {}),
+                        ...(changes ? { changes: S.changeSummary(changes) || 'none' } : {}),
                     },
                     userEmail: req.userEmail,
                 });
@@ -785,6 +883,10 @@ function registerQcVisitCommsRoutes(app, deps) {
 
 module.exports = {
     registerQcVisitCommsRoutes,
+    // the schedule page (src/handlers/qc-schedule.js) prints the visit the way the emails do
+    buildVars,
+    linesFor,
+    linesCsv,
     // exported for tests
     _internals: { buildVars, fmtVisitDate, fmtChinaWindow, fmtUkWindow, lineText, linesFor, linesHtml, sendToJson, esc },
 };

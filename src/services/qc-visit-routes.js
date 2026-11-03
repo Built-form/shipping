@@ -37,6 +37,8 @@ const KD = require('../lib/qc-kit-docs');
 const { contentDisposition, viewResponseParams, isUploadType } = require('../lib/qc-file-types');
 // Open availability links follow status / visit_date changes (updateVisit).
 const { syncAvailabilityLinks } = require('./qc-availability-routes');
+// The detail's sendChanges: lines changed since each party's last email.
+const { sendChanges } = require('./qc-schedule-routes');
 
 const {
     VISIT_STATUSES, OPEN_STATUSES, TERMINAL_STATUSES, CANDIDATE_ORDER_STATUSES,
@@ -660,6 +662,7 @@ function registerQcVisitRoutes(app, deps) {
         ]);
         return {
             id: Number(a.id),
+            jfCode: a.jf_code || null, // the product it belongs to; null: the whole visit
             filename: a.filename,
             contentType: a.content_type || null,
             fileSize: num(a.file_size),
@@ -685,8 +688,26 @@ function registerQcVisitRoutes(app, deps) {
         out.moves = moves.map(moveToJson);
         out.confirmations = confirmations.map(confirmationToJson);
         out.attachments = await Promise.all(attachments.map(attachmentToJson));
+        // Per party: the lines added / removed / changed since its last
+        // proposal or update email (null: never emailed). ShipLine shows a
+        // "send an update" banner from it (docs/qc-schedule-link.md).
+        out.sendChanges = await sendChanges(conn, id, lines);
         if (extra && typeof extra === 'object') Object.assign(out, extra);
         return out;
+    }
+
+    // An attachment's product: a JF code on one of the visit's lines
+    // (normalised), or null for the whole visit. Throws BAD_FIELD otherwise.
+    async function attachmentJfCode(conn, visitId, raw) {
+        if (raw == null || raw === '') return null;
+        if (typeof raw !== 'string') throw badField('jfCode', 'jfCode must be a JF code or null.');
+        const code = normJfCode(raw);
+        if (!code) return null;
+        const lines = await loadLineRows(conn, [visitId]);
+        if (!lines.some(l => normJfCode(l.o_jf_code || '') === code)) {
+            throw badField('jfCode', `${code} is not a product on this visit.`);
+        }
+        return code;
     }
 
     async function loadDetailOr404(conn, id) {
@@ -1420,7 +1441,10 @@ function registerQcVisitRoutes(app, deps) {
         });
     }));
 
-    // POST /api/v1/qc-visits/:id/attachments  { s3Key, filename, contentType, note? }
+    // POST /api/v1/qc-visits/:id/attachments  { s3Key, filename, contentType, note?, jfCode? }
+    // jfCode: the product the file belongs to (one of the visit's JF codes);
+    // omitted or null, it is for the whole visit. Both show on the
+    // inspector's schedule page.
     // Attachments do not bump the visit's updated_at: they are not part of
     // the agreed slot and must not make another user's open copy STALE.
     app.post('/api/v1/qc-visits/:id(\\d+)/attachments', route('POST /qc-visits/:id/attachments', async (req, res) => {
@@ -1449,18 +1473,56 @@ function registerQcVisitRoutes(app, deps) {
         const contentType = head.ContentType || clip(b.contentType, 100) || 'application/octet-stream';
 
         const row = await withConnection(async (conn) => {
+            const jfCode = await attachmentJfCode(conn, id, b.jfCode);
             const [taken] = await conn.query(`SELECT id FROM qc_visit_attachments WHERE s3_key = ? LIMIT 1`, [b.s3Key]);
             if (taken.length) throw new HttpFail(409, 'DUPLICATE_UPLOAD', 'That file is already registered.', { existingId: taken[0].id });
             const [ins] = await conn.query(
-                `INSERT INTO qc_visit_attachments (visit_id, filename, s3_key, content_type, file_size, note, uploaded_by_email)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-                [id, filename, b.s3Key, contentType, size, note, req.userEmail || null]
+                `INSERT INTO qc_visit_attachments (visit_id, jf_code, filename, s3_key, content_type, file_size, note, uploaded_by_email)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+                [id, jfCode, filename, b.s3Key, contentType, size, note, req.userEmail || null]
             );
-            await audit(conn, 'qc_visit', id, 'attachment_added', null, { attachmentId: ins.insertId, filename, fileSize: size, note }, req.userEmail);
+            await audit(conn, 'qc_visit', id, 'attachment_added', null, { attachmentId: ins.insertId, filename, fileSize: size, note, jfCode }, req.userEmail);
             const [rows] = await conn.query(`SELECT * FROM qc_visit_attachments WHERE id = ?`, [ins.insertId]);
             return rows[0];
         });
         res.status(201).json(await attachmentToJson(row));
+    }));
+
+    // PATCH /api/v1/qc-visits/:id/attachments/:attId  { jfCode?, note? }
+    // Move a file to a product (jfCode) or to the whole visit (jfCode null),
+    // and/or change its note. Fields left out are unchanged.
+    app.patch('/api/v1/qc-visits/:id(\\d+)/attachments/:attId(\\d+)', route('PATCH /qc-visits/:id/attachments/:attId', async (req, res) => {
+        refuseReadOnly(req);
+        await auditLogSchemaReady;
+        if (!poBucket) return res.status(500).json({ error: 'PO_DOCS_BUCKET env var not configured.' });
+        const id = Number(req.params.id);
+        const attId = Number(req.params.attId);
+        const b = req.body || {};
+        const row = await withConnection(async (conn) => {
+            const [rows] = await conn.query(
+                `SELECT * FROM qc_visit_attachments WHERE id = ? AND visit_id = ? AND deleted_at IS NULL`, [attId, id]
+            );
+            if (!rows.length) throw notFound(`Attachment ${attId} not found on this visit.`);
+            const cur = rows[0];
+            const patch = {};
+            if ('jfCode' in b) patch.jf_code = await attachmentJfCode(conn, id, b.jfCode);
+            if ('note' in b) {
+                if (b.note != null && typeof b.note !== 'string') throw badField('note', 'note must be text.');
+                patch.note = clip(b.note, 255);
+            }
+            const changed = Object.keys(patch).filter(k => (patch[k] ?? null) !== (cur[k] ?? null));
+            if (changed.length) {
+                const set = setClause(Object.fromEntries(changed.map(k => [k, patch[k]])));
+                await conn.query(`UPDATE qc_visit_attachments SET ${set.sql} WHERE id = ?`, [...set.params, attId]);
+                await audit(conn, 'qc_visit', id, 'attachment_updated',
+                    { attachmentId: attId, ...Object.fromEntries(changed.map(k => [k === 'jf_code' ? 'jfCode' : k, cur[k] ?? null])) },
+                    { attachmentId: attId, ...Object.fromEntries(changed.map(k => [k === 'jf_code' ? 'jfCode' : k, patch[k] ?? null])) },
+                    req.userEmail);
+            }
+            const [fresh] = await conn.query(`SELECT * FROM qc_visit_attachments WHERE id = ?`, [attId]);
+            return fresh[0];
+        });
+        res.json(await attachmentToJson(row));
     }));
 
     // DELETE /api/v1/qc-visits/:id/attachments/:attId — soft; the file stays.

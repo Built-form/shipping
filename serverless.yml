@@ -389,6 +389,24 @@ functions:
           path: /api/v1/confirm-receipt/{token}
           method: POST
 
+  # ── QC visit schedule page (PUBLIC — no authorizer) ──
+  # The link in the inspector's QC visit email (docs/qc-schedule-link.md):
+  # every product to inspect with its QC documents and files, always current,
+  # changes since the last email highlighted. The 43-character token in the
+  # path IS the capability; files go through /files/{file}, which answers a
+  # 302 to a fresh 5-minute presigned URL. Isolated so the public surface is
+  # just these two GETs. Low concurrency + per-route throttling (below).
+  qcScheduleApi:
+    handler: src/handlers/qc-schedule.handler
+    reservedConcurrency: 5
+    events:
+      - httpApi:
+          path: /api/v1/qc-schedule/{token}
+          method: GET
+      - httpApi:
+          path: /api/v1/qc-schedule/{token}/files/{file}
+          method: GET
+
   stockSnapshot:
     handler: src/handlers/mintsoft-snapshot.handler
     reservedConcurrency: 2
@@ -778,6 +796,8 @@ resources:
         - HttpApiRoutePostApiV1PortalQcDashvisit
         - HttpApiRouteGetApiV1ConfirmDashreceiptTokenVar
         - HttpApiRoutePostApiV1ConfirmDashreceiptTokenVar
+        - HttpApiRouteGetApiV1QcDashscheduleTokenVar
+        - HttpApiRouteGetApiV1QcDashscheduleTokenVarFilesFileVar
         - HttpApiRoutePostApiV1ScanLookup
         - HttpApiRoutePostApiV1ScanReceive
         - HttpApiRouteGetApiV1ScanWarehouses
@@ -806,6 +826,15 @@ resources:
           'POST /api/v1/confirm-receipt/{token}':
             ThrottlingRateLimit: 5
             ThrottlingBurstLimit: 10
+          # Public QC schedule page and its file redirects. The token is
+          # unguessable; the file route gets more room because one page can
+          # open several documents in a row.
+          'GET /api/v1/qc-schedule/{token}':
+            ThrottlingRateLimit: 5
+            ThrottlingBurstLimit: 10
+          'GET /api/v1/qc-schedule/{token}/files/{file}':
+            ThrottlingRateLimit: 10
+            ThrottlingBurstLimit: 20
           # PUBLIC carton-scan receiving routes — same code-only gating, so
           # throttle brute force at the edge. gemini-key reveals a secret, so
           # it's throttled tighter.
