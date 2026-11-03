@@ -8,6 +8,7 @@ For the engineer who reviews, deploys and supports QC Visits. It describes the c
 
 - Adds a **QC VISITS** view to ShipLine (`/qc-visits`, header tab `10`, placed after QC) for **arranging** a factory QC visit in China.
 - **Candidates** lists PO lines in `UNDER_PRODUCTION` / `READY_FOR_QC`. The user ticks lines and arranges a visit: units to inspect per line, host factory (`qc_factories`), goods moved in from other suppliers, inspector (`qc_inspectors`), and the date and window in China time (UK time shown alongside).
+- **Due for QC** (tab `?tab=due`, frontend only) narrows the candidates to `READY_FOR_QC` lines plus `UNDER_PRODUCTION` lines whose ready date (actual, else estimated; overdue included) is within 7 days (China time), per supplier. Lines on an open visit start hidden. **DRAFT VISIT** per supplier (or **DRAFT ALL**, one per supplier) calls `POST /qc-visits` with the ticked lines at their full free quantity (`_FQC` as `destructive`), the supplier's default factory (or its only live one) and the inspector when exactly one is active; date and window are left for the visit.
 - A visit goes `DRAFT → PROPOSED → CONFIRMED → COMPLETED`, or `CANCELLED` (with a category; two categories flag a **wasted trip**). It reaches CONFIRMED only when both the factory and the inspector have confirmed.
 - **Kits** come from JFPRO (§8): a product's inspection kit is its JFPRO QA documents at the Plan of Action stage "China Agent — factory QC", attached to the product or to a product group it is in. ShipLine lists them; shipping stores no kit. There is no checklist, no company default kit and no brief PDF.
 - **Comms**: proposal and cancellation emails to the factory or inspector go through Front. They can carry the products' kit documents (inspector proposals only), an ICS invite and a QA document, and they get an email receipt.
@@ -110,7 +111,7 @@ Run this on the test stack. Note that the test stack's EventBridge schedules are
 | `qc_visit_lines` | One order per visit: `quantity_to_inspect`, `po_quantity_snapshot` (for `po_shrank`), sample method / AQL, note |
 | `qc_visit_moves` | Goods moved from another supplier to the host factory, so that one stop covers them |
 | `qc_visit_confirmations` | Append-only log per party: `proposed`, `confirmed`, `declined`, `counter`, with the channel (`portal` for supplier-portal writes) |
-| `qc_visit_attachments` | Free-form files on a visit (`qc-visits/<uuid>/<name>`, 25 MB max). Soft delete |
+| `qc_visit_attachments` | Free-form files on a visit (`qc-visits/<uuid>/<name>`, 250 MB max). Soft delete |
 | `qc_visit_sends` | One row per Front email (audience, `proposal`/`cancel`, recipients, Front ids). `kit_documents_json` is `[{ documentId, versionId, version, filename }]` of the JFPRO kit documents attached, or NULL. It is linked from `email_receipts` (`email_type='qc_visit'`) |
 | view `qc_kit_documents` | Migration `_20` (§2.2). One row per (product, attachment path, document) for JFPRO documents with category `qa` and `qa_type` tag `poa_china` or no (or an empty) `qa_type` tag, not deleted, current version only, attached to the product directly (`attached_via 'product'`) or to a product group it is in (`'product_group'`). Columns: `jf_code` (`UPPER(TRIM(jfcode))`), `product_id`, `product_name`, `document_id`, `document_name`, `version_id`, `version_number`, `s3_key`, `filename`, `mime_type`, `size_bytes`, `uploaded_by`, `uploaded_at`, `attached_via`, `document_updated_at` |
 
@@ -136,7 +137,7 @@ All authed routes are under `/api/v1`. Writes require `admin` or `standard`. Vis
 | `POST /qc-visits/:id/confirmations` | qc-visit-routes | Record a party's confirmation, decline or counter (refused in DRAFT) |
 | `POST /qc-visits/:id/accept-counter` | qc-visit-routes | Apply a counter-proposal's date/window and confirm that party |
 | `POST /qc-visits/:id/clone` | qc-visit-routes | New DRAFT from a COMPLETED or CANCELLED visit (409 `NOT_CLONEABLE` otherwise). Drops lines that left the candidate statuses (`droppedOrderIds`) |
-| `POST /qc-visits/:id/attachments/upload-url` | qc-visit-routes | Presigned PUT ticket (600 s, 25 MB). `contentType` must be on the allowlist (§4.3) |
+| `POST /qc-visits/:id/attachments/upload-url` | qc-visit-routes | Presigned PUT ticket (600 s, 250 MB). `contentType` must be on the allowlist (§4.3) |
 | `POST /qc-visits/:id/attachments` | qc-visit-routes | Register an uploaded file (HeadObject check) |
 | `DELETE /qc-visits/:id/attachments/:attId` | qc-visit-routes | Soft delete |
 | `GET /qc-factories` | qc-visit-routes | `?supplier=&includeDeleted=1`. Lazily re-homes factories whose `supplier_code` now maps to a renamed supplier |

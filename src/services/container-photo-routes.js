@@ -23,7 +23,7 @@ const { v4: uuidv4 } = require('uuid');
 const P = require('./packing-list-check');
 const R = require('./packing-review');
 
-const MAX_PHOTO_BYTES = 25 * 1024 * 1024;
+const MAX_PHOTO_BYTES = 250 * 1024 * 1024;
 const VIEW_URL_SECONDS = 3600;
 const SAFE_FILENAME_RE = /[^A-Za-z0-9._-]+/g;
 const PHOTO_KEY_RE = /^container-photos\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/[A-Za-z0-9._-]+$/;

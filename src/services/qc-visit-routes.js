@@ -48,7 +48,7 @@ const {
     ymdOf, hmOf,
 } = Q;
 
-const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+const MAX_ATTACHMENT_BYTES = 250 * 1024 * 1024;
 const UPLOAD_URL_SECONDS = 600;
 const VIEW_URL_SECONDS = 3600;
 const SAFE_FILENAME_RE = /[^A-Za-z0-9._-]+/g;

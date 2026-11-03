@@ -32,6 +32,10 @@ const {
 } = require('../lib/email-receipt');
 const { sendReminderForReceipt } = require('../services/receipt-reminders');
 const { receiveOrderStock, ReceiveError } = require('../services/order-receive');
+// The PO send links to the PDF on the supplier portal and pre-approves its
+// recipients there; the portal records who opened it (docs/po-portal-send.md).
+const { preapprovePortalUsers, loadPoDocumentViews } = require('../services/portal-access');
+const poPortalEmail = require('../lib/po-portal-email');
 const { listWarehousesWithLocations, listLocationsForWarehouse } = require('../services/mintsoft-locations');
 // Daily alerts (slide-out alert window). Generation logic lives in the service
 // so the nightly Lambda reuses it; here we only expose the read/ack routes.
@@ -6324,7 +6328,7 @@ app.get('/api/v1/purchase-orders/:id/documents', async (req, res) => {
     try {
         await purchaseOrdersSchemaReady;
         const { id } = req.params;
-        const { docs, sendsByDoc } = await withConnection(async (conn) => {
+        const { docs, sendsByDoc, viewsByDoc } = await withConnection(async (conn) => {
             // SELECT * so lines_json is read when the column exists and this
             // still answers before its migration is applied.
             const [r] = await conn.query(
@@ -6353,7 +6357,9 @@ app.get('/api/v1/purchase-orders/:id/documents', async (req, res) => {
                 if (!byDoc.has(s.purchase_order_document_id)) byDoc.set(s.purchase_order_document_id, []);
                 byDoc.get(s.purchase_order_document_id).push(s);
             }
-            return { docs: r, sendsByDoc: byDoc };
+            // Who opened each version on the supplier portal (the SEEN tick).
+            const viewsByDoc = await loadPoDocumentViews(conn, ids);
+            return { docs: r, sendsByDoc: byDoc, viewsByDoc };
         });
         res.json({
             data: docs.map(r => ({
@@ -6365,6 +6371,7 @@ app.get('/api/v1/purchase-orders/:id/documents', async (req, res) => {
                 generatedByEmail: r.generated_by_email || null,
                 generatedAt: r.generated_at?.toISOString?.() ?? r.generated_at,
                 sends: (sendsByDoc.get(r.id) || []).map(sendRowToJson),
+                views: viewsByDoc.get(Number(r.id)) || [],
                 lines: parseLinesJson(r.lines_json),
             })),
         });
@@ -6434,13 +6441,17 @@ app.get('/api/v1/suppliers/:id/emails', async (req, res) => {
 });
 
 // ── POST /api/v1/purchase-order-documents/:id/email ──────────────────────
-// Sends a specific PO PDF version to a single recipient via Front, with
-// the PDF attached. Purely a delivery primitive: doesn't touch order
-// status, doesn't fire the legacy Make webhook. Inputs are the document
-// id (which version to send) and the recipient address — the caller picks
-// which generated version to deliver. Subject and body come from the stored
-// `purchase_order` email template (editable via /email-templates), and can be
-// overridden per-send via the request body.
+// Tells the supplier that a specific PO PDF version is on the supplier portal:
+// an email via Front with a link to the PO there, NOT the PDF attached
+// (docs/po-portal-send.md). Before it goes out, every supplier recipient is
+// pre-approved as a portal user for the PO's supplier, so registering with
+// that address needs no approval; staff addresses are left alone. The send row
+// written here is also what lists the version on the portal. Otherwise still a
+// delivery primitive: doesn't touch order status, doesn't fire the legacy Make
+// webhook. Subject and body come from the stored `purchase_order_portal`
+// template (editable via /email-templates) and can be overridden per send;
+// {poNumber} and {version} are filled in either way, and the fixed portal
+// block (button to the PO, how to register) is appended under the body.
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 app.post('/api/v1/purchase-order-documents/:id/email', async (req, res) => {
@@ -6453,8 +6464,8 @@ app.post('/api/v1/purchase-order-documents/:id/email', async (req, res) => {
         const { id } = req.params;
         // `subject`/`body` are optional per-send overrides. When the caller
         // supplies a body (typically the template fetched via
-        // GET /email-templates, then edited in the UI), it's used verbatim;
-        // otherwise the stored `purchase_order` template is rendered.
+        // GET /email-templates, then edited in the UI), it's used as the
+        // message; otherwise the stored `purchase_order_portal` template is.
         const { to, subject, body } = req.body || {};
 
         // `to` accepts either a single string or an array of strings. Each
@@ -6470,55 +6481,78 @@ app.post('/api/v1/purchase-order-documents/:id/email', async (req, res) => {
         if (!process.env.FRONT_API_TOKEN || !process.env.FRONT_CHANNEL_ID) {
             return res.status(500).json({ error: 'Front is not configured (FRONT_API_TOKEN, FRONT_CHANNEL_ID).' });
         }
-        if (!PO_BUCKET) {
-            return res.status(500).json({ error: 'PO_DOCS_BUCKET env var not configured.' });
+        const portalBase = poPortalEmail.portalBaseOf();
+        if (!portalBase) {
+            return res.status(409).json({
+                code: 'PORTAL_URL_UNSET',
+                error: 'The supplier portal address (SUPPLIER_PORTAL_URL) is not configured, so the PO link cannot be sent.',
+            });
         }
 
         const result = await withConnection(async (conn) => {
             const [docRows] = await conn.query(
-                `SELECT d.id, d.purchase_order_id, d.version, d.s3_key, d.public_url, d.file_size,
-                        po.po_number
+                `SELECT d.id, d.purchase_order_id, d.version, po.po_number, po.supplier
                    FROM purchase_order_documents d
                    JOIN purchase_orders po ON po.id = d.purchase_order_id
-                  WHERE d.id = ? AND po.deleted_at IS NULL`,
+                  WHERE d.id = ? AND po.deleted_at IS NULL AND d.deleted_at IS NULL`,
                 [id]
             );
             if (!docRows.length) return { notFound: true };
             const doc = docRows[0];
+            const poUrl = poPortalEmail.poPortalUrl(portalBase, doc.purchase_order_id);
 
-            const obj = await s3.send(new GetObjectCommand({ Bucket: PO_BUCKET, Key: doc.s3_key }));
-            const pdfBytes = Buffer.from(await obj.Body.transformToByteArray());
+            // Pre-approve first, in its own committed transaction, so the
+            // account is there by the time the supplier follows the link. A
+            // failure here never stops the email: the block then just says our
+            // team will approve them.
+            let portalAccess;
+            try {
+                portalAccess = await preapprovePortalUsers(conn, {
+                    recipients: toAddresses,
+                    poSupplier: doc.supplier,
+                    actorEmail: req.userEmail,
+                    note: `Pre-approved from ShipLine: PO ${doc.po_number} v${doc.version} emailed by ${req.userEmail || 'ShipLine'}`,
+                });
+            } catch (e) {
+                log.error('[purchase-order-documents/email] portal pre-approval failed', { documentId: doc.id, error: e.message });
+                portalAccess = { status: 'error', suppliers: [], users: [], skipped: [] };
+            }
+            const preapproved = portalAccess.status === 'ok'
+                && portalAccess.users.every(u => poPortalEmail.GRANTED_OUTCOMES.has(u.outcome));
 
-            const safePoNumber = String(doc.po_number).replace(/[^A-Za-z0-9._-]/g, '_');
-            const filename = `${safePoNumber}-v${doc.version}.pdf`;
-
-            const tpl = await getEmailTemplate(conn, 'purchase_order');
-            const vars = { poNumber: doc.po_number };
+            const tpl = await getEmailTemplate(conn, 'purchase_order_portal');
+            const vars = { poNumber: doc.po_number, version: doc.version };
             const finalSubject = (typeof subject === 'string' && subject.trim())
-                ? subject.trim()
+                ? renderTemplate(subject.trim(), vars)
                 : (renderTemplate(tpl.subject, vars) || String(doc.po_number));
             const htmlBody = (typeof body === 'string' && body.trim())
-                ? body
+                ? renderTemplate(body, vars)
                 : renderTemplate(tpl.bodyHtml, vars);
+            const bodyWithPortal = htmlBody + poPortalEmail.portalBlockHtml({
+                poNumber: doc.po_number,
+                version: doc.version,
+                poUrl,
+                registerUrl: poPortalEmail.registerUrl(portalBase),
+                preapproved,
+            });
 
             // Mint a receipt token and embed a "Confirm receipt" link so the
             // recipient can one-click confirm they got this email.
             const receiptToken = await createEmailReceipt(conn, {
                 emailType: 'purchase_order', sentTo: toAddresses, subject: finalSubject,
             });
-            const bodyWithReceipt = appendReceiptLink(htmlBody, receiptToken, apiBaseUrlFromReq(req));
+            const bodyWithReceipt = appendReceiptLink(bodyWithPortal, receiptToken, apiBaseUrlFromReq(req));
 
-            // Front /channels/{id}/messages — multipart so we can attach the
-            // PDF. `to[]` notation makes Front treat the field as an array;
-            // we append once per recipient. body_format=html so our HTML
-            // styling renders instead of being shown as source.
+            // Front /channels/{id}/messages. `to[]` notation makes Front treat
+            // the field as an array; we append once per recipient.
+            // body_format=html so our HTML styling renders instead of being
+            // shown as source. No attachment: the PDF is on the portal.
             const form = new FormData();
             for (const addr of toAddresses) form.append('to[]', addr);
             form.append('subject', finalSubject);
             form.append('body', bodyWithReceipt);
             form.append('body_format', 'html');
             form.append('options[archive]', 'false');
-            form.append('attachments[]', new Blob([pdfBytes], { type: 'application/pdf' }), filename);
 
             const frontUrl = `https://api2.frontapp.com/channels/${encodeURIComponent(process.env.FRONT_CHANNEL_ID)}/messages`;
             const resp = await fetch(frontUrl, {
@@ -6580,6 +6614,8 @@ app.post('/api/v1/purchase-order-documents/:id/email', async (req, res) => {
                     subject: finalSubject,
                     frontMessageUid,
                     frontConversationId,
+                    portalUrl: poUrl,
+                    portalAccess,
                 },
                 userEmail: req.userEmail,
             });
@@ -6595,6 +6631,8 @@ app.post('/api/v1/purchase-order-documents/:id/email', async (req, res) => {
                 sentAt,
                 frontMessageUid,
                 frontConversationId,
+                portalUrl: poUrl,
+                portalAccess,
             };
         });
 
@@ -7848,6 +7886,10 @@ async function loadPurchaseOrdersForOrders(conn, orders) {
     const docSends = await sendsByParent(
         conn, 'purchase_order_document_sends', 'purchase_order_document_id', docRows.map(d => d.id)
     );
+    // Portal views (the SEEN tick) for each PO's newest version only, like the
+    // line snapshot below: the tick only ever reads the newest.
+    const newestDocIds = [...new Map(docRows.map(d => [d.purchase_order_id, d.id]).reverse()).values()];
+    const docViews = await loadPoDocumentViews(conn, newestDocIds);
 
     // Invoices (+ the latest check per invoice).
     const [invRows] = await conn.query(
@@ -7915,10 +7957,12 @@ async function loadPurchaseOrdersForOrders(conn, orders) {
             generatedByEmail: d.generated_by_email || null,
             generatedAt: d.generated_at?.toISOString?.() ?? d.generated_at,
             sends: (docSends.get(d.id) || []).map(sendRowToJson),
-            // Line snapshot on the newest version only (rows arrive version
-            // DESC): it is the only baseline ShipLine compares against, and
+            // Line snapshot and portal views on the newest version only (rows
+            // arrive version DESC): the only ones ShipLine reads here, and
             // this payload is polled every few seconds.
-            ...(b.documents.length === 0 ? { lines: parseLinesJson(d.lines_json) } : {}),
+            ...(b.documents.length === 0
+                ? { lines: parseLinesJson(d.lines_json), views: docViews.get(Number(d.id)) || [] }
+                : {}),
         });
     }
     for (const r of invRows) {

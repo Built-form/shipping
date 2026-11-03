@@ -55,6 +55,28 @@ const DEFAULT_EMAIL_TEMPLATES = [
         ].join(''),
     },
     {
+        // The PO send no longer attaches the PDF: the sender appends the portal
+        // block (button to the PO, how to register; src/lib/po-portal-email.js)
+        // under this body, so the copy here only has to explain it.
+        key: 'purchase_order_portal',
+        name: 'Purchase Order (supplier portal)',
+        category: 'PO',
+        description: 'Emailed to a supplier when a PO PDF is published: no attachment, the PDF is on the supplier portal. A button to the PO and registration instructions are appended automatically. Tokens: {poNumber} {version}.',
+        subject: 'New PO {poNumber} – on the supplier portal / 新采购订单',
+        bodyHtml: [
+            '<div style="font-family:Helvetica,Arial,sans-serif;font-size:14px;color:#222;line-height:1.5;">',
+            '<p>Greetings,</p>',
+            '<p>We have published a new PDF of purchase order <strong>{poNumber}</strong> (version {version}). It is not attached to this email: please sign in to our supplier portal and download it from the order\'s page. The latest version is always kept there.</p>',
+            '<p>Please review it and send back a PI. You can upload the PI on the order\'s page in the portal. I will send artwork shortly.</p>',
+            '<p>您好，</p>',
+            '<p>我们已发布采购订单 <strong>{poNumber}</strong> 的新 PDF（第 {version} 版）。本邮件不附带该文件：请登录我们的供应商门户，在该订单页面下载。门户中始终保存最新版本。</p>',
+            '<p>请查阅后回传形式发票（PI），您可以在门户中该订单的页面上传 PI。我们稍后会发送图稿。</p>',
+            '<p>Thank you. / 谢谢。</p>',
+            '<p>Kind Regards,<br>Operations Team.<br>JFA Medical Ltd.</p>',
+            '</div>',
+        ].join(''),
+    },
+    {
         key: 'draft_container_quote',
         name: 'Delivery Quote Request',
         category: 'Logistics',
@@ -242,4 +264,7 @@ const SUPPLIER_PI_TEMPLATE_KEYS = ['supplier_pi_imported', 'supplier_pi_rejected
 // qc_visit_update arrived later, seeded by 2026-11-03_11_qc_visit_update_template.js.
 const QC_VISIT_TEMPLATE_KEYS = ['qc_visit_factory', 'qc_visit_inspector', 'qc_visit_cancel', 'qc_visit_update'];
 
-module.exports = { DEFAULT_EMAIL_TEMPLATES, SUPPLIER_PI_TEMPLATE_KEYS, QC_VISIT_TEMPLATE_KEYS };
+// The PO send's portal-link email (seeded by 2026-11-03_20_seed_po_portal_template.js).
+const PO_PORTAL_TEMPLATE_KEY = 'purchase_order_portal';
+
+module.exports = { DEFAULT_EMAIL_TEMPLATES, SUPPLIER_PI_TEMPLATE_KEYS, QC_VISIT_TEMPLATE_KEYS, PO_PORTAL_TEMPLATE_KEY };
