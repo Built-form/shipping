@@ -54,7 +54,7 @@ const LIVE_STATUSES = ['IN_PRODUCTION', 'READY_FOR_QC', 'READY', 'CONSOLIDATED',
 // A line on its way in no shipment: not in production yet (an allocation
 // planned ahead, which may well move), or written off. Never expected in a
 // container, whatever it is allocated to.
-const INACTIVE_STATUSES = ['SCHEDULED', 'PO_SENT', 'DESTROYED'];
+const INACTIVE_STATUSES = ['SCHEDULED', 'PO_SENT', 'DESTROYED', 'REPACKAGED'];
 const isActiveLine = r => !INACTIVE_STATUSES.includes(r.status);
 const CANDIDATE_CAP = 60;
 // Skip the fallback model when less than this is left before the deadline.

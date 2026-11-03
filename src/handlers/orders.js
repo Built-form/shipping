@@ -400,6 +400,7 @@ const STATUS_DATE_KEY = {
     IN_WAREHOUSE: 'received_by_warehouse',
     RECEIVED: 'received',
     PARTIALLY_RECEIVED: 'received',
+    REPACKAGED: 'repackaged',
 };
 
 const ALL_STATUSES = [
@@ -9777,6 +9778,8 @@ function shipmentPaymentDocumentRowToJson(r) {
         paymentId: r.payment_id ?? null,
         /** The transfer a proof of payment was applied with. */
         supplierPaymentId: r.supplier_payment_id ?? null,
+        /** The PO whose combined / repackaged goods a balance invoice with no shipment bills. */
+        purchaseOrderId: r.purchase_order_id ?? null,
         docKind: r.doc_kind || 'balance_invoice',
         filename: r.filename,
         url: r.public_url || publicS3Url(r.s3_key),
@@ -10428,9 +10431,34 @@ app.post('/api/v1/shipment-payment-documents', async (req, res) => {
             // An invoice is for a shipment; a proof of payment is to a
             // supplier and may name no shipment at all (uploaded from the
             // Payments page while recording a transfer).
-            const supplierName = typeof b.supplierName === 'string' && b.supplierName.trim()
+            let supplierName = typeof b.supplierName === 'string' && b.supplierName.trim()
                 ? b.supplierName.trim().slice(0, 255) : null;
             const hasShipment = !!(b.shipmentId || b.shipmentReference);
+            // The balance invoice for a PO's combined / repackaged goods (user,
+            // 2026-11-02): they never ship, so it names the PO, not a shipment.
+            // Needs purchase_order_id (migration 2026-11-02_10).
+            let purchaseOrderId = null;
+            if (b.purchaseOrderId != null && b.purchaseOrderId !== '') {
+                const id = Number(b.purchaseOrderId);
+                let po = null;
+                let repackagedLines = 0;
+                if (Number.isInteger(id) && id > 0 && !hasShipment && docKind === 'balance_invoice') {
+                    const [poRows] = await conn.query(
+                        `SELECT id, po_number, supplier FROM purchase_orders WHERE id = ? AND deleted_at IS NULL`, [id]
+                    );
+                    if (poRows.length) {
+                        po = { id: poRows[0].id, poNumber: poRows[0].po_number, supplier: poRows[0].supplier || null };
+                        const [[n]] = await conn.query(
+                            `SELECT COUNT(*) AS n FROM orders WHERE purchase_order_id = ? AND deleted_at IS NULL AND status = 'REPACKAGED'`, [id]
+                        );
+                        repackagedLines = Number(n.n) || 0;
+                    }
+                }
+                const refusal = paymentDocumentsLib.repackagedUploadRefusal({ docKind, hasShipment, purchaseOrderId: b.purchaseOrderId, po, repackagedLines });
+                if (refusal) return { fail: refusal };
+                purchaseOrderId = po.id;
+                if (!supplierName && po.supplier) supplierName = po.supplier.trim().slice(0, 255);
+            }
             let shipment = null;
             if (hasShipment) {
                 const resolved = await requireBookedShipment(conn, {
@@ -10486,11 +10514,13 @@ app.post('/api/v1/shipment-payment-documents', async (req, res) => {
             // and bank reference pre-fill the transfer it is applied with);
             // 'other' is filed.
             const wantExtract = b.extract === undefined ? docKind !== 'other' : b.extract === true;
+            // purchase_order_id only when a PO is named: every other upload
+            // still works on a database without the column.
             const [ins] = await conn.query(
                 `INSERT INTO shipment_payment_documents
                     (shipment_id, shipment_reference, supplier_name, supplier_key, payment_id, doc_kind,
-                     filename, s3_key, public_url, content_type, file_size, notes, extract_status, uploaded_by_email)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                     filename, s3_key, public_url, content_type, file_size, notes, extract_status, uploaded_by_email${purchaseOrderId != null ? ', purchase_order_id' : ''})
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?${purchaseOrderId != null ? ', ?' : ''})`,
                 [
                     shipment ? shipment.id : null, shipment ? (shipment.reference || String(shipment.id)) : null,
                     supplierName, supplierName ? shipmentPaymentsService.supplierKey(supplierName) : null,
@@ -10499,13 +10529,14 @@ app.post('/api/v1/shipment-payment-documents', async (req, res) => {
                     typeof b.notes === 'string' && b.notes.trim() ? b.notes.trim().slice(0, 2000) : null,
                     wantExtract ? 'processing' : 'none',
                     req.userEmail || null,
+                    ...(purchaseOrderId != null ? [purchaseOrderId] : []),
                 ]
             );
             const [readback] = await conn.query(`SELECT * FROM shipment_payment_documents WHERE id = ?`, [ins.insertId]);
             await recordAudit(conn, {
                 entityType: 'shipment_payment_document', entityId: ins.insertId, action: 'create',
                 before: null,
-                after: { shipmentId: shipment ? shipment.id : null, supplierName, filename: filename.slice(0, 200), docKind, fileSize: buffer.length },
+                after: { shipmentId: shipment ? shipment.id : null, purchaseOrderId, supplierName, filename: filename.slice(0, 200), docKind, fileSize: buffer.length },
                 userEmail: req.userEmail,
             });
             return { document: shipmentPaymentDocumentRowToJson(readback[0]), wantExtract, documentId: ins.insertId };
@@ -10516,6 +10547,10 @@ app.post('/api/v1/shipment-payment-documents', async (req, res) => {
 
         if (result.wantExtract) startShipmentPaymentExtraction(req, result.documentId);
     } catch (error) {
+        // An upload naming a PO before migration 2026-11-02_10 added the column.
+        if (error && error.errno === 1054 && !res.headersSent) {
+            return res.status(503).json({ error: 'Invoices for combined / repackaged goods are not set up on this database yet (migration 2026-11-02_10).', code: 'NOT_MIGRATED' });
+        }
         log.error('[POST /shipment-payment-documents]', error);
         if (!res.headersSent) res.status(500).json({ error: 'An internal error occurred.' });
     }
@@ -10655,7 +10690,12 @@ const { groupDeliveredAir, attachBalances, findPaidClash } = require('../lib/del
 // ones a transfer pays. What is owed on one is the page's (it knows the
 // terms); the server only caps the money at the line's value. Nothing is
 // flipped: paid is what the lines add up to.
-const SUPPLIER_PAYMENT_LINE_KINDS = ['balance', 'pi', 'po_deposit', 'extra', 'qc'];
+// 'repackaged' = one order line marked REPACKAGED ("Combined / Repackaged",
+// user 2026-11-02): goods combined into, or repackaged as, another product at
+// the factory. They never ship, so no container balance will pay them; the
+// page owes their balance from the day they were marked and the user ticks
+// them line by line, exactly like a QC unit (cap = the line's value, nothing flipped).
+const SUPPLIER_PAYMENT_LINE_KINDS = ['balance', 'pi', 'po_deposit', 'extra', 'qc', 'repackaged'];
 // A fourth kind exists on the way in only: 'container_balance' names a
 // shipment whose balance nobody has recorded yet (the page projects it from
 // the goods on board). Saving records that balance — split across the
@@ -10855,6 +10895,26 @@ async function loadSupplierPaymentTargets(conn, lines) {
                 purchaseOrderId: r.purchase_order_id, poNumber: r.po_number, paymentType: null,
                 shipmentId: null, shipmentReference: null, invoiceNumber: null,
                 isQcUnit: !!code,
+            });
+        }
+    }
+    const repackagedIds = idsOf('repackaged');
+    if (repackagedIds.length) {
+        const [rows] = await conn.query(
+            `SELECT o.id, o.jf_code, o.asin, o.quantity, o.unit_price, o.status, o.purchase_order_id, po.po_number, po.supplier, po.currency
+               FROM orders o JOIN purchase_orders po ON po.id = o.purchase_order_id AND po.deleted_at IS NULL
+              WHERE o.id IN (${repackagedIds.map(() => '?').join(',')}) AND o.deleted_at IS NULL`, repackagedIds
+        );
+        for (const r of rows) {
+            const value = r.quantity != null && r.unit_price != null ? Math.round(Number(r.quantity) * Number(r.unit_price) * 100) / 100 : null;
+            out.set(`repackaged:${r.id}`, {
+                // amount: the line's value — the most any transfers can put on it.
+                kind: 'repackaged', id: r.id, amount: value, currency: (r.currency || '').toUpperCase() || null, status: null,
+                supplier: r.supplier, supplierKey: shipmentPaymentsService.supplierKey(r.supplier), settledBy: null,
+                label: `${r.po_number} combined / repackaged ${String(r.jf_code || r.asin || '').trim()}`,
+                purchaseOrderId: r.purchase_order_id, poNumber: r.po_number, paymentType: null,
+                shipmentId: null, shipmentReference: null, invoiceNumber: null,
+                isRepackaged: r.status === 'REPACKAGED',
             });
         }
     }
@@ -11123,6 +11183,9 @@ async function checkSupplierPaymentLines(conn, { lines, currency, amount, suppli
         if (t.kind === 'qc' && !t.isQcUnit) {
             return { fail: { status: 422, error: `Order line ${l.id} on ${t.poNumber} is goods, not a QC unit — pay it with its container or PI.`, code: 'NOT_QC_UNIT', payload: { kind: 'qc', id: l.id } } };
         }
+        if (t.kind === 'repackaged' && !t.isRepackaged) {
+            return { fail: { status: 422, error: `${t.label} is not marked Combined / Repackaged — pay it with its container or PI.`, code: 'NOT_REPACKAGED', payload: { kind: 'repackaged', id: l.id } } };
+        }
         if (t.currency && currency && t.currency !== currency) {
             return { fail: { status: 422, error: `${t.label} is in ${t.currency}; this transfer is in ${currency}.`, code: 'CURRENCY_MISMATCH', payload: { kind: l.kind, id: l.id, targetCurrency: t.currency } } };
         }
@@ -11202,9 +11265,11 @@ async function lockSupplierPaymentTargets(conn, { paymentId = null, lines }) {
         const [rows] = await conn.query(`SELECT id FROM supplier_payments WHERE id = ? AND deleted_at IS NULL FOR UPDATE`, [paymentId]);
         paymentLive = rows.length > 0;
     }
-    const order = [['container_balance', 'shipments'], ['balance', 'shipment_payments'], ['pi', 'purchase_order_invoice_payments'], ['extra', 'payment_extras'], ['qc', 'orders']];
+    // QC units and repackaged lines are both order lines: one sorted lock on orders.
+    const order = [['container_balance', 'shipments'], ['balance', 'shipment_payments'], ['pi', 'purchase_order_invoice_payments'], ['extra', 'payment_extras'], ['qc|repackaged', 'orders']];
     for (const [kind, table] of order) {
-        const ids = [...new Set(lines.filter(l => l.kind === kind).map(l => Number(l.id)))].filter(Number.isInteger).sort((a, b) => a - b);
+        const kinds = kind.split('|');
+        const ids = [...new Set(lines.filter(l => kinds.includes(l.kind)).map(l => Number(l.id)))].filter(Number.isInteger).sort((a, b) => a - b);
         if (!ids.length) continue;
         try {
             await conn.query(`SELECT id FROM ${table} WHERE id IN (${ids.map(() => '?').join(',')}) ORDER BY id FOR UPDATE`, ids);

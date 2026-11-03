@@ -28,7 +28,7 @@ The backend mirrors ShipLine's `orderHelpers.ts` rules (see
 
 - **Status values** use the live DB vocabulary: `SCHEDULED · PO_SENT ·
   IN_PRODUCTION · READY_FOR_QC · READY · CONSOLIDATED · ON_SEA · ON_AIR ·
-  ARRIVED_AT_WAREHOUSE · RECEIVED · DESTROYED`. (The movement-rules doc labels two
+  ARRIVED_AT_WAREHOUSE · RECEIVED · DESTROYED · REPACKAGED`. (The movement-rules doc labels two
   of these `UNDER_PRODUCTION` and `READY_AT_FACTORY`; those are display aliases for
   `IN_PRODUCTION` and `READY`.)
 - **`suggestedStatus` is always exactly ONE valid step**: one stage forward, a
@@ -38,7 +38,7 @@ The backend mirrors ShipLine's `orderHelpers.ts` rules (see
   **next** valid step and lists the remaining path (`category: "multi_step"`).
 - **FQC samples** (jf_code/asin ends `_FQC`) are never suggested past `READY`.
 - Orders already received/terminal (`ARRIVED_AT_WAREHOUSE`, `RECEIVED`,
-  `PARTIALLY_RECEIVED`, `DESTROYED`) are never candidates.
+  `PARTIALLY_RECEIVED`, `DESTROYED`, `REPACKAGED`) are never candidates.
 
 Each suggestion carries a **`category`**:
 

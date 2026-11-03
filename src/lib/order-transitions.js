@@ -31,6 +31,7 @@ const STATUS_LEVEL = {
     ARRIVED_AT_WAREHOUSE: 7,
     RECEIVED: 8,
     DESTROYED: 99,          // hidden; FQC samples (and QC-failed) only
+    REPACKAGED: 99,         // hidden; "Combined / Repackaged" — any product, factory stages only
 };
 
 // Canonical status occupying each forward level (ON_SEA is the default for the
@@ -43,7 +44,8 @@ const STATUS_AT_LEVEL = {
 const CONTAINER_STAGES = new Set(['CONSOLIDATED', 'ON_SEA', 'ON_AIR']);
 
 // Milestones a supplier email can plausibly assert (a subset of the pipeline,
-// factory → freight). RECEIVED is warehouse-internal; DESTROYED is internal.
+// factory → freight). RECEIVED is warehouse-internal; DESTROYED and REPACKAGED
+// are internal.
 const INFERRABLE_MILESTONES = [
     'PO_SENT', 'IN_PRODUCTION', 'READY_FOR_QC', 'READY',
     'CONSOLIDATED', 'ON_SEA', 'ON_AIR', 'ARRIVED_AT_WAREHOUSE',
@@ -52,8 +54,13 @@ const INFERRABLE_MILESTONES = [
 // An order whose CURRENT status is one of these is past the point a supplier
 // email would advance — never a suggestion candidate.
 const CANDIDATE_EXCLUDED_STATUSES = new Set([
-    'ARRIVED_AT_WAREHOUSE', 'RECEIVED', 'PARTIALLY_RECEIVED', 'DESTROYED',
+    'ARRIVED_AT_WAREHOUSE', 'RECEIVED', 'PARTIALLY_RECEIVED', 'DESTROYED', 'REPACKAGED',
 ]);
+
+// Factory stages an order may be marked REPACKAGED from (user, 2026-11-02):
+// the goods were combined into, or repackaged as, another product before they
+// shipped. Any product, FQC included; never once in a container.
+const REPACKAGE_FROM = new Set(['PO_SENT', 'IN_PRODUCTION', 'READY_FOR_QC', 'READY']);
 
 function statusLevel(status) {
     return Object.prototype.hasOwnProperty.call(STATUS_LEVEL, status) ? STATUS_LEVEL[status] : null;
@@ -78,6 +85,9 @@ function canTransition(from, to, { isFqc = false } = {}) {
         // FQC: from READY_FOR_QC or READY. Non-FQC: only from READY_FOR_QC.
         return isFqc ? (from === 'READY_FOR_QC' || from === 'READY') : (from === 'READY_FOR_QC');
     }
+    if (to === 'REPACKAGED') return REPACKAGE_FROM.has(from);
+    // Nothing leaves REPACKAGED for a non-admin.
+    if (from === 'REPACKAGED') return false;
     // FQC can never enter a stage past READY (no container/shipping/warehouse).
     if (isFqc && lt > 4) return false;
 
@@ -262,6 +272,7 @@ module.exports = {
     CONTAINER_STAGES,
     INFERRABLE_MILESTONES,
     CANDIDATE_EXCLUDED_STATUSES,
+    REPACKAGE_FROM,
     FIELD_COLUMN,
     statusLevel,
     isFqcOrder,

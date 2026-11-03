@@ -196,6 +196,53 @@ async function loadShipmentContext(conn, shipmentId) {
     };
 }
 
+// What the reader needs for the balance invoice of a PO's combined /
+// repackaged goods (uploaded on their balance, user 2026-11-02): the PO, its
+// lines marked REPACKAGED (they never ship) and their value, and the deposit
+// on file — the same shape as loadShipmentContext, with no shipment. Null when
+// the PO is gone.
+async function loadRepackagedContext(conn, purchaseOrderId) {
+    const [poRows] = await conn.query(
+        `SELECT id, po_number, supplier, currency FROM purchase_orders WHERE id = ? AND deleted_at IS NULL`,
+        [purchaseOrderId]
+    );
+    const po = poRows[0];
+    if (!po) return null;
+    const [lines] = await conn.query(
+        `SELECT jf_code, product_name, quantity, unit_price
+           FROM orders
+          WHERE deleted_at IS NULL AND purchase_order_id = ? AND status = 'REPACKAGED'
+          ORDER BY id`,
+        [po.id]
+    );
+    const deposits = await loadDepositsFor(conn, [po.id]);
+    const ours = lines.map(l => ({
+        jfCode: l.jf_code || null,
+        productName: l.product_name || null,
+        quantity: l.quantity != null ? Number(l.quantity) : null,
+        unitPrice: l.unit_price != null ? Number(l.unit_price) : null,
+    }));
+    const value = Math.round(ours.reduce((a, l) => a + (l.quantity || 0) * (l.unitPrice || 0), 0) * 100) / 100;
+    const currency = (po.currency || 'USD').toUpperCase();
+    return {
+        shipment: null,
+        shipmentCurrency: currency,
+        repackaged: true,
+        purchaseOrders: [{
+            id: po.id,
+            poNumber: po.po_number,
+            supplier: po.supplier || null,
+            supplierKey: supplierKey(po.supplier),
+            currency,
+            lineCount: ours.length,
+            unitsInShipment: ours.reduce((a, l) => a + (l.quantity || 0), 0),
+            valueInShipment: value,
+            deposit: deposits.get(po.id) || null,
+            lines: ours,
+        }],
+    };
+}
+
 // The QC sample units still unshipped on any purchase order: lines whose code
 // ends _FQC and that are in no shipment (they never travel). A supplier bills
 // them on their own invoice or beside the goods, often for several POs at
@@ -345,6 +392,7 @@ module.exports = {
     loadMemberPurchaseOrders,
     loadDepositsFor,
     loadShipmentContext,
+    loadRepackagedContext,
     loadQcLines,
     loadRecordContext,
     shareAllocations,

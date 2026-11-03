@@ -22,7 +22,7 @@ const CONTAINER_NUMBER_RE = /^[A-Z]{4}\d{7}$/;
 // most container numbers on file belong to long-since-received orders.
 const SETTLED_STATUSES = [
     'ARRIVED_AT_WAREHOUSE', 'RECEIVED', 'PARTIALLY_RECEIVED',
-    'IN_WAREHOUSE', 'MINTSOFT', 'DESTROYED',
+    'IN_WAREHOUSE', 'MINTSOFT', 'DESTROYED', 'REPACKAGED',
 ];
 
 async function getDistinctExternalContainers(conn) {
