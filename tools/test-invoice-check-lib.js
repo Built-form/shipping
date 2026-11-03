@@ -867,3 +867,56 @@ test('lines of one quantity on both rows: the later-printed line moves, whatever
     assert.deepEqual(moved(c), [['SECOND LINE', 'box_qty']]);
     assert.deepEqual(moved(familyCheck([b, a], ctx)), [['FIRST LINE', 'box_qty']]);
 });
+
+// ── The balance invoice for a PO's combined / repackaged goods ──────────
+// Uploaded on their balance (user, 2026-11-02): no shipment, the PO named.
+// Read against that PO's goods marked Combined / Repackaged — never as a QC
+// invoice, and never "needs its container" (none will ever bill them).
+const REPACK_LINES = OUR_LINES.slice(0, 2); // 2,500 + 2,400 = 4,900 of goods
+const REPACK_CONTEXT = {
+    shipment: null, shipmentCurrency: 'USD', repackaged: true,
+    purchaseOrders: [{ ...CONTEXT.purchaseOrders[0], valueInShipment: 4900, lines: REPACK_LINES }],
+};
+
+test('a repackaged-goods invoice is checked line by line and says it was checked', () => {
+    assert.equal(shouldCheck({ documentKind: 'balance_invoice', hasShipment: false, repackaged: true }), true);
+    assert.equal(shouldCheck({ documentKind: 'deposit_invoice', hasShipment: false, repackaged: true }), true);
+    assert.equal(shouldCheck({ documentKind: 'remittance', hasShipment: false, repackaged: true }), false);
+    assert.equal(noPaymentReason({ documentKind: 'balance_invoice', hasShipment: false, invoiceKind: 'goods', repackaged: true }), 'checked');
+    assert.equal(noPaymentReason({ documentKind: 'balance_invoice', hasShipment: false, invoiceKind: 'goods' }), 'no_shipment');
+});
+
+test('its check runs against the repackaged lines only', () => {
+    const c = compareInvoiceToContainer({ extract: { ...CI, totalAmount: 4900, lines: invoiceLines(REPACK_LINES) }, context: REPACK_CONTEXT, supplierName: SUPPLIER });
+    assert.equal(c.goodsOnBoard, 4900);
+    assert.equal(c.verdict, 'match');
+    assert.equal(c.invoiceKind, 'goods');
+    assert.deepEqual(c.missingOurLines, []);
+});
+
+test('the reader is told the PO and its combined / repackaged goods — no shipment, no QC wording', () => {
+    const p = promptFor(REPACK_CONTEXT);
+    assert.match(p, /combined or repackaged at the factory/);
+    assert.match(p, /### PO_00306J/);
+    assert.ok(p.includes('- JF1001 A · qty 1000 @ 2.5'));
+    assert.ok(p.includes('- JF1002 B · qty 2000 @ 1.2'));
+    assert.ok(!p.includes('JF1003'));
+    assert.doesNotMatch(p, /## Shipment|QC sample units|remittance/);
+});
+
+test('its fit: the PO it names, the money against the repackaged goods — no container to contradict', () => {
+    const f = assessFit({
+        extract: { supplierName: SUPPLIER, currency: 'USD', containerRefs: ['MSKU1234567'], blRefs: [], poRefs: ['PO_00306J'], lines: [], bank: null, documentKind: 'balance_invoice' },
+        shipment: null, supplierName: SUPPLIER, memberPos: REPACK_CONTEXT.purchaseOrders, amount: 3430, repackaged: true,
+    });
+    assert.equal(f.verdict, 'match');
+    assert.equal(f.checks.find(c => c.key === 'container'), undefined);
+    assert.equal(f.checks.find(c => c.key === 'pos').text, 'Names PO_00306J.');
+    assert.equal(f.checks.find(c => c.key === 'amount').text, '70% of the USD 4,900.00 of combined / repackaged goods on PO_00306J.');
+    const other = assessFit({
+        extract: { supplierName: SUPPLIER, currency: 'USD', containerRefs: [], blRefs: [], poRefs: ['PO_00999J'], lines: [], bank: null, documentKind: 'balance_invoice' },
+        shipment: null, supplierName: SUPPLIER, memberPos: REPACK_CONTEXT.purchaseOrders, amount: 3430, repackaged: true,
+    });
+    assert.equal(other.verdict, 'mismatch');
+    assert.equal(other.checks.find(c => c.key === 'pos').text, 'Names PO_00999J — not PO_00306J.');
+});

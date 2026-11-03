@@ -9777,6 +9777,8 @@ function shipmentPaymentDocumentRowToJson(r) {
         paymentId: r.payment_id ?? null,
         /** The transfer a proof of payment was applied with. */
         supplierPaymentId: r.supplier_payment_id ?? null,
+        /** The PO whose combined / repackaged goods a balance invoice with no shipment bills. */
+        purchaseOrderId: r.purchase_order_id ?? null,
         docKind: r.doc_kind || 'balance_invoice',
         filename: r.filename,
         url: r.public_url || publicS3Url(r.s3_key),
@@ -10428,9 +10430,34 @@ app.post('/api/v1/shipment-payment-documents', async (req, res) => {
             // An invoice is for a shipment; a proof of payment is to a
             // supplier and may name no shipment at all (uploaded from the
             // Payments page while recording a transfer).
-            const supplierName = typeof b.supplierName === 'string' && b.supplierName.trim()
+            let supplierName = typeof b.supplierName === 'string' && b.supplierName.trim()
                 ? b.supplierName.trim().slice(0, 255) : null;
             const hasShipment = !!(b.shipmentId || b.shipmentReference);
+            // The balance invoice for a PO's combined / repackaged goods (user,
+            // 2026-11-02): they never ship, so it names the PO, not a shipment.
+            // Needs purchase_order_id (migration 2026-11-02_10).
+            let purchaseOrderId = null;
+            if (b.purchaseOrderId != null && b.purchaseOrderId !== '') {
+                const id = Number(b.purchaseOrderId);
+                let po = null;
+                let repackagedLines = 0;
+                if (Number.isInteger(id) && id > 0 && !hasShipment && docKind === 'balance_invoice') {
+                    const [poRows] = await conn.query(
+                        `SELECT id, po_number, supplier FROM purchase_orders WHERE id = ? AND deleted_at IS NULL`, [id]
+                    );
+                    if (poRows.length) {
+                        po = { id: poRows[0].id, poNumber: poRows[0].po_number, supplier: poRows[0].supplier || null };
+                        const [[n]] = await conn.query(
+                            `SELECT COUNT(*) AS n FROM orders WHERE purchase_order_id = ? AND deleted_at IS NULL AND status = 'REPACKAGED'`, [id]
+                        );
+                        repackagedLines = Number(n.n) || 0;
+                    }
+                }
+                const refusal = paymentDocumentsLib.repackagedUploadRefusal({ docKind, hasShipment, purchaseOrderId: b.purchaseOrderId, po, repackagedLines });
+                if (refusal) return { fail: refusal };
+                purchaseOrderId = po.id;
+                if (!supplierName && po.supplier) supplierName = po.supplier.trim().slice(0, 255);
+            }
             let shipment = null;
             if (hasShipment) {
                 const resolved = await requireBookedShipment(conn, {
@@ -10486,11 +10513,13 @@ app.post('/api/v1/shipment-payment-documents', async (req, res) => {
             // and bank reference pre-fill the transfer it is applied with);
             // 'other' is filed.
             const wantExtract = b.extract === undefined ? docKind !== 'other' : b.extract === true;
+            // purchase_order_id only when a PO is named: every other upload
+            // still works on a database without the column.
             const [ins] = await conn.query(
                 `INSERT INTO shipment_payment_documents
                     (shipment_id, shipment_reference, supplier_name, supplier_key, payment_id, doc_kind,
-                     filename, s3_key, public_url, content_type, file_size, notes, extract_status, uploaded_by_email)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                     filename, s3_key, public_url, content_type, file_size, notes, extract_status, uploaded_by_email${purchaseOrderId != null ? ', purchase_order_id' : ''})
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?${purchaseOrderId != null ? ', ?' : ''})`,
                 [
                     shipment ? shipment.id : null, shipment ? (shipment.reference || String(shipment.id)) : null,
                     supplierName, supplierName ? shipmentPaymentsService.supplierKey(supplierName) : null,
@@ -10499,13 +10528,14 @@ app.post('/api/v1/shipment-payment-documents', async (req, res) => {
                     typeof b.notes === 'string' && b.notes.trim() ? b.notes.trim().slice(0, 2000) : null,
                     wantExtract ? 'processing' : 'none',
                     req.userEmail || null,
+                    ...(purchaseOrderId != null ? [purchaseOrderId] : []),
                 ]
             );
             const [readback] = await conn.query(`SELECT * FROM shipment_payment_documents WHERE id = ?`, [ins.insertId]);
             await recordAudit(conn, {
                 entityType: 'shipment_payment_document', entityId: ins.insertId, action: 'create',
                 before: null,
-                after: { shipmentId: shipment ? shipment.id : null, supplierName, filename: filename.slice(0, 200), docKind, fileSize: buffer.length },
+                after: { shipmentId: shipment ? shipment.id : null, purchaseOrderId, supplierName, filename: filename.slice(0, 200), docKind, fileSize: buffer.length },
                 userEmail: req.userEmail,
             });
             return { document: shipmentPaymentDocumentRowToJson(readback[0]), wantExtract, documentId: ins.insertId };
@@ -10516,6 +10546,10 @@ app.post('/api/v1/shipment-payment-documents', async (req, res) => {
 
         if (result.wantExtract) startShipmentPaymentExtraction(req, result.documentId);
     } catch (error) {
+        // An upload naming a PO before migration 2026-11-02_10 added the column.
+        if (error && error.errno === 1054 && !res.headersSent) {
+            return res.status(503).json({ error: 'Invoices for combined / repackaged goods are not set up on this database yet (migration 2026-11-02_10).', code: 'NOT_MIGRATED' });
+        }
         log.error('[POST /shipment-payment-documents]', error);
         if (!res.headersSent) res.status(500).json({ error: 'An internal error occurred.' });
     }

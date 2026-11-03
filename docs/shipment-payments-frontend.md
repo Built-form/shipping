@@ -221,6 +221,26 @@ fine for the one- to three-page documents suppliers send. Refusals:
 filename and size already on the shipment; `force: true` overrides) ·
 `413 TOO_LARGE` · `400 BAD_FIELD`.
 
+**Where it is filed decides how it is read.** On a shipment: that container's
+invoice. On the supplier alone with `docKind: balance_invoice`: a QC invoice
+(the Payments page's "Upload QC invoice"). With `purchaseOrderId` and no
+shipment (since 2026-11-02, migration `2026-11-02_10`): the supplier's balance
+invoice for that PO's **combined / repackaged** goods, which never ship. It is
+read against the PO's `REPACKAGED` lines and never as a QC invoice. The
+document comes back with `purchaseOrderId` set, and `supplierName` defaults to
+the PO's supplier when it is not sent.
+
+```json
+{ "purchaseOrderId": 394, "supplierName": "Roosin Medical Co., Ltd.", "docKind": "balance_invoice",
+  "filename": "balance-PO_00394J.pdf", "contentType": "application/pdf", "dataBase64": "…" }
+```
+
+Its own refusals: `400 BAD_FIELD` (not a positive id; sent with a shipment;
+not a `balance_invoice`) · `404 NOT_FOUND` (no live PO) ·
+`422 NOT_REPACKAGED` (the PO has no line marked Combined / Repackaged). Until
+the migration is applied, an upload naming a PO is refused with
+`503 NOT_MIGRATED`; every other upload is unaffected.
+
 The document carries its own read state, so polling the feed is enough:
 
 | `extractStatus` | meaning |

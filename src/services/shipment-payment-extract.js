@@ -26,8 +26,9 @@ const { fetchInvoicePdf, toDateOnlyOrNull } = require('./po-invoice-check');
 const { withGeminiRetry } = require('./supplier-email-check');
 const { recordAudit } = require('../lib/audit');
 const {
-    supplierKey, loadShipmentContext, loadMemberPurchaseOrders, loadQcLines, shareAllocations,
+    supplierKey, loadShipmentContext, loadRepackagedContext, loadMemberPurchaseOrders, loadQcLines, shareAllocations,
 } = require('./shipment-payments');
+const { readPlaceOf } = require('../lib/payment-documents');
 const { EXTRA_KINDS, OTHER_CHARGES_SCHEMA } = require('../lib/payment-extras');
 
 // Flash reads the figures; the judging (lines vs the box, invoice vs what is
@@ -305,7 +306,9 @@ const fmtAmount = (n, currency) =>
     `${currency ? `${currency} ` : ''}${Number(n).toLocaleString('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 
 /** { verdict: 'match' | 'unconfirmed' | 'mismatch', checks: [{ key, ok, text }], onBoard, currency } */
-function assessFit({ extract, shipment, supplierName, memberPos, qcPos = [], amount }) {
+// `repackaged`: uploaded on a PO's combined / repackaged goods — `memberPos`
+// is that PO with their value; there is no container to compare.
+function assessFit({ extract, shipment, supplierName, memberPos, qcPos = [], amount, repackaged = false }) {
     const checks = [];
     const add = (key, ok, text) => checks.push({ key, ok, text });
     const pos = memberPos || [];
@@ -329,7 +332,9 @@ function assessFit({ extract, shipment, supplierName, memberPos, qcPos = [], amo
     const ours = [s.reference, s.tracking_ref, s.bl_number, s.booking_ref].filter(v => norm(v));
     const heldNumber = [s.tracking_ref, s.bl_number, s.booking_ref].some(v => norm(v));
     const label = s.tracking_ref ? `${s.tracking_ref} (${s.reference})` : String(s.reference ?? '');
-    if (!docRefs.length) {
+    if (repackaged) {
+        // Combined / repackaged goods never ship: nothing to compare.
+    } else if (!docRefs.length) {
         add('container', null, 'Names no container or bill of lading.');
     } else {
         const hits = docRefs.filter(r => ours.some(o => sameRef(r, o)));
@@ -362,10 +367,11 @@ function assessFit({ extract, shipment, supplierName, memberPos, qcPos = [], amo
         const ownFound = found.filter(p => mine.includes(p));
         const qcFound = [...qcHits.values()];
         const named = [...ownFound.map(p => p.poNumber), ...qcFound.map(p => `${p.poNumber} (QC units)`)];
-        const missNote = misses.length ? `; ${misses.slice(0, 3).join(', ')}${misses.length > 3 ? '…' : ''} ${misses.length === 1 ? 'is' : 'are'} not on this shipment` : '';
+        const where = repackaged ? (mine.length ? mine : pos).map(p => p.poNumber).join(', ') : 'on this shipment';
+        const missNote = misses.length ? `; ${misses.slice(0, 3).join(', ')}${misses.length > 3 ? '…' : ''} ${misses.length === 1 ? 'is' : 'are'} not ${where}` : '';
         if (named.length) add('pos', true, `Names ${named.join(', ')}${missNote}.`);
         else if (found.length) add('pos', false, `Names ${found.map(p => p.poNumber).join(', ')}, filed under ${found[0].supplier || 'another supplier'}.`);
-        else add('pos', false, `Names ${misses.slice(0, 3).join(', ')}${misses.length > 3 ? '…' : ''} — not on this shipment.`);
+        else add('pos', false, `Names ${misses.slice(0, 3).join(', ')}${misses.length > 3 ? '…' : ''} — not ${where}.`);
 
         // Suppliers often invoice through another company (the factory for
         // the trading house, or the reverse). An invoice that cites this
@@ -391,10 +397,11 @@ function assessFit({ extract, shipment, supplierName, memberPos, qcPos = [], amo
     } else if (goods != null && goods > 0 && onBoard > 0) {
         const cur = currency || currencies[0] || null;
         const less = charges ? ` (after ${fmtAmount(charges, cur)} of other charges)` : '';
+        const goodsHere = repackaged ? ` of combined / repackaged goods on ${mine.map(p => p.poNumber).join(', ')}` : '';
         if (goods > onBoard * 1.05 + 1) {
-            add('amount', false, `${fmtAmount(goods, cur)}${less} is more than the ${fmtAmount(onBoard, cur)} of goods this supplier has on board.`);
+            add('amount', false, `${fmtAmount(goods, cur)}${less} is more than the ${fmtAmount(onBoard, cur)}${repackaged ? goodsHere : ' of goods this supplier has on board'}.`);
         } else {
-            add('amount', null, `${Math.round((goods / onBoard) * 100)}% of the ${fmtAmount(onBoard, cur)} this supplier has on board${less}.`);
+            add('amount', null, `${Math.round((goods / onBoard) * 100)}% of the ${fmtAmount(onBoard, cur)}${repackaged ? goodsHere : ' this supplier has on board'}${less}.`);
         }
     }
 
@@ -937,6 +944,23 @@ function qcSectionOf(context) {
     return lines;
 }
 
+// Each PO the document is read against, with its lines.
+function poSectionsOf(context, valueLabel) {
+    const lines = [];
+    for (const po of context.purchaseOrders) {
+        lines.push(`### ${po.poNumber}`);
+        lines.push(`supplier as filed: ${po.supplier ?? '(none)'} · currency ${po.currency} · ${valueLabel} ${po.valueInShipment}`);
+        if (po.deposit) {
+            lines.push(`deposit already recorded: ${po.deposit.amountDue ?? '?'} ${po.deposit.currency ?? ''} (${po.deposit.paymentStatus ?? 'unknown'})`);
+        }
+        for (const l of po.lines.slice(0, 40)) {
+            lines.push(`- ${l.jfCode ?? ''} ${l.productName ?? ''} · qty ${l.quantity ?? '?'} @ ${l.unitPrice ?? '?'}`);
+        }
+        lines.push('');
+    }
+    return lines;
+}
+
 function promptFor(context) {
     const s = context.shipment;
     if (!s && context.portalUpload) {
@@ -947,6 +971,16 @@ function promptFor(context) {
             'The supplier uploaded this document through our supplier portal as their commercial invoice — the invoice for goods being shipped to us, usually a balance invoice. We do not know yet which shipment it is for, and no purchase orders are listed here: copy every container number, bill-of-lading number and purchase-order reference exactly as printed, so we can find the shipment. Read it as it is.',
             '',
             ...qcSectionOf(context),
+        ].join('\n');
+    }
+    if (!s && context.repackaged) {
+        // Uploaded on the balance of a PO's combined / repackaged goods (user,
+        // 2026-11-02): they never ship, so it names no container.
+        return [
+            '## Context',
+            'This invoice was uploaded against goods on the purchase order below that were combined or repackaged at the factory: they will never ship in a container, so the supplier bills their balance on its own. Map every reference on the document to the PO number when the digits allow it. Read it as it is.',
+            '',
+            ...poSectionsOf(context, 'value of these goods'),
         ].join('\n');
     }
     if (!s) {
@@ -981,17 +1015,7 @@ function promptFor(context) {
         'Map every reference on the document to one of these PO numbers when the digits allow it.',
         '',
     ].filter(Boolean);
-    for (const po of context.purchaseOrders) {
-        lines.push(`### ${po.poNumber}`);
-        lines.push(`supplier as filed: ${po.supplier ?? '(none)'} · currency ${po.currency} · value on board ${po.valueInShipment}`);
-        if (po.deposit) {
-            lines.push(`deposit already recorded: ${po.deposit.amountDue ?? '?'} ${po.deposit.currency ?? ''} (${po.deposit.paymentStatus ?? 'unknown'})`);
-        }
-        for (const l of po.lines.slice(0, 40)) {
-            lines.push(`- ${l.jfCode ?? ''} ${l.productName ?? ''} · qty ${l.quantity ?? '?'} @ ${l.unitPrice ?? '?'}`);
-        }
-        lines.push('');
-    }
+    lines.push(...poSectionsOf(context, 'value on board'));
     lines.push(...qcSectionOf(context));
     return lines.join('\n');
 }
@@ -1000,16 +1024,18 @@ function promptFor(context) {
  *  the supplier alone, any invoice uploaded there as a QC invoice — the upload
  *  place decides (user, 2026-11-02), not what the reader calls it or whether
  *  the supplier has QC units on file. A proof of payment never is. */
-function shouldCheck({ documentKind, hasShipment, qcUpload = false }) {
+function shouldCheck({ documentKind, hasShipment, qcUpload = false, repackaged = false }) {
     if (documentKind !== 'balance_invoice' && documentKind !== 'deposit_invoice') return false;
-    return hasShipment || qcUpload;
+    // An invoice uploaded on a PO's combined / repackaged goods is checked against them.
+    return hasShipment || qcUpload || repackaged;
 }
 
 /** What a read says it made (it never makes a balance): a balance invoice with
- *  no container is "no_shipment" — unless it bills QC units, which need none. */
-function noPaymentReason({ documentKind, hasShipment, invoiceKind }) {
+ *  no container is "no_shipment" — unless it bills QC units, or a PO's
+ *  combined / repackaged goods, which need none. */
+function noPaymentReason({ documentKind, hasShipment, invoiceKind, repackaged = false }) {
     if (documentKind !== 'balance_invoice') return documentKind;
-    if (!hasShipment && invoiceKind !== 'qc') return 'no_shipment';
+    if (!hasShipment && !repackaged && invoiceKind !== 'qc') return 'no_shipment';
     return 'checked';
 }
 
@@ -1098,7 +1124,12 @@ async function runShipmentPaymentExtraction(pool, { documentId, userEmail = null
             const [rows] = await conn.query(`SELECT * FROM shipment_payment_documents WHERE id = ?`, [documentId]);
             doc = rows[0];
             if (!doc || doc.deleted_at) return { skipped: 'not_found' };
-            if (doc.shipment_id == null) {
+            if (readPlaceOf(doc) === 'repackaged') {
+                // Uploaded on the balance of a PO's combined / repackaged
+                // goods: read against those goods. Never a QC invoice.
+                context = await loadRepackagedContext(conn, doc.purchase_order_id);
+                memberPos = context ? context.purchaseOrders : [];
+            } else if (doc.shipment_id == null) {
                 // Uploaded against the supplier alone: a proof of payment (no
                 // box to map it to, only the transfer it will be applied with) —
                 // or, uploaded as an invoice, one billing QC units, which belong
@@ -1125,10 +1156,15 @@ async function runShipmentPaymentExtraction(pool, { documentId, userEmail = null
             conn.release();
         }
     }
+    if (!context && doc.shipment_id == null) {
+        await finishFailed(pool, documentId, 'PO_MISSING', 'The purchase order this invoice was uploaded on no longer exists.', userEmail);
+        return { failed: 'PO_MISSING' };
+    }
     if (!context) {
         await finishFailed(pool, documentId, 'SHIPMENT_MISSING', 'The shipment this document belongs to no longer resolves.', userEmail);
         return { failed: 'SHIPMENT_MISSING' };
     }
+    const repackaged = !!context.repackaged;
 
     // (b) The model call, holding nothing.
     let read;
@@ -1154,7 +1190,7 @@ async function runShipmentPaymentExtraction(pool, { documentId, userEmail = null
         // checked too — and against the supplier's QC units for a QC invoice
         // on the supplier alone. A remittance proves a payment and is applied
         // by an operator (Record payment), never by the reader.
-        const check = shouldCheck({ documentKind: extract.documentKind, hasShipment: doc.shipment_id != null, qcUpload: !!context.qcUpload })
+        const check = shouldCheck({ documentKind: extract.documentKind, hasShipment: doc.shipment_id != null, qcUpload: !!context.qcUpload, repackaged })
             ? compareInvoiceToContainer({ extract, context, supplierName: supplierName || doc.supplier_name || '' })
             : null;
         // The figure it shows (what it states payable, else its total) — for the
@@ -1164,7 +1200,7 @@ async function runShipmentPaymentExtraction(pool, { documentId, userEmail = null
         const goodsAmount = amount == null ? 0 : Math.round((amount - chargesTotalOf(chargesOf(extract))) * 100) / 100;
         const matched = matchLinesToPos(extract, memberPos, goodsAmount);
         const qcPos = [...new Map((context.qcLines || []).map(l => [l.poId, { id: l.poId, poNumber: l.poNumber, supplier: l.supplier, supplierKey: l.supplierKey }])).values()];
-        const fit = assessFit({ extract, shipment: context.shipment, supplierName: doc.supplier_name || null, memberPos, qcPos, amount });
+        const fit = assessFit({ extract, shipment: context.shipment, supplierName: doc.supplier_name || null, memberPos, qcPos, amount, repackaged });
 
         const stored = {
             ...extract,
@@ -1186,7 +1222,7 @@ async function runShipmentPaymentExtraction(pool, { documentId, userEmail = null
             // this document is only checked against it. A balance is recorded
             // when it is paid (Record payment). A link an older read made stays.
             const paymentId = doc.payment_id ?? null;
-            stored.noPaymentCreated = noPaymentReason({ documentKind: extract.documentKind, hasShipment: doc.shipment_id != null, invoiceKind: check?.invoiceKind ?? null });
+            stored.noPaymentCreated = noPaymentReason({ documentKind: extract.documentKind, hasShipment: doc.shipment_id != null, invoiceKind: check?.invoiceKind ?? null, repackaged });
 
             await conn.query(
                 `UPDATE shipment_payment_documents
