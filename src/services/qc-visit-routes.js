@@ -190,6 +190,7 @@ function visitToJson(r, { lines = [], warnings = [], includeLines = false } = {}
     const out = {
         id: Number(r.id),
         ref: r.ref || formatRef(r.id),
+        name: r.name || null,
         status: r.status,
         supplierName: r.supplier_name,
         factory: {
@@ -1064,6 +1065,7 @@ function registerQcVisitRoutes(app, deps) {
                 await syncLines(conn, visitId, lines, moves, orders, [], []);
                 await audit(conn, 'qc_visit', visitId, 'created', null, {
                     ref: formatRef(visitId),
+                    name: cols.name || null,
                     supplierName: cols.supplier_name,
                     factoryId: cols.factory_id == null ? null : cols.factory_id,
                     inspectorId: cols.inspector_id == null ? null : cols.inspector_id,
@@ -1360,7 +1362,7 @@ function registerQcVisitRoutes(app, deps) {
                 const keptIds = new Set(keepLines.map(l => Number(l.order_id)));
 
                 const copy = [
-                    'supplier_name', 'factory_id', ...Object.values(FACTORY_SNAPSHOT_COLS),
+                    'supplier_name', 'name', 'factory_id', ...Object.values(FACTORY_SNAPSHOT_COLS),
                     'inspector_id', ...Object.values(INSPECTOR_SNAPSHOT_COLS),
                     'window_start', 'window_end', 'tz', 'expected_production_state', 'report_deadline_hours',
                     'escalation_note', 'notes',
