@@ -69,6 +69,7 @@ const { registerPiSubmissionRoutes } = require('../services/pi-submission-routes
 const { registerPlSubmissionRoutes } = require('../services/pl-submission-routes');
 const { registerCiSubmissionRoutes } = require('../services/ci-submission-routes');
 const { registerPaymentDocumentRefileRoutes } = require('../services/payment-document-refile-routes');
+const { registerFileTransferRoutes } = require('../services/file-transfer-routes');
 // Bank-detail verification on portal PIs: the positive payment gate (isPayable).
 const bankVerification = require('../lib/bank-verification');
 const { registerPaymentDueDateRoutes } = require('../services/payment-due-date-routes');
@@ -6444,9 +6445,9 @@ app.get('/api/v1/suppliers/:id/emails', async (req, res) => {
 // ── POST /api/v1/purchase-order-documents/:id/email ──────────────────────
 // Tells the supplier that a specific PO PDF version is on the supplier portal:
 // an email via Front with a link to the PO there, NOT the PDF attached
-// (docs/po-portal-send.md). Before it goes out, every supplier recipient is
-// pre-approved as a portal user for the PO's supplier, so registering with
-// that address needs no approval; staff addresses are left alone. The send row
+// (docs/po-portal-send.md). Before it goes out, every recipient (staff too) is
+// pre-approved as a portal user and linked to the PO's suppliers (its own and
+// its lines'), so registering with that address needs no approval. The send row
 // written here is also what lists the version on the portal. Otherwise still a
 // delivery primitive: doesn't touch order status, doesn't fire the legacy Make
 // webhook. Subject and body come from the stored `purchase_order_portal`
@@ -6469,14 +6470,17 @@ app.post('/api/v1/purchase-order-documents/:id/email', async (req, res) => {
         // message; otherwise the stored `purchase_order_portal` template is.
         const { to, subject, body } = req.body || {};
 
-        // `to` accepts either a single string or an array of strings. Each
-        // address is validated; the whole request fails if any one is bad
-        // so partial sends never happen by accident.
-        const toAddresses = (Array.isArray(to) ? to : [to])
-            .filter(x => typeof x === 'string')
-            .map(x => x.trim())
-            .filter(Boolean);
-        if (toAddresses.length === 0 || toAddresses.some(a => !EMAIL_RE.test(a))) {
+        // `to` accepts either a single string or an array of strings, each
+        // possibly several addresses pasted together ("a@x.com; b@x.com",
+        // "Name <a@x.com>"): see parseRecipients. These addresses are also
+        // pre-approved on the portal, so they must be clean. The whole
+        // request fails if any piece is not an address, so partial sends
+        // never happen by accident.
+        const { addresses: toAddresses, invalid } = poPortalEmail.parseRecipients(to);
+        if (invalid.length) {
+            return res.status(400).json({ error: `Not a valid email address: ${invalid.map(a => `"${a}"`).join(', ')}`, invalid });
+        }
+        if (toAddresses.length === 0) {
             return res.status(400).json({ error: 'A valid `to` email address (or array of addresses) is required.' });
         }
         if (!process.env.FRONT_API_TOKEN || !process.env.FRONT_CHANNEL_ID) {
@@ -6508,17 +6512,29 @@ app.post('/api/v1/purchase-order-documents/:id/email', async (req, res) => {
             // team will approve them.
             let portalAccess;
             try {
+                // Recipients are linked to every supplier on the PO: its own
+                // and its live lines' (which on older POs name other rows).
+                const [lineRows] = await conn.query(
+                    `SELECT DISTINCT supplier FROM orders
+                      WHERE purchase_order_id = ? AND deleted_at IS NULL
+                        AND supplier IS NOT NULL AND supplier <> ''`,
+                    [doc.purchase_order_id]
+                );
                 portalAccess = await preapprovePortalUsers(conn, {
                     recipients: toAddresses,
                     poSupplier: doc.supplier,
+                    lineSuppliers: lineRows.map(r => r.supplier),
                     actorEmail: req.userEmail,
                     note: `Pre-approved from ShipLine: PO ${doc.po_number} v${doc.version} emailed by ${req.userEmail || 'ShipLine'}`,
                 });
             } catch (e) {
-                log.error('[purchase-order-documents/email] portal pre-approval failed', { documentId: doc.id, error: e.message });
-                portalAccess = { status: 'error', suppliers: [], users: [], skipped: [] };
+                log.error('[purchase-order-documents/email] portal pre-approval failed', { documentId: doc.id, error: e.message, errno: e.errno });
+                portalAccess = { status: 'error', suppliers: [], poSupplierMatched: false, users: [] };
             }
+            // "Already approved, you'll see this order when you sign in" only
+            // when that is true for every supplier recipient.
             const preapproved = portalAccess.status === 'ok'
+                && portalAccess.poSupplierMatched
                 && portalAccess.users.every(u => poPortalEmail.GRANTED_OUTCOMES.has(u.outcome));
 
             const tpl = await getEmailTemplate(conn, 'purchase_order_portal');
@@ -12232,6 +12248,24 @@ registerPaymentDocumentRefileRoutes(app, {
     recordAudit,
     shipmentPaymentDocumentRowToJson,
     runShipmentPaymentExtraction,
+    log,
+});
+
+// ── Supplier-portal file transfers (/api/v1/file-transfers) ──────────────
+// Files suppliers send us through the portal (jportal.file_transfers,
+// direction from_supplier), opened and downloaded here, and files staff send a
+// supplier from here (to_supplier: a presigned PUT into the portal's bucket,
+// then an email through Front). Frontend guide: docs/file-transfers-frontend.md.
+registerFileTransferRoutes(app, {
+    withConnection,
+    pool,
+    ready: async () => {
+        await auditLogSchemaReady;
+        await emailTemplatesSchemaReady;
+    },
+    s3,
+    recordAudit,
+    getEmailTemplate, renderTemplate,
     log,
 });
 

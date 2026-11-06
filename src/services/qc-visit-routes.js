@@ -190,6 +190,7 @@ function visitToJson(r, { lines = [], warnings = [], includeLines = false } = {}
     const out = {
         id: Number(r.id),
         ref: r.ref || formatRef(r.id),
+        name: r.name || null,
         status: r.status,
         supplierName: r.supplier_name,
         factory: {
@@ -1064,6 +1065,7 @@ function registerQcVisitRoutes(app, deps) {
                 await syncLines(conn, visitId, lines, moves, orders, [], []);
                 await audit(conn, 'qc_visit', visitId, 'created', null, {
                     ref: formatRef(visitId),
+                    name: cols.name || null,
                     supplierName: cols.supplier_name,
                     factoryId: cols.factory_id == null ? null : cols.factory_id,
                     inspectorId: cols.inspector_id == null ? null : cols.inspector_id,
@@ -1097,8 +1099,13 @@ function registerQcVisitRoutes(app, deps) {
         const b = req.body || {};
         const updatedAtMs = requireUpdatedAt(b);
         await writeVisit(res, id, updatedAtMs, async (conn, row) => {
-            if (TERMINAL_STATUSES.includes(row.status)) throw terminalFail(row.status);
             const value = fromValidation(validateVisitFields(b, { partial: true, current: row })).value;
+            // A completed / cancelled visit is frozen except for its name: the
+            // name is only a label, so ops can still name (or rename) old trips.
+            if (TERMINAL_STATUSES.includes(row.status)) {
+                const other = Object.keys(value).filter(c => c !== 'name' && normCol(c, value[c]) !== normCol(c, row[c]));
+                if (other.length) throw terminalFail(row.status);
+            }
             if ('supplier_name' in value && row.status !== 'DRAFT'
                 && normSupplier(value.supplier_name) !== normSupplier(row.supplier_name)) {
                 throw badField('supplierName', 'The supplier can only be changed while the visit is a draft.');
@@ -1360,7 +1367,7 @@ function registerQcVisitRoutes(app, deps) {
                 const keptIds = new Set(keepLines.map(l => Number(l.order_id)));
 
                 const copy = [
-                    'supplier_name', 'factory_id', ...Object.values(FACTORY_SNAPSHOT_COLS),
+                    'supplier_name', 'name', 'factory_id', ...Object.values(FACTORY_SNAPSHOT_COLS),
                     'inspector_id', ...Object.values(INSPECTOR_SNAPSHOT_COLS),
                     'window_start', 'window_end', 'tz', 'expected_production_state', 'report_deadline_hours',
                     'escalation_note', 'notes',

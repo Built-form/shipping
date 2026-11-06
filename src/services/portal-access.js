@@ -24,40 +24,91 @@ const P = require('../lib/po-portal-email');
 const NOTE_MAX = 500;      // supplier_users.decided_note
 const ISO_UTC = "'%Y-%m-%dT%H:%i:%sZ'";
 
+// Two sends that each invite a new address deadlock under REPEATABLE READ:
+// each `SELECT … FOR UPDATE` of a missing email takes a gap lock on
+// uniq_email, gap locks don't conflict with each other, and then both INSERTs
+// wait on the other's gap. With few portal users most new addresses share one
+// gap, so it is not only the same address twice (tools/smoke-po-portal-preapproval.js
+// reproduced it every time for the same address, and for different ones).
+// READ COMMITTED takes no gap locks for those reads; a real clash on the same
+// email then waits and lands in the 1062 branch below. A deadlock that still
+// happens (two sends listing the same new addresses in opposite orders) has
+// rolled the whole transaction back, so it is simply run again.
+const ER_LOCK_DEADLOCK = 1213;
+const MAX_ATTEMPTS = 3;
+
 /**
- * Pre-approves `emails` on the portal for the supplier rows named exactly as
- * the PO's supplier (the portal's own access rule, so the PO is visible to
- * them). Per address: no row -> created `active` and unbound ('invited');
- * `pending` -> `active` ('approved'); `active` -> left as is
+ * Pre-approves `emails` on the portal and links them to every supplier on the
+ * PO: the rows named exactly as the PO's own supplier (the portal's access
+ * rule for the PO itself, so it is visible to them) and as each of its lines'
+ * suppliers (`lineSuppliers`; older POs' lines often name a different row of
+ * the same company). Per address: no row -> created `active` and unbound
+ * ('invited'); `pending` -> `active` ('approved'); `active` -> left as is
  * ('already_active'); `rejected` / `disabled` -> left as is ('blocked', no
  * supplier added). Every non-blocked address gets the supplier rows it lacks.
  * One transaction; commits before the email is sent.
  *
- * Returns { status, suppliers, users, skipped } where status is 'ok', 'none'
- * (no supplier recipients), 'no_supplier' (no live supplier has the PO's
- * exact name, so nobody could see it) or 'unavailable' (no portal schema here).
+ * Every recipient is pre-approved, staff included (P.provisionList).
+ *
+ * Returns { status, suppliers, poSupplierMatched, users } where
+ * status is 'ok', 'none' (no recipients), 'no_supplier' (no live
+ * supplier has the exact name of the PO or any of its lines, so nobody is
+ * linked) or 'unavailable' (no portal schema here). poSupplierMatched is
+ * false when only line suppliers matched: recipients are linked to those, but
+ * the PO itself will not show for them until its supplier name is fixed.
  */
-async function preapprovePortalUsers(conn, { recipients, poSupplier, actorEmail, note }) {
-    const [staffRows] = await conn.query('SELECT email FROM shipping_allowed_emails');
-    const { provision, skipped } = P.splitRecipients(recipients, staffRows.map(r => r.email));
-    if (!provision.length) return { status: 'none', suppliers: [], users: [], skipped };
+async function preapprovePortalUsers(conn, { recipients, poSupplier, lineSuppliers = [], actorEmail, note }) {
+    const empty = status => ({ status, suppliers: [], poSupplierMatched: false, users: [] });
+    const provision = P.provisionList(recipients);
+    if (!provision.length) return empty('none');
 
+    const poName = poSupplier == null ? '' : String(poSupplier);
+    const names = [...new Set([poName, ...lineSuppliers.map(n => (n == null ? '' : String(n)))].filter(Boolean))];
+    if (!names.length) return empty('no_supplier');
+    const BIN = 'COLLATE utf8mb4_0900_bin';
     const [suppliers] = await conn.query(
         `SELECT s.id, s.name
            FROM suppliers s
           WHERE s.deleted_at IS NULL
-            AND CONVERT(s.name USING utf8mb4) COLLATE utf8mb4_0900_bin
-              = CONVERT(? USING utf8mb4) COLLATE utf8mb4_0900_bin
+            AND CONVERT(s.name USING utf8mb4) ${BIN}
+                IN (${names.map(() => `CONVERT(? USING utf8mb4) ${BIN}`).join(', ')})
           ORDER BY s.id`,
-        [poSupplier == null ? '' : String(poSupplier)]
+        names
     );
-    if (!suppliers.length) return { status: 'no_supplier', suppliers: [], users: [], skipped };
+    if (!suppliers.length) return empty('no_supplier');
+    // utf8mb4_0900_bin is a plain code-point comparison, as === is.
+    const poSupplierMatched = suppliers.some(s => s.name === poName);
 
-    const jp = jportalSchema();
-    const actor = actorEmail || 'shipline';
-    const decidedNote = String(note || '').slice(0, NOTE_MAX) || null;
+    const ctx = {
+        jp: jportalSchema(),
+        actor: actorEmail || 'shipline',
+        decidedNote: String(note || '').slice(0, NOTE_MAX) || null,
+    };
+    for (let attempt = 1; ; attempt++) {
+        try {
+            const users = await provisionOnce(conn, provision, suppliers, ctx);
+            return {
+                status: 'ok',
+                suppliers: suppliers.map(s => ({ id: s.id, name: s.name })),
+                poSupplierMatched,
+                users,
+            };
+        } catch (e) {
+            if (isSourceMissing(e)) return empty('unavailable');
+            if (e.errno === ER_LOCK_DEADLOCK && attempt < MAX_ATTEMPTS) continue;
+            throw e;
+        }
+    }
+}
+
+// One attempt, in one READ COMMITTED transaction; rolled back on any error.
+async function provisionOnce(conn, provision, suppliers, { jp, actor, decidedNote }) {
     const users = [];
     try {
+        // Applies to the next transaction only, so it goes right before BEGIN:
+        // any statement in between (even a plain SELECT, which autocommits as
+        // its own transaction) would use it up.
+        await conn.query('SET TRANSACTION ISOLATION LEVEL READ COMMITTED');
         await conn.beginTransaction();
         for (const email of provision) {
             const lock = async () => (await conn.query(
@@ -109,15 +160,9 @@ async function preapprovePortalUsers(conn, { recipients, poSupplier, actorEmail,
         await conn.commit();
     } catch (e) {
         await conn.rollback().catch(() => {});
-        if (isSourceMissing(e)) return { status: 'unavailable', suppliers: [], users: [], skipped };
         throw e;
     }
-    return {
-        status: 'ok',
-        suppliers: suppliers.map(s => ({ id: s.id, name: s.name })),
-        users,
-        skipped,
-    };
+    return users;
 }
 
 /**

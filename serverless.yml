@@ -200,6 +200,22 @@ provider:
             - arn:aws:s3:::jportal-pi-uploads-${self:custom.envName}/pi/*
             - arn:aws:s3:::jportal-pi-uploads-${self:custom.envName}/pl/*
             - arn:aws:s3:::jportal-pi-uploads-${self:custom.envName}/ci/*
+        # File transfers (src/services/file-transfer-routes.js, portal README
+        # section 18). files/staff/: the files staff send a supplier — signing
+        # ShipLine's PUT (PutObject), then HeadObject, the ranged read and the
+        # signed download (GetObject). files/sup/: a supplier's file as the
+        # portal published it, read only. No delete anywhere.
+        - Effect: Allow
+          Action:
+            - s3:PutObject
+            - s3:GetObject
+          Resource:
+            - arn:aws:s3:::jportal-pi-uploads-${self:custom.envName}/files/staff/*
+        - Effect: Allow
+          Action:
+            - s3:GetObject
+          Resource:
+            - arn:aws:s3:::jportal-pi-uploads-${self:custom.envName}/files/sup/*
         - Effect: Allow
           Action:
             - s3:ListBucket

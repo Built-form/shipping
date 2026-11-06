@@ -267,4 +267,35 @@ const QC_VISIT_TEMPLATE_KEYS = ['qc_visit_factory', 'qc_visit_inspector', 'qc_vi
 // The PO send's portal-link email (seeded by 2026-11-03_20_seed_po_portal_template.js).
 const PO_PORTAL_TEMPLATE_KEY = 'purchase_order_portal';
 
-module.exports = { DEFAULT_EMAIL_TEMPLATES, SUPPLIER_PI_TEMPLATE_KEYS, QC_VISIT_TEMPLATE_KEYS, PO_PORTAL_TEMPLATE_KEY };
+// "A file is waiting for you on the portal" (src/services/file-transfer-routes.js;
+// seeded by 2026-11-04_20_seed_file_transfer_template.js). Kept apart from the
+// list above so the older seed migrations, which iterate it, never pick it up.
+const FILE_TRANSFER_TEMPLATE_KEY = 'file_transfer_portal';
+const FILE_TRANSFER_TEMPLATE = {
+    key: FILE_TRANSFER_TEMPLATE_KEY,
+    name: 'Supplier portal: file sent',
+    category: 'Supplier portal',
+    description: 'Sent automatically to a supplier’s portal users when our team send them a file through ShipLine (SUPPLIER PORTAL > Files). Tokens: {supplierName} {filename} {note} {noteHtml} {portalLinkHtml}.',
+    subject: 'A file for you on the supplier portal – {filename}',
+    bodyHtml: [
+        '<div style="font-family:Helvetica,Arial,sans-serif;font-size:14px;color:#222;line-height:1.5;">',
+        '<p>Greetings,</p>',
+        '<p>We have sent you a file, <strong>{filename}</strong>, on the supplier portal. Sign in and open <strong>Files</strong> to download it.</p>',
+        '<p>您好，</p>',
+        '<p>我们已通过供应商门户向您发送文件 <strong>{filename}</strong>。请登录后打开“文件传输”下载。</p>',
+        '{noteHtml}',
+        '{portalLinkHtml}',
+        '<p>Kind Regards,<br>Operations Team.<br>JFA Medical Ltd.</p>',
+        '</div>',
+    ].join(''),
+};
+
+// In the list too, so getEmailTemplate's in-code fallback knows it before the
+// seed has run (the generic seed, 2026-09-21_11, has long been applied and
+// never runs again; a brand-new server gets it from there, INSERT IGNORE).
+DEFAULT_EMAIL_TEMPLATES.push(FILE_TRANSFER_TEMPLATE);
+
+module.exports = {
+    DEFAULT_EMAIL_TEMPLATES, SUPPLIER_PI_TEMPLATE_KEYS, QC_VISIT_TEMPLATE_KEYS, PO_PORTAL_TEMPLATE_KEY,
+    FILE_TRANSFER_TEMPLATE_KEY, FILE_TRANSFER_TEMPLATE,
+};

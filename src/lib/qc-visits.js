@@ -286,6 +286,8 @@ function validateVisitFields(body, { partial = false, current = null } = {}) {
         const b = body == null ? {} : optObject(body, 'body');
         const value = {};
         if (has(b, 'supplierName') || !partial) value.supplier_name = reqText(b.supplierName, 'supplierName', 255);
+        // Optional, beside the ref: what ops call the trip (2026-11-04_10_qc_visit_name.sql).
+        if (has(b, 'name')) value.name = optText(b.name, 'name', 120);
         if (has(b, 'factoryId')) value.factory_id = optId(b.factoryId, 'factoryId');
         if (has(b, 'inspectorId')) value.inspector_id = optId(b.inspectorId, 'inspectorId');
         if (has(b, 'visitDate')) value.visit_date = optYmd(b.visitDate, 'visitDate');

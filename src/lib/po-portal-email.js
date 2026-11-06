@@ -23,44 +23,56 @@ const registerUrl = base => `${base}/register`;
 // The portal matches a user row by the trimmed, lower-cased email claim.
 const normalizeEmail = e => String(e == null ? '' : e).trim().toLowerCase();
 
-const domainOf = e => {
-    const at = e.lastIndexOf('@');
-    return at < 0 ? '' : e.slice(at + 1);
-};
+// One plain address: no spaces, brackets, quotes or separators, one @, a dot in
+// the domain. Stricter than the old check, which let "<a@b.com>",
+// "mailto:a@b.com" and "a@b.com" + a zero-width space through to Front AND to
+// the portal, where the supplier (signing in as a@b.com) never matched the row.
+const PLAIN_ADDRESS = /^[^\s@<>()[\]\\,;:"]+@[^\s@<>()[\]\\,;:"]+\.[^\s@<>()[\]\\,;:"]+$/;
 
-// Mailbox providers anyone can sign up to. A staff address on one of these
-// marks only itself as ours, never its whole domain: suppliers use qq.com and
-// 163.com as often as we use gmail.com.
-const PUBLIC_MAILBOX_DOMAINS = new Set([
-    'gmail.com', 'googlemail.com', 'outlook.com', 'hotmail.com', 'hotmail.co.uk', 'live.com',
-    'live.co.uk', 'msn.com', 'yahoo.com', 'yahoo.co.uk', 'icloud.com', 'me.com', 'aol.com',
-    'proton.me', 'protonmail.com', 'qq.com', 'foxmail.com', '163.com', '126.com', 'yeah.net',
-    'sina.com', 'sina.cn', 'sohu.com', 'aliyun.com', '139.com', '189.cn', 'tom.com',
-]);
+// Invisible format characters (zero-width space / joiner, direction marks, BOM)
+// that ride along when an address is copied from a web page, PDF or chat app.
+const INVISIBLE = /\p{Cf}/gu;
 
 /**
- * Splits a send's recipients into the addresses to pre-approve on the portal
- * and the staff addresses to leave alone. A recipient is staff when it is a
- * ShipLine user (shipping_allowed_emails) or on the same company domain as
- * one; a colleague copied on a PO must not become a supplier user. Duplicates
- * (after normalising) collapse to one.
+ * The send dialog's recipient boxes as typed or pasted, into addresses.
+ * Each box may hold several addresses separated by "," or ";" (or new lines);
+ * each may be wrapped as `Name <a@b.com>` or `<a@b.com>`, or start with
+ * `mailto:`. NFKC turns full-width characters a Chinese IME types (＠ ．) into
+ * ASCII. Duplicates (ignoring case) collapse to the first spelling.
+ * Returns { addresses, invalid }: `invalid` holds the pieces that are still
+ * not one plain address, as typed.
  */
-function splitRecipients(recipients, staffEmails) {
-    const staff = new Set((staffEmails || []).map(normalizeEmail).filter(Boolean));
-    const staffDomains = new Set(
-        [...staff].map(domainOf).filter(d => d && !PUBLIC_MAILBOX_DOMAINS.has(d))
-    );
-    const provision = [];
-    const skipped = [];
+function parseRecipients(to) {
+    const addresses = [];
+    const invalid = [];
     const seen = new Set();
-    for (const raw of recipients || []) {
-        const email = normalizeEmail(raw);
-        if (!email || seen.has(email)) continue;
-        seen.add(email);
-        if (staff.has(email) || staffDomains.has(domainOf(email))) skipped.push(email);
-        else provision.push(email);
+    for (const box of (Array.isArray(to) ? to : [to])) {
+        if (typeof box !== 'string') continue;
+        for (const piece of box.normalize('NFKC').replace(INVISIBLE, '').split(/[,;\r\n]+/)) {
+            let s = piece.trim();
+            if (!s) continue;
+            const wrapped = s.match(/<([^<>]*)>$/);
+            if (wrapped) s = wrapped[1].trim();
+            s = s.replace(/^mailto:/i, '').trim();
+            if (!PLAIN_ADDRESS.test(s)) { invalid.push(piece.trim()); continue; }
+            const key = s.toLowerCase();
+            if (seen.has(key)) continue;
+            seen.add(key);
+            addresses.push(s);
+        }
     }
-    return { provision, skipped };
+    return { addresses, invalid };
+}
+
+/**
+ * The addresses a send pre-approves on the portal: EVERY recipient, staff
+ * included (a colleague sent a PO is set up to see it as the supplier does;
+ * until 2026-11-04 ShipLine users and their company domain were skipped, which
+ * left them "waiting for approval" when they registered). Normalised as the
+ * portal matches them; duplicates collapse to one.
+ */
+function provisionList(recipients) {
+    return [...new Set((recipients || []).map(normalizeEmail).filter(Boolean))];
 }
 
 // What pre-approval did with one address, from the row it found. pending ->
@@ -124,9 +136,9 @@ module.exports = {
     poPortalUrl,
     registerUrl,
     normalizeEmail,
-    splitRecipients,
+    parseRecipients,
+    provisionList,
     outcomeFor,
     GRANTED_OUTCOMES,
-    PUBLIC_MAILBOX_DOMAINS,
     portalBlockHtml,
 };

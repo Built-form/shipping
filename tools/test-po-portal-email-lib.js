@@ -1,7 +1,7 @@
 'use strict';
 
 // Unit tests for src/lib/po-portal-email.js — the PO send's portal-link email
-// (docs/po-portal-send.md): portal links, which recipients are staff, the
+// (docs/po-portal-send.md): portal links, parsing pasted recipients, the
 // outcome per portal user row, the appended portal block — plus
 // preapprovePortalUsers / loadPoDocumentViews from
 // src/services/portal-access.js against a fake connection. No database.
@@ -19,14 +19,11 @@ test('portal base and links', () => {
     assert.equal(P.registerUrl('https://p.example'), 'https://p.example/register');
 });
 
-test('splitRecipients: staff addresses and their company domain are skipped, public domains are not', () => {
-    const staff = ['Ops@Built-Form.co.uk', 'someone@gmail.com'];
-    const { provision, skipped } = P.splitRecipients(
-        [' Sales@Supplier.cn ', 'sales@supplier.cn', 'boss@built-form.co.uk', 'someone@gmail.com', 'factory@gmail.com', 'li@qq.com'],
-        staff
+test('provisionList: every recipient, staff included, normalised and de-duplicated', () => {
+    assert.deepEqual(
+        P.provisionList([' Sales@Supplier.cn ', 'sales@supplier.cn', 'Cindy@JFAmedical.co.uk', 'lukepbasil@gmail.com', '', null]),
+        ['sales@supplier.cn', 'cindy@jfamedical.co.uk', 'lukepbasil@gmail.com']
     );
-    assert.deepEqual(provision, ['sales@supplier.cn', 'factory@gmail.com', 'li@qq.com']);
-    assert.deepEqual(skipped, ['boss@built-form.co.uk', 'someone@gmail.com']);
 });
 
 test('outcomeFor', () => {
@@ -51,20 +48,25 @@ test('portalBlockHtml: link escaped, wording follows pre-approval', () => {
 });
 
 // A fake connection: just enough of supplier_users / user_supplier_access /
-// suppliers / shipping_allowed_emails for preapprovePortalUsers.
-function fakeConn({ staff = [], suppliers = [], users = [], missing = false } = {}) {
-    const state = { users: users.map(u => ({ ...u })), access: [], committed: false, rolledBack: false, nextId: 100 };
+// suppliers for preapprovePortalUsers.
+function fakeConn({ suppliers = [], users = [], missing = false, deadlocks = 0 } = {}) {
+    const state = { users: users.map(u => ({ ...u })), access: [], committed: false, rolledBack: false, nextId: 100, isolation: [], deadlocks };
     const conn = {
         state,
         async beginTransaction() {},
         async commit() { state.committed = true; },
         async rollback() { state.rolledBack = true; },
         async query(sql, params = []) {
-            if (/FROM shipping_allowed_emails/.test(sql)) return [staff.map(email => ({ email }))];
-            if (/FROM suppliers s/.test(sql)) return [suppliers.filter(s => s.name === params[0])];
+            if (/^SET TRANSACTION ISOLATION LEVEL/.test(sql)) { state.isolation.push(sql); return [{}]; }
+            if (/FROM suppliers s/.test(sql)) return [suppliers.filter(s => params.includes(s.name))];
             if (missing && /jportal/.test(sql)) { const e = new Error('Unknown database'); e.errno = 1049; throw e; }
             if (/SELECT id, status FROM .*supplier_users/.test(sql)) {
                 return [state.users.filter(u => u.email === params[0])];
+            }
+            if (/INSERT INTO .*supplier_users/.test(sql) && state.deadlocks > 0) {
+                state.deadlocks--;
+                const e = new Error('Deadlock found when trying to get lock'); e.errno = 1213; e.code = 'ER_LOCK_DEADLOCK';
+                throw e;
             }
             if (/INSERT INTO .*supplier_users/.test(sql)) {
                 const id = state.nextId++;
@@ -98,9 +100,8 @@ function fakeConn({ staff = [], suppliers = [], users = [], missing = false } = 
     return conn;
 }
 
-test('preapprovePortalUsers: invites, approves pending, keeps active, blocks rejected, skips staff', async () => {
+test('preapprovePortalUsers: invites, approves pending, keeps active, blocks rejected, includes staff', async () => {
     const conn = fakeConn({
-        staff: ['ops@built-form.co.uk'],
         suppliers: [{ id: 7, name: 'Acme Co' }],
         users: [
             { id: 1, email: 'pending@acme.cn', status: 'pending' },
@@ -113,28 +114,88 @@ test('preapprovePortalUsers: invites, approves pending, keeps active, blocks rej
         poSupplier: 'Acme Co', actorEmail: 'ops@built-form.co.uk', note: 'n',
     });
     assert.equal(r.status, 'ok');
-    assert.deepEqual(r.skipped, ['colleague@built-form.co.uk']);
     assert.deepEqual(r.users.map(u => [u.email, u.outcome, u.suppliersAdded]), [
         ['new@acme.cn', 'invited', 1],
         ['pending@acme.cn', 'approved', 1],
         ['active@acme.cn', 'already_active', 1],
         ['rejected@acme.cn', 'blocked', 0],
+        ['colleague@built-form.co.uk', 'invited', 1],
     ]);
     assert.equal(conn.state.users.find(u => u.email === 'pending@acme.cn').status, 'active');
     assert.equal(conn.state.users.find(u => u.email === 'rejected@acme.cn').status, 'rejected');
     assert.ok(conn.state.committed);
 });
 
-test('preapprovePortalUsers: no exact supplier name, staff only, missing portal', async () => {
+test('parseRecipients: pasted forms become clean addresses, anything else is invalid', () => {
+    assert.deepEqual(P.parseRecipients([
+        ' Zoe <Zoe@Roosin.com> ',
+        'a@x.com; b@x.com, a@X.com',
+        '<c@x.com>',
+        'mailto:d@x.com',
+        'e@x.com​',
+        '‎f@x.com',
+        'g＠x．com',
+        '',
+        null,
+    ]), {
+        addresses: ['Zoe@Roosin.com', 'a@x.com', 'b@x.com', 'c@x.com', 'd@x.com', 'e@x.com', 'f@x.com', 'g@x.com'],
+        invalid: [],
+    });
+    assert.deepEqual(P.parseRecipients('one@x.com'), { addresses: ['one@x.com'], invalid: [] });
+    assert.deepEqual(P.parseRecipients(['zoe@roosin,com', 'two words@x.com', 'a@@x.com', 'nodot@x', 'ok@x.com']), {
+        addresses: ['ok@x.com'],
+        invalid: ['zoe@roosin', 'com', 'two words@x.com', 'a@@x.com', 'nodot@x'],
+    });
+});
+
+test('preapprovePortalUsers: links the PO supplier AND its lines\' suppliers', async () => {
+    const conn = fakeConn({ suppliers: [{ id: 2, name: 'Sunmed Co.,Ltd.' }, { id: 87, name: 'Sunmed Co., Ltd' }, { id: 9, name: 'Other' }] });
+    const r = await preapprovePortalUsers(conn, {
+        recipients: ['a@sunmed.cn'], poSupplier: 'Sunmed Co.,Ltd.', lineSuppliers: ['Sunmed Co., Ltd', 'Sunmed Co.,Ltd.', null],
+    });
+    assert.equal(r.status, 'ok');
+    assert.equal(r.poSupplierMatched, true);
+    assert.deepEqual(r.suppliers.map(s => s.id), [2, 87]);
+    assert.deepEqual(r.users, [{ email: 'a@sunmed.cn', outcome: 'invited', suppliersAdded: 2 }]);
+
+    // Only a line supplier exists: linked to it, but the PO itself will not show.
+    const lineOnly = await preapprovePortalUsers(fakeConn({ suppliers: [{ id: 87, name: 'Sunmed Co., Ltd' }] }), {
+        recipients: ['a@sunmed.cn'], poSupplier: 'Sunmed (typo)', lineSuppliers: ['Sunmed Co., Ltd'],
+    });
+    assert.equal(lineOnly.status, 'ok');
+    assert.equal(lineOnly.poSupplierMatched, false);
+    assert.deepEqual(lineOnly.suppliers.map(s => s.id), [87]);
+});
+
+test('preapprovePortalUsers: READ COMMITTED right before BEGIN, a deadlock is retried', async () => {
+    const conn = fakeConn({ suppliers: [{ id: 7, name: 'Acme Co' }], deadlocks: 1 });
+    const r = await preapprovePortalUsers(conn, { recipients: ['a@acme.cn'], poSupplier: 'Acme Co' });
+    assert.equal(r.status, 'ok');
+    assert.deepEqual(r.users, [{ email: 'a@acme.cn', outcome: 'invited', suppliersAdded: 1 }]);
+    assert.equal(conn.state.isolation.length, 2);   // once per attempt
+    assert.match(conn.state.isolation[0], /READ COMMITTED/);
+    assert.equal(conn.state.users.filter(u => u.email === 'a@acme.cn').length, 1);
+
+    // Deadlocking every time: gives up after a few attempts and throws (the route then reports 'error').
+    const stuck = fakeConn({ suppliers: [{ id: 7, name: 'Acme Co' }], deadlocks: 99 });
+    await assert.rejects(preapprovePortalUsers(stuck, { recipients: ['a@acme.cn'], poSupplier: 'Acme Co' }), { errno: 1213 });
+    assert.equal(stuck.state.isolation.length, 3);
+});
+
+test('preapprovePortalUsers: no exact supplier name, staff only, no recipients, missing portal', async () => {
     const noMatch = await preapprovePortalUsers(fakeConn({ suppliers: [{ id: 7, name: 'Acme Co' }] }), {
         recipients: ['a@acme.cn'], poSupplier: 'ACME CO',
     });
     assert.equal(noMatch.status, 'no_supplier');
 
-    const staffOnly = await preapprovePortalUsers(fakeConn({ staff: ['ops@built-form.co.uk'], suppliers: [{ id: 7, name: 'Acme Co' }] }), {
-        recipients: ['ops@built-form.co.uk'], poSupplier: 'Acme Co',
+    // What happened to PO_00430J on 2026-11-04: colleagues only. Now they are set up too.
+    const staffOnly = await preapprovePortalUsers(fakeConn({ suppliers: [{ id: 7, name: 'Acme Co' }] }), {
+        recipients: ['cindy@jfamedical.co.uk', 'lukepbasil@gmail.com'], poSupplier: 'Acme Co',
     });
-    assert.equal(staffOnly.status, 'none');
+    assert.equal(staffOnly.status, 'ok');
+    assert.deepEqual(staffOnly.users.map(u => u.outcome), ['invited', 'invited']);
+
+    assert.equal((await preapprovePortalUsers(fakeConn(), { recipients: ['  '], poSupplier: 'Acme Co' })).status, 'none');
 
     const conn = fakeConn({ suppliers: [{ id: 7, name: 'Acme Co' }], missing: true });
     const missing = await preapprovePortalUsers(conn, { recipients: ['a@acme.cn'], poSupplier: 'Acme Co' });
