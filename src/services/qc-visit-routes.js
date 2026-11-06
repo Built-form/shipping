@@ -1099,8 +1099,13 @@ function registerQcVisitRoutes(app, deps) {
         const b = req.body || {};
         const updatedAtMs = requireUpdatedAt(b);
         await writeVisit(res, id, updatedAtMs, async (conn, row) => {
-            if (TERMINAL_STATUSES.includes(row.status)) throw terminalFail(row.status);
             const value = fromValidation(validateVisitFields(b, { partial: true, current: row })).value;
+            // A completed / cancelled visit is frozen except for its name: the
+            // name is only a label, so ops can still name (or rename) old trips.
+            if (TERMINAL_STATUSES.includes(row.status)) {
+                const other = Object.keys(value).filter(c => c !== 'name' && normCol(c, value[c]) !== normCol(c, row[c]));
+                if (other.length) throw terminalFail(row.status);
+            }
             if ('supplier_name' in value && row.status !== 'DRAFT'
                 && normSupplier(value.supplier_name) !== normSupplier(row.supplier_name)) {
                 throw badField('supplierName', 'The supplier can only be changed while the visit is a draft.');
