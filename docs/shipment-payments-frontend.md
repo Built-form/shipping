@@ -197,6 +197,7 @@ with `documentId`) and ticks what it covered.
 ```
 POST   /api/v1/shipment-payment-documents              → 201 { document }
 POST   /api/v1/shipment-payment-documents/:id/extract   → 202 { document, alreadyRunning }
+POST   /api/v1/shipment-payment-documents/:id/refile    → 202 { document, refiled: { from, to }, portalRows }   (admin, standard)
 GET    /api/v1/shipment-payment-documents              → { data: [document] }
 DELETE /api/v1/shipment-payment-documents/:id          → 204   (admin only)
 ```
@@ -343,6 +344,47 @@ step over every line before the next:
 A line coded as a product its PO has no unit for is left in
 `extraInvoiceLines`. `qcBilled` is every line but a charge. Quantity and
 price differences (pieces against packs) are still listed in `issues`.
+
+**Refiling — commercial ↔ QC (2026-11-06).** The place decides the read, so an
+invoice filed in the wrong place — a QC invoice imported from the supplier
+portal on a shipment, a goods invoice uploaded through "Upload QC invoice", a
+commercial invoice on the wrong box — is **moved**, never deleted and uploaded
+again (user: "if anyone accidentally assigns it the wrong type there is a way
+to switch easily"). The file, the document id and its audit trail stay; the
+read runs again in the new place after the response (`extractStatus` back to
+`processing`). Routes: `src/services/payment-document-refile-routes.js`; rules:
+`src/lib/payment-documents.js` (`parseRefileBody`, `refileRefusal`,
+`refilePlace`), tested in `tools/test-payment-documents-lib.js`.
+
+```json
+{ "kind": "qc" }                                              // → on the supplier alone, no shipment; supplierName defaults to its own
+{ "kind": "commercial", "shipmentId": 62 }                    // → on that booked shipment, filed under its own supplier (must have POs on board)
+{ "kind": "commercial", "shipmentId": 62, "supplierName": "Other Co" }   // under another supplier on that shipment (the PO's spelling is used)
+{ "kind": "qc", "force": true }                               // past DOCUMENT_SIGNED_OFF / DUPLICATE_DOCUMENT / SUPPLIER_NOT_ON_SHIPMENT
+```
+
+- `kind` is required: `commercial` needs `shipmentId | shipmentReference`; `qc` must name none.
+- The row's `shipment_id`, `shipment_reference`, `supplier_name`, `supplier_key` are rewritten;
+  `extract_status` is set to `processing` and `extract_error` cleared. Audit
+  `shipment_payment_document` / `refile` with `before` and `after` (`{ kind, shipmentId,
+  shipmentReference, supplierName }`, plus `onShipment`, `force`, `signOffs`, `duplicateOf`).
+- A document imported from the supplier portal: the `jportal.ci_submissions` row's
+  `confirmed_shipment_id` / `confirmed_shipment_reference` are rewritten to match (`row_version`
+  bumped), so the supplier's "Filed (shipment 324)" follows; `portalRows` says how many (0 when
+  the portal schema is not reachable — logged, never a failed refile).
+- Who: admin and standard users (the supplier-portal import deciders) — `403 CANNOT_REFILE`.
+- Refusals: `400 BAD_FIELD` · `404 NOT_FOUND | SHIPMENT_NOT_FOUND` · `409 NO_CHANGE` (already
+  filed that way under that supplier) · `409 DOCUMENT_IN_USE { supplierPaymentId, paymentId }`
+  (evidence for a recorded payment: never moves, `force` or not) · `409 DOCUMENT_SIGNED_OFF
+  { signOffs }` (current `qc:<id>` sign-offs would no longer apply; `force` passes — the
+  sign-offs are left as they are) · `409 DUPLICATE_DOCUMENT { existingId }` (same name and size
+  in the new place; `force` passes) · `409 MERGED { mergedIntoId }` · `409 CONFLICT` ·
+  `422 NOT_AN_INVOICE` (a proof of payment) · `422 NOT_REFILABLE` (the balance invoice of a PO's
+  combined / repackaged goods) · `422 NOT_BOOKED { stage }` · `422 SUPPLIER_NOT_ON_SHIPMENT
+  { suppliers }` (`supplierName` from `suppliers`, or `force` to keep its own name).
+- ShipLine: the ⇄ button on a document row (the shipment's documents on the Payments page and in
+  the shipment pop-up, and the QC invoices strip) and "Change type / shipment" on an imported
+  supplier-portal invoice open the same dialog (`payments/RefileDocumentDialog.tsx`).
 
 **Does it belong here? — `fit`.** Every read is compared with the shipment and
 the supplier it was uploaded against:

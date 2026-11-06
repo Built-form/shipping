@@ -175,14 +175,26 @@ test('importBlockers', () => {
 
 test('parseImportBody / parseShipmentChoice', () => {
     assert.deepEqual(L.parseImportBody({ rowVersion: 2, shipmentId: '61' }).value,
-        { rowVersion: 2, shipmentId: 61, shipmentReference: null, supplierName: null, force: false, note: null });
+        { rowVersion: 2, kind: 'commercial', shipmentId: 61, shipmentReference: null, supplierName: null, force: false, note: null });
     assert.deepEqual(L.parseImportBody({ rowVersion: 0, shipmentReference: ' 324 ', supplierName: ' Acme ', force: true, note: 'Filed on 324' }).value,
-        { rowVersion: 0, shipmentId: null, shipmentReference: '324', supplierName: 'Acme', force: true, note: 'Filed on 324' });
+        { rowVersion: 0, kind: 'commercial', shipmentId: null, shipmentReference: '324', supplierName: 'Acme', force: true, note: 'Filed on 324' });
     assert.match(L.parseImportBody({ shipmentId: 1 }).error, /rowVersion/);
     assert.match(L.parseImportBody({ rowVersion: 1 }).error, /shipmentId or shipmentReference/);
     assert.match(L.parseImportBody({ rowVersion: 1, shipmentId: -2 }).error, /positive integer/);
     assert.match(L.parseImportBody({ rowVersion: 1, shipmentId: 2, force: 'yes' }).error, /force/);
     assert.match(L.parseImportBody({ rowVersion: 1, shipmentId: 2, supplierName: 7 }).error, /supplierName/);
+});
+
+test('parseImportBody: the kind — a commercial invoice on a shipment, or a QC invoice on the supplier alone', () => {
+    assert.deepEqual(L.IMPORT_KINDS, ['commercial', 'qc']);
+    assert.equal(L.parseImportBody({ rowVersion: 2, shipmentId: 61 }).value.kind, 'commercial', 'the default: every older client sends a shipment');
+    assert.equal(L.parseImportBody({ rowVersion: 2, shipmentId: 61, kind: 'commercial' }).value.kind, 'commercial');
+    assert.deepEqual(L.parseImportBody({ rowVersion: 2, kind: 'qc', supplierName: ' Acme Ltd ' }).value,
+        { rowVersion: 2, kind: 'qc', shipmentId: null, shipmentReference: null, supplierName: 'Acme Ltd', force: false, note: null });
+    assert.deepEqual(L.parseImportBody({ rowVersion: 2, kind: 'qc' }).value.supplierName, null, 'the server picks the group’s one name');
+    assert.match(L.parseImportBody({ rowVersion: 2, kind: 'qc', shipmentId: 61 }).error, /QC invoice.*not.*shipment/i, 'a QC invoice never names a shipment');
+    assert.match(L.parseImportBody({ rowVersion: 2, kind: 'commercial' }).error, /shipmentId or shipmentReference/);
+    assert.match(L.parseImportBody({ rowVersion: 2, kind: 'proforma', shipmentId: 61 }).error, /kind must be/);
     assert.match(L.parseRejectBody({ rowVersion: 1 }).error, /note is required/);
 });
 
@@ -200,6 +212,27 @@ test('submissionToJson', () => {
     const imported = L.submissionToJson(submitted({ status: 'imported', document_id: 77, confirmed_shipment_id: 62, confirmed_shipment_reference: '325', filed_supplier_name: 'Medoffice' }));
     assert.deepEqual(imported.confirmed, { shipmentId: 62, shipmentReference: '325', supplierName: 'Medoffice' });
     assert.equal(imported.documentId, 77);
+    assert.equal(j.importedAs, null, 'nothing filed yet');
+});
+
+test('submissionToJson: what it was imported as, from the document it became', () => {
+    const filed = (over) => L.submissionToJson(submitted({ status: 'imported', document_id: 77, filed_supplier_name: 'Acme Ltd', filed_doc_kind: 'balance_invoice', filed_deleted_at: null, ...over }));
+    const onBox = filed({ confirmed_shipment_id: 62, confirmed_shipment_reference: '325', filed_shipment_id: 62, filed_shipment_reference: '325' });
+    assert.equal(onBox.importedAs, 'commercial');
+    const qc = filed({ confirmed_shipment_id: null, confirmed_shipment_reference: null, filed_shipment_id: null, filed_shipment_reference: null });
+    assert.equal(qc.importedAs, 'qc');
+    assert.deepEqual(qc.confirmed, { shipmentId: null, shipmentReference: null, supplierName: 'Acme Ltd' }, 'filed, under the supplier, on no shipment');
+    // Refiled on the Payments page since the import: the document’s live place wins over the row’s snapshot.
+    const moved = filed({ confirmed_shipment_id: null, confirmed_shipment_reference: null, filed_shipment_id: 62, filed_shipment_reference: '325' });
+    assert.equal(moved.importedAs, 'commercial');
+    assert.deepEqual(moved.confirmed, { shipmentId: 62, shipmentReference: '325', supplierName: 'Acme Ltd' });
+    // Deleted on the Payments page: the row’s snapshot is all that is left.
+    const gone = filed({ confirmed_shipment_id: 62, confirmed_shipment_reference: '325', filed_shipment_id: 62, filed_shipment_reference: '325', filed_deleted_at: new Date(), filed_supplier_name: null });
+    assert.equal(gone.importedAs, 'commercial');
+    assert.deepEqual(gone.confirmed, { shipmentId: 62, shipmentReference: '325', supplierName: null });
+    // An older list (no document join): the row’s own columns decide.
+    assert.equal(L.submissionToJson(submitted({ status: 'imported', document_id: 77, confirmed_shipment_id: 62, confirmed_shipment_reference: '325' })).importedAs, 'commercial');
+    assert.equal(L.submissionToJson(submitted({ status: 'imported', document_id: 77, confirmed_shipment_id: null, confirmed_shipment_reference: null })).importedAs, 'qc');
 });
 
 // ── The evidence, over the real assessFit ─────────────────────────────────
@@ -447,8 +480,15 @@ test('runner: the staff re-read claims a succeeded row; no payload can', async (
 // ── The staff import route, against a fake connection and S3 ───────────────
 const { registerCiSubmissionRoutes } = require('../src/services/ci-submission-routes');
 
-function routeWorld({ row = submitted(), shipment = { ...SHIP_324, merged_into_id: null, deleted_at: null }, memberPos = POS_324, duplicate = null, object = PDF, etag = '"abc"' } = {}) {
-    const state = { row: { ...row }, audits: [], puts: [], inserted: null, extractions: [], tx: [] };
+function routeWorld({ row = submitted(), shipment = { ...SHIP_324, merged_into_id: null, deleted_at: null }, memberPos = POS_324, duplicate = null, object = PDF, etag = '"abc"', groupSuppliers = [{ id: 3, name: 'Acme Ltd' }] } = {}) {
+    const state = { row: { ...row }, audits: [], puts: [], inserted: null, extractions: [], tx: [], dupeWhere: null };
+    // The list / detail SELECT joins the document the row became (selectSql): its place decides importedAs.
+    const joined = () => {
+        const ins = state.inserted;
+        return state.row.document_id && ins
+            ? { filed_shipment_id: ins[0], filed_shipment_reference: ins[1], filed_supplier_name: ins[2], filed_doc_kind: 'balance_invoice', filed_deleted_at: null }
+            : {};
+    };
     const conn = {
         async beginTransaction() { state.tx.push('begin'); },
         async commit() { state.tx.push('commit'); },
@@ -456,16 +496,19 @@ function routeWorld({ row = submitted(), shipment = { ...SHIP_324, merged_into_i
         async query(sql, params = []) {
             const s = sql.replace(/\s+/g, ' ');
             if (/FROM `jportal`\.ci_submissions r LEFT JOIN suppliers/.test(s)) {
-                return [Number(params[0]) === state.row.id && L.VISIBLE_STATUSES.includes(state.row.status) ? [{ ...state.row, supplier_exists: 1 }] : []];
+                return [Number(params[0]) === state.row.id && L.VISIBLE_STATUSES.includes(state.row.status) ? [{ ...state.row, supplier_exists: 1, ...joined() }] : []];
             }
             if (/FROM `jportal`\.ci_submissions WHERE id = \? FOR UPDATE/.test(s)) return [[{ ...state.row }]];
-            if (/SELECT id, name FROM suppliers WHERE id IN/.test(s)) return [[{ id: 3, name: 'Acme Ltd' }]];
+            if (/SELECT id, name FROM suppliers WHERE id IN/.test(s)) return [groupSuppliers];
             if (/FROM shipments WHERE id = \?/.test(s)) return [Number(params[0]) === shipment.id ? [shipment] : []];
             if (/FROM shipments s WHERE s\.id = \?/.test(s)) return [[shipment]];
             if (/FROM orders o JOIN purchase_orders po/.test(s)) {
                 return [memberPos.map(p => ({ shipment_id: shipment.id, id: p.id, po_number: p.poNumber, supplier: p.supplier, currency: p.currency, line_count: 1, units_in_shipment: 100, value_in_shipment: p.valueInShipment }))];
             }
-            if (/FROM shipment_payment_documents WHERE deleted_at IS NULL AND filename/.test(s)) return [duplicate ? [{ id: duplicate }] : []];
+            if (/FROM shipment_payment_documents WHERE deleted_at IS NULL AND filename/.test(s)) {
+                state.dupeWhere = /shipment_id IS NULL AND supplier_key/.test(s) ? 'supplier' : 'shipment';
+                return [duplicate ? [{ id: duplicate }] : []];
+            }
             if (/INSERT INTO shipment_payment_documents/.test(s)) { state.inserted = params; return [{ insertId: 77 }]; }
             if (/INSERT INTO audit_log/.test(s)) { state.audits.push(`${params[0]}:${params[2]}`); return [{ insertId: 1 }]; }
             if (/SET status = 'imported'/.test(s)) {
@@ -517,7 +560,8 @@ test('import: files the invoice on the shipment, then starts the usual read', as
     const res = await call(IMPORT, { params: { id: '9' }, body: { rowVersion: 2, shipmentId: 61, note: 'Thanks' } });
     assert.equal(res.statusCode, 200, JSON.stringify(res.body));
     assert.equal(res.body.submission.status, 'imported');
-    assert.deepEqual(res.body.submission.confirmed, { shipmentId: 61, shipmentReference: '324', supplierName: null });
+    assert.deepEqual(res.body.submission.confirmed, { shipmentId: 61, shipmentReference: '324', supplierName: 'Acme Ltd' });
+    assert.equal(res.body.submission.importedAs, 'commercial');
     assert.equal(res.body.submission.documentId, 77);
     const [shipmentId, reference, supplierName, supplierKey, filename, s3Key, publicUrl, contentType, size, notes, uploadedBy] = state.inserted;
     assert.deepEqual([shipmentId, reference, supplierName, supplierKey, filename], [61, '324', 'Acme Ltd', 'acme ltd', 'CI-324.pdf']);
@@ -548,6 +592,40 @@ test('import: the supplier it is filed under', async () => {
     assert.equal((await importIt(other, { supplierName: 'other co' })).statusCode, 200, 'another supplier on the box, chosen by staff');
     assert.equal(other.state.inserted[2], 'Other Co', 'the PO’s own spelling');
     assert.equal((await importIt(routeWorld(), { supplierName: 'Nobody Ltd' })).body.code, 'SUPPLIER_NOT_ON_SHIPMENT');
+});
+
+test('import: a QC invoice — on the supplier alone, no shipment, read as “Upload QC invoice” files it', async () => {
+    process.env.PI_UPLOADS_BUCKET = BUCKET;
+    const { state, call } = routeWorld();
+    const res = await call(IMPORT, { params: { id: '9' }, body: { rowVersion: 2, kind: 'qc', note: 'QC' } });
+    assert.equal(res.statusCode, 200, JSON.stringify(res.body));
+    assert.equal(res.body.submission.status, 'imported');
+    assert.equal(res.body.submission.importedAs, 'qc');
+    assert.deepEqual(res.body.submission.confirmed, { shipmentId: null, shipmentReference: null, supplierName: 'Acme Ltd' });
+    const [shipmentId, reference, supplierName, supplierKey] = state.inserted;
+    assert.deepEqual([shipmentId, reference, supplierName, supplierKey], [null, null, 'Acme Ltd', 'acme ltd'], 'the group’s one live name, no shipment');
+    assert.deepEqual([state.row.confirmed_shipment_id, state.row.confirmed_shipment_reference], [null, null]);
+    assert.deepEqual(state.audits, ['shipment_payment_document:create', 'ci_submission:import']);
+    assert.equal(state.dupeWhere, 'supplier', 'the duplicate guard looks on the supplier, not a shipment');
+    await new Promise(r => setImmediate(r));
+    assert.deepEqual(state.extractions, [{ documentId: 77, userEmail: 'ops@example.com' }], 'the usual read; the document’s place (no shipment) makes it a QC read');
+
+    // Two companies in the group: staff name the one it is for.
+    const two = routeWorld({ groupSuppliers: [{ id: 3, name: 'Acme Ltd' }, { id: 8, name: 'Medoffice' }] });
+    const asked = await two.call(IMPORT, { params: { id: '9' }, body: { rowVersion: 2, kind: 'qc' } });
+    assert.deepEqual([asked.statusCode, asked.body.code], [422, 'SUPPLIER_REQUIRED']);
+    assert.deepEqual(asked.body.suppliers, ['Acme Ltd', 'Medoffice']);
+    assert.equal(two.state.puts.length, 0, 'refused before anything is copied');
+    const named = await two.call(IMPORT, { params: { id: '9' }, body: { rowVersion: 2, kind: 'qc', supplierName: 'medoffice' } });
+    assert.equal(named.statusCode, 200, JSON.stringify(named.body));
+    assert.equal(two.state.inserted[2], 'Medoffice', 'the live spelling');
+    const stranger = await routeWorld().call(IMPORT, { params: { id: '9' }, body: { rowVersion: 2, kind: 'qc', supplierName: 'Nobody Ltd' } });
+    assert.deepEqual([stranger.statusCode, stranger.body.code], [422, 'SUPPLIER_NOT_IN_GROUP']);
+    assert.deepEqual(stranger.body.suppliers, ['Acme Ltd']);
+    const forced = await routeWorld().call(IMPORT, { params: { id: '9' }, body: { rowVersion: 2, kind: 'qc', supplierName: 'Nobody Ltd', force: true } });
+    assert.equal(forced.statusCode, 200);
+    const dup = await routeWorld({ duplicate: 41 }).call(IMPORT, { params: { id: '9' }, body: { rowVersion: 2, kind: 'qc' } });
+    assert.deepEqual([dup.statusCode, dup.body.code, dup.body.existingId], [409, 'DUPLICATE_DOCUMENT', 41]);
 });
 
 test('import: refusals', async () => {

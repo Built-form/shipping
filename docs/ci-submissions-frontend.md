@@ -15,8 +15,11 @@ otherwise receive by email and upload on the shipment (`POST /api/v1/shipment-pa
 ([pi-submissions-frontend.md](pi-submissions-frontend.md)).
 
 Suppliers upload one on the supplier portal's "Send invoices" page **without choosing a shipment** —
-they do not know our shipment numbers. The portal sends it to staff as soon as the file has arrived
-and shows the supplier only "Sent to our team", then "Filed (shipment 324)" or "Not accepted: <note>".
+they do not know our shipment numbers. **The page takes any invoice — a commercial invoice for the
+goods in a shipment, or a QC invoice for `_FQC` units — and never asks which (user, 2026-11-06):
+staff say which at import (`kind`).** The portal sends it to staff as soon as the file has arrived
+and shows the supplier only "Sent to our team", then "Filed (shipment 324)" (or just "Filed" for a QC
+invoice, which has no shipment) or "Not accepted: <note>".
 Shipping's `ciCheck` Lambda reads it with **the balance-invoice reader's own prompt and schema**
 (told it came through the portal, shipment unknown) and **suggests which of the supplier's booked
 shipments it belongs to**. Staff confirm or choose the shipment here and **import** it: it becomes an
@@ -36,6 +39,16 @@ shipping:                           └──reject──▶ rejected   (note sh
 `shipment_payment_documents` without an Import. Drafts and discarded rows are never shown to staff.
 A submitted row may still be `checkStatus: pending` for a minute or two: Import does not wait for it
 (the read after import is the one that matters for payments).
+
+**The kind.** Import takes `kind`: `commercial` (the default) files the document on the shipment
+staff confirm; `qc` files it on the supplier alone with **no shipment** — exactly what the Payments
+page's "Upload QC invoice" does — so the read treats every line as a QC line whatever the reader
+calls the file ([shipment-payments-frontend.md](shipment-payments-frontend.md), "Uploaded on the
+supplier alone"). The place decides the read, so **a wrong kind is put right by refiling the
+document**, not by deleting it: `POST /api/v1/shipment-payment-documents/:id/refile` (same guide,
+"Refiling") moves it between the two places (or to another shipment), reads it again, and rewrites
+this row's `confirmed_shipment_*` to match. The list and detail report what the row **is now**
+(`importedAs`, `confirmed`) from the document it became, so a refiled one answers truthfully.
 
 ## The page
 
@@ -66,11 +79,19 @@ Pending and History tabs:
     filed under (`supplierName`), and `duplicateDocumentId` when the same file is already there;
   - "Read again" (`canRecheck`) — `POST …/recheck`, then poll the detail while `check.status` is
     `pending`.
+- **File as** — a segmented choice, Commercial invoice (the default) / QC invoice. For a QC invoice
+  the shipment blocks hide and the supplier it is filed under is picked from `groupNames` (the login's
+  live suppliers; pre-picked when there is one, or when the suggestion names one of them). The page
+  hints when the reading's lines mention QC / inspection / an `_FQC` code.
 - **Import** — on the chosen shipment. Confirm `force` when the supplier has no POs on it (422
   `SUPPLIER_NOT_ON_SHIPMENT`, with `suppliers` to pick another name from) or the file is already
   there (409 `DUPLICATE_DOCUMENT` — usually the same invoice that also came by email: prefer
-  rejecting it with "already received"). After import, "Open payments" goes to the shipment on the
-  Payments page, where the document shows with its read (`document.extractStatus`).
+  rejecting it with "already received"). As a QC invoice: `kind: 'qc'` and no shipment; `supplierName`
+  one of `groupNames`, required when there are several (422 `SUPPLIER_REQUIRED`), or any name with
+  `force` (422 `SUPPLIER_NOT_IN_GROUP` otherwise). After import, "Open on Payments" goes to the
+  shipment on the Payments page (or, for a QC invoice, the QC tab's invoices found by the file name),
+  where the document shows with its read (`document.extractStatus`). **"Change type / shipment"** on
+  an imported one opens the refile dialog (commercial ↔ QC, or another shipment).
 - **Reject** — the note is required and shown to the supplier word for word.
 
 Who: admin and standard users import, reject and re-read (`X-User-Type`); read-only users only look
@@ -122,7 +143,13 @@ rows' `group_supplier_ids`), `pending`, `total`, `oldestSubmittedAt`. Pending fi
 - No Gemini call; 404 `SHIPMENT_NOT_FOUND`, 409 `MERGED { mergedIntoId }` (preview the survivor).
 
 `POST /api/v1/ci-submissions/:id/import` — body
-`{ rowVersion, shipmentId | shipmentReference, supplierName?, note?, force? }`
+`{ rowVersion, kind?, shipmentId | shipmentReference, supplierName?, note?, force? }`
+- `kind`: `commercial` (default) or `qc`. A QC invoice names **no** shipment (400 `BAD_FIELD` if it
+  does): it is filed on the supplier alone — `supplierName` one of the group's live names (its live
+  spelling is used), required when the group has several (422 `SUPPLIER_REQUIRED { suppliers }`); a
+  name outside the group is 422 `SUPPLIER_NOT_IN_GROUP { suppliers }` unless `force`. The duplicate
+  guard then looks among the supplier's shipment-less documents. The rest below is the commercial
+  path.
 - `rowVersion`: the `submission.rowVersion` you were looking at (`STALE` otherwise: the check or the
   supplier changed the row — reload).
 - The shipment must be live and booked (`BOOKED`, `IN_TRANSIT`, `ARRIVED`, `CLOSED`), like a staff
@@ -137,11 +164,13 @@ rows' `group_supplier_ids`), `pending`, `total`, `oldestSubmittedAt`. Pending fi
 - What it writes: the bytes copied (exactly the ones the portal validated, `IfMatch` its ETag) to the
   PO bucket at `shipment-payments/<uuid>/<name>`; a `shipment_payment_documents` row (`doc_kind
   balance_invoice`, `extract_status processing`, `uploaded_by_email` = **the supplier's** email,
-  `notes` "Uploaded by the supplier through the supplier portal (invoice upload <id>).") with its
-  `create` audit (`after.source: 'portal'`, `ciSubmissionId`); the submission `imported` with
-  `documentId` and `confirmed`. After the response, `runShipmentPaymentExtraction` — the background
-  read every staff upload gets. Poll `GET /api/v1/shipment-payment-documents?shipmentId=` (or the
-  Payments page's feed) for its `extractStatus`.
+  `notes` "Uploaded by the supplier through the supplier portal (invoice upload <id>)[, filed as a QC
+  invoice].", `shipment_id` NULL for a QC invoice) with its `create` audit (`after.source: 'portal'`,
+  `ciSubmissionId`, `kind`); the submission `imported` with `documentId` and `confirmed`
+  (`confirmed_shipment_*` NULL for a QC invoice). After the response, `runShipmentPaymentExtraction`
+  — the background read every staff upload gets; with no shipment it is the QC read. Poll
+  `GET /api/v1/shipment-payment-documents?shipmentId=` (or the Payments page's feed) for its
+  `extractStatus`.
 
 `POST /api/v1/ci-submissions/:id/reject` — body `{ rowVersion, note }`; the note is required (at most
 1000 characters).
@@ -171,6 +200,8 @@ past ten minutes), or looks wrong. A failed re-read leaves the previous suggesti
 | 422 | `NOT_BOOKED` | the shipment is not booked yet — payload `stage` |
 | 422 | `SUPPLIER_NOT_FOUND` | none of the row's group ids has a live `suppliers` row |
 | 422 | `SUPPLIER_NOT_ON_SHIPMENT` | the supplier (or the body's `supplierName`) has no POs on that shipment — payload `suppliers`; retry with `force: true` or another `supplierName` |
+| 422 | `SUPPLIER_REQUIRED` | `kind: 'qc'` and the login holds several suppliers — payload `suppliers` (names); send `supplierName` |
+| 422 | `SUPPLIER_NOT_IN_GROUP` | `kind: 'qc'` with a `supplierName` that is not one of the group's live names — payload `suppliers`; `force: true` files it under that name anyway |
 | 502 | `FILE_UNAVAILABLE` | the portal's bucket could not be read, or the copy could not be written; try again |
 
 Blockers (`blockers[]`, codes): `not_submitted`, `supplier_not_found`, `bad_key`, `bad_type`,
@@ -182,6 +213,7 @@ differ from the validated ones).
 
 ```ts
 type CiStatus = 'submitted'|'imported'|'rejected'|'withdrawn';
+type CiImportKind = 'commercial'|'qc';   // what staff import it as: on a shipment, or on the supplier alone (no shipment)
 type CiMatchConfidence = 'confident'|'unsure'|'none';
 type CiMatchReason = 'container'|'po_numbers'|'amount'|'single'|'conflict';
 type FitCheck = { key: 'supplier'|'container'|'pos'|'currency'|'amount'; ok: boolean|null; text: string };
@@ -194,7 +226,8 @@ type CiSubmission = {              // list item; the `submission` of the detail 
   invoiceNumber: string|null;
   matchConfidence: CiMatchConfidence|null; matchReason: CiMatchReason|null;
   suggested: { shipmentId: number|null; shipmentReference: string|null; supplierName: string|null }|null;
-  confirmed: { shipmentId: number|null; shipmentReference: string|null; supplierName: string|null }|null;   // imported only; supplierName = the document's (filed under), not the row's
+  confirmed: { shipmentId: number|null; shipmentReference: string|null; supplierName: string|null }|null;   // imported only: the document's LIVE place (refiled since or not); both shipment fields null for a QC invoice; supplierName = the document's (filed under), not the row's
+  importedAs: CiImportKind|null;                                                // from the document it became; null until imported
   documentId: number|null;                                                      // the shipment_payment_documents row
   submittedAt: string|null; decidedBy: string|null; decidedAt: string|null; decidedNote: string|null;
   rowVersion: number; createdAt: string|null;
@@ -229,6 +262,7 @@ type CiSubmissionDetail = {
   };
   fileUrl: string|null; fileExpiresAt: string|null;
   document: (ShipmentPaymentDocument & { deleted: boolean })|null;   // once imported: extractStatus, extracted.fit / .check …
+  groupNames: string[];                                               // the login's live supplier names: a QC invoice is filed under one of them
   canImport: boolean; canRecheck: boolean;
   audit: { action: string; userEmail: string|null; createdAt: string|null; after: unknown }[];
 };
