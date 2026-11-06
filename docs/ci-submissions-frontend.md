@@ -50,6 +50,14 @@ document**, not by deleting it: `POST /api/v1/shipment-payment-documents/:id/ref
 this row's `confirmed_shipment_*` to match. The list and detail report what the row **is now**
 (`importedAs`, `confirmed`) from the document it became, so a refiled one answers truthfully.
 
+**One spelling per company.** The roster holds several spellings of one supplier ("SUNMED",
+"Suzhou Sunmed Co., Ltd", "Suzhou Sunmed Co.,Ltd." — Shipsline-era rows beside the native one) and a
+portal login is granted all of them. `groupNames` (the detail) and `supplierNames` / `supplierName`
+(the suppliers rail) hold one per company (`lib collapseSpellings` over the extractor's
+`sameSupplier`): the spelling with the most live purchase orders, ties to the lowest id. A QC import
+naming a duplicate spelling is filed under its company's leading one; two real companies in a group
+still need `supplierName`.
+
 ## The page
 
 ShipLine's **SUPPLIER PORTAL** tab, sub-tab **Invoices** (beside Proforma invoices and Packing lists),

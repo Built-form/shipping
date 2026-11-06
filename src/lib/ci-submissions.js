@@ -334,6 +334,45 @@ function importBlockers({ row, supplier = null, file = null }) {
     return [...new Set(out)];
 }
 
+// ── Spellings ───────────────────────────────────────────────────────────────
+/**
+ * One spelling per company. The roster holds several spellings of one
+ * supplier ("SUNMED", "Suzhou Sunmed Co., Ltd", "Suzhou Sunmed Co.,Ltd.":
+ * Shipsline-era rows beside the native one), and a portal login is granted
+ * all of them. Pickers show one (user, 2026-11-06): the spelling the live POs
+ * use (`weight`), ties to the earlier name (the group's order is by id, so the
+ * older row). `same(a, b)` is the extractor's sameSupplier.
+ * → [{ name, others }] in the group's order; blanks dropped.
+ */
+function collapseSpellings(names, { same, weight = () => 0 }) {
+    const clusters = [];
+    for (const name of names || []) {
+        if (!name || !String(name).trim()) continue;
+        const c = clusters.find(x => [x.name, ...x.others].some(n => same(n, name)));
+        if (!c) { clusters.push({ name, others: [] }); continue; }
+        if (weight(name) > weight(c.name)) { c.others.push(c.name); c.name = name; } else c.others.push(name);
+    }
+    return clusters;
+}
+
+/**
+ * The supplier a QC invoice is filed under: the body's name when it is one of
+ * the group's spellings (filed under that company's leading one), any name
+ * with force, else the group's one company, else a choice is needed.
+ * `key` is shipment-payments' supplierKey.
+ * → { supplierName } or { fail: { code: 'SUPPLIER_REQUIRED' | 'SUPPLIER_NOT_IN_GROUP', suppliers } }
+ */
+function qcSupplierChoice({ clusters, wanted, force, key }) {
+    const suppliers = clusters.map(c => c.name);
+    if (wanted) {
+        const hit = clusters.find(c => [c.name, ...c.others].some(n => key(n) === key(wanted)));
+        if (hit) return { supplierName: hit.name };
+        return force ? { supplierName: wanted } : { fail: { code: 'SUPPLIER_NOT_IN_GROUP', suppliers } };
+    }
+    if (clusters.length === 1) return { supplierName: clusters[0].name };
+    return { fail: { code: 'SUPPLIER_REQUIRED', suppliers } };
+}
+
 // ── Request parsing ─────────────────────────────────────────────────────────
 // The shipment a request names: { shipmentId, shipmentReference }, at least
 // one of them (the id wins). → { value } or { error }
@@ -515,6 +554,8 @@ module.exports = {
     parseStoredCandidates,
     candidateToJson,
     importBlockers,
+    collapseSpellings,
+    qcSupplierChoice,
     parseShipmentChoice,
     parseImportBody,
     importedAsOf,

@@ -480,7 +480,7 @@ test('runner: the staff re-read claims a succeeded row; no payload can', async (
 // ── The staff import route, against a fake connection and S3 ───────────────
 const { registerCiSubmissionRoutes } = require('../src/services/ci-submission-routes');
 
-function routeWorld({ row = submitted(), shipment = { ...SHIP_324, merged_into_id: null, deleted_at: null }, memberPos = POS_324, duplicate = null, object = PDF, etag = '"abc"', groupSuppliers = [{ id: 3, name: 'Acme Ltd' }] } = {}) {
+function routeWorld({ row = submitted(), shipment = { ...SHIP_324, merged_into_id: null, deleted_at: null }, memberPos = POS_324, duplicate = null, object = PDF, etag = '"abc"', groupSuppliers = [{ id: 3, name: 'Acme Ltd' }], poCounts = { 'Acme Ltd': 5 } } = {}) {
     const state = { row: { ...row }, audits: [], puts: [], inserted: null, extractions: [], tx: [], dupeWhere: null };
     // The list / detail SELECT joins the document the row became (selectSql): its place decides importedAs.
     const joined = () => {
@@ -500,6 +500,9 @@ function routeWorld({ row = submitted(), shipment = { ...SHIP_324, merged_into_i
             }
             if (/FROM `jportal`\.ci_submissions WHERE id = \? FOR UPDATE/.test(s)) return [[{ ...state.row }]];
             if (/SELECT id, name FROM suppliers WHERE id IN/.test(s)) return [groupSuppliers];
+            if (/SELECT supplier, COUNT\(\*\) AS n FROM purchase_orders WHERE deleted_at IS NULL AND supplier IN/.test(s)) {
+                return [params[0].filter(n => poCounts[n]).map(n => ({ supplier: n, n: poCounts[n] }))];
+            }
             if (/FROM shipments WHERE id = \?/.test(s)) return [Number(params[0]) === shipment.id ? [shipment] : []];
             if (/FROM shipments s WHERE s\.id = \?/.test(s)) return [[shipment]];
             if (/FROM orders o JOIN purchase_orders po/.test(s)) {
@@ -626,6 +629,56 @@ test('import: a QC invoice — on the supplier alone, no shipment, read as “Up
     assert.equal(forced.statusCode, 200);
     const dup = await routeWorld({ duplicate: 41 }).call(IMPORT, { params: { id: '9' }, body: { rowVersion: 2, kind: 'qc' } });
     assert.deepEqual([dup.statusCode, dup.body.code, dup.body.existingId], [409, 'DUPLICATE_DOCUMENT', 41]);
+});
+
+test('import: duplicate spellings of one company in the group collapse to the one the POs use', async () => {
+    process.env.PI_UPLOADS_BUCKET = BUCKET;
+    const sunmed = () => routeWorld({
+        groupSuppliers: [{ id: 2, name: 'Suzhou Sunmed Co.,Ltd.' }, { id: 58, name: 'SUNMED' }, { id: 87, name: 'Suzhou Sunmed Co., Ltd' }],
+        poCounts: { 'Suzhou Sunmed Co.,Ltd.': 58, 'Suzhou Sunmed Co., Ltd': 1 },
+    });
+    const auto = sunmed();
+    const res = await auto.call(IMPORT, { params: { id: '9' }, body: { rowVersion: 2, kind: 'qc' } });
+    assert.equal(res.statusCode, 200, JSON.stringify(res.body));
+    assert.equal(auto.state.inserted[2], 'Suzhou Sunmed Co.,Ltd.', 'three spellings, one company: no SUPPLIER_REQUIRED, filed under the spelling with the POs');
+    const legacy = sunmed();
+    const named = await legacy.call(IMPORT, { params: { id: '9' }, body: { rowVersion: 2, kind: 'qc', supplierName: 'SUNMED' } });
+    assert.equal(named.statusCode, 200, JSON.stringify(named.body));
+    assert.equal(legacy.state.inserted[2], 'Suzhou Sunmed Co.,Ltd.', 'a legacy spelling asked for is filed under the one the POs use');
+    // Two real companies in the group, each with spellings: still a choice, offered once per company.
+    const mixed = routeWorld({
+        groupSuppliers: [{ id: 2, name: 'Suzhou Sunmed Co.,Ltd.' }, { id: 9, name: 'Medoffice Saglik Endustri A.S.' }, { id: 58, name: 'SUNMED' }],
+        poCounts: { 'Suzhou Sunmed Co.,Ltd.': 58, 'Medoffice Saglik Endustri A.S.': 7 },
+    });
+    const asked = await mixed.call(IMPORT, { params: { id: '9' }, body: { rowVersion: 2, kind: 'qc' } });
+    assert.deepEqual([asked.statusCode, asked.body.code], [422, 'SUPPLIER_REQUIRED']);
+    assert.deepEqual(asked.body.suppliers, ['Suzhou Sunmed Co.,Ltd.', 'Medoffice Saglik Endustri A.S.']);
+});
+
+test('collapseSpellings: one spelling per company, the one with the POs', () => {
+    const same = (a, b) => a.replace(/[^a-z]/gi, '').toLowerCase() === b.replace(/[^a-z]/gi, '').toLowerCase() || /sunmed/i.test(a) && /sunmed/i.test(b);
+    const names = ['Suzhou Sunmed Co.,Ltd.', 'Medoffice', 'SUNMED', 'Suzhou Sunmed Co., Ltd', 'medoffice'];
+    const weight = n => ({ 'Suzhou Sunmed Co.,Ltd.': 58, 'Suzhou Sunmed Co., Ltd': 1, medoffice: 3 })[n] || 0;
+    assert.deepEqual(L.collapseSpellings(names, { same, weight }), [
+        { name: 'Suzhou Sunmed Co.,Ltd.', others: ['SUNMED', 'Suzhou Sunmed Co., Ltd'] },
+        { name: 'medoffice', others: ['Medoffice'] },
+    ], 'clusters keep the group’s order; the heaviest spelling leads, the rest are kept as others');
+    assert.deepEqual(L.collapseSpellings(['SUNMED', 'Suzhou Sunmed Co.,Ltd.'], { same }), [{ name: 'SUNMED', others: ['Suzhou Sunmed Co.,Ltd.'] }], 'no weights: the first (lowest id) leads');
+    assert.deepEqual(L.collapseSpellings(['A', 'B'], { same: () => false }), [{ name: 'A', others: [] }, { name: 'B', others: [] }]);
+    assert.deepEqual(L.collapseSpellings([], { same }), []);
+});
+
+test('qcSupplierChoice: the supplier a QC invoice is filed under', () => {
+    const key = v => String(v).trim().replace(/\s+/g, ' ').toLowerCase();
+    const one = [{ name: 'Suzhou Sunmed Co.,Ltd.', others: ['SUNMED'] }];
+    const two = [...one, { name: 'Medoffice', others: [] }];
+    assert.deepEqual(L.qcSupplierChoice({ clusters: one, wanted: null, force: false, key }), { supplierName: 'Suzhou Sunmed Co.,Ltd.' });
+    assert.deepEqual(L.qcSupplierChoice({ clusters: one, wanted: 'sunmed', force: false, key }), { supplierName: 'Suzhou Sunmed Co.,Ltd.' }, 'a duplicate spelling resolves to its company’s leading one');
+    assert.deepEqual(L.qcSupplierChoice({ clusters: two, wanted: 'MEDOFFICE', force: false, key }), { supplierName: 'Medoffice' });
+    assert.deepEqual(L.qcSupplierChoice({ clusters: two, wanted: null, force: false, key }), { fail: { code: 'SUPPLIER_REQUIRED', suppliers: ['Suzhou Sunmed Co.,Ltd.', 'Medoffice'] } });
+    assert.deepEqual(L.qcSupplierChoice({ clusters: two, wanted: 'Nobody', force: false, key }), { fail: { code: 'SUPPLIER_NOT_IN_GROUP', suppliers: ['Suzhou Sunmed Co.,Ltd.', 'Medoffice'] } });
+    assert.deepEqual(L.qcSupplierChoice({ clusters: two, wanted: 'Nobody', force: true, key }), { supplierName: 'Nobody' }, 'forced: any name');
+    assert.deepEqual(L.qcSupplierChoice({ clusters: [], wanted: null, force: false, key }), { fail: { code: 'SUPPLIER_REQUIRED', suppliers: [] } });
 });
 
 test('import: refusals', async () => {

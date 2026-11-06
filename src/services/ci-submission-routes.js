@@ -68,6 +68,7 @@ const { recordAuditStrict } = require('../lib/audit');
 const PL = require('./pl-results');
 const SP = require('./shipment-payments');
 const C = require('./ci-check');
+const { sameSupplier } = require('./shipment-payment-extract');
 
 const FILE_URL_SECONDS = 15 * 60;
 // A staff re-read runs after the response, in this API Lambda: well inside
@@ -188,6 +189,23 @@ function registerCiSubmissionRoutes(app, deps) {
         return rows[0] || null;
     };
     const supplierOf = row => ({ exists: Number(row.supplier_exists) === 1 });
+
+    // Live POs under each spelling: what makes one spelling of a company lead.
+    const poCountsFor = async (conn, names) => {
+        const counts = new Map();
+        const list = [...new Set((names || []).filter(n => n && String(n).trim()))];
+        if (!list.length) return counts;
+        const [rows] = await conn.query(
+            `SELECT supplier, COUNT(*) AS n FROM purchase_orders WHERE deleted_at IS NULL AND supplier IN (?) GROUP BY supplier`, [list]
+        );
+        for (const r of rows) counts.set(r.supplier, Number(r.n) || 0);
+        return counts;
+    };
+    // The group's spellings collapsed to one per company (lib collapseSpellings):
+    // the roster holds Shipsline-era duplicates ("SUNMED") beside the native
+    // row, and a login is granted all of them; pickers show the one the POs use.
+    const clustersOf = (names, counts) => L.collapseSpellings(names, { same: sameSupplier, weight: n => counts.get(n) || 0 });
+    const groupClusters = async (conn, names) => clustersOf(names, await poCountsFor(conn, names));
     const blockersOf = row => (row.status === 'submitted' ? L.importBlockers({ row, supplier: supplierOf(row) }) : []);
     const toJson = (row, { blockers = [] } = {}) => L.submissionToJson(row, { blockers });
 
@@ -409,25 +427,21 @@ function registerCiSubmissionRoutes(app, deps) {
                     const [names] = await conn.query(`SELECT id, name FROM suppliers WHERE id IN (?) AND deleted_at IS NULL`, [[...ids]]);
                     for (const n of names) live.set(Number(n.id), n.name);
                 }
-                // supplierNames: the live names of every supplier in the group, the
-                // row's own first, one per name once case, spaces and punctuation are
-                // dropped (so "Suzhou Sunmed Co.,Ltd." and "Suzhou Sunmed Co., Ltd"
-                // show once). A multi-supplier login's invoices can be for any of them.
-                const groupNames = (g, primary) => {
-                    const seen = new Set();
-                    const out = [];
-                    for (const name of [primary, ...[...g.supplierIds].sort((a, b) => a - b).map(id => live.get(id))]) {
-                        const key = name ? SP.supplierKey(name).replace(/[^a-z0-9]/g, '') : '';
-                        if (!key || seen.has(key)) continue;
-                        seen.add(key);
-                        out.push(name);
-                    }
-                    return out;
-                };
+                // supplierNames: one live name per company in the group, the row's
+                // own company first: the roster holds several spellings of one
+                // supplier ("SUNMED", "Suzhou Sunmed Co., Ltd", "Suzhou Sunmed
+                // Co.,Ltd."), and a multi-supplier login's invoices can be for any
+                // company. The spelling with the most live POs leads, and names the
+                // rail (supplierName) too.
+                const counts = await poCountsFor(conn, [...live.values()]);
+                const groupNames = (g, primary) => clustersOf(
+                    [primary, ...[...g.supplierIds].sort((a, b) => a - b).map(id => live.get(id))], counts,
+                ).map(c => c.name);
                 return [...groups.values()]
                     .map(g => {
-                        const supplierName = live.get(g.supplierId) || g.supplierName;
-                        return { ...g, supplierName, supplierNames: groupNames(g, supplierName), supplierIds: [...g.supplierIds].sort((a, b) => a - b) };
+                        const names = groupNames(g, live.get(g.supplierId) || g.supplierName);
+                        const supplierName = names[0] || live.get(g.supplierId) || g.supplierName;
+                        return { ...g, supplierName, supplierNames: names, supplierIds: [...g.supplierIds].sort((a, b) => a - b) };
                     })
                     .sort((a, b) => (b.pending > 0) - (a.pending > 0)
                         || String(a.oldestSubmittedAt || '~').localeCompare(String(b.oldestSubmittedAt || '~'))
@@ -459,11 +473,11 @@ function registerCiSubmissionRoutes(app, deps) {
                 const extract = usableExtract(row);
                 let live = null;
                 let liveError = null;
-                // The group's live supplier names: a QC invoice is filed under one of them.
+                // The group's companies, one spelling each: a QC invoice is filed under one of them.
                 let groupNames = [];
                 try {
                     const group = await PL.portalGroup(conn, row);
-                    groupNames = group.names;
+                    groupNames = (await groupClusters(conn, group.names)).map(c => c.name);
                     if (row.status === 'submitted' && extract) {
                         if (PL.groupGone(group)) liveError = 'The supplier no longer exists.';
                         else live = await C.suggestShipment(conn, { group, extract });
@@ -601,28 +615,24 @@ function registerCiSubmissionRoutes(app, deps) {
                 const blockers = L.importBlockers({ row, supplier: { exists: true } });
                 if (blockers.length) return { fail: NOT_IMPORTABLE(blockers) };
                 if (body.kind === 'qc') {
-                    // On the supplier alone: one of the group's live names.
-                    const names = group.names;
-                    let supplierName = null;
-                    if (body.supplierName) {
-                        const inGroup = names.find(n => SP.supplierKey(n) === SP.supplierKey(body.supplierName));
-                        supplierName = inGroup || (body.force ? body.supplierName : null);
-                        if (!supplierName) {
-                            return { fail: {
-                                status: 422, code: 'SUPPLIER_NOT_IN_GROUP',
-                                error: `${body.supplierName} is not one of this login's suppliers (${names.join(', ')}). Send force: true to file it under that name anyway.`,
-                                extra: { suppliers: names },
-                            } };
-                        }
-                    } else if (names.length === 1) {
-                        supplierName = names[0];
-                    } else {
-                        return { fail: {
+                    // On the supplier alone: one of the group's companies, under the
+                    // spelling its POs use (a duplicate spelling asked for resolves
+                    // to it; any name with force).
+                    const clusters = await groupClusters(conn, group.names);
+                    const choice = L.qcSupplierChoice({ clusters, wanted: body.supplierName, force: body.force, key: SP.supplierKey });
+                    if (choice.fail) {
+                        const names = choice.fail.suppliers;
+                        return { fail: choice.fail.code === 'SUPPLIER_REQUIRED' ? {
                             status: 422, code: 'SUPPLIER_REQUIRED',
                             error: `This login holds ${names.length} suppliers: say which one the QC invoice is for (supplierName).`,
                             extra: { suppliers: names },
+                        } : {
+                            status: 422, code: 'SUPPLIER_NOT_IN_GROUP',
+                            error: `${body.supplierName} is not one of this login's suppliers (${names.join(', ')}). Send force: true to file it under that name anyway.`,
+                            extra: { suppliers: names },
                         } };
                     }
+                    const supplierName = choice.supplierName;
                     const duplicateId = await duplicateOf(conn, row, { supplierName });
                     if (duplicateId && !body.force) {
                         return { fail: {
