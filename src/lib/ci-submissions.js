@@ -50,6 +50,19 @@ const isCiKey = key => typeof key === 'string' && CI_KEY_RE.test(key);
 
 const STATUSES = ['draft', 'submitted', 'imported', 'rejected', 'withdrawn', 'discarded'];
 const CONFIDENCES = ['confident', 'unsure', 'none'];
+// What staff import an upload as. The portal's "Send invoices" page takes
+// whatever the supplier calls an invoice, so staff say which it is (user,
+// 2026-11-06). The place it is filed decides how it is read
+// (lib/payment-documents.js readPlaceOf, shipment-payment-extract.js):
+//   commercial  the invoice for the goods in a shipment: filed on that
+//               shipment, read against the box;
+//   qc          an invoice for QC units (_FQC lines), which belong to no
+//               container: filed on the supplier alone with no shipment, as
+//               the Payments page's "Upload QC invoice" files one, so every
+//               line is read as a QC line whatever the reader calls the file.
+// A wrong choice is put right afterwards with the document's refile route
+// (POST /shipment-payment-documents/:id/refile), never by deleting.
+const IMPORT_KINDS = ['commercial', 'qc'];
 // Why the top candidate won (match_reason). null with confidence 'none'.
 //   container   the invoice prints that shipment's container, B/L or booking number
 //   po_numbers  it names the group's purchase orders on board there, and no other candidate as many
@@ -321,6 +334,45 @@ function importBlockers({ row, supplier = null, file = null }) {
     return [...new Set(out)];
 }
 
+// ── Spellings ───────────────────────────────────────────────────────────────
+/**
+ * One spelling per company. The roster holds several spellings of one
+ * supplier ("SUNMED", "Suzhou Sunmed Co., Ltd", "Suzhou Sunmed Co.,Ltd.":
+ * Shipsline-era rows beside the native one), and a portal login is granted
+ * all of them. Pickers show one (user, 2026-11-06): the spelling the live POs
+ * use (`weight`), ties to the earlier name (the group's order is by id, so the
+ * older row). `same(a, b)` is the extractor's sameSupplier.
+ * → [{ name, others }] in the group's order; blanks dropped.
+ */
+function collapseSpellings(names, { same, weight = () => 0 }) {
+    const clusters = [];
+    for (const name of names || []) {
+        if (!name || !String(name).trim()) continue;
+        const c = clusters.find(x => [x.name, ...x.others].some(n => same(n, name)));
+        if (!c) { clusters.push({ name, others: [] }); continue; }
+        if (weight(name) > weight(c.name)) { c.others.push(c.name); c.name = name; } else c.others.push(name);
+    }
+    return clusters;
+}
+
+/**
+ * The supplier a QC invoice is filed under: the body's name when it is one of
+ * the group's spellings (filed under that company's leading one), any name
+ * with force, else the group's one company, else a choice is needed.
+ * `key` is shipment-payments' supplierKey.
+ * → { supplierName } or { fail: { code: 'SUPPLIER_REQUIRED' | 'SUPPLIER_NOT_IN_GROUP', suppliers } }
+ */
+function qcSupplierChoice({ clusters, wanted, force, key }) {
+    const suppliers = clusters.map(c => c.name);
+    if (wanted) {
+        const hit = clusters.find(c => [c.name, ...c.others].some(n => key(n) === key(wanted)));
+        if (hit) return { supplierName: hit.name };
+        return force ? { supplierName: wanted } : { fail: { code: 'SUPPLIER_NOT_IN_GROUP', suppliers } };
+    }
+    if (clusters.length === 1) return { supplierName: clusters[0].name };
+    return { fail: { code: 'SUPPLIER_REQUIRED', suppliers } };
+}
+
 // ── Request parsing ─────────────────────────────────────────────────────────
 // The shipment a request names: { shipmentId, shipmentReference }, at least
 // one of them (the id wins). → { value } or { error }
@@ -337,13 +389,25 @@ function parseShipmentChoice(b) {
     return { value: { shipmentId, shipmentReference } };
 }
 
-// POST /:id/import body { rowVersion, shipmentId | shipmentReference, supplierName?, note?, force? }.
+// POST /:id/import body { rowVersion, kind?, shipmentId | shipmentReference, supplierName?, note?, force? }.
+// kind defaults to 'commercial' (every older client names a shipment). A QC
+// invoice names no shipment: with kind 'qc' the body must carry none.
 function parseImportBody(body) {
     const b = isObj(body) ? body : {};
     const rv = parseRowVersion(b.rowVersion);
     if (rv.error) return { error: rv.error };
-    const s = parseShipmentChoice(b);
-    if (s.error) return { error: s.error };
+    const kind = b.kind === undefined || b.kind === null || b.kind === '' ? 'commercial' : b.kind;
+    if (!IMPORT_KINDS.includes(kind)) return { error: `kind must be one of: ${IMPORT_KINDS.join(', ')}.` };
+    let s;
+    if (kind === 'qc') {
+        const named = (b.shipmentId !== undefined && b.shipmentId !== null && b.shipmentId !== '')
+            || (typeof b.shipmentReference === 'string' && b.shipmentReference.trim());
+        if (named) return { error: 'A QC invoice is filed on the supplier, not on a shipment: leave shipmentId and shipmentReference out.' };
+        s = { value: { shipmentId: null, shipmentReference: null } };
+    } else {
+        s = parseShipmentChoice(b);
+        if (s.error) return { error: s.error };
+    }
     let supplierName = null;
     if (b.supplierName !== undefined && b.supplierName !== null && b.supplierName !== '') {
         if (typeof b.supplierName !== 'string' || !b.supplierName.trim()) return { error: 'supplierName must be a non-empty string.' };
@@ -352,7 +416,23 @@ function parseImportBody(body) {
     if (b.force !== undefined && b.force !== null && typeof b.force !== 'boolean') return { error: 'force must be true or false.' };
     const note = parseNote(b.note);
     if (note.error) return { error: note.error };
-    return { value: { rowVersion: rv.value, ...s.value, supplierName, force: b.force === true, note: note.value } };
+    return { value: { rowVersion: rv.value, kind, ...s.value, supplierName, force: b.force === true, note: note.value } };
+}
+
+/**
+ * What an imported row was filed as, from the document it became (the routes'
+ * SELECT joins it: filed_shipment_id / filed_doc_kind / filed_deleted_at), so
+ * a document refiled on the Payments page since the import still answers
+ * truthfully. Without the join (an older caller), the row's own confirmed
+ * shipment decides. null until something is filed.
+ * → 'commercial' | 'qc' | null
+ */
+function importedAsOf(row) {
+    if (row.document_id == null) return null;
+    const live = row.filed_doc_kind !== undefined && row.filed_deleted_at == null;
+    const shipmentId = live ? row.filed_shipment_id : row.confirmed_shipment_id;
+    const reference = live ? row.filed_shipment_reference : row.confirmed_shipment_reference;
+    return shipmentId != null || (reference && String(reference).trim()) ? 'commercial' : 'qc';
 }
 
 // ── JSON ────────────────────────────────────────────────────────────────────
@@ -363,7 +443,12 @@ function parseImportBody(body) {
  */
 function submissionToJson(row, { blockers = [] } = {}) {
     const suggestedId = num(row.suggested_shipment_id);
-    const confirmedId = num(row.confirmed_shipment_id);
+    // Where it is filed now: the document's live place when the SELECT joined
+    // it (refiled since the import, or deleted: then the row's snapshot).
+    const liveDoc = row.document_id != null && row.filed_doc_kind !== undefined && row.filed_deleted_at == null;
+    const confirmedId = num(liveDoc ? row.filed_shipment_id : row.confirmed_shipment_id);
+    const confirmedRef = (liveDoc ? row.filed_shipment_reference : row.confirmed_shipment_reference) || null;
+    const importedAs = importedAsOf(row);
     return {
         id: Number(row.id),
         supplierId: Number(row.supplier_id),
@@ -386,12 +471,15 @@ function submissionToJson(row, { blockers = [] } = {}) {
             shipmentReference: row.suggested_shipment_reference || null,
             supplierName: row.suggested_supplier_name || null,
         } : null,
-        confirmed: confirmedId || row.confirmed_shipment_reference ? {
+        // Filed: on a shipment (a commercial invoice), or on the supplier alone
+        // with no shipment (a QC invoice: both shipment fields null).
+        confirmed: confirmedId || confirmedRef || importedAs ? {
             shipmentId: confirmedId,
-            shipmentReference: row.confirmed_shipment_reference || null,
+            shipmentReference: confirmedRef,
             // The name the document was filed under; null when it is gone.
             supplierName: row.filed_supplier_name || null,
         } : null,
+        importedAs,
         documentId: num(row.document_id),
         submittedAt: row.submitted_at_iso || null,
         decidedBy: row.decided_by || null,
@@ -446,6 +534,7 @@ module.exports = {
     CI_KEY_RE,
     STATUSES,
     CONFIDENCES,
+    IMPORT_KINDS,
     MATCH_REASONS,
     STAFF_MAX_CHECK_ATTEMPTS,
     CANDIDATE_LIMIT,
@@ -465,8 +554,11 @@ module.exports = {
     parseStoredCandidates,
     candidateToJson,
     importBlockers,
+    collapseSpellings,
+    qcSupplierChoice,
     parseShipmentChoice,
     parseImportBody,
+    importedAsOf,
     submissionToJson,
     checkToJson,
 };

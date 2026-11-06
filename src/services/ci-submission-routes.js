@@ -19,16 +19,30 @@
 // The files live in the portal's private bucket (PI_UPLOADS_BUCKET, ci/*,
 // s3:GetObject only); an import copies the bytes into this app's PO bucket.
 //
+// The portal's "Send invoices" page takes whatever the supplier calls an
+// invoice, so staff say what each one is at import (body.kind, user
+// 2026-11-06): 'commercial' (the default) files it on the shipment they
+// confirm; 'qc' files it on the supplier alone with NO shipment — exactly
+// what the Payments page's "Upload QC invoice" does — so the read treats
+// every line as a QC line (lib/payment-documents.js readPlaceOf). A wrong
+// choice is put right with POST /shipment-payment-documents/:id/refile
+// (payment-document-refile-routes.js), which moves the document and reads it
+// again; the row's confirmed_* columns follow.
+//
 // Import, in order:
 //   1. plain reads (gates): the row (status, rowVersion), the supplier group
 //      (pl-results.js portalGroup; SUPPLIER_NOT_FOUND when none is live), the
-//      blockers, the shipment (resolveShipment: SHIPMENT_NOT_FOUND, MERGED,
-//      NOT_BOOKED — the staff upload's requireBookedShipment rules), the
-//      supplier name the document is filed under (the group's spelling on that
-//      shipment's POs with the most on board, or the body's supplierName when
-//      it is on the shipment; else 422 SUPPLIER_NOT_ON_SHIPMENT unless
-//      `force`), and the duplicate guard (a live document with the same file
-//      name and size on that shipment: 409 DUPLICATE_DOCUMENT unless `force`);
+//      blockers; for a commercial invoice the shipment (resolveShipment:
+//      SHIPMENT_NOT_FOUND, MERGED, NOT_BOOKED — the staff upload's
+//      requireBookedShipment rules) and the supplier name the document is
+//      filed under (the group's spelling on that shipment's POs with the most
+//      on board, or the body's supplierName when it is on the shipment; else
+//      422 SUPPLIER_NOT_ON_SHIPMENT unless `force`); for a QC invoice the
+//      group's one live name, or the body's supplierName when the group has
+//      several (422 SUPPLIER_REQUIRED without it; 422 SUPPLIER_NOT_IN_GROUP
+//      for a name outside the group unless `force`); and the duplicate guard
+//      (a live document with the same file name and size in that place — the
+//      shipment, or the supplier alone: 409 DUPLICATE_DOCUMENT unless `force`);
 //   2. outside any transaction: GetObject (IfMatch the ETag the portal pinned
 //      when it sent the invoice), size and magic bytes, PutObject into the PO
 //      bucket at shipment-payments/<uuid>/<name>, the staff upload's layout;
@@ -54,6 +68,7 @@ const { recordAuditStrict } = require('../lib/audit');
 const PL = require('./pl-results');
 const SP = require('./shipment-payments');
 const C = require('./ci-check');
+const { sameSupplier } = require('./shipment-payment-extract');
 
 const FILE_URL_SECONDS = 15 * 60;
 // A staff re-read runs after the response, in this API Lambda: well inside
@@ -144,11 +159,15 @@ function registerCiSubmissionRoutes(app, deps) {
     const getChecker = () => (checker || (checker = C.createCiChecker({ pool, s3 })));
 
     // Every column of the row, the timestamps as ISO UTC strings, whether
-    // its supplier row is live (supplier_exists), and for an imported row the
-    // supplier its document was filed under (filed_supplier_name: the row's own
-    // supplier_name is the lowest id of the uploader's group, which for a
-    // multi-supplier login is often not the one on the shipment). Read on every
-    // call: an invalid JPORTAL_DB_SCHEMA is a 500 on these routes, not a failed import.
+    // its supplier row is live (supplier_exists), and for an imported row its
+    // document's live place (filed_*): the supplier it was filed under
+    // (filed_supplier_name: the row's own supplier_name is the lowest id of the
+    // uploader's group, which for a multi-supplier login is often not the one
+    // on the shipment), its shipment (none for a QC invoice; it may have been
+    // refiled since the import, so the document, not the row's confirmed_*
+    // snapshot, says what it is — lib importedAsOf) and whether it was deleted.
+    // Read on every call: an invalid JPORTAL_DB_SCHEMA is a 500 on these
+    // routes, not a failed import.
     const selectSql = () => `SELECT r.*,
                        DATE_FORMAT(r.submitted_at, '%Y-%m-%dT%H:%i:%sZ') AS submitted_at_iso,
                        DATE_FORMAT(r.decided_at, '%Y-%m-%dT%H:%i:%sZ') AS decided_at_iso,
@@ -156,7 +175,11 @@ function registerCiSubmissionRoutes(app, deps) {
                        DATE_FORMAT(r.created_at, '%Y-%m-%dT%H:%i:%sZ') AS created_at_iso,
                        TIMESTAMPDIFF(SECOND, r.check_started_at, UTC_TIMESTAMP()) AS check_age_seconds,
                        (s.id IS NOT NULL) AS supplier_exists,
-                       d.supplier_name AS filed_supplier_name
+                       d.supplier_name AS filed_supplier_name,
+                       d.shipment_id AS filed_shipment_id,
+                       d.shipment_reference AS filed_shipment_reference,
+                       d.doc_kind AS filed_doc_kind,
+                       d.deleted_at AS filed_deleted_at
                   FROM ${jportalSchema()}.ci_submissions r
                   LEFT JOIN suppliers s ON s.id = r.supplier_id AND s.deleted_at IS NULL
                   LEFT JOIN shipment_payment_documents d ON d.id = r.document_id`;
@@ -166,6 +189,23 @@ function registerCiSubmissionRoutes(app, deps) {
         return rows[0] || null;
     };
     const supplierOf = row => ({ exists: Number(row.supplier_exists) === 1 });
+
+    // Live POs under each spelling: what makes one spelling of a company lead.
+    const poCountsFor = async (conn, names) => {
+        const counts = new Map();
+        const list = [...new Set((names || []).filter(n => n && String(n).trim()))];
+        if (!list.length) return counts;
+        const [rows] = await conn.query(
+            `SELECT supplier, COUNT(*) AS n FROM purchase_orders WHERE deleted_at IS NULL AND supplier IN (?) GROUP BY supplier`, [list]
+        );
+        for (const r of rows) counts.set(r.supplier, Number(r.n) || 0);
+        return counts;
+    };
+    // The group's spellings collapsed to one per company (lib collapseSpellings):
+    // the roster holds Shipsline-era duplicates ("SUNMED") beside the native
+    // row, and a login is granted all of them; pickers show the one the POs use.
+    const clustersOf = (names, counts) => L.collapseSpellings(names, { same: sameSupplier, weight: n => counts.get(n) || 0 });
+    const groupClusters = async (conn, names) => clustersOf(names, await poCountsFor(conn, names));
     const blockersOf = row => (row.status === 'submitted' ? L.importBlockers({ row, supplier: supplierOf(row) }) : []);
     const toJson = (row, { blockers = [] } = {}) => L.submissionToJson(row, { blockers });
 
@@ -239,14 +279,16 @@ function registerCiSubmissionRoutes(app, deps) {
         return { shipment: cand.shipment, memberPos: cand.memberPos };
     };
 
-    // A live document with the same file name and size on the shipment: the
-    // staff upload's duplicate guard.
-    const duplicateOf = async (conn, row, shipmentId) => {
+    // A live document with the same file name and size in the same place —
+    // the shipment, or (a QC invoice) the supplier alone: the staff upload's
+    // duplicate guard.
+    const duplicateOf = async (conn, row, { shipmentId = null, supplierName = null } = {}) => {
         const [dupes] = await conn.query(
             `SELECT id FROM shipment_payment_documents
-              WHERE deleted_at IS NULL AND filename = ? AND file_size = ? AND shipment_id = ?
+              WHERE deleted_at IS NULL AND filename = ? AND file_size = ?
+                AND ${shipmentId != null ? 'shipment_id = ?' : 'shipment_id IS NULL AND supplier_key = ?'}
               ORDER BY id LIMIT 1`,
-            [String(row.filename || '').slice(0, 200), Number(row.file_size), shipmentId]
+            [String(row.filename || '').slice(0, 200), Number(row.file_size), shipmentId != null ? shipmentId : SP.supplierKey(supplierName)]
         );
         return dupes.length ? Number(dupes[0].id) : null;
     };
@@ -385,25 +427,21 @@ function registerCiSubmissionRoutes(app, deps) {
                     const [names] = await conn.query(`SELECT id, name FROM suppliers WHERE id IN (?) AND deleted_at IS NULL`, [[...ids]]);
                     for (const n of names) live.set(Number(n.id), n.name);
                 }
-                // supplierNames: the live names of every supplier in the group, the
-                // row's own first, one per name once case, spaces and punctuation are
-                // dropped (so "Suzhou Sunmed Co.,Ltd." and "Suzhou Sunmed Co., Ltd"
-                // show once). A multi-supplier login's invoices can be for any of them.
-                const groupNames = (g, primary) => {
-                    const seen = new Set();
-                    const out = [];
-                    for (const name of [primary, ...[...g.supplierIds].sort((a, b) => a - b).map(id => live.get(id))]) {
-                        const key = name ? SP.supplierKey(name).replace(/[^a-z0-9]/g, '') : '';
-                        if (!key || seen.has(key)) continue;
-                        seen.add(key);
-                        out.push(name);
-                    }
-                    return out;
-                };
+                // supplierNames: one live name per company in the group, the row's
+                // own company first: the roster holds several spellings of one
+                // supplier ("SUNMED", "Suzhou Sunmed Co., Ltd", "Suzhou Sunmed
+                // Co.,Ltd."), and a multi-supplier login's invoices can be for any
+                // company. The spelling with the most live POs leads, and names the
+                // rail (supplierName) too.
+                const counts = await poCountsFor(conn, [...live.values()]);
+                const groupNames = (g, primary) => clustersOf(
+                    [primary, ...[...g.supplierIds].sort((a, b) => a - b).map(id => live.get(id))], counts,
+                ).map(c => c.name);
                 return [...groups.values()]
                     .map(g => {
-                        const supplierName = live.get(g.supplierId) || g.supplierName;
-                        return { ...g, supplierName, supplierNames: groupNames(g, supplierName), supplierIds: [...g.supplierIds].sort((a, b) => a - b) };
+                        const names = groupNames(g, live.get(g.supplierId) || g.supplierName);
+                        const supplierName = names[0] || live.get(g.supplierId) || g.supplierName;
+                        return { ...g, supplierName, supplierNames: names, supplierIds: [...g.supplierIds].sort((a, b) => a - b) };
                     })
                     .sort((a, b) => (b.pending > 0) - (a.pending > 0)
                         || String(a.oldestSubmittedAt || '~').localeCompare(String(b.oldestSubmittedAt || '~'))
@@ -435,16 +473,20 @@ function registerCiSubmissionRoutes(app, deps) {
                 const extract = usableExtract(row);
                 let live = null;
                 let liveError = null;
-                if (row.status === 'submitted' && extract) {
-                    try {
-                        const group = await PL.portalGroup(conn, row);
+                // The group's companies, one spelling each: a QC invoice is filed under one of them.
+                let groupNames = [];
+                try {
+                    const group = await PL.portalGroup(conn, row);
+                    groupNames = (await groupClusters(conn, group.names)).map(c => c.name);
+                    if (row.status === 'submitted' && extract) {
                         if (PL.groupGone(group)) liveError = 'The supplier no longer exists.';
                         else live = await C.suggestShipment(conn, { group, extract });
-                    } catch (e) {
-                        liveError = e.message;
-                        log.warn('[GET /ci-submissions/:id] live candidates failed', { id, error: e.message });
                     }
-                } else if (row.status === 'submitted') {
+                } catch (e) {
+                    liveError = e.message;
+                    log.warn('[GET /ci-submissions/:id] live candidates failed', { id, error: e.message });
+                }
+                if (row.status === 'submitted' && !extract && !liveError) {
                     liveError = 'The file has not been read.';
                 }
                 const [auditRows] = await conn.query(
@@ -452,7 +494,7 @@ function registerCiSubmissionRoutes(app, deps) {
                       WHERE entity_type = 'ci_submission' AND entity_id = ? ORDER BY created_at, id`,
                     [id]
                 );
-                return { row, document, live, liveError, auditRows };
+                return { row, document, live, liveError, auditRows, groupNames };
             });
             if (!out) return refuse(res, notFound(id));
             const { row, document, live } = out;
@@ -476,6 +518,7 @@ function registerCiSubmissionRoutes(app, deps) {
                 fileUrl: file.url,
                 fileExpiresAt: file.expiresAt,
                 document: documentJson(document),
+                groupNames: out.groupNames,
                 canImport: row.status === 'submitted' && blockers.length === 0,
                 canRecheck: L.planEvent('staff', row, Date.now()).claim,
                 audit: out.auditRows.map(a => ({
@@ -523,7 +566,7 @@ function registerCiSubmissionRoutes(app, deps) {
                     suppliers,
                     evidence: evidence ? L.candidateToJson(evidence) : null,
                     extractionUsable: Boolean(extract),
-                    duplicateDocumentId: await duplicateOf(conn, row, Number(r.shipment.id)),
+                    duplicateDocumentId: await duplicateOf(conn, row, { shipmentId: Number(r.shipment.id) }),
                 };
             });
             if (out.fail) return refuse(res, out.fail);
@@ -535,16 +578,21 @@ function registerCiSubmissionRoutes(app, deps) {
     });
 
     // POST /api/v1/ci-submissions/:id/import
-    // Body: { rowVersion, shipmentId | shipmentReference, supplierName?, note?, force? }
-    // Files the invoice on that shipment and reads it as a staff upload is
-    // (see the header). supplierName: file it under that name (one of the
-    // shipment's PO supplier names, or any name with force). force: file it
-    // although the supplier has no POs on the shipment, or a document with the
-    // same name and size is already there. note: shown to the supplier.
+    // Body: { rowVersion, kind?, shipmentId | shipmentReference, supplierName?, note?, force? }
+    // kind 'commercial' (default): files the invoice on that shipment and
+    // reads it as a staff upload is (see the header). supplierName: file it
+    // under that name (one of the shipment's PO supplier names, or any name
+    // with force). force: file it although the supplier has no POs on the
+    // shipment, or a document with the same name and size is already there.
+    // kind 'qc': files it on the supplier alone, no shipment (the Payments
+    // page's "Upload QC invoice"); supplierName: one of the group's live
+    // names, required when the group has several (or any name with force).
+    // note: shown to the supplier.
     // 200 { submission, document }
     // 400 BAD_FIELD · 403 CANNOT_DECIDE · 404 NOT_FOUND | SHIPMENT_NOT_FOUND
     // 409 NOT_SUBMITTED | STALE | CONFLICT | MERGED | DUPLICATE_DOCUMENT
-    // 422 NOT_IMPORTABLE | NOT_BOOKED | SUPPLIER_NOT_FOUND | SUPPLIER_NOT_ON_SHIPMENT · 502 FILE_UNAVAILABLE
+    // 422 NOT_IMPORTABLE | NOT_BOOKED | SUPPLIER_NOT_FOUND | SUPPLIER_NOT_ON_SHIPMENT
+    //     | SUPPLIER_REQUIRED | SUPPLIER_NOT_IN_GROUP · 502 FILE_UNAVAILABLE
     app.post('/api/v1/ci-submissions/:id(\\d+)/import', async (req, res) => {
         try {
             if (!L.canDecide(req.userType)) return refuse(res, CANNOT_DECIDE(req.userType));
@@ -566,6 +614,34 @@ function registerCiSubmissionRoutes(app, deps) {
                 if (PL.groupGone(group)) return { fail: SUPPLIER_NOT_FOUND(row) };
                 const blockers = L.importBlockers({ row, supplier: { exists: true } });
                 if (blockers.length) return { fail: NOT_IMPORTABLE(blockers) };
+                if (body.kind === 'qc') {
+                    // On the supplier alone: one of the group's companies, under the
+                    // spelling its POs use (a duplicate spelling asked for resolves
+                    // to it; any name with force).
+                    const clusters = await groupClusters(conn, group.names);
+                    const choice = L.qcSupplierChoice({ clusters, wanted: body.supplierName, force: body.force, key: SP.supplierKey });
+                    if (choice.fail) {
+                        const names = choice.fail.suppliers;
+                        return { fail: choice.fail.code === 'SUPPLIER_REQUIRED' ? {
+                            status: 422, code: 'SUPPLIER_REQUIRED',
+                            error: `This login holds ${names.length} suppliers: say which one the QC invoice is for (supplierName).`,
+                            extra: { suppliers: names },
+                        } : {
+                            status: 422, code: 'SUPPLIER_NOT_IN_GROUP',
+                            error: `${body.supplierName} is not one of this login's suppliers (${names.join(', ')}). Send force: true to file it under that name anyway.`,
+                            extra: { suppliers: names },
+                        } };
+                    }
+                    const supplierName = choice.supplierName;
+                    const duplicateId = await duplicateOf(conn, row, { supplierName });
+                    if (duplicateId && !body.force) {
+                        return { fail: {
+                            status: 409, code: 'DUPLICATE_DOCUMENT',
+                            error: `${row.filename} is already a QC invoice of this supplier.`, extra: { existingId: duplicateId },
+                        } };
+                    }
+                    return { group, shipment: null, supplierName, onShipment: null, duplicateId };
+                }
                 const r = await resolveShipment(conn, body);
                 if (r.fail) return r;
                 const { shipment, memberPos } = r;
@@ -587,7 +663,7 @@ function registerCiSubmissionRoutes(app, deps) {
                         extra: { suppliers },
                     } };
                 }
-                const duplicateId = await duplicateOf(conn, row, Number(shipment.id));
+                const duplicateId = await duplicateOf(conn, row, { shipmentId: Number(shipment.id) });
                 if (duplicateId && !body.force) {
                     return { fail: {
                         status: 409, code: 'DUPLICATE_DOCUMENT',
@@ -643,7 +719,9 @@ function registerCiSubmissionRoutes(app, deps) {
                 const g = await gates(conn, lockedRow);
                 if (g.fail) return g;
                 const { shipment, supplierName } = g;
-                const reference = shipment.reference || String(shipment.id);
+                // A QC invoice has no shipment: the place is what makes it one.
+                const shipmentId = shipment ? shipment.id : null;
+                const reference = shipment ? (shipment.reference || String(shipment.id)) : null;
                 const filename = String(lockedRow.filename || shownName).trim().slice(0, 200) || shownName;
 
                 const [ins] = await conn.query(
@@ -652,9 +730,9 @@ function registerCiSubmissionRoutes(app, deps) {
                          filename, s3_key, public_url, content_type, file_size, notes, extract_status, uploaded_by_email)
                      VALUES (?, ?, ?, ?, NULL, 'balance_invoice', ?, ?, ?, ?, ?, ?, 'processing', ?)`,
                     [
-                        shipment.id, reference, supplierName, SP.supplierKey(supplierName),
+                        shipmentId, reference, supplierName, SP.supplierKey(supplierName),
                         filename, s3Key, publicS3Url(s3Key), lockedRow.content_type, bytes.length,
-                        `Uploaded by the supplier through the supplier portal (invoice upload ${id}).`,
+                        `Uploaded by the supplier through the supplier portal (invoice upload ${id})${body.kind === 'qc' ? ', filed as a QC invoice' : ''}.`,
                         lockedRow.submitted_by_email || null,
                     ]
                 );
@@ -662,7 +740,7 @@ function registerCiSubmissionRoutes(app, deps) {
                 await recordAuditStrict(conn, {
                     entityType: 'shipment_payment_document', entityId: documentId, action: 'create', before: null,
                     after: {
-                        shipmentId: shipment.id, supplierName, filename, docKind: 'balance_invoice', fileSize: bytes.length,
+                        shipmentId, supplierName, filename, docKind: 'balance_invoice', fileSize: bytes.length, kind: body.kind,
                         source: 'portal', ciSubmissionId: id, uploadedByEmail: lockedRow.submitted_by_email || null,
                     },
                     userEmail: req.userEmail,
@@ -674,7 +752,7 @@ function registerCiSubmissionRoutes(app, deps) {
                             document_id = ?, confirmed_shipment_id = ?, confirmed_shipment_reference = ?,
                             row_version = row_version + 1
                       WHERE id = ? AND status = 'submitted' AND row_version = ?`,
-                    [req.userEmail || 'unknown', body.note, documentId, shipment.id, String(reference).slice(0, 100), id, body.rowVersion]
+                    [req.userEmail || 'unknown', body.note, documentId, shipmentId, reference == null ? null : String(reference).slice(0, 100), id, body.rowVersion]
                 );
                 // The row is locked, so this cannot miss; if it does, nothing is committed.
                 if (done.affectedRows !== 1) throw new Error(`ci_submissions ${id} was not submitted at import`);
@@ -683,7 +761,7 @@ function registerCiSubmissionRoutes(app, deps) {
                     entityType: 'ci_submission', entityId: id, action: 'import',
                     before: { status: 'submitted', rowVersion: body.rowVersion },
                     after: {
-                        status: 'imported', documentId, shipmentId: shipment.id, shipmentReference: reference, supplierName,
+                        status: 'imported', documentId, kind: body.kind, shipmentId, shipmentReference: reference, supplierName,
                         onShipment: g.onShipment, force: body.force, duplicateOf: g.duplicateId, note: body.note,
                         groupSupplierIds: g.group.supplierIds,
                         suggestedShipmentId: lockedRow.suggested_shipment_id == null ? null : Number(lockedRow.suggested_shipment_id),

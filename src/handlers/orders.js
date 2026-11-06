@@ -69,6 +69,7 @@ const { registerPoChangeRequestRoutes } = require('../services/po-change-request
 const { registerPiSubmissionRoutes } = require('../services/pi-submission-routes');
 const { registerPlSubmissionRoutes } = require('../services/pl-submission-routes');
 const { registerCiSubmissionRoutes } = require('../services/ci-submission-routes');
+const { registerPaymentDocumentRefileRoutes } = require('../services/payment-document-refile-routes');
 const { registerFileTransferRoutes } = require('../services/file-transfer-routes');
 // Bank-detail verification on portal PIs: the positive payment gate (isPayable).
 const bankVerification = require('../lib/bank-verification');
@@ -12234,6 +12235,24 @@ registerCiSubmissionRoutes(app, {
     s3,
     poBucket: PO_BUCKET,
     publicS3Url,
+    shipmentPaymentDocumentRowToJson,
+    runShipmentPaymentExtraction,
+    log,
+});
+
+// ── Refiling a balance invoice (/api/v1/shipment-payment-documents/:id/refile) ──
+// Moves an invoice between a shipment (a commercial invoice) and the supplier
+// alone (a QC invoice) — the place decides how it is read — and reads it again.
+// Frontend guide: docs/shipment-payments-frontend.md.
+registerPaymentDocumentRefileRoutes(app, {
+    withConnection,
+    pool,
+    ready: async () => {
+        await auditLogSchemaReady;
+        await shipmentsSchemaReady;
+        await shipmentPaymentsSchemaReady;
+    },
+    recordAudit,
     shipmentPaymentDocumentRowToJson,
     runShipmentPaymentExtraction,
     log,
