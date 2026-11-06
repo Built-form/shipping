@@ -92,9 +92,7 @@ const outcomeFor = row => (row ? (OUTCOME_FOR_STATUS[row.status] || 'blocked') :
 // Outcomes after which the address can see the PO on the portal once signed in.
 const GRANTED_OUTCOMES = new Set(['invited', 'approved', 'already_active']);
 
-const escapeHtml = s => String(s == null ? '' : s)
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+const { FONT, INK, MUTED, BORDER, CODE_BG, escapeHtml, button, linkFallback, small } = require('./email-layout');
 
 /**
  * The fixed portal block under the template body: the button to the PO, and
@@ -107,27 +105,25 @@ function portalBlockHtml({ poNumber, version, poUrl, registerUrl: regUrl, preapp
     const po = escapeHtml(poNumber);
     const v = version != null ? ` v${escapeHtml(version)}` : '';
     const vZh = version != null ? `（第 ${escapeHtml(version)} 版）` : '';
-    const href = escapeHtml(poUrl);
     const reg = escapeHtml(regUrl);
-    const P = 'margin:0 0 10px;';
-    const SMALL = 'margin:0 0 8px;font-size:13px;color:#444;';
+    const regLink = `<a href="${reg}" style="color:#1f5fbf;word-break:break-all;">${reg}</a>`;
     const account = preapproved
         ? [
-            `<p style="${SMALL}"><strong>New to the portal?</strong> Register at <a href="${reg}">${reg}</a> with the email address this message was sent to. That address is already approved for your company, so you will see this order as soon as you sign in. There is no approval to wait for.</p>`,
-            `<p style="${SMALL}"><strong>首次使用门户？</strong>请使用接收本邮件的邮箱地址在 <a href="${reg}">${reg}</a> 注册。该邮箱已获批准，登录后即可查看此订单，无需等待审核。</p>`,
+            small(`<strong style="color:${INK};">New to the portal?</strong> Register at ${regLink} with the email address this message was sent to. That address is already approved for your company, so you will see this order as soon as you sign in. There is no approval to wait for.`),
+            small(`<strong style="color:${INK};">首次使用门户？</strong>请使用接收本邮件的邮箱地址在 ${regLink} 注册。该邮箱已获批准，登录后即可查看此订单，无需等待审核。`),
         ]
         : [
-            `<p style="${SMALL}"><strong>New to the portal?</strong> Register at <a href="${reg}">${reg}</a> with the email address this message was sent to, and our team will approve your access.</p>`,
-            `<p style="${SMALL}"><strong>首次使用门户？</strong>请使用接收本邮件的邮箱地址在 <a href="${reg}">${reg}</a> 注册，我们的团队将审核并开通您的访问权限。</p>`,
+            small(`<strong style="color:${INK};">New to the portal?</strong> Register at ${regLink} with the email address this message was sent to, and our team will approve your access.`),
+            small(`<strong style="color:${INK};">首次使用门户？</strong>请使用接收本邮件的邮箱地址在 ${regLink} 注册，我们的团队将审核并开通您的访问权限。`),
         ];
     return [
-        '<div style="margin:18px 0;padding:14px 16px;border:1px solid #d6dbe1;border-radius:4px;background:#f7f9fb;font-family:Helvetica,Arial,sans-serif;font-size:14px;color:#222;line-height:1.5;">',
-        `<p style="${P}"><strong>PO ${po}${v}</strong> is on the supplier portal. Sign in, and download the PDF from the order's page. / 采购订单 <strong>${po}</strong>${vZh}已发布在供应商门户。请登录门户，在该订单页面下载 PDF。</p>`,
-        `<p style="margin:0 0 12px;"><a href="${href}" style="display:inline-block;padding:9px 16px;background:#1f5fbf;color:#ffffff;text-decoration:none;border-radius:3px;font-weight:600;">Go to the supplier portal / 前往供应商门户</a></p>`,
-        `<p style="${SMALL}">Or copy this address into your browser / 或将此地址复制到浏览器：<a href="${href}">${href}</a></p>`,
+        `<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:18px 0;"><tr><td style="padding:16px 18px 6px;border:1px solid ${BORDER};border-radius:8px;background:${CODE_BG};">`,
+        `<p style="margin:0 0 12px;font-family:${FONT};font-size:15px;line-height:1.6;color:${INK};"><strong>PO ${po}${v}</strong> is on the supplier portal. Sign in, and download the PDF from the order's page.<br>采购订单 <strong>${po}</strong>${vZh}已发布在供应商门户。请登录门户，在该订单页面下载 PDF。</p>`,
+        button(poUrl, 'Go to the supplier portal / 前往供应商门户'),
+        linkFallback(poUrl),
         ...account,
-        `<p style="margin:0;font-size:12px;color:#666;">No PDF is attached to this email: the PO is kept on the portal, so you always download the current version. / 本邮件不附带 PDF：采购订单保存在门户中，您下载的始终是最新版本。</p>`,
-        '</div>',
+        `<p style="margin:0 0 10px;font-family:${FONT};font-size:12px;line-height:1.5;color:${MUTED};">No PDF is attached to this email: the PO is kept on the portal, so you always download the current version. / 本邮件不附带 PDF：采购订单保存在门户中，您下载的始终是最新版本。</p>`,
+        '</td></tr></table>',
     ].join('');
 }
 

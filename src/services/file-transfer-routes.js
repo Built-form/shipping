@@ -40,6 +40,7 @@ const { v4: uuidv4 } = require('uuid');
 const L = require('../lib/file-transfers');
 const { jportalSchema, isSourceMissing } = require('../lib/jportal');
 const { sendFrontMessage } = require('./front-send');
+const { wrapEmail } = require('../lib/email-layout');
 
 const UPLOAD_URL_SECONDS = 15 * 60;
 const FILE_URL_SECONDS = 15 * 60;
@@ -183,8 +184,10 @@ function registerFileTransferRoutes(app, deps) {
             const tpl = await getEmailTemplate(conn, L.TEMPLATE_KEY);
             const vars = L.buildEmailVars({ row, portalUrl: process.env.SUPPLIER_PORTAL_URL || '' });
             let subject = renderTemplate(tpl.subject, vars.subject) || `A file from JFA Medical – ${vars.subject.filename}`;
+            const title = subject;
             if (redirect) subject = `[for ${original.join(', ') || 'nobody'}] ${subject}`;
-            const html = renderTemplate(tpl.bodyHtml, vars.body);
+            // The template is the inside of the card (src/lib/email-layout.js).
+            const html = wrapEmail({ title, bodyHtml: renderTemplate(tpl.bodyHtml, vars.body) });
             const sent = await sendFrontMessage({ to, subject, html });
             if (sent.ok) {
                 await conn.query(`UPDATE ${jp()}.file_transfers SET notified_at = UTC_TIMESTAMP(), notify_error = NULL WHERE id = ?`, [id]);

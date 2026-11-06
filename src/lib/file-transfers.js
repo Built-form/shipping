@@ -304,9 +304,7 @@ function viewToJson(v) {
 
 // ── The email to the supplier ──────────────────────────────────────────────
 
-const escapeHtml = s => String(s == null ? '' : s)
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+const { escapeHtml, button, linkFallback, noteBox } = require('./email-layout');
 
 const TEMPLATE_KEY = 'file_transfer_portal';
 
@@ -322,7 +320,7 @@ function buildEmailVars({ row, portalUrl }) {
     const base = portalUrl ? String(portalUrl).replace(/\/+$/, '') : '';
     const href = base ? `${base}/files` : '';
     const portalLinkHtml = href
-        ? `<p><a href="${escapeHtml(href)}">Download it in the supplier portal / 在供应商门户中下载</a></p>`
+        ? button(href, 'Download it in the supplier portal / 在供应商门户中下载') + linkFallback(href)
         : '';
     return {
         subject: { supplierName, filename: String(row.filename || '').replace(/[\r\n]+/g, ' ') },
@@ -331,7 +329,7 @@ function buildEmailVars({ row, portalUrl }) {
             filename: escapeHtml(row.filename || ''),
             note: escapeHtml(text),
             noteHtml: text
-                ? `<p><strong>Message from our team / 我方留言：</strong><br>${escapeHtml(text).replace(/\r?\n/g, '<br>')}</p>`
+                ? noteBox('Message from our team / 我方留言', escapeHtml(text).replace(/\r?\n/g, '<br>'))
                 : '',
             portalLinkHtml,
         },

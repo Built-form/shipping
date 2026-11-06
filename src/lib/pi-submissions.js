@@ -471,9 +471,7 @@ function checkToJson(row, usability) {
 }
 
 // ── Email ───────────────────────────────────────────────────────────────────
-const escapeHtml = s => String(s == null ? '' : s)
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+const { escapeHtml, button, linkFallback, noteBox } = require('./email-layout');
 
 const templateKeyFor = status => TEMPLATE_KEYS[status] || null;
 
@@ -497,7 +495,7 @@ function buildEmailVars({ row, status, note, portalUrl }) {
         const label = status === 'rejected'
             ? 'Upload a corrected PI / 上传更正后的形式发票'
             : 'View in the supplier portal / 在供应商门户中查看';
-        portalLinkHtml = `<p><a href="${escapeHtml(href)}">${label}</a></p>`;
+        portalLinkHtml = button(href, label) + linkFallback(href);
     }
     return {
         subject: { poNumber },
@@ -506,7 +504,7 @@ function buildEmailVars({ row, status, note, portalUrl }) {
             filename: escapeHtml(row.filename || ''),
             note: escapeHtml(text),
             noteHtml: text
-                ? `<p><strong>Note from our team / 我方备注：</strong><br>${escapeHtml(text).replace(/\r?\n/g, '<br>')}</p>`
+                ? noteBox('Note from our team / 我方备注', escapeHtml(text).replace(/\r?\n/g, '<br>'))
                 : '',
             portalLinkHtml,
         },

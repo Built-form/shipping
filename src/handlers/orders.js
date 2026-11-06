@@ -36,6 +36,7 @@ const { receiveOrderStock, ReceiveError } = require('../services/order-receive')
 // recipients there; the portal records who opened it (docs/po-portal-send.md).
 const { preapprovePortalUsers, loadPoDocumentViews } = require('../services/portal-access');
 const poPortalEmail = require('../lib/po-portal-email');
+const { wrapEmail } = require('../lib/email-layout');
 const { listWarehousesWithLocations, listLocationsForWarehouse } = require('../services/mintsoft-locations');
 // Daily alerts (slide-out alert window). Generation logic lives in the service
 // so the nightly Lambda reuses it; here we only expose the read/ack routes.
@@ -6557,7 +6558,13 @@ app.post('/api/v1/purchase-order-documents/:id/email', async (req, res) => {
             const receiptToken = await createEmailReceipt(conn, {
                 emailType: 'purchase_order', sentTo: toAddresses, subject: finalSubject,
             });
-            const bodyWithReceipt = appendReceiptLink(bodyWithPortal, receiptToken, apiBaseUrlFromReq(req));
+            // The template (or the staff member's edit of it), the portal block
+            // and the receipt link, inside the portal emails' frame
+            // (src/lib/email-layout.js).
+            const bodyWithReceipt = wrapEmail({
+                title: finalSubject,
+                bodyHtml: appendReceiptLink(bodyWithPortal, receiptToken, apiBaseUrlFromReq(req)),
+            });
 
             // Front /channels/{id}/messages. `to[]` notation makes Front treat
             // the field as an array; we append once per recipient.

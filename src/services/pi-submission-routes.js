@@ -47,6 +47,7 @@ const { loadBankReference } = require('./bank-reference');
 const { jportalSchema, PO_SUPPLIER_IS } = require('../lib/jportal');
 const { recordAuditStrict } = require('../lib/audit');
 const { sendFrontMessage } = require('./front-send');
+const { wrapEmail } = require('../lib/email-layout');
 
 const FILE_URL_SECONDS = 15 * 60;
 
@@ -241,8 +242,10 @@ function registerPiSubmissionRoutes(app, deps) {
             const tpl = await getEmailTemplate(conn, key);
             const vars = L.buildEmailVars({ row, status, note, portalUrl: process.env.SUPPLIER_PORTAL_URL || '' });
             let subject = renderTemplate(tpl.subject, vars.subject) || `PI – ${vars.subject.poNumber}`;
+            const title = subject;
             if (redirect) subject = `[for ${original}] ${subject}`;
-            const html = renderTemplate(tpl.bodyHtml, vars.body);
+            // The template is the inside of the card (src/lib/email-layout.js).
+            const html = wrapEmail({ title, bodyHtml: renderTemplate(tpl.bodyHtml, vars.body) });
             const sent = await sendFrontMessage({ to, subject, html });
             if (sent.ok) {
                 await conn.query(`UPDATE ${jp}.pi_submissions SET notified_at = UTC_TIMESTAMP(), notify_error = NULL WHERE id = ?`, [id]);

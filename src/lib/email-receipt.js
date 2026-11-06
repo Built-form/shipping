@@ -169,11 +169,12 @@ function appendReceiptLink(htmlBody, token, baseUrl) {
     const base = (baseUrl || '').replace(/\/+$/, '');
     if (!token || !base) return htmlBody || '';
     const url = `${base}${CONFIRM_PATH}/${token}`;
+    const { FONT, INK, MUTED, BORDER, button } = require('./email-layout');
     const block = [
-        '<div style="font-family:Helvetica,Arial,sans-serif;font-size:13px;color:#555;line-height:1.5;margin-top:28px;padding-top:16px;border-top:1px solid #e5e7eb;">',
-        '<p style="margin:0 0 12px;">Kindly confirm you have received this email:<br><span style="color:#777;">请确认您已收到此邮件：</span></p>',
-        `<p style="margin:0 0 12px;"><a href="${url}" style="display:inline-block;background:#0b6bcb;color:#ffffff;text-decoration:none;padding:11px 20px;border-radius:6px;font-weight:600;">I've read it · 看好了</a></p>`,
-        '<p style="margin:0;font-size:12px;color:#888;line-height:1.5;">To opt out of automated follow-up reminders for this email, please confirm receipt above.<br>如需停止接收关于此邮件的自动跟进提醒，请在上方确认收到。</p>',
+        `<div style="font-family:${FONT};font-size:13px;color:${INK};line-height:1.5;margin-top:28px;padding-top:16px;border-top:1px solid ${BORDER};">`,
+        `<p style="margin:0 0 4px;">Kindly confirm you have received this email:<br><span style="color:${MUTED};">请确认您已收到此邮件：</span></p>`,
+        button(url, "I've read it · 看好了"),
+        `<p style="margin:0;font-size:12px;color:${MUTED};line-height:1.5;">To opt out of automated follow-up reminders for this email, please confirm receipt above.<br>如需停止接收关于此邮件的自动跟进提醒，请在上方确认收到。</p>`,
         '</div>',
     ].join('');
     return `${htmlBody || ''}${block}`;
