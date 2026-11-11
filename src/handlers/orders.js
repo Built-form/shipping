@@ -458,6 +458,10 @@ const UPDATABLE_FIELDS = {
     orderedDate: 'ordered_date',
     estimatedReadyDate: 'estimated_ready_date',
     artworkConfirmedDate: 'artwork_confirmed_date',
+    // The supplier's own confirmation (docs/artwork-confirmations.md). Normally
+    // set by their tick on the portal; staff can also set or clear it on the
+    // order form. Copied to both halves of a split, as the staff date is.
+    artworkConfirmedBySupplier: 'artwork_confirmed_by_supplier',
 };
 
 // INSERT shape derived from UPDATABLE_FIELDS so every CRUD path covers every

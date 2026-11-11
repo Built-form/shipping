@@ -19,6 +19,7 @@ const COPIED = [
     'lot_number', 'mfg_date', 'exp_date', 'delivery_time', 'container_status', 'booking_status', 'arrived_date',
     'external_container_number', 'awb_number', 'purchase_order_id', 'unit_price', 'actual_ready_date',
     'estimated_departure_date', 'shipped_date', 'ordered_date', 'estimated_ready_date', 'artwork_confirmed_date',
+    'artwork_confirmed_by_supplier',
 ];
 
 const same = (a, b) => (a instanceof Date || b instanceof Date)
