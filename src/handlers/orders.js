@@ -74,6 +74,7 @@ const { registerFileTransferRoutes } = require('../services/file-transfer-routes
 // Bank-detail verification on portal PIs: the positive payment gate (isPayable).
 const bankVerification = require('../lib/bank-verification');
 const { registerPaymentDueDateRoutes } = require('../services/payment-due-date-routes');
+const { registerUiHintRoutes } = require('../services/ui-hint-routes');
 const extrasLib = require('../lib/payment-extras');
 const { correctBalance } = require('../lib/balance-correction');
 const paymentDocumentsLib = require('../lib/payment-documents');
@@ -12142,6 +12143,16 @@ registerPaymentAlertRoutes(app, {
 // A date a person sets on a payment, or on one row of it, in place of the one
 // the Payments flow page derives; cleared to go back to the derived date.
 registerPaymentDueDateRoutes(app, {
+    withConnection,
+    recordAudit,
+    auditLogSchemaReady,
+    log,
+});
+
+// ── Info bubbles (/api/v1/ui-hints) ───────────────────────────────────────
+// Short explanations people write on ShipLine's captions (column heads, field
+// labels, section headings) for everyone to read. Keyed by the caption's place.
+registerUiHintRoutes(app, {
     withConnection,
     recordAudit,
     auditLogSchemaReady,

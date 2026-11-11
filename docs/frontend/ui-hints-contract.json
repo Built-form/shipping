@@ -1,0 +1,370 @@
+{
+  "contract": 1,
+  "source": "shipping/src/lib/ui-hints.js via shipping/tools/gen-ui-hints-contract.js — do not edit by hand",
+  "keyRe": "^[a-z0-9][a-z0-9_-]{0,59}(\\.[a-z0-9][a-z0-9_-]{0,59}){0,4}(\\/[a-z0-9][a-z0-9_.-]{0,60}){1,4}$",
+  "limits": {
+    "key": 160,
+    "body": 600,
+    "linkPath": 200,
+    "linkLabel": 80
+  },
+  "roles": [
+    "admin",
+    "standard"
+  ],
+  "linkRoots": [
+    "bridge",
+    "purchase-orders",
+    "manifest",
+    "draft",
+    "warehouse",
+    "delivered",
+    "qc-visits",
+    "supplier-portal",
+    "shipments",
+    "payments",
+    "audit-log",
+    "email-receipts",
+    "users",
+    "info"
+  ],
+  "refusals": {
+    "STALE": {
+      "status": 409
+    },
+    "OCCUPIED": {
+      "status": 409
+    },
+    "OCCUPIED_MOVE": {
+      "status": 409
+    },
+    "DELETED": {
+      "status": 404
+    },
+    "NOT_AUTHOR": {
+      "status": 403
+    },
+    "CANNOT_WRITE_HINTS": {
+      "status": 403
+    }
+  },
+  "cases": {
+    "keys": [
+      {
+        "key": "a/b",
+        "ok": true
+      },
+      {
+        "key": "payments.ready/col.supplier",
+        "ok": true
+      },
+      {
+        "key": "order/field.carton-cbm",
+        "ok": true
+      },
+      {
+        "key": "draft.plan/candidates/col.mo_ex_sea",
+        "ok": true
+      },
+      {
+        "key": "stages/stage.in_transit",
+        "ok": true
+      },
+      {
+        "key": "a.b.c.d.e/w/x/y/z",
+        "ok": true
+      },
+      {
+        "key": "a/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "ok": true
+      },
+      {
+        "key": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/cccccccccccccccccccccccccccccccccccccc",
+        "ok": true
+      },
+      {
+        "key": "",
+        "ok": false
+      },
+      {
+        "key": "payments",
+        "ok": false
+      },
+      {
+        "key": "Payments/col.x",
+        "ok": false
+      },
+      {
+        "key": "payments/",
+        "ok": false
+      },
+      {
+        "key": "/col.x",
+        "ok": false
+      },
+      {
+        "key": "payments//x",
+        "ok": false
+      },
+      {
+        "key": "a.b.c.d.e.f/x",
+        "ok": false
+      },
+      {
+        "key": "a/b/c/d/e/f",
+        "ok": false
+      },
+      {
+        "key": "a/-x",
+        "ok": false
+      },
+      {
+        "key": "a/.x",
+        "ok": false
+      },
+      {
+        "key": "-a/x",
+        "ok": false
+      },
+      {
+        "key": "a b/c",
+        "ok": false
+      },
+      {
+        "key": "a/é",
+        "ok": false
+      },
+      {
+        "key": "a/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "ok": false
+      },
+      {
+        "key": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/ccccccccccccccccccccccccccccccccccccccc",
+        "ok": false
+      }
+    ],
+    "bodies": [
+      {
+        "body": "Plain sentence.",
+        "ok": true,
+        "normalized": "Plain sentence."
+      },
+      {
+        "body": "  one\r\ntwo\rthree  ",
+        "ok": true,
+        "normalized": "one\ntwo\nthree"
+      },
+      {
+        "body": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "ok": true,
+        "normalized": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      },
+      {
+        "body": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "ok": false
+      },
+      {
+        "body": "",
+        "ok": false
+      },
+      {
+        "body": "   \n  ",
+        "ok": false
+      }
+    ],
+    "links": [
+      {
+        "input": {},
+        "ok": true,
+        "linkPath": null,
+        "linkLabel": null
+      },
+      {
+        "input": {
+          "linkPath": "",
+          "linkLabel": "  "
+        },
+        "ok": true,
+        "linkPath": null,
+        "linkLabel": null
+      },
+      {
+        "input": {
+          "linkPath": "/payments?tab=ready",
+          "linkLabel": "  Ready to pay "
+        },
+        "ok": true,
+        "linkPath": "/payments?tab=ready",
+        "linkLabel": "Ready to pay"
+      },
+      {
+        "input": {
+          "linkPath": "/info",
+          "linkLabel": "All hints"
+        },
+        "ok": true,
+        "linkPath": "/info",
+        "linkLabel": "All hints"
+      },
+      {
+        "input": {
+          "linkPath": "/qc-visits?tab=visits&vst=CONFIRMED",
+          "linkLabel": "Confirmed visits"
+        },
+        "ok": true,
+        "linkPath": "/qc-visits?tab=visits&vst=CONFIRMED",
+        "linkLabel": "Confirmed visits"
+      },
+      {
+        "input": {
+          "linkPath": "/payments",
+          "linkLabel": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        },
+        "ok": true,
+        "linkPath": "/payments",
+        "linkLabel": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      },
+      {
+        "input": {
+          "linkPath": "/payments"
+        },
+        "ok": false
+      },
+      {
+        "input": {
+          "linkLabel": "Payments"
+        },
+        "ok": false
+      },
+      {
+        "input": {
+          "linkPath": "payments",
+          "linkLabel": "x"
+        },
+        "ok": false
+      },
+      {
+        "input": {
+          "linkPath": "//evil.example",
+          "linkLabel": "x"
+        },
+        "ok": false
+      },
+      {
+        "input": {
+          "linkPath": "https://evil.example/payments",
+          "linkLabel": "x"
+        },
+        "ok": false
+      },
+      {
+        "input": {
+          "linkPath": "/qc",
+          "linkLabel": "x"
+        },
+        "ok": false
+      },
+      {
+        "input": {
+          "linkPath": "/supplier-changes",
+          "linkLabel": "x"
+        },
+        "ok": false
+      },
+      {
+        "input": {
+          "linkPath": "/nope",
+          "linkLabel": "x"
+        },
+        "ok": false
+      },
+      {
+        "input": {
+          "linkPath": "/payments/../users",
+          "linkLabel": "x"
+        },
+        "ok": false
+      },
+      {
+        "input": {
+          "linkPath": "/%2e%2e/users",
+          "linkLabel": "x"
+        },
+        "ok": false
+      },
+      {
+        "input": {
+          "linkPath": "/payments%zz",
+          "linkLabel": "x"
+        },
+        "ok": false
+      },
+      {
+        "input": {
+          "linkPath": "/payments\\x",
+          "linkLabel": "x"
+        },
+        "ok": false
+      },
+      {
+        "input": {
+          "linkPath": "/pay ments",
+          "linkLabel": "x"
+        },
+        "ok": false
+      },
+      {
+        "input": {
+          "linkPath": "/payments?xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "linkLabel": "x"
+        },
+        "ok": false
+      },
+      {
+        "input": {
+          "linkPath": "/payments",
+          "linkLabel": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        },
+        "ok": false
+      }
+    ],
+    "deletes": [
+      {
+        "userType": "admin",
+        "userEmail": "someone@jfa.test",
+        "createdBy": "Maria@JFA.test",
+        "ok": true
+      },
+      {
+        "userType": "standard",
+        "userEmail": "maria@jfa.test",
+        "createdBy": "Maria@JFA.test",
+        "ok": true
+      },
+      {
+        "userType": "standard",
+        "userEmail": "tom@jfa.test",
+        "createdBy": "Maria@JFA.test",
+        "ok": false
+      },
+      {
+        "userType": "accountant",
+        "userEmail": "maria@jfa.test",
+        "createdBy": "Maria@JFA.test",
+        "ok": false
+      },
+      {
+        "userType": "warehouse",
+        "userEmail": "maria@jfa.test",
+        "createdBy": "Maria@JFA.test",
+        "ok": false
+      },
+      {
+        "userType": "exec",
+        "userEmail": "maria@jfa.test",
+        "createdBy": "Maria@JFA.test",
+        "ok": false
+      }
+    ]
+  }
+}
