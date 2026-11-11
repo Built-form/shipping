@@ -295,7 +295,36 @@ const FILE_TRANSFER_TEMPLATE = {
 // never runs again; a brand-new server gets it from there, INSERT IGNORE).
 DEFAULT_EMAIL_TEMPLATES.push(FILE_TRANSFER_TEMPLATE);
 
+// "Please confirm the final artwork" (src/services/artwork-confirmation-routes.js,
+// docs/artwork-confirmations.md; seeded by
+// 2026-11-11_20_seed_artwork_confirmation_template.js). Sent from a PO in
+// ShipLine (category 'Artwork'). The sender appends a fixed block under this
+// body: the items asked about and the "Confirm artwork" button, whose link
+// carries the request's token and needs no sign-in. {lines} is an HTML list of
+// those items; {poNumber} and {supplier} are HTML-escaped by the sender. A tick
+// fills the line's artwork_confirmed_by_supplier.
+const ARTWORK_CONFIRMATION_TEMPLATE_KEY = 'artwork_confirmation';
+const ARTWORK_CONFIRMATION_TEMPLATE = {
+    key: ARTWORK_CONFIRMATION_TEMPLATE_KEY,
+    name: 'Artwork Confirmed',
+    category: 'Artwork',
+    description: 'Emailed to a supplier to ask them to confirm the final artwork of a PO’s items. A "Confirm artwork" button is appended automatically: it opens a page on the supplier portal (no sign-in) where they tick each item, and each tick marks the line as artwork-confirmed by the supplier. Tokens: {poNumber} {supplier} {lines}.',
+    subject: 'Please confirm final artwork – {poNumber} / 请确认最终图稿',
+    bodyHtml: [
+        '<div style="font-family:Helvetica,Arial,sans-serif;font-size:14px;color:#222;line-height:1.5;">',
+        '<p>Greetings,</p>',
+        '<p>Please confirm the final artwork for the items of purchase order <strong>{poNumber}</strong>. Use the button below and tick each item whose artwork you have confirmed.</p>',
+        '<p>您好，</p>',
+        '<p>请确认采购订单 <strong>{poNumber}</strong> 各产品的最终图稿。请点击下方按钮，并勾选您已确认图稿的每个产品。</p>',
+        '<p>Thank you. / 谢谢。</p>',
+        '<p>Kind Regards,<br>Operations Team.<br>JFA Medical Ltd.</p>',
+        '</div>',
+    ].join(''),
+};
+DEFAULT_EMAIL_TEMPLATES.push(ARTWORK_CONFIRMATION_TEMPLATE);
+
 module.exports = {
     DEFAULT_EMAIL_TEMPLATES, SUPPLIER_PI_TEMPLATE_KEYS, QC_VISIT_TEMPLATE_KEYS, PO_PORTAL_TEMPLATE_KEY,
     FILE_TRANSFER_TEMPLATE_KEY, FILE_TRANSFER_TEMPLATE,
+    ARTWORK_CONFIRMATION_TEMPLATE_KEY, ARTWORK_CONFIRMATION_TEMPLATE,
 };

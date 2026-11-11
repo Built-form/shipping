@@ -729,6 +729,20 @@ functions:
     reservedConcurrency: 2
     maximumRetryAttempts: 1
 
+  # ── Supplier-portal "artwork confirmed" ticks ──
+  # Invoked directly (async) by jportal with { purchaseOrderId } after a supplier
+  # ticks items as artwork-confirmed, from the email link's page or their order
+  # page (docs/artwork-confirmations.md). Fills artwork_confirmed_date on those
+  # lines and moves a PO_SENT line into IN_PRODUCTION, with the usual audit rows;
+  # a no-op when nothing is waiting. No events: the portal's invoke is the only trigger.
+  artworkConfirmed:
+    handler: src/handlers/artwork-confirmed.handler
+    name: jportal-artwork-confirmed-${self:custom.envName}
+    timeout: 60
+    memorySize: 512
+    reservedConcurrency: 2
+    maximumRetryAttempts: 1
+
   # ── Daily alerts generator (nightly) ──
   # Aggregates the day's container ETAs + supplier ready dates into the
   # daily_alerts table for the Shipsline slide-out alert window. Runs at 04:00
