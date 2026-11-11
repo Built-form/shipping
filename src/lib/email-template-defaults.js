@@ -298,7 +298,7 @@ DEFAULT_EMAIL_TEMPLATES.push(FILE_TRANSFER_TEMPLATE);
 // "Please confirm the final artwork" (src/services/artwork-confirmation-routes.js,
 // docs/artwork-confirmations.md; seeded by
 // 2026-11-11_20_seed_artwork_confirmation_template.js; reworded by
-// 2026-11-11_30_reword_artwork_confirmation_template.js). Sent from a PO in
+// 2026-11-11_30 and 2026-11-11_40). Sent from a PO in
 // ShipLine (category 'Artwork'). The sender appends a fixed block under this
 // body: the items asked about and the "Confirm artwork" button, whose link
 // carries the request's token and needs no sign-in. {lines} is an HTML list of
@@ -309,16 +309,16 @@ const ARTWORK_CONFIRMATION_TEMPLATE = {
     key: ARTWORK_CONFIRMATION_TEMPLATE_KEY,
     name: 'Artwork Confirmed',
     category: 'Artwork',
-    description: 'Emailed to a supplier to tell them the final artwork of a PO’s items is approved and to ask them to acknowledge it per item. A "Confirm artwork" button is appended automatically: it opens a page on the supplier portal (no sign-in) where they tick each item, and each tick marks the line as artwork-confirmed by the supplier. Tokens: {poNumber} {supplier} {lines}.',
-    subject: 'Please confirm final artwork – {poNumber} / 请确认最终图稿',
+    description: 'Emailed to a supplier to tell them the final artwork of a PO’s items is approved and to ask them to acknowledge it per item. A "Confirm artwork received" button is appended automatically: it opens a page on the supplier portal (no sign-in) where they tick each item, and each tick marks the line as artwork-confirmed by the supplier. Tokens: {poNumber} {supplier} {lines}.',
+    subject: 'Final artwork approved – {poNumber} – please confirm receipt / 最终图稿已批准，请确认收到',
     bodyHtml: [
         '<div style="font-family:Helvetica,Arial,sans-serif;font-size:14px;color:#222;line-height:1.5;">',
         '<p>Dear Team,</p>',
         '<p>We confirm that the final artwork for items under <strong>{poNumber}</strong> has been reviewed and approved.</p>',
-        '<p>Please proceed accordingly and kindly acknowledge receipt of this email to confirm that our final artwork approval has been received and noted. Please ensure cartons are made with glue and not staples. Use the button below and tick each item whose artwork you have confirmed.</p>',
+        '<p>Please proceed accordingly and kindly acknowledge receipt of this email to confirm that our final artwork approval has been received and noted. Please ensure cartons are made with glue and not staples. Use the button below and tick each item to confirm you have received all of its final artwork and are happy to proceed.</p>',
         '<p>您好，</p>',
         '<p>我们确认，采购订单 <strong>{poNumber}</strong> 项下各产品的最终图稿已审核并批准。</p>',
-        '<p>请据此安排后续工作，并请确认收到本邮件，以表明贵方已收到并知悉我们的最终图稿确认。请确保纸箱使用胶水粘合，不要使用钉子（订书钉）封箱。请点击下方按钮，并勾选您已确认图稿的每个产品。</p>',
+        '<p>请据此安排后续工作，并请确认收到本邮件，以表明贵方已收到并知悉我们的最终图稿确认。请确保纸箱使用胶水粘合，不要使用钉子（订书钉）封箱。请点击下方按钮，并勾选每个产品，确认您已收到其全部最终图稿并同意继续。</p>',
         '<p>Thank you. / 谢谢。</p>',
         '<p>Kind Regards,<br>Operations Team.<br>JFA Medical Ltd.</p>',
         '</div>',

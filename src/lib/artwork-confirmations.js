@@ -140,8 +140,9 @@ function linesHtml(lines) {
 }
 
 /**
- * The fixed block under the template body: what is asked, the items, the
- * button, the link as text and when it stops working. English and Chinese, as
+ * The fixed block under the template body: we have approved the final artwork
+ * and ask the supplier to confirm they have all of it and will proceed; then
+ * the items, the button, the link as text and when it stops working. English and Chinese, as
  * the portal is. `expiresOn` is 'YYYY-MM-DD'.
  */
 function artworkBlockHtml({ poNumber, url, lines, expiresOn }) {
@@ -149,12 +150,12 @@ function artworkBlockHtml({ poNumber, url, lines, expiresOn }) {
     const until = escapeHtml(expiresOn || '');
     return [
         `<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:18px 0;"><tr><td style="padding:16px 18px 6px;border:1px solid ${BORDER};border-radius:8px;background:${CODE_BG};">`,
-        `<p style="margin:0 0 12px;font-family:${FONT};font-size:15px;line-height:1.6;color:${INK};"><strong>Artwork to confirm for PO ${po}</strong><br>采购订单 <strong>${po}</strong> 待确认图稿的产品</p>`,
+        `<p style="margin:0 0 12px;font-family:${FONT};font-size:15px;line-height:1.6;color:${INK};"><strong>Final artwork approved for PO ${po}: please confirm you have it</strong><br>采购订单 <strong>${po}</strong> 的最终图稿已获我方批准，请确认收到</p>`,
         linesHtml(lines),
-        button(url, 'Confirm artwork / 确认图稿'),
+        button(url, 'Confirm artwork received / 确认已收到图稿'),
         linkFallback(url),
-        small('Open the page and tick each item whose final artwork you have confirmed, then press Confirm. No sign-in is needed. A confirmation cannot be undone, so tick an item only once its artwork is final.'),
-        small('打开页面后，请勾选您已确认最终图稿的每个产品，然后点击“确认”。无需登录。确认后无法撤销，请仅在图稿最终确定后勾选。'),
+        small('Open the page and tick each item to confirm you have received all of its final artwork and are happy to proceed, then press Confirm. No sign-in is needed. A confirmation cannot be undone, so tick an item only once you have everything for it.'),
+        small('打开页面后，请勾选每个产品，确认您已收到其全部最终图稿并同意继续，然后点击“确认”。无需登录。确认后无法撤销，请仅在已收到该产品的全部图稿后勾选。'),
         until ? `<p style="margin:0 0 10px;font-family:${FONT};font-size:12px;line-height:1.5;color:${MUTED};">This link works until ${until}. / 此链接有效期至 ${until}。</p>` : '',
         '</td></tr></table>',
     ].join('');
