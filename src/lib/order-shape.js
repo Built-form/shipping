@@ -179,6 +179,8 @@ function rowToOrder(row) {
         orderedDate: formatDate(row.ordered_date),
         estimatedReadyDate: formatDate(row.estimated_ready_date),
         artworkConfirmedDate: formatDate(row.artwork_confirmed_date),
+        // The supplier's own confirmation on the portal (docs/artwork-confirmations.md).
+        artworkConfirmedBySupplier: formatDate(row.artwork_confirmed_by_supplier),
         shipmentId: row.shipment_id ?? null,
         qcVisitIds,
     };

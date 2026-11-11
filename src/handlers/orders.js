@@ -71,6 +71,7 @@ const { registerPlSubmissionRoutes } = require('../services/pl-submission-routes
 const { registerCiSubmissionRoutes } = require('../services/ci-submission-routes');
 const { registerPaymentDocumentRefileRoutes } = require('../services/payment-document-refile-routes');
 const { registerFileTransferRoutes } = require('../services/file-transfer-routes');
+const { registerArtworkConfirmationRoutes } = require('../services/artwork-confirmation-routes');
 // Bank-detail verification on portal PIs: the positive payment gate (isPayable).
 const bankVerification = require('../lib/bank-verification');
 const { registerPaymentDueDateRoutes } = require('../services/payment-due-date-routes');
@@ -12271,6 +12272,22 @@ registerFileTransferRoutes(app, {
         await emailTemplatesSchemaReady;
     },
     s3,
+    recordAudit,
+    getEmailTemplate, renderTemplate,
+    log,
+});
+
+// ── Artwork confirmation (/api/v1/purchase-orders/:id/artwork-confirmation) ──
+// The "Artwork Confirmed" email with its no-login link into the supplier
+// portal, and what suppliers ticked there per PO line. The ticks are applied to
+// orders by jportal-artwork-confirmed-<env> (src/handlers/artwork-confirmed.js).
+// docs/artwork-confirmations.md.
+registerArtworkConfirmationRoutes(app, {
+    withConnection,
+    ready: async () => {
+        await auditLogSchemaReady;
+        await emailTemplatesSchemaReady;
+    },
     recordAudit,
     getEmailTemplate, renderTemplate,
     log,

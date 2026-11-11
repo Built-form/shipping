@@ -136,6 +136,10 @@ flowchart TB
     AL --> API
 ```
 
+### Artwork confirmation by the supplier
+
+Staff email a supplier the "Artwork Confirmed" request from a PO in ShipLine. Its link opens a no-login page on the supplier portal where the supplier ticks each item; a tick fills that line's `artwork_confirmed_by_supplier` (a field of its own, apart from the staff-set `artwork_confirmed_date`) and, when the supplier requires no deposit or the deposit has been paid, moves a `PO_SENT` line to `IN_PRODUCTION` (the `jportal-artwork-confirmed-<env>` Lambda). See [docs/artwork-confirmations.md](docs/artwork-confirmations.md).
+
 ### Order status lifecycle
 
 ```mermaid
