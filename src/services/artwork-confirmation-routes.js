@@ -26,6 +26,7 @@ const { escapeHtml, wrapEmail } = require('../lib/email-layout');
 const { ARTWORK_CONFIRMATION_TEMPLATE_KEY } = require('../lib/email-template-defaults');
 const { sendFrontMessage: defaultSend } = require('./front-send');
 const { loadDepositGate } = require('./deposit-gate');
+const { londonToday: defaultLondonToday } = require('./daily-alerts');
 const defaultLog = require('../lib/logger');
 
 // The tables are not there yet (the migration has not run on this server).
@@ -56,6 +57,7 @@ function registerArtworkConfirmationRoutes(app, deps) {
         withConnection, recordAudit, getEmailTemplate, renderTemplate,
         ready = async () => {},
         sendFrontMessage = defaultSend,
+        londonToday = defaultLondonToday,
         log = defaultLog,
     } = deps;
 
@@ -291,6 +293,35 @@ function registerArtworkConfirmationRoutes(app, deps) {
                 'UPDATE artwork_confirmation_requests SET front_message_uid = ?, front_conversation_id = ? WHERE id = ?',
                 [sent.frontMessageUid, sent.frontConversationId, requestId]
             );
+
+            // Sending the email IS staff confirming the artwork: each line it covers
+            // gets the staff Artwork Confirmed date (artwork_confirmed_date) of today,
+            // UK time. A line that already has one keeps it. Only once Front has
+            // taken the message: a failed send dates nothing.
+            const artworkDate = londonToday();
+            const toDate = chosenLines.filter(l => A.toYmd(l.artwork_confirmed_date) === null).map(l => Number(l.id));
+            let datedOrderIds = [];
+            if (toDate.length) {
+                await conn.query(
+                    `UPDATE orders SET artwork_confirmed_date = ?
+                      WHERE id IN (?) AND purchase_order_id = ? AND artwork_confirmed_date IS NULL AND deleted_at IS NULL`,
+                    [artworkDate, toDate, id]
+                );
+                const [now] = await conn.query(
+                    'SELECT id FROM orders WHERE id IN (?) AND artwork_confirmed_date = ?',
+                    [toDate, artworkDate]
+                );
+                datedOrderIds = now.map(r => Number(r.id));
+                for (const orderId of datedOrderIds) {
+                    await recordAudit(conn, {
+                        entityType: 'order', entityId: orderId, action: 'update',
+                        before: { artworkConfirmedDate: null },
+                        after: { artworkConfirmedDate: artworkDate, note: 'set when the artwork confirmation email was sent' },
+                        userEmail: req.userEmail,
+                    });
+                }
+            }
+
             // Never the token: whoever reads the audit log must not get the link.
             await recordAudit(conn, {
                 entityType: 'purchase_order', entityId: id, action: 'artwork_confirmation_requested',
@@ -298,10 +329,15 @@ function registerArtworkConfirmationRoutes(app, deps) {
                 after: {
                     requestId, orderIds: chosen.orderIds, to: addresses, subject: finalSubject,
                     frontMessageUid: sent.frontMessageUid, frontConversationId: sent.frontConversationId, expiresOn,
+                    artworkConfirmedDate: datedOrderIds.length ? artworkDate : null, datedOrderIds,
                 },
                 userEmail: req.userEmail,
             });
-            return { ok: true, requestId, sentTo: addresses, subject: finalSubject, panel: await readPanel(conn, id) };
+            return {
+                ok: true, requestId, sentTo: addresses, subject: finalSubject,
+                datedOrderIds, artworkConfirmedDate: datedOrderIds.length ? artworkDate : null,
+                panel: await readPanel(conn, id),
+            };
         });
         res.json(out);
     }));

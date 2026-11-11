@@ -11,7 +11,7 @@ Code: `src/lib/artwork-confirmations.js` (pure rules) and `src/lib/payment-terms
 
 ## Decisions
 
-- **A field of its own.** The supplier's confirmation is `orders.artwork_confirmed_by_supplier` (DATE, the UTC day of the tick; `2026-11-11_05_orders_artwork_confirmed_by_supplier.sql`), returned on every order as `artworkConfirmedBySupplier`. `artwork_confirmed_date` stays what staff record in ShipLine and is **neither read nor written** by any of this. So the payment rules' "deposit after artwork is confirmed" trigger and the gate on a manual move into production still follow the staff date, not the supplier's tick.
+- **A field of its own.** The supplier's confirmation is `orders.artwork_confirmed_by_supplier` (DATE, the UTC day of the tick; `2026-11-11_05_orders_artwork_confirmed_by_supplier.sql`), returned on every order as `artworkConfirmedBySupplier`. `artwork_confirmed_date` stays staff's own date. The supplier's tick never reads or writes it; **sending the request email sets it** (staff emailing the approved artwork is staff confirming it): today, UK time, on each line the email covers that has no date yet (see the email route below). So the payment rules' "deposit after artwork is confirmed" trigger and the gate on a manual move into production still follow the staff date, not the supplier's tick.
 - **The move into production is gated on the deposit** (below). When the gate holds, the confirmation is still recorded and the line stays at `PO_SENT`; nothing moves it later by itself (the supplier's "deposit received" tick on the portal does, through `jportal-deposit-received-<env>`, as before).
 - When it does move, the move skips ShipLine's gate for `IN_PRODUCTION` (staff Artwork Confirmed date, lot number, MFG and EXP dates), knowingly.
 - **A tick is one-way for the supplier.** There is no untick route. Staff take a confirmation off a line with CLEAR in ShipLine's ARTWORK panel, which makes the line tickable again.
@@ -121,7 +121,7 @@ Authed through the greedy `/api/v1/{proxy+}` route. Reads are open to every staf
 
 ### `POST /api/v1/purchase-orders/:id/artwork-confirmation/email`
 
-Body `{ to, subject?, body?, orderIds? }`. `to` as the PO send takes it (`parseRecipients`). `orderIds` defaults to every tickable line; a named line must be tickable. Answers `{ ok, requestId, sentTo, subject, panel }` (`panel` = the GET above). Audits `artwork_confirmation_requested` on the PO.
+Body `{ to, subject?, body?, orderIds? }`. `to` as the PO send takes it (`parseRecipients`). `orderIds` defaults to every tickable line; a named line must be tickable. Once Front has accepted the message, every line it covers whose `artwork_confirmed_date` is NULL gets today's date (Europe/London), with an `update` audit row on that order. A line that already has a date keeps it, and a failed send dates nothing. Answers `{ ok, requestId, sentTo, subject, datedOrderIds, artworkConfirmedDate, panel }` (`panel` = the GET above; `artworkConfirmedDate` is the date set, or null when no line needed one). Audits `artwork_confirmation_requested` on the PO, with `datedOrderIds`.
 
 | status | code | when |
 |---|---|---|
