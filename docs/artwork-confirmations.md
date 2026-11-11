@@ -77,6 +77,8 @@ GRANT SELECT (artwork_confirmed_by_supplier) ON jfa.orders TO 'jportal_app'@'%';
 ## Rules
 
 - **Tickable line**: live, `artwork_confirmed_by_supplier` NULL, no tick waiting, status `PO_SENT`, `IN_PRODUCTION`, `READY_FOR_QC` or `READY`. Staff's `artwork_confirmed_date` plays no part.
+- **`_FQC` sample lines are ignored** (`isFqcLine`: `jf_code` or `asin` ends in `_FQC`, as `isFqcOrder`). They have no artwork of their own: never tickable, never in the email, not in the panel's `lines` or counts, and dropped from the `orderIds` of a request that named one before this rule. ShipLine's ART tick leaves them out too, so a PO goes green without them. The one thing that reaches them: a send also sets `artwork_confirmed_date` on the `_FQC` sample of each line in that email, where it has none (`fqcSamplesOf`: `JF0787` in the email dates `JF0787_FQC`; matched field for field on `jf_code` or `asin`, ignoring case; they are in `datedOrderIds`). A sample whose product is not in the email is left alone. The supplier's tick is not copied to them. This filtering is artwork's alone: nothing else about `_FQC` lines changes.
+- **No quantities** in the supplier's email: the items are listed by code and name only (the portal's pages show none either).
 - **Request state**, one precedence in shipping, the portal and ShipLine: `revoked` > `expired` > `done` > `open`. `done` = none of its lines can be ticked any more. Only `open` takes ticks. Expiry is decided on the database clock.
 - Requests are independent: a new one does not close earlier ones. Staff close a link with REVOKE; ticks already saved stay.
 - A Front failure on send revokes the request (`send_failed`), so no dead link is left open.

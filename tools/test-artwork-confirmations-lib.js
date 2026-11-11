@@ -40,6 +40,30 @@ test('isTickable: production-phase lines the supplier has not confirmed', () => 
     assert.equal(A.isTickable({ status: 'SCHEDULED', artwork_confirmed_by_supplier: null }), false);
     assert.equal(A.isTickable({ status: 'ON_SEA', artwork_confirmed_by_supplier: null }), false);
     assert.equal(A.isTickable(null), false);
+    // _FQC sample lines are never asked about, by code or by asin.
+    assert.equal(A.isTickable({ status: 'PO_SENT', jf_code: 'JF0787_FQC', artwork_confirmed_by_supplier: null }), false);
+    assert.equal(A.isTickable({ status: 'PO_SENT', jf_code: 'JF0787', asin: 'b0abc_fqc', artwork_confirmed_by_supplier: null }), false);
+    assert.equal(A.isTickable({ status: 'PO_SENT', jf_code: 'JF0787', artwork_confirmed_by_supplier: null }), true);
+});
+
+test('fqcSamplesOf: only the _FQC samples of the lines in the email', () => {
+    const all = [
+        { id: 1, jf_code: 'JF0787', asin: 'B0AAA' },
+        { id: 2, jf_code: 'JF0895', asin: 'B0BBB' },
+        { id: 3, jf_code: 'jf0787_fqc', asin: null },      // JF0787's sample, by code, any case
+        { id: 4, jf_code: 'JF0895_FQC', asin: null },      // JF0895's sample
+        { id: 5, jf_code: 'JF0787', asin: 'B0AAA_FQC' },   // JF0787's sample, by asin
+        { id: 6, jf_code: 'JF9999_FQC', asin: null },      // its product is not on the PO
+    ];
+    const ids = (parents) => A.fqcSamplesOf(parents, all).map(l => l.id);
+    assert.deepEqual(ids([all[0]]), [3, 5]);
+    assert.deepEqual(ids([all[1]]), [4]);
+    assert.deepEqual(ids([all[0], all[1]]), [3, 4, 5]);
+    assert.deepEqual(ids([]), []);
+    // A sample is never a parent: JF0787_FQC does not pull in anything.
+    assert.deepEqual(ids([all[2]]), []);
+    // JF078 is not JF0787: no prefix matching.
+    assert.deepEqual(ids([{ id: 9, jf_code: 'JF078', asin: null }]), []);
 });
 
 test('staff\'s own Artwork Confirmed date is a different field: it does not confirm for the supplier', () => {
@@ -87,7 +111,7 @@ test('artworkBlockHtml: items and link escaped', () => {
     });
     assert.ok(html.includes('PO&lt;1&gt;'));
     assert.ok(html.includes('JF&lt;1&gt; · Mask &amp; strap'));
-    assert.ok(html.includes('× 1,200'));
+    assert.ok(!html.includes('1,200'), 'no quantities in the supplier email');
     assert.ok(html.includes('https://p.example/artwork/abc?x=&quot;y&quot;'));
     assert.ok(html.includes('2027-01-10'));
     assert.ok(!html.includes('<1>'));

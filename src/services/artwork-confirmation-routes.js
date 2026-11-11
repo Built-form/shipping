@@ -88,7 +88,7 @@ function registerArtworkConfirmationRoutes(app, deps) {
 
     async function loadLines(conn, poId) {
         const [rows] = await conn.query(
-            `SELECT id, jf_code, product_name, quantity, status, artwork_confirmed_date,
+            `SELECT id, jf_code, asin, product_name, quantity, status, artwork_confirmed_date,
                     artwork_confirmed_by_supplier
                FROM orders
               WHERE purchase_order_id = ? AND deleted_at IS NULL
@@ -123,8 +123,8 @@ function registerArtworkConfirmationRoutes(app, deps) {
         }
     }
 
-    function requestJson(row, lineById, pendingOrderIds, portalBase) {
-        const orderIds = A.parseOrderIds(row.order_ids);
+    function requestJson(row, lineById, pendingOrderIds, portalBase, fqcIds = new Set()) {
+        const orderIds = A.parseOrderIds(row.order_ids).filter(id => !fqcIds.has(id));
         const live = orderIds.map(id => lineById.get(id)).filter(Boolean)
             .map(l => ({ confirmed: A.isConfirmed(l) || pendingOrderIds.has(Number(l.id)) }));
         const state = A.requestState(row, live);
@@ -157,7 +157,11 @@ function registerArtworkConfirmationRoutes(app, deps) {
 
     async function readPanel(conn, poId) {
         const po = await loadPo(conn, poId);
-        const lines = await loadLines(conn, poId);
+        const allLines = await loadLines(conn, poId);
+        // _FQC samples have no artwork of their own: not listed, not counted, and dropped
+        // from a request that named one before they were left out.
+        const fqcIds = new Set(allLines.filter(l => A.isFqcLine(l)).map(l => Number(l.id)));
+        const lines = allLines.filter(l => !fqcIds.has(Number(l.id)));
         const gate = await readGate(conn, po);
         const { confirmations, requests, missing } = await loadPortalRows(conn, poId);
         const portalBase = poPortalEmail.portalBaseOf();
@@ -196,7 +200,7 @@ function registerArtworkConfirmationRoutes(app, deps) {
                     } : null,
                 };
             }),
-            requests: requests.map(r => requestJson(r, lineById, pendingOrderIds, portalBase)),
+            requests: requests.map(r => requestJson(r, lineById, pendingOrderIds, portalBase, fqcIds)),
         };
     }
 
@@ -232,7 +236,8 @@ function registerArtworkConfirmationRoutes(app, deps) {
 
         const out = await withConnection(async (conn) => {
             const po = await loadPo(conn, id);
-            const lines = await loadLines(conn, id);
+            const allLines = await loadLines(conn, id);
+            const lines = allLines.filter(l => !A.isFqcLine(l)); // never asked about, never listed
             const { confirmations } = await loadPortalRows(conn, id);
             const pending = new Set(confirmations.filter(c => !c.applied_at).map(c => Number(c.order_id)));
             const chosen = A.chooseLines(lines.filter(l => !pending.has(Number(l.id))), orderIds);
@@ -297,9 +302,13 @@ function registerArtworkConfirmationRoutes(app, deps) {
             // Sending the email IS staff confirming the artwork: each line it covers
             // gets the staff Artwork Confirmed date (artwork_confirmed_date) of today,
             // UK time. A line that already has one keeps it. Only once Front has
-            // taken the message: a failed send dates nothing.
+            // taken the message: a failed send dates nothing. An _FQC sample line is
+            // never in the email, but it is the same artwork as its product: when
+            // JF0787 is in the email, JF0787_FQC gets the date too. A sample whose
+            // product is not in this email is left alone.
             const artworkDate = londonToday();
-            const toDate = chosenLines.filter(l => A.toYmd(l.artwork_confirmed_date) === null).map(l => Number(l.id));
+            const toDate = [...chosenLines, ...A.fqcSamplesOf(chosenLines, allLines)]
+                .filter(l => A.toYmd(l.artwork_confirmed_date) === null).map(l => Number(l.id));
             let datedOrderIds = [];
             if (toDate.length) {
                 await conn.query(

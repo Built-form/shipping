@@ -10,6 +10,7 @@
 // TOKEN_RE, TICKABLE_STATUSES and requestState in its src/lib/artworkConfirmations.js.
 
 const crypto = require('crypto');
+const { isFqcOrder } = require('./order-transitions');
 const { FONT, INK, MUTED, BORDER, CODE_BG, escapeHtml, button, linkFallback, small } = require('./email-layout');
 
 /** 48 lower-case hex characters: unguessable, and the link's whole permission. */
@@ -71,9 +72,43 @@ function toYmd(value) {
 // what staff record in ShipLine and is neither read nor written by any of this.
 const isConfirmed = line => toYmd(line && (line.artworkConfirmedBySupplier ?? line.artwork_confirmed_by_supplier)) !== null;
 
+/**
+ * An _FQC sample line (jf_code or asin ends in _FQC): the units inspected and
+ * destroyed. It has no artwork of its own, so it is left out of everything
+ * here: never asked about, never listed, never counted. Only the staff date
+ * set on send reaches it, and only when its product is in that email
+ * (fqcSamplesOf; artwork-confirmation-routes.js).
+ */
+const isFqcLine = line => isFqcOrder(line);
+
+const codeOf = v => String(v ?? '').trim().toUpperCase();
+const FQC_SUFFIX = /_FQC$/;
+
+/**
+ * The _FQC sample lines that belong to `parents` (the lines an email covers):
+ * the same PO's lines whose code is a parent's code plus _FQC. JF0787 in the
+ * email matches JF0787_FQC; the comparison is field for field (jf_code with
+ * jf_code, asin with asin), ignoring case. A sample whose product is not among
+ * the parents is not returned.
+ */
+function fqcSamplesOf(parents, allLines) {
+    const jf = new Set(), asin = new Set();
+    for (const p of parents || []) {
+        if (isFqcLine(p)) continue;
+        if (codeOf(p.jf_code)) jf.add(codeOf(p.jf_code));
+        if (codeOf(p.asin)) asin.add(codeOf(p.asin));
+    }
+    return (allLines || []).filter((l) => {
+        if (!isFqcLine(l)) return false;
+        const j = codeOf(l.jf_code), a = codeOf(l.asin);
+        return (FQC_SUFFIX.test(j) && jf.has(j.replace(FQC_SUFFIX, '')))
+            || (FQC_SUFFIX.test(a) && asin.has(a.replace(FQC_SUFFIX, '')));
+    });
+}
+
 /** Whether a supplier may still confirm this (live) line's artwork. */
 function isTickable(line) {
-    if (!line) return false;
+    if (!line || isFqcLine(line)) return false;
     return TICKABLE_STATUSES.includes(String(line.status)) && !isConfirmed(line);
 }
 
@@ -132,9 +167,7 @@ const lineLabel = l => [l.jfCode ?? l.jf_code, l.productName ?? l.product_name].
 /** The {lines} token: the items asked about, as an HTML list. */
 function linesHtml(lines) {
     const items = (lines || []).map((l) => {
-        const qty = Number(l.quantity);
-        const q = Number.isFinite(qty) && qty > 0 ? ` <span style="color:${MUTED};">× ${qty.toLocaleString('en-GB')}</span>` : '';
-        return `<li style="margin:0 0 4px;">${escapeHtml(lineLabel(l))}${q}</li>`;
+        return `<li style="margin:0 0 4px;">${escapeHtml(lineLabel(l))}</li>`;
     });
     return `<ul style="margin:0 0 14px;padding-left:20px;font-family:${FONT};font-size:14px;line-height:1.5;color:${INK};">${items.join('')}</ul>`;
 }
@@ -221,6 +254,6 @@ function planApply(confirmations, orders, sentToByRequest = new Map(), gate = { 
 module.exports = {
     TOKEN_RE, newToken, isToken, EXPIRY_DAYS, artworkUrl,
     TICKABLE_STATUSES, MOVES_FROM, MOVES_TO, REVOKE_REASONS, depositGate,
-    toYmd, isConfirmed, isTickable, parseOrderIds, chooseLines, requestState,
+    toYmd, isConfirmed, isFqcLine, fqcSamplesOf, isTickable, parseOrderIds, chooseLines, requestState,
     linesHtml, artworkBlockHtml, confirmerOf, planApply,
 };
