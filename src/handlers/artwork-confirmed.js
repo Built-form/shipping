@@ -11,7 +11,9 @@
 // staff record, is never touched. A line still at PO_SENT also moves to IN_PRODUCTION,
 // but ONLY when the supplier requires no deposit or the deposit has been paid
 // (src/services/deposit-gate.js); otherwise its status stays and the audit note says
-// why. Each line written gets one audit_log row under "supplier-portal:<who>". A line
+// why. When a line does move, its _FQC sample line on the same PO (JF0787_FQC for
+// JF0787) moves from PO_SENT with it; the sample gets no date, only the status.
+// Each line written gets one audit_log row under "supplier-portal:<who>". A line
 // the supplier had already confirmed, or that is deleted, is left alone. Every
 // confirmation handled is stamped applied_at, so a re-run is a no-op and a
 // confirmation staff clear later is not written back.
@@ -68,7 +70,7 @@ async function applyArtworkConfirmations(conn, purchaseOrderId, { loadGate = def
 
         const orderIds = [...new Set(confirmations.map(c => Number(c.order_id)))];
         const [orders] = await conn.query(
-            `SELECT id, status, artwork_confirmed_by_supplier FROM orders
+            `SELECT id, status, artwork_confirmed_by_supplier, jf_code, asin FROM orders
               WHERE purchase_order_id = ? AND deleted_at IS NULL
                 AND id IN (${orderIds.map(() => '?').join(', ')})
                 FOR UPDATE`,
@@ -106,6 +108,33 @@ async function applyArtworkConfirmations(conn, purchaseOrderId, { loadGate = def
                 before: u.before, after: u.after, userEmail: u.userEmail,
             });
         }
+
+        // A line that moved takes its _FQC sample line with it (same PO, still at
+        // PO_SENT). Read only when something moved; the status is checked again in
+        // the UPDATE, and a sample that did not change gets no audit row.
+        let samplesMoved = 0;
+        if (plan.updates.some(u => u.status)) {
+            const [samples] = await conn.query(
+                `SELECT id, jf_code, asin, status FROM orders
+                  WHERE purchase_order_id = ? AND deleted_at IS NULL AND status = ?
+                    AND (UPPER(jf_code) LIKE '%\\_FQC' OR UPPER(asin) LIKE '%\\_FQC')
+                    FOR UPDATE`,
+                [purchaseOrderId, A.MOVES_FROM],
+            );
+            for (const m of A.planSampleMoves(plan.updates, orders, samples)) {
+                const [upd] = await conn.query(
+                    'UPDATE orders SET status = ? WHERE id = ? AND status = ?',
+                    [m.status, m.orderId, A.MOVES_FROM],
+                );
+                if (!upd.affectedRows) continue;
+                samplesMoved += 1;
+                await recordAuditStrict(conn, {
+                    entityType: 'order', entityId: m.orderId, action: 'update',
+                    before: m.before, after: m.after, userEmail: m.userEmail,
+                });
+            }
+        }
+
         await conn.query(
             `UPDATE artwork_confirmations SET applied_at = UTC_TIMESTAMP()
               WHERE id IN (${plan.appliedIds.map(() => '?').join(', ')})`,
@@ -116,6 +145,7 @@ async function applyArtworkConfirmations(conn, purchaseOrderId, { loadGate = def
             outcome: 'applied',
             updated: plan.updates.length,
             moved: plan.updates.filter(u => u.status).length,
+            samplesMoved,
             applied: plan.appliedIds.length,
             gate: gate.reason,
         };

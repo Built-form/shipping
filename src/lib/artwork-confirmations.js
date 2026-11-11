@@ -75,9 +75,10 @@ const isConfirmed = line => toYmd(line && (line.artworkConfirmedBySupplier ?? li
 /**
  * An _FQC sample line (jf_code or asin ends in _FQC): the units inspected and
  * destroyed. It has no artwork of its own, so it is left out of everything
- * here: never asked about, never listed, never counted. Only the staff date
- * set on send reaches it, and only when its product is in that email
- * (fqcSamplesOf; artwork-confirmation-routes.js).
+ * here: never asked about, never listed, never counted. Two things reach it,
+ * both through its product (fqcSamplesOf): the staff date set on send, when
+ * its product is in that email (artwork-confirmation-routes.js), and the move
+ * into production, when its product's tick makes that move (planSampleMoves).
  */
 const isFqcLine = line => isFqcOrder(line);
 
@@ -251,9 +252,47 @@ function planApply(confirmations, orders, sentToByRequest = new Map(), gate = { 
     return { updates, appliedIds };
 }
 
+/**
+ * The _FQC sample lines that follow their product into production. `updates`
+ * is planApply's; `orders` the lines it was planned from, with jf_code and
+ * asin; `samples` the PO's live _FQC lines ({ id, status, jf_code, asin }).
+ *
+ * A sample moves only with its own product (fqcSamplesOf: JF0787 takes
+ * JF0787_FQC), only when that product's tick moved it PO_SENT → IN_PRODUCTION
+ * in this run, and only from PO_SENT itself. So the deposit gate that held
+ * the product holds the sample too, and a sample already further on is left
+ * alone. The sample gets no supplier date: it was never asked about.
+ * → [{ orderId, parentOrderId, status, before, after, userEmail }]
+ */
+function planSampleMoves(updates, orders, samples) {
+    const byId = new Map((orders || []).map(o => [Number(o.id), o]));
+    const moves = [];
+    const taken = new Set();
+    for (const u of updates || []) {
+        if (u.status !== MOVES_TO) continue;
+        const parent = byId.get(Number(u.orderId));
+        if (!parent) continue;
+        const code = codeOf(parent.jf_code) || codeOf(parent.asin) || `line ${u.orderId}`;
+        for (const s of fqcSamplesOf([parent], samples)) {
+            const id = Number(s.id);
+            if (String(s.status) !== MOVES_FROM || taken.has(id)) continue;
+            taken.add(id);
+            moves.push({
+                orderId: id,
+                parentOrderId: Number(u.orderId),
+                status: MOVES_TO,
+                before: { status: MOVES_FROM },
+                after: { status: MOVES_TO, note: `moved to production with ${code}, whose artwork the supplier confirmed (supplier portal)` },
+                userEmail: u.userEmail,
+            });
+        }
+    }
+    return moves;
+}
+
 module.exports = {
     TOKEN_RE, newToken, isToken, EXPIRY_DAYS, artworkUrl,
     TICKABLE_STATUSES, MOVES_FROM, MOVES_TO, REVOKE_REASONS, depositGate,
     toYmd, isConfirmed, isFqcLine, fqcSamplesOf, isTickable, parseOrderIds, chooseLines, requestState,
-    linesHtml, artworkBlockHtml, confirmerOf, planApply,
+    linesHtml, artworkBlockHtml, confirmerOf, planApply, planSampleMoves,
 };
