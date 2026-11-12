@@ -25,6 +25,7 @@ const poPortalEmail = require('../lib/po-portal-email');
 const { escapeHtml, wrapEmail } = require('../lib/email-layout');
 const { ARTWORK_CONFIRMATION_TEMPLATE_KEY } = require('../lib/email-template-defaults');
 const { sendFrontMessage: defaultSend } = require('./front-send');
+const { logSentEmail } = require('../lib/email-receipt');
 const { loadDepositGate } = require('./deposit-gate');
 const { londonToday: defaultLondonToday } = require('./daily-alerts');
 const defaultLog = require('../lib/logger');
@@ -298,6 +299,13 @@ function registerArtworkConfirmationRoutes(app, deps) {
                 'UPDATE artwork_confirmation_requests SET front_message_uid = ?, front_conversation_id = ? WHERE id = ?',
                 [sent.frontMessageUid, sent.frontConversationId, requestId]
             );
+            // On ShipLine's Email Receipts page as a portal email: the link is
+            // the one thing asked (no "Confirm receipt" button), and a tick on
+            // one of its items confirms it (src/lib/email-receipt.js).
+            await logSentEmail(conn, {
+                emailType: 'artwork_confirmation', sentTo: addresses, subject: finalSubject,
+                confirmVia: 'portal', sendTable: 'artwork_confirmation_requests', sendId: requestId,
+            });
 
             // Sending the email IS staff confirming the artwork: each line it covers
             // gets the staff Artwork Confirmed date (artwork_confirmed_date) of today,

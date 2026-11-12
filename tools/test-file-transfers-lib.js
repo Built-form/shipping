@@ -162,6 +162,7 @@ function harness({ userType = 'standard', userEmail = 'me@jfa.test' } = {}) {
         suppliers: [{ id: 11, name: 'Acme Limited', deleted_at: null }],
         users: [{ id: 1, email: 'li@acme.test', status: 'active', supplier_id: 11 }, { id: 2, email: 'old@acme.test', status: 'disabled', supplier_id: 11 }],
         audits: [],
+        receipts: [],
         templates: [],
     };
     const objects = new Map();
@@ -236,6 +237,11 @@ function harness({ userType = 'standard', userEmail = 'me@jfa.test' } = {}) {
                 const id = db.transfers.length + 100;
                 db.transfers.push({ id, direction: 'to_supplier', status: 'draft', supplier_id, supplier_name, user_id: null, sender_email, filename, content_type, file_size, s3_key, s3_etag: null, final_s3_key: null, final_etag: null, note, sent_at: null, withdrawn_at: null, withdrawn_by: null, notified_at: null, notify_error: null, row_version: 0, created_at: new Date() });
                 return [{ insertId: id, affectedRows: 1 }];
+            }
+            if (s.startsWith('INSERT INTO email_receipts')) {
+                const [, email_type, send_table, send_id, sent_to, subject, confirm_via, action_url] = params;
+                db.receipts.push({ email_type, send_table, send_id, sent_to, subject, confirm_via, action_url });
+                return [{ insertId: db.receipts.length, affectedRows: 1 }];
             }
             if (s.startsWith('INSERT INTO `jportal`.file_transfer_views')) {
                 const [transfer_id, viewer_email] = params;
@@ -423,6 +429,13 @@ test('routes: sending a file — create, uploaded (checked, pinned, emailed), no
         assert.equal(sent[0].subject, 'A file – Artwork.pdf');
         assert.match(fetchCalls[0].url, /channels\/cha_1\/messages/);
         assert.ok(h.db.audits.some(a => a.action === 'sent') && h.db.audits.some(a => a.action === 'notified'));
+        // Listed on the Email Receipts page as a portal email: no confirm
+        // button, no reminder (no action_url); opening the file confirms it.
+        assert.deepEqual(h.db.receipts, [{
+            email_type: 'file_transfer', send_table: 'file_transfers', send_id: transfer.id,
+            sent_to: '["li@acme.test"]', subject: 'A file – Artwork.pdf', confirm_via: 'portal', action_url: null,
+        }]);
+        assert.doesNotMatch(String(fetchCalls[0].init.body.get('body')), /confirm-receipt/);
 
         // Again: idempotent, no second email.
         r = await h.call('POST', `/api/v1/file-transfers/${transfer.id}/uploaded`, {});

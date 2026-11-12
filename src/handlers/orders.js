@@ -26,9 +26,10 @@ const { requestLinesSnapshot } = require('../lib/request-to-send-drift');
 // a draft's history outlives renames, conversion and deletion.
 const draftAudit = require('../lib/draft-audit');
 const {
-    apiBaseUrlFromReq, createEmailReceipt,
+    apiBaseUrlFromReq, createEmailReceipt, logSentEmail, discardEmailReceipt,
     linkReceiptToSend, appendReceiptLink,
     getReceiptForResend, recordReminderSend, listReminders,
+    confirmViaOf, canRemind, syncPortalReceipts,
 } = require('../lib/email-receipt');
 const { sendReminderForReceipt } = require('../services/receipt-reminders');
 const { receiveOrderStock, ReceiveError } = require('../services/order-receive');
@@ -3256,6 +3257,8 @@ app.post('/api/v1/draft-container-documents/:id/email', async (req, res) => {
                 log.error('[draft-container-documents/email] Front API error', {
                     status: resp.status, body: respText.slice(0, 500),
                 });
+                // Not sent: its receipt must not be listed, or chased.
+                await discardEmailReceipt(conn, receiptToken);
                 return { frontError: { status: resp.status, body: respText.slice(0, 500) } };
             }
             let parsed = null;
@@ -3769,6 +3772,8 @@ app.post('/api/v1/quality-assurance-documents/:id/email', async (req, res) => {
                 log.error('[quality-assurance-documents/email] Front API error', {
                     status: resp.status, body: respText.slice(0, 500),
                 });
+                // Not sent: its receipt must not be listed, or chased.
+                await discardEmailReceipt(conn, receiptToken);
                 return { frontError: { status: resp.status, body: respText.slice(0, 500) } };
             }
             let parsed = null;
@@ -6560,18 +6565,12 @@ app.post('/api/v1/purchase-order-documents/:id/email', async (req, res) => {
                 preapproved,
             });
 
-            // Mint a receipt token and embed a "Confirm receipt" link so the
-            // recipient can one-click confirm they got this email.
-            const receiptToken = await createEmailReceipt(conn, {
-                emailType: 'purchase_order', sentTo: toAddresses, subject: finalSubject,
-            });
-            // The template (or the staff member's edit of it), the portal block
-            // and the receipt link, inside the portal emails' frame
-            // (src/lib/email-layout.js).
-            const bodyWithReceipt = wrapEmail({
-                title: finalSubject,
-                bodyHtml: appendReceiptLink(bodyWithPortal, receiptToken, apiBaseUrlFromReq(req)),
-            });
+            // The template (or the staff member's edit of it) and the portal
+            // block, inside the portal emails' frame (src/lib/email-layout.js).
+            // No "Confirm receipt" button: the supplier is asked to do one
+            // thing, open the PO on the portal, and that view is what marks
+            // this email confirmed (syncPortalReceipts, src/lib/email-receipt.js).
+            const emailHtml = wrapEmail({ title: finalSubject, bodyHtml: bodyWithPortal });
 
             // Front /channels/{id}/messages. `to[]` notation makes Front treat
             // the field as an array; we append once per recipient.
@@ -6580,7 +6579,7 @@ app.post('/api/v1/purchase-order-documents/:id/email', async (req, res) => {
             const form = new FormData();
             for (const addr of toAddresses) form.append('to[]', addr);
             form.append('subject', finalSubject);
-            form.append('body', bodyWithReceipt);
+            form.append('body', emailHtml);
             form.append('body_format', 'html');
             form.append('options[archive]', 'false');
 
@@ -6629,7 +6628,14 @@ app.post('/api/v1/purchase-order-documents/:id/email', async (req, res) => {
                 [sendInsert.insertId]
             );
             const sentAt = sentRow[0]?.sent_at?.toISOString?.() ?? sentRow[0]?.sent_at ?? null;
-            await linkReceiptToSend(conn, receiptToken, 'purchase_order_document_sends', sendInsert.insertId);
+            // On the Email Receipts page as a portal email: confirmed when the
+            // PO is opened on the portal, and reminded with the portal's
+            // address (action_url) until then.
+            await logSentEmail(conn, {
+                emailType: 'purchase_order', sentTo: toAddresses, subject: finalSubject,
+                confirmVia: 'portal', actionUrl: poUrl,
+                sendTable: 'purchase_order_document_sends', sendId: sendInsert.insertId,
+            });
 
             await recordAudit(conn, {
                 entityType: 'purchase_order',
@@ -7401,6 +7407,8 @@ app.post('/api/v1/purchase-order-signed-pis/:id/email', async (req, res) => {
                 log.error('[purchase-order-signed-pis/email] Front API error', {
                     status: resp.status, body: respText.slice(0, 500),
                 });
+                // Not sent: its receipt must not be listed, or chased.
+                await discardEmailReceipt(conn, receiptToken);
                 return { frontError: { status: resp.status, body: respText.slice(0, 500) } };
             }
             let parsed = null;
@@ -8232,12 +8240,16 @@ app.delete('/api/v1/purchase-order-payments/:id', async (req, res) => {
 });
 
 // ── Email receipt status (read) ──────────────────────────────────────────
-// Per-email confirmation status for the "Confirm receipt" links embedded in
-// outbound supplier/forwarder emails (see src/lib/email-receipt.js). One row
-// per sent email, with a three-state lifecycle:
+// Every email sent to a supplier, forwarder or inspector, and whether it was
+// confirmed (see src/lib/email-receipt.js). One row per sent email, with a
+// three-state lifecycle:
 //   'sent'      → link never fetched
 //   'opened'    → landing page fetched (WEAK: link-scanners fetch it too)
-//   'confirmed' → recipient pressed the Confirm button (STRONG: a form POST)
+//   'confirmed' → recipient pressed the Confirm button (STRONG: a form POST),
+//                 or, for an email that carries a portal link instead of the
+//                 button (confirmVia 'portal'), did what the link asks there
+// confirmVia: 'email' (confirm button) | 'portal' (portal / magic link, no
+// button) | 'none' (a notice). canRemind: a reminder can be sent for it.
 // Filter by a specific send (sendTable+sendId, as recorded on the *_sends row),
 // by email_type, or by status ('sent'|'opened'|'confirmed'). Newest first.
 //   email_type ∈ purchase_order | purchase_order_signed_pi |
@@ -8256,6 +8268,8 @@ function rowToEmailReceipt(r) {
         sendId: r.send_id || null,
         sentTo,
         subject: r.subject || null,
+        confirmVia: confirmViaOf(r),
+        canRemind: canRemind(r),
         status,
         createdAt: r.created_at?.toISOString?.() ?? r.created_at,
         openedAt: r.opened_at?.toISOString?.() ?? r.opened_at,
@@ -8289,10 +8303,13 @@ app.get('/api/v1/email-receipts', async (req, res) => {
         const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
 
         const rows = await withConnection(async (conn) => {
+            // Portal emails are confirmed by what the portal recorded: bring
+            // them up to date first (at most every 20 s per container).
+            await syncPortalReceipts(conn);
             const [r] = await conn.query(
                 `SELECT id, email_type, send_table, send_id, sent_to, subject,
                         created_at, opened_at, open_count, confirmed_at, confirmed_ip, confirmed_user_agent,
-                        reminder_count, last_reminder_at
+                        reminder_count, last_reminder_at, confirm_via, action_url
                    FROM email_receipts
                    ${whereSql}
                   ORDER BY created_at DESC, id DESC
@@ -8311,19 +8328,28 @@ app.get('/api/v1/email-receipts', async (req, res) => {
 // ── POST /api/v1/email-receipts/:id/resend ───────────────────────────────
 // Resend a reminder for a receipt that hasn't been confirmed yet. Sends a
 // short standalone email (no attachment) to the ORIGINAL recipients via Front,
-// reusing the original confirm token so a click updates the same row. No-op
-// (200, resent:false) if the receipt is already confirmed. Bumps
-// reminder_count / last_reminder_at.
+// reusing the original confirm token so a click updates the same row; for a
+// portal email (the PO) the reminder carries the portal's address instead. No-op
+// (200, resent:false) if the receipt is already confirmed. 422 for an email
+// with nothing to remind about (canRemind false). Bumps reminder_count /
+// last_reminder_at.
 app.post('/api/v1/email-receipts/:id/resend', async (req, res) => {
     try {
         await emailReceiptsSchemaReady;
         const id = Number(req.params.id);
         if (!Number.isFinite(id)) return res.status(400).json({ error: 'Invalid id.' });
 
-        const receipt = await withConnection((conn) => getReceiptForResend(conn, id));
+        const receipt = await withConnection(async (conn) => {
+            // The supplier may have opened it on the portal since the page loaded.
+            await syncPortalReceipts(conn, { maxAgeMs: 0 });
+            return getReceiptForResend(conn, id);
+        });
         if (!receipt) return res.status(404).json({ error: 'Email receipt not found.' });
         if (receipt.confirmed_at) {
             return res.json({ resent: false, reason: 'already_confirmed' });
+        }
+        if (!canRemind(receipt)) {
+            return res.status(422).json({ error: 'There is no reminder for this email: it asks for nothing by email.' });
         }
 
         // Same send path the auto-reminder sweep uses (reuses the original
@@ -8332,6 +8358,9 @@ app.post('/api/v1/email-receipts/:id/resend', async (req, res) => {
         if (!result.ok) {
             if (result.reason === 'no_recipients') {
                 return res.status(422).json({ error: 'No recipients recorded for this email; cannot resend.' });
+            }
+            if (result.reason === 'no_reminder') {
+                return res.status(422).json({ error: 'There is no reminder for this email: it asks for nothing by email.' });
             }
             if (result.reason === 'front_not_configured') {
                 return res.status(503).json({ error: 'Front is not configured.' });
@@ -8354,7 +8383,7 @@ app.post('/api/v1/email-receipts/:id/resend', async (req, res) => {
             const [rows] = await conn.query(
                 `SELECT id, email_type, send_table, send_id, sent_to, subject,
                         created_at, opened_at, open_count, confirmed_at, confirmed_ip, confirmed_user_agent,
-                        reminder_count, last_reminder_at
+                        reminder_count, last_reminder_at, confirm_via, action_url
                    FROM email_receipts WHERE id = ?`,
                 [id]
             );

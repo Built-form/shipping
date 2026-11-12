@@ -48,6 +48,7 @@ const { jportalSchema, PO_SUPPLIER_IS } = require('../lib/jportal');
 const { recordAuditStrict } = require('../lib/audit');
 const { sendFrontMessage } = require('./front-send');
 const { wrapEmail } = require('../lib/email-layout');
+const { logSentEmail } = require('../lib/email-receipt');
 
 const FILE_URL_SECONDS = 15 * 60;
 
@@ -249,6 +250,11 @@ function registerPiSubmissionRoutes(app, deps) {
             const sent = await sendFrontMessage({ to, subject, html });
             if (sent.ok) {
                 await conn.query(`UPDATE ${jp}.pi_submissions SET notified_at = UTC_TIMESTAMP(), notify_error = NULL WHERE id = ?`, [id]);
+                // On the Email Receipts page, as a notice: nothing to confirm.
+                await logSentEmail(conn, {
+                    emailType: 'pi_decision', sentTo: to, subject,
+                    confirmVia: 'none', sendTable: 'pi_submissions', sendId: id,
+                });
             } else {
                 const why = [sent.reason, sent.status, sent.detail].filter(v => v != null && v !== '').join(': ').slice(0, 500);
                 await conn.query(`UPDATE ${jp}.pi_submissions SET notify_error = ? WHERE id = ?`, [why, id]);

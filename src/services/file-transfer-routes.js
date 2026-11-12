@@ -41,6 +41,7 @@ const L = require('../lib/file-transfers');
 const { jportalSchema, isSourceMissing } = require('../lib/jportal');
 const { sendFrontMessage } = require('./front-send');
 const { wrapEmail } = require('../lib/email-layout');
+const { logSentEmail } = require('../lib/email-receipt');
 
 const UPLOAD_URL_SECONDS = 15 * 60;
 const FILE_URL_SECONDS = 15 * 60;
@@ -191,6 +192,12 @@ function registerFileTransferRoutes(app, deps) {
             const sent = await sendFrontMessage({ to, subject, html });
             if (sent.ok) {
                 await conn.query(`UPDATE ${jp()}.file_transfers SET notified_at = UTC_TIMESTAMP(), notify_error = NULL WHERE id = ?`, [id]);
+                // On the Email Receipts page: confirmed when a supplier's user
+                // opens the file on the portal (src/lib/email-receipt.js).
+                await logSentEmail(conn, {
+                    emailType: 'file_transfer', sentTo: to, subject,
+                    confirmVia: 'portal', sendTable: 'file_transfers', sendId: id,
+                });
             } else {
                 const why = [sent.reason, sent.status, sent.detail].filter(v => v != null && v !== '').join(': ').slice(0, 500);
                 await conn.query(`UPDATE ${jp()}.file_transfers SET notify_error = ? WHERE id = ?`, [why, id]);

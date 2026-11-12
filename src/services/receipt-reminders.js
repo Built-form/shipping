@@ -1,9 +1,15 @@
 // ── Email-receipt auto-reminders ────────────────────────────────────────────
-// Every outbound supplier/forwarder email carries a "Confirm receipt" link
-// (src/lib/email-receipt.js). When a supplier hasn't confirmed, we chase them
-// automatically: this service sends a short bilingual reminder that reuses the
-// ORIGINAL confirm token (so a click still lands on the same email_receipts
+// An outbound supplier/forwarder email that carries a "Confirm receipt" link
+// (src/lib/email-receipt.js, confirm_via 'email') is chased automatically while
+// it is unconfirmed: this service sends a short bilingual reminder that reuses
+// the ORIGINAL confirm token (so a click still lands on the same email_receipts
 // row) and shows which reminder number it is.
+//
+// A portal email (confirm_via 'portal') has no confirm button and its reminder
+// has none either: it repeats the portal address the first email pointed at
+// (action_url) and stops once the portal shows the recipient opened it. Only
+// the PO email stores one today; a portal email without it, and a notice
+// ('none'), are never chased.
 //
 // Two entry points share ONE send implementation (sendReminderForReceipt):
 //   • runReceiptReminders(pool) — the scheduled sweep (src/handlers/send-receipt-reminders.js).
@@ -12,7 +18,7 @@
 //   • the manual "resend" button — POST /api/v1/email-receipts/:id/resend (orders.js).
 const log = require('../lib/logger');
 const {
-    appendReceiptLink,
+    appendReceiptLink, appendPortalLink, confirmViaOf, canRemind, syncPortalReceipts,
     renderReminderEmailHtml, recordReminderSend, parseRecipients,
 } = require('../lib/email-receipt');
 
@@ -26,8 +32,10 @@ const REMINDER_MAX = Math.max(0, Number(process.env.RECEIPT_REMINDER_MAX ?? 5));
 // transaction/response. Reuses receipt.token (the original capability) and
 // shows reminder #(reminder_count + 1). Returns a discriminated result:
 //   { ok: true, recipients, subject, reminderNumber, frontMessageUid, frontConversationId }
-//   { ok: false, reason: 'no_recipients' | 'front_not_configured' | 'front_error', status?, detail? }
+//   { ok: false, reason: 'no_reminder' | 'no_recipients' | 'front_not_configured' | 'front_error', status?, detail? }
 async function sendReminderForReceipt(receipt, baseUrl) {
+    if (!canRemind(receipt)) return { ok: false, reason: 'no_reminder' };
+    const portal = confirmViaOf(receipt) === 'portal';
     const recipients = parseRecipients(receipt.sent_to);
     if (!recipients.length) return { ok: false, reason: 'no_recipients' };
     if (!process.env.FRONT_CHANNEL_ID || !process.env.FRONT_API_TOKEN) {
@@ -38,14 +46,13 @@ async function sendReminderForReceipt(receipt, baseUrl) {
     const label = `Reminder #${reminderNumber} / 第 ${reminderNumber} 次提醒`;
     const subject = receipt.subject
         ? `${label}: ${receipt.subject}`
-        : `${label}: please confirm receipt`;
-    // Reuse the ORIGINAL token so the reminder's Confirm button records against
-    // the same email_receipts row.
-    const body = appendReceiptLink(
-        renderReminderEmailHtml(receipt.subject, reminderNumber),
-        receipt.token,
-        baseUrl
-    );
+        : `${label}: ${portal ? 'please see the supplier portal' : 'please confirm receipt'}`;
+    // A portal email's reminder points at the portal again and asks for no
+    // confirmation. Otherwise reuse the ORIGINAL token so the reminder's
+    // Confirm button records against the same email_receipts row.
+    const body = portal
+        ? appendPortalLink(renderReminderEmailHtml(receipt.subject, reminderNumber, { portal: true }), receipt.action_url)
+        : appendReceiptLink(renderReminderEmailHtml(receipt.subject, reminderNumber), receipt.token, baseUrl);
 
     const form = new FormData();
     for (const addr of recipients) form.append('to[]', addr);
@@ -100,12 +107,23 @@ async function runReceiptReminders(pool, opts = {}) {
 
     const conn = await pool.getConnection();
     try {
+        // What suppliers did on the portal since the last run, first: a PO
+        // opened there is confirmed and must not be chased. If that could not
+        // be read this run, portal emails are left alone rather than chased blind.
+        const sync = await syncPortalReceipts(conn, { maxAgeMs: 0 });
+        const chasePortal = !sync.failed.includes('po_viewed');
+        if (!chasePortal) log.warn('[receipt-reminders] portal views could not be read; portal emails are not chased this run');
+        const chased = chasePortal
+            ? `(confirm_via = 'email' OR (confirm_via = 'portal' AND action_url IS NOT NULL))`
+            : `confirm_via = 'email'`;
+
         // intervalHours/limit are sanitized ints → safe to inline (INTERVAL and
         // LIMIT can't be bound params in MySQL). maxReminders is bound.
         const [rows] = await conn.query(
-            `SELECT id, token, email_type, sent_to, subject, reminder_count
+            `SELECT id, token, email_type, sent_to, subject, reminder_count, confirm_via, action_url
                FROM email_receipts
               WHERE confirmed_at IS NULL
+                AND ${chased}
                 AND sent_to IS NOT NULL
                 AND reminder_count < ?
                 AND COALESCE(last_reminder_at, created_at) <= (NOW() - INTERVAL ${intervalHours} HOUR)
@@ -127,7 +145,7 @@ async function runReceiptReminders(pool, opts = {}) {
                     sentByEmail: null, // automated sweep
                 });
                 summary.sent++;
-            } else if (result.reason === 'no_recipients') {
+            } else if (result.reason === 'no_recipients' || result.reason === 'no_reminder') {
                 summary.skipped++;
             } else {
                 summary.failed++;

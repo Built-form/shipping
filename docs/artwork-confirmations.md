@@ -17,7 +17,7 @@ Code: `src/lib/artwork-confirmations.js` (pure rules) and `src/lib/payment-terms
 - **A tick is one-way for the supplier.** There is no untick route. Staff take a confirmation off a line with CLEAR in ShipLine's ARTWORK panel, which makes the line tickable again.
 - **Staff can set it by hand.** The order form in ShipLine has an "Artwork Confirmed by Supplier" date beside "Artwork Confirmed" (`artworkConfirmedBySupplier` in `UPDATABLE_FIELDS`, so `PUT /orders/:id` takes it and the audit log records it under the staff user), for a supplier who confirmed by email or phone. Setting it by hand never moves the status; clearing it there makes the line tickable again, as CLEAR does.
 - **Opening the link confirms nothing.** The page's read never writes, and the tick is a `PUT` that needs the portal's CSRF header, so a mail scanner that follows the link (Safe Links, Mimecast…) cannot confirm anything.
-- **No "I've read it" receipt button** on this email (and so no automatic reminders): the artwork button is the acknowledgment.
+- **No "I've read it" receipt button** on this email (and so no automatic reminders): the artwork button is the acknowledgment. The email is still listed on ShipLine's Email Receipts page (`email_receipts`, `email_type='artwork_confirmation'`, `confirm_via='portal'`), and shows as confirmed once the supplier ticks one of its items.
 
 ## The deposit gate
 

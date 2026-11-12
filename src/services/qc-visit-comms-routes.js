@@ -39,6 +39,7 @@ const { getOrCreateLink, liveLinkOf, sendChanges } = require('./qc-schedule-rout
 const {
     apiBaseUrlFromReq,
     createEmailReceipt,
+    discardEmailReceipt,
     appendReceiptLink,
     linkReceiptToSend,
 } = require('../lib/email-receipt');
@@ -771,10 +772,21 @@ function registerQcVisitCommsRoutes(app, deps) {
                     ? S.appendScheduleLinkHtml(htmlBody, schedule.url)
                     : S.stripSchedulePlaceholderHtml(htmlBody);
 
+                // An email that carries the availability or the schedule link
+                // asks for one thing, done through that link: no "Confirm
+                // receipt" button on top of it. Its receipt is confirmed when
+                // the party answers the availability page, and marked opened
+                // when the schedule page is fetched (syncPortalReceipts,
+                // src/lib/email-receipt.js). Without a link (a cancellation, a
+                // factory's update) the confirm button stays.
+                const viaLink = Boolean(availability || schedule);
                 const receiptToken = await createEmailReceipt(conn, {
                     emailType: 'qc_visit', sentTo: toAddresses, subject: finalSubject,
+                    confirmVia: viaLink ? 'portal' : 'email',
                 });
-                const bodyWithReceipt = appendReceiptLink(htmlBody, receiptToken, apiBaseUrlFromReq(req));
+                const bodyWithReceipt = viaLink
+                    ? htmlBody
+                    : appendReceiptLink(htmlBody, receiptToken, apiBaseUrlFromReq(req));
 
                 const form = new FormData();
                 for (const addr of toAddresses) form.append('to[]', addr);
@@ -798,6 +810,8 @@ function registerQcVisitCommsRoutes(app, deps) {
                 const respText = await resp.text();
                 if (!resp.ok) {
                     log.error('[qc-visits/email] Front API error', { status: resp.status, body: respText.slice(0, 500) });
+                    // Not sent: its receipt must not be listed, or chased.
+                    await discardEmailReceipt(conn, receiptToken);
                     return {
                         status: 502, error: 'Front rejected the message.', code: 'FRONT_FAILED',
                         payload: { frontStatus: resp.status, frontBody: respText.slice(0, 500) },

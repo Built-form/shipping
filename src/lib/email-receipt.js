@@ -1,12 +1,28 @@
-// ── Email receipt confirmation ──────────────────────────────────────────────
-// Every outbound supplier/forwarder email (PO, delivery-quote request, QA
-// sheet, signed PI) carries a "Confirm receipt" link. The link points at a
-// PUBLIC, no-login endpoint (served by the dedicated emailReceiptApi Lambda,
-// src/handlers/email-receipt.js) keyed by an unguessable token. Opening it shows
-// a Confirm button; pressing it records email_receipts.confirmed_at and then
-// redirects to a static confirmation page (or renders a built-in one if unset).
+// ── Email receipts: the log of every email sent, and how each is confirmed ──
+// email_receipts holds one row per email sent to a supplier, forwarder or
+// inspector; ShipLine's Email Receipts page lists them
+// (GET /api/v1/email-receipts, orders.js). confirm_via says how an email gets
+// confirmed (2026-11-12_10):
+//   'email'   it carries the "Confirm receipt" button: the delivery-quote
+//             request, the QA sheet, the signed PI, and a QC visit email with
+//             no link of its own. The two-step flow below.
+//   'portal'  it carries a link into the supplier portal or a no-login magic
+//             link, and NO confirm button, so the recipient is asked to do one
+//             thing, not two: the PO, the artwork request, the "a file is
+//             waiting" notice, a QC visit email with an availability or
+//             schedule link, JFPRO's quote request. What the recipient does
+//             through the link sets confirmed_at (syncPortalReceipts).
+//   'none'    a notice; nothing is asked: a PI decision, a portal approval.
+// Only an 'email' row, or a 'portal' row with an action_url (the PO), is chased
+// with reminders (src/services/receipt-reminders.js).
 //
-// Flow:
+// The confirm button's link points at a PUBLIC, no-login endpoint (served by
+// the dedicated emailReceiptApi Lambda, src/handlers/email-receipt.js) keyed by
+// an unguessable token. Opening it shows a Confirm button; pressing it records
+// email_receipts.confirmed_at and then redirects to a static confirmation page
+// (or renders a built-in one if unset).
+//
+// Flow of an 'email' receipt:
 //   1. send handler → createEmailReceipt() mints a token + a pending row
 //   2. appendReceiptLink() embeds the link in the email body before it's sent
 //   3. after the *_sends row is written, linkReceiptToSend() ties them together
@@ -17,6 +33,19 @@
 // "confirm" is strong (a form POST a bot won't submit). Ops reads per-email
 // status via GET /api/v1/email-receipts (authed, orders.js).
 const crypto = require('crypto');
+const log = require('./logger');
+const { jportalSchema, isSourceMissing } = require('./jportal');
+
+const CONFIRM_VIA = ['email', 'portal', 'none'];
+
+/** A row's confirm_via; a row from before the column existed is 'email'. */
+const confirmViaOf = row => (row && CONFIRM_VIA.includes(row.confirm_via) ? row.confirm_via : 'email');
+
+/**
+ * Whether a reminder can be sent for this row: it has the confirm button, or it
+ * is a portal email whose link a reminder may repeat (action_url).
+ */
+const canRemind = row => confirmViaOf(row) === 'email' || (confirmViaOf(row) === 'portal' && Boolean(row.action_url));
 
 // Path (on the shared httpApi domain) of the public confirm endpoint. Kept in
 // sync with the route registered in serverless.yml + the emailReceiptApi
@@ -39,21 +68,56 @@ function newToken() {
     return crypto.randomBytes(24).toString('hex'); // 48 hex chars — unguessable
 }
 
-// Insert a pending receipt row and return its token. Called just before the
-// email body is assembled so the token can be embedded in the link.
-async function createEmailReceipt(conn, { emailType, sentTo, subject }) {
+// Insert a receipt row and return its token. For an 'email' receipt this is
+// called just before the email body is assembled, so the token can be embedded
+// in the link (and discardEmailReceipt drops the row if Front then refuses the
+// email). sendTable / sendId may be given here when the send row already exists.
+async function createEmailReceipt(conn, { emailType, sentTo, subject, confirmVia = 'email', actionUrl = null, sendTable = null, sendId = null }) {
     const token = newToken();
     await conn.query(
-        `INSERT INTO email_receipts (token, email_type, sent_to, subject)
-         VALUES (?, ?, ?, ?)`,
+        `INSERT INTO email_receipts (token, email_type, send_table, send_id, sent_to, subject, confirm_via, action_url)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
         [
             token,
             emailType,
+            sendTable || null,
+            sendId || null,
             Array.isArray(sentTo) ? JSON.stringify(sentTo) : (sentTo || null),
-            subject || null,
+            subject ? String(subject).slice(0, 500) : null,
+            CONFIRM_VIA.includes(confirmVia) ? confirmVia : 'email',
+            actionUrl ? String(actionUrl).slice(0, 1000) : null,
         ]
     );
     return token;
+}
+
+// Record an email that has ALREADY gone out with no confirm button
+// (confirmVia 'portal' or 'none'), so it shows on the Email Receipts page.
+// The email is sent, so a failure here is logged and never thrown.
+// → the row's token, or null.
+async function logSentEmail(conn, fields) {
+    try {
+        return await createEmailReceipt(conn, { confirmVia: 'none', ...fields });
+    } catch (e) {
+        log.warn('[email-receipt] a sent email was not recorded', { emailType: fields && fields.emailType, error: e.message });
+        return null;
+    }
+}
+
+// Front refused the email: drop the receipt minted for it, so the page lists
+// only emails that went out and the reminder sweep never chases one that did
+// not. Only a row no send was linked to. Never throws.
+async function discardEmailReceipt(conn, token) {
+    if (!token) return;
+    try {
+        await conn.query(
+            `DELETE FROM email_receipts
+              WHERE token = ? AND send_id IS NULL AND opened_at IS NULL AND confirmed_at IS NULL AND reminder_count = 0`,
+            [token]
+        );
+    } catch (e) {
+        log.warn('[email-receipt] an unsent email\'s receipt was not removed', { error: e.message });
+    }
 }
 
 // After the send row is written, point the receipt at it so a click can be
@@ -75,7 +139,7 @@ async function linkReceiptToSend(conn, token, sendTable, sendId) {
 async function getReceiptForResend(conn, id) {
     if (!Number.isFinite(Number(id))) return null;
     const [rows] = await conn.query(
-        `SELECT id, token, email_type, sent_to, subject, confirmed_at, reminder_count
+        `SELECT id, token, email_type, sent_to, subject, confirmed_at, reminder_count, confirm_via, action_url
            FROM email_receipts WHERE id = ?`,
         [Number(id)]
     );
@@ -143,8 +207,10 @@ function parseRecipients(sentTo) {
 // click still lands on the same email_receipts row. `subject` is the original
 // email's subject, shown so the recipient knows which email to acknowledge.
 // `reminderNumber` (1-based) is shown so both sides can see how many times we've
-// followed up.
-function renderReminderEmailHtml(subject, reminderNumber) {
+// followed up. `portal`: the reminder of a portal email, which asks the
+// recipient to open it on the portal (appendPortalLink adds the button) and
+// never to confirm receipt.
+function renderReminderEmailHtml(subject, reminderNumber, { portal = false } = {}) {
     const ref = subject ? esc(subject) : null;
     const n = Number(reminderNumber) > 0 ? Math.floor(Number(reminderNumber)) : null;
     return [
@@ -153,11 +219,15 @@ function renderReminderEmailHtml(subject, reminderNumber) {
         '<p style="margin:0 0 12px;">Hello,</p>',
         '<p style="margin:0 0 12px;">This is a friendly reminder about our earlier email' ,
         ref ? ` regarding <strong>${ref}</strong>` : '',
-        '. We would be grateful if you could confirm you have received it.</p>',
+        portal
+            ? '. It is waiting for you on our supplier portal.</p>'
+            : '. We would be grateful if you could confirm you have received it.</p>',
         '<p style="margin:0 0 4px;color:#555;">您好，</p>',
         '<p style="margin:0;color:#555;">这是关于我们之前' ,
         ref ? ` <strong>${ref}</strong> ` : '',
-        '邮件的友情提醒。如您已收到，敬请确认，谢谢。</p>',
+        portal
+            ? '邮件的友情提醒。相关内容已发布在供应商门户，请前往门户查看，谢谢。</p>'
+            : '邮件的友情提醒。如您已收到，敬请确认，谢谢。</p>',
         '</div>',
     ].join('');
 }
@@ -180,8 +250,174 @@ function appendReceiptLink(htmlBody, token, baseUrl) {
     return `${htmlBody || ''}${block}`;
 }
 
+// The block under a PORTAL email's reminder: the button to the portal page the
+// first email pointed at, in place of the confirm button. No url → the body
+// unchanged.
+function appendPortalLink(htmlBody, url) {
+    if (!url) return htmlBody || '';
+    const { FONT, INK, MUTED, BORDER, button, linkFallback } = require('./email-layout');
+    const block = [
+        `<div style="font-family:${FONT};font-size:13px;color:${INK};line-height:1.5;margin-top:28px;padding-top:16px;border-top:1px solid ${BORDER};">`,
+        `<p style="margin:0 0 4px;">Please open it on the supplier portal:<br><span style="color:${MUTED};">请在供应商门户中查看：</span></p>`,
+        button(url, 'Go to the supplier portal / 前往供应商门户'),
+        linkFallback(url),
+        `<p style="margin:0;font-size:12px;color:${MUTED};line-height:1.5;">These automated reminders stop once it has been opened on the portal.<br>在门户中查看后，将不再发送关于此邮件的自动提醒。</p>`,
+        '</div>',
+    ].join('');
+    return `${htmlBody || ''}${block}`;
+}
+
+// ── What the recipient did through a portal email's link ────────────────────
+// A 'portal' email has no confirm button. Its row is confirmed (or, for a link
+// a scanner could fetch, opened) from what the portal recorded AFTER the email
+// went out. Shipping is not told when that happens (the portal writes its own
+// tables), so the rows are brought up to date when they are read: before the
+// Email Receipts page lists them, before a reminder is sent, and at the start
+// of the reminder sweep. Also here: the two supplier emails JFPRO sends about
+// the portal are copied in from its audit log, so the page lists them too.
+//
+// Each step is its own statement and its own failure: a schema that is not on
+// this server (jportal, jfpro) is skipped quietly, anything else is logged.
+// → { skipped } or { failed: [step names] }. Never throws.
+const PORTAL_SYNC_MS = 20 * 1000;
+let lastPortalSync = 0;
+
+const JFPRO_AUDIT = 'jfpro.audit_log';
+// As JFPRO's api/portal-approval-email.js sends it.
+const PORTAL_APPROVAL_SUBJECT = 'Your supplier portal account is approved / 您的供应商门户账户已获批准';
+
+const PENDING_PORTAL = `r.confirm_via = 'portal' AND r.confirmed_at IS NULL`;
+
+function portalSyncSteps(jp) {
+    // The emailed version, or a later version of the same PO: a supplier who
+    // downloaded v3 is not chased about the email for v2.
+    const poView = `${jp}.po_document_views v
+                 WHERE v.purchase_order_id = d.purchase_order_id
+                   AND v.purchase_order_document_id >= d.id
+                   AND v.last_viewed_at >= r.created_at`;
+    const artworkTick = `artwork_confirmations c
+                 WHERE c.purchase_order_id = q.purchase_order_id
+                   AND c.created_at >= r.created_at
+                   AND (c.request_id = q.id OR JSON_CONTAINS(q.order_ids, CAST(c.order_id AS JSON)))`;
+    const fileView = `${jp}.file_transfer_views v
+                 WHERE v.transfer_id = r.send_id AND v.viewer_kind = 'supplier'`;
+    const availabilityAnswer = `${jp}.qc_availability_requests a
+                 WHERE a.visit_id = s.visit_id AND a.party = s.audience
+                   AND a.answered_at >= r.created_at`;
+    return [
+        // The PO email: a supplier's user opened that PDF on the portal.
+        ['po_viewed', `
+            UPDATE email_receipts r
+              JOIN purchase_order_document_sends s ON s.id = r.send_id
+              JOIN purchase_order_documents d ON d.id = s.purchase_order_document_id
+               SET r.confirmed_at = (SELECT MIN(IF(v.first_viewed_at >= r.created_at, v.first_viewed_at, v.last_viewed_at))
+                                       FROM ${poView})
+             WHERE ${PENDING_PORTAL} AND r.send_table = 'purchase_order_document_sends'
+               AND EXISTS (SELECT 1 FROM ${poView})`],
+        // The artwork request: the supplier ticked one of its items, through
+        // the link or signed in.
+        ['artwork_ticked', `
+            UPDATE email_receipts r
+              JOIN artwork_confirmation_requests q ON q.id = r.send_id
+               SET r.confirmed_at = (SELECT MIN(c.created_at) FROM ${artworkTick})
+             WHERE ${PENDING_PORTAL} AND r.send_table = 'artwork_confirmation_requests'
+               AND EXISTS (SELECT 1 FROM ${artworkTick})`],
+        // The "a file is waiting" notice: a supplier's user opened the file.
+        ['file_opened', `
+            UPDATE email_receipts r
+               SET r.confirmed_at = (SELECT MIN(v.first_viewed_at) FROM ${fileView})
+             WHERE ${PENDING_PORTAL} AND r.send_table = 'file_transfers'
+               AND EXISTS (SELECT 1 FROM ${fileView})`],
+        // A QC visit email with a link: the party answered the availability
+        // page (a form they submit: confirmed) ...
+        ['qc_availability_answered', `
+            UPDATE email_receipts r
+              JOIN qc_visit_sends s ON s.id = r.send_id
+               SET r.confirmed_at = (SELECT MIN(a.answered_at) FROM ${availabilityAnswer})
+             WHERE ${PENDING_PORTAL} AND r.send_table = 'qc_visit_sends'
+               AND EXISTS (SELECT 1 FROM ${availabilityAnswer})`],
+        // ... or the schedule page was fetched (a GET a mail scanner makes
+        // too: opened, never confirmed).
+        ['qc_schedule_opened', `
+            UPDATE email_receipts r
+              JOIN qc_visit_sends s ON s.id = r.send_id
+              JOIN qc_visit_links l ON l.id = s.schedule_link_id
+               SET r.opened_at = IF(l.first_opened_at >= r.created_at, l.first_opened_at, l.last_opened_at),
+                   r.open_count = GREATEST(r.open_count, 1)
+             WHERE ${PENDING_PORTAL} AND r.send_table = 'qc_visit_sends' AND r.opened_at IS NULL
+               AND l.last_opened_at >= r.created_at`],
+        // JFPRO's quote request: the supplier answered it on the portal.
+        ['quote_answered', `
+            UPDATE email_receipts r
+              JOIN ${JFPRO_AUDIT} a ON a.id = r.send_id
+              JOIN ${jp}.quote_requests q ON q.id = a.entity_id
+               SET r.confirmed_at = q.answered_at
+             WHERE ${PENDING_PORTAL} AND r.send_table = '${JFPRO_AUDIT}' AND r.email_type = 'quote_request'
+               AND q.answered_at IS NOT NULL`],
+    ];
+}
+
+// JFPRO's supplier emails about the portal, from its audit log: the approval
+// email ('approval_email_sent', stored cut to the column's 16 characters) and
+// the quote-request email ('email_sent' on a quote_request). One receipt per
+// audit row: the token is derived from the row's id, so a second import of the
+// same row is refused by the unique key. Such a token opens nothing: the
+// confirm endpoint answers 'email' receipts only.
+async function importJfproEmails(conn) {
+    const [[{ last }]] = await conn.query(
+        `SELECT COALESCE(MAX(send_id), 0) AS last FROM email_receipts WHERE send_table = ?`,
+        [JFPRO_AUDIT]
+    );
+    await conn.query(
+        `INSERT IGNORE INTO email_receipts
+                (token, email_type, send_table, send_id, sent_to, subject, confirm_via, created_at)
+         SELECT SHA2(CONCAT('jfpro-audit:', a.id), 256),
+                IF(a.entity_type = 'portal_user', 'portal_approval', 'quote_request'),
+                ?, a.id,
+                JSON_UNQUOTE(JSON_EXTRACT(a.after_json, '$.to')),
+                LEFT(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(a.after_json, '$.subject')),
+                              IF(a.entity_type = 'portal_user', ?, NULL)), 500),
+                IF(a.entity_type = 'portal_user', 'none', 'portal'),
+                a.created_at
+           FROM ${JFPRO_AUDIT} a
+          WHERE a.id > ?
+            AND ((a.entity_type = 'portal_user' AND a.action LIKE 'approval_email_s%')
+              OR (a.entity_type = 'quote_request' AND a.action = 'email_sent'))
+          ORDER BY a.id`,
+        [JFPRO_AUDIT, PORTAL_APPROVAL_SUBJECT, Number(last) || 0]
+    );
+}
+
+async function syncPortalReceipts(conn, { maxAgeMs = PORTAL_SYNC_MS } = {}) {
+    if (maxAgeMs > 0 && Date.now() - lastPortalSync < maxAgeMs) return { skipped: true, failed: [] };
+    lastPortalSync = Date.now();
+    const failed = [];
+    const run = async (name, fn) => {
+        try {
+            await fn();
+        } catch (e) {
+            failed.push(name);
+            if (!isSourceMissing(e)) log.warn('[email-receipt] portal sync step failed', { step: name, error: e.message, errno: e.errno });
+        }
+    };
+    await run('jfpro_emails', () => importJfproEmails(conn));
+    let steps = [];
+    try {
+        steps = portalSyncSteps(jportalSchema());
+    } catch (e) {
+        // JPORTAL_DB_SCHEMA is not a plain identifier: nothing can be read.
+        log.warn('[email-receipt] portal sync skipped', { error: e.message });
+        return { failed: ['po_viewed', 'artwork_ticked', 'file_opened', 'qc_availability_answered', 'qc_schedule_opened', 'quote_answered', ...failed] };
+    }
+    for (const [name, sql] of steps) await run(name, () => conn.query(sql));
+    return { failed };
+}
+
 const TOKEN_RE = /^[a-f0-9]{16,128}$/;
 
+// Only an 'email' receipt has a confirm link: a token of any other row (never
+// emailed, or derived from a JFPRO audit id) is answered as unknown.
+//
 // Record a landing-page view (the GET). WEAK signal: automated email security
 // scanners (Microsoft Safe Links, Mimecast, Proofpoint…) fetch links too, so an
 // "open" may be a bot rather than the recipient. Stamps opened_at once and bumps
@@ -191,7 +427,7 @@ async function markReceiptOpened(conn, token) {
     if (typeof token !== 'string' || !TOKEN_RE.test(token)) return null;
     const [rows] = await conn.query(
         `SELECT id, token, email_type, subject, sent_to, opened_at, open_count, confirmed_at
-           FROM email_receipts WHERE token = ?`,
+           FROM email_receipts WHERE token = ? AND confirm_via = 'email'`,
         [token]
     );
     if (!rows.length) return null;
@@ -215,7 +451,7 @@ async function markReceiptConfirmed(conn, token, { userAgent, ip } = {}) {
     if (typeof token !== 'string' || !TOKEN_RE.test(token)) return null;
     const [rows] = await conn.query(
         `SELECT id, token, email_type, subject, sent_to, confirmed_at
-           FROM email_receipts WHERE token = ?`,
+           FROM email_receipts WHERE token = ? AND confirm_via = 'email'`,
         [token]
     );
     if (!rows.length) return null;
@@ -316,10 +552,18 @@ function renderConfirmButtonHtml(receipt, actionUrl) {
 
 module.exports = {
     CONFIRM_PATH,
+    CONFIRM_VIA,
+    confirmViaOf,
+    canRemind,
     apiBaseUrlFromReq,
     createEmailReceipt,
+    logSentEmail,
+    discardEmailReceipt,
     linkReceiptToSend,
     appendReceiptLink,
+    appendPortalLink,
+    portalSyncSteps,
+    syncPortalReceipts,
     getReceiptForResend,
     recordReminderSend,
     listReminders,
