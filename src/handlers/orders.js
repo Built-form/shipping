@@ -35,7 +35,7 @@ const { sendReminderForReceipt } = require('../services/receipt-reminders');
 const { receiveOrderStock, ReceiveError } = require('../services/order-receive');
 // The PO send links to the PDF on the supplier portal and pre-approves its
 // recipients there; the portal records who opened it (docs/po-portal-send.md).
-const { preapprovePortalUsers, loadPoDocumentViews } = require('../services/portal-access');
+const { preapprovePortalUsers, loadPoDocumentViews, loadSignedPiViews } = require('../services/portal-access');
 const poPortalEmail = require('../lib/po-portal-email');
 const { wrapEmail } = require('../lib/email-layout');
 const { listWarehousesWithLocations, listLocationsForWarehouse } = require('../services/mintsoft-locations');
@@ -7147,8 +7147,9 @@ app.delete('/api/v1/payment-rules/:id', async (req, res) => {
 // ── Purchase Order Signed PIs (PI_signed) ────────────────────────────────
 // A signed proforma invoice attached to a PO. Same upload mechanics as
 // purchase_order_invoices (base64 → public S3 under a `signed-pis/` prefix),
-// but no Gemini check, and it can be emailed to a recipient via Front (with
-// the file attached), recording each send like the PO document sends.
+// but no Gemini check, and it can be sent to the supplier: an email via Front
+// with a link to it on the supplier portal (not the file attached), recording
+// each send like the PO document sends.
 function signedPiRowToJson(r) {
     return {
         id: r.id,
@@ -7247,12 +7248,13 @@ app.post('/api/v1/purchase-orders/:id/signed-pis', async (req, res) => {
     }
 });
 
-// GET /api/v1/purchase-orders/:id/signed-pis — newest first, each with its send history.
+// GET /api/v1/purchase-orders/:id/signed-pis — newest first, each with its send
+// history and who opened it on the supplier portal.
 app.get('/api/v1/purchase-orders/:id/signed-pis', async (req, res) => {
     try {
         await purchaseOrdersSchemaReady;
         const { id } = req.params;
-        const { rows, sendsByPi } = await withConnection(async (conn) => {
+        const { rows, sendsByPi, viewsByPi } = await withConnection(async (conn) => {
             const [piRows] = await conn.query(
                 `SELECT id, purchase_order_id, filename, s3_key, public_url, content_type,
                         file_size, notes, uploaded_by_email, uploaded_at
@@ -7277,12 +7279,14 @@ app.get('/api/v1/purchase-orders/:id/signed-pis', async (req, res) => {
                 if (!sendsByPi.has(s.purchase_order_signed_pi_id)) sendsByPi.set(s.purchase_order_signed_pi_id, []);
                 sendsByPi.get(s.purchase_order_signed_pi_id).push(s);
             }
-            return { rows: piRows, sendsByPi };
+            const viewsByPi = await loadSignedPiViews(conn, ids);
+            return { rows: piRows, sendsByPi, viewsByPi };
         });
         res.json({
             data: rows.map(r => ({
                 ...signedPiRowToJson(r),
                 sends: (sendsByPi.get(r.id) || []).map(sendRowToJson),
+                views: viewsByPi.get(Number(r.id)) || [],
             })),
         });
     } catch (error) {
@@ -7328,9 +7332,15 @@ app.delete('/api/v1/purchase-order-signed-pis/:id', async (req, res) => {
 });
 
 // POST /api/v1/purchase-order-signed-pis/:id/email
-// Sends a signed PI to a recipient via Front with the file attached. Subject/
-// body come from the `purchase_order_signed_pi` email template ({poNumber}
-// token) and can be overridden per-send via the request body.
+// Tells the supplier that a signed PI is on the supplier portal: an email via
+// Front with a link to the order there, NOT the file attached. The same send
+// as the PO's (POST /purchase-order-documents/:id/email above, and
+// docs/po-portal-send.md): every recipient is pre-approved as a portal user
+// and linked to the PO's suppliers before it goes out, and the send row written
+// here is what lists the signed PI on the portal. Subject and body come from
+// the stored `purchase_order_signed_pi` template and can be overridden per
+// send; {poNumber} is filled in either way, and the fixed portal block (button
+// to the order, how to register) is appended under the body.
 app.post('/api/v1/purchase-order-signed-pis/:id/email', async (req, res) => {
     try {
         await auditLogSchemaReady;
@@ -7340,24 +7350,29 @@ app.post('/api/v1/purchase-order-signed-pis/:id/email', async (req, res) => {
 
         const { id } = req.params;
         const { to, subject, body } = req.body || {};
-        const toAddresses = (Array.isArray(to) ? to : [to])
-            .filter(x => typeof x === 'string')
-            .map(x => x.trim())
-            .filter(Boolean);
-        if (toAddresses.length === 0 || toAddresses.some(a => !EMAIL_RE.test(a))) {
+        // As the PO send: these addresses are also pre-approved on the portal,
+        // so each must be one clean address, and one bad piece fails the lot.
+        const { addresses: toAddresses, invalid } = poPortalEmail.parseRecipients(to);
+        if (invalid.length) {
+            return res.status(400).json({ error: `Not a valid email address: ${invalid.map(a => `"${a}"`).join(', ')}`, invalid });
+        }
+        if (toAddresses.length === 0) {
             return res.status(400).json({ error: 'A valid `to` email address (or array of addresses) is required.' });
         }
         if (!process.env.FRONT_API_TOKEN || !process.env.FRONT_CHANNEL_ID) {
             return res.status(500).json({ error: 'Front is not configured (FRONT_API_TOKEN, FRONT_CHANNEL_ID).' });
         }
-        if (!PO_BUCKET) {
-            return res.status(500).json({ error: 'PO_DOCS_BUCKET env var not configured.' });
+        const portalBase = poPortalEmail.portalBaseOf();
+        if (!portalBase) {
+            return res.status(409).json({
+                code: 'PORTAL_URL_UNSET',
+                error: 'The supplier portal address (SUPPLIER_PORTAL_URL) is not configured, so the signed PI link cannot be sent.',
+            });
         }
 
         const result = await withConnection(async (conn) => {
             const [rows] = await conn.query(
-                `SELECT spi.id, spi.purchase_order_id, spi.filename, spi.s3_key, spi.content_type,
-                        po.po_number
+                `SELECT spi.id, spi.purchase_order_id, spi.filename, po.po_number, po.supplier
                    FROM purchase_order_signed_pis spi
                    JOIN purchase_orders po ON po.id = spi.purchase_order_id
                   WHERE spi.id = ? AND spi.deleted_at IS NULL AND po.deleted_at IS NULL`,
@@ -7365,33 +7380,62 @@ app.post('/api/v1/purchase-order-signed-pis/:id/email', async (req, res) => {
             );
             if (!rows.length) return { notFound: true };
             const doc = rows[0];
+            const poUrl = poPortalEmail.poPortalUrl(portalBase, doc.purchase_order_id);
 
-            const obj = await s3.send(new GetObjectCommand({ Bucket: PO_BUCKET, Key: doc.s3_key }));
-            const fileBytes = Buffer.from(await obj.Body.transformToByteArray());
-            const safeFilename = String(doc.filename || `signed-pi-${doc.id}`).replace(SAFE_FILENAME_RE, '_');
-            const ct = doc.content_type || 'application/octet-stream';
+            // Pre-approve first, in its own committed transaction; a failure
+            // never stops the email (the block then says our team will approve
+            // them). Linked to every supplier on the PO: its own and its lines'.
+            let portalAccess;
+            try {
+                const [lineRows] = await conn.query(
+                    `SELECT DISTINCT supplier FROM orders
+                      WHERE purchase_order_id = ? AND deleted_at IS NULL
+                        AND supplier IS NOT NULL AND supplier <> ''`,
+                    [doc.purchase_order_id]
+                );
+                portalAccess = await preapprovePortalUsers(conn, {
+                    recipients: toAddresses,
+                    poSupplier: doc.supplier,
+                    lineSuppliers: lineRows.map(r => r.supplier),
+                    actorEmail: req.userEmail,
+                    note: `Pre-approved from ShipLine: signed PI for PO ${doc.po_number} emailed by ${req.userEmail || 'ShipLine'}`,
+                });
+            } catch (e) {
+                log.error('[purchase-order-signed-pis/email] portal pre-approval failed', { signedPiId: doc.id, error: e.message, errno: e.errno });
+                portalAccess = { status: 'error', suppliers: [], poSupplierMatched: false, users: [] };
+            }
+            const preapproved = portalAccess.status === 'ok'
+                && portalAccess.poSupplierMatched
+                && portalAccess.users.every(u => poPortalEmail.GRANTED_OUTCOMES.has(u.outcome));
 
             const tpl = await getEmailTemplate(conn, 'purchase_order_signed_pi');
             const vars = { poNumber: doc.po_number };
             const finalSubject = (typeof subject === 'string' && subject.trim())
-                ? subject.trim()
+                ? renderTemplate(subject.trim(), vars)
                 : (renderTemplate(tpl.subject, vars) || `Signed PI – ${doc.po_number}`);
             const htmlBody = (typeof body === 'string' && body.trim())
-                ? body
+                ? renderTemplate(body, vars)
                 : renderTemplate(tpl.bodyHtml, vars);
-
-            const receiptToken = await createEmailReceipt(conn, {
-                emailType: 'purchase_order_signed_pi', sentTo: toAddresses, subject: finalSubject,
+            const bodyWithPortal = htmlBody + poPortalEmail.signedPiPortalBlockHtml({
+                poNumber: doc.po_number,
+                filename: doc.filename,
+                poUrl,
+                registerUrl: poPortalEmail.registerUrl(portalBase),
+                preapproved,
             });
-            const bodyWithReceipt = appendReceiptLink(htmlBody, receiptToken, apiBaseUrlFromReq(req));
 
+            // Inside the portal emails' frame, with no "Confirm receipt"
+            // button: opening the signed PI on the portal is what marks this
+            // email confirmed (syncPortalReceipts, src/lib/email-receipt.js).
+            const emailHtml = wrapEmail({ title: finalSubject, bodyHtml: bodyWithPortal });
+
+            // No attachment: the file is on the portal.
             const form = new FormData();
             for (const addr of toAddresses) form.append('to[]', addr);
             form.append('subject', finalSubject);
-            form.append('body', bodyWithReceipt);
+            form.append('body', emailHtml);
             form.append('body_format', 'html');
             form.append('options[archive]', 'false');
-            form.append('attachments[]', new Blob([fileBytes], { type: ct }), safeFilename);
 
             const frontUrl = `https://api2.frontapp.com/channels/${encodeURIComponent(process.env.FRONT_CHANNEL_ID)}/messages`;
             const resp = await fetch(frontUrl, {
@@ -7407,8 +7451,6 @@ app.post('/api/v1/purchase-order-signed-pis/:id/email', async (req, res) => {
                 log.error('[purchase-order-signed-pis/email] Front API error', {
                     status: resp.status, body: respText.slice(0, 500),
                 });
-                // Not sent: its receipt must not be listed, or chased.
-                await discardEmailReceipt(conn, receiptToken);
                 return { frontError: { status: resp.status, body: respText.slice(0, 500) } };
             }
             let parsed = null;
@@ -7429,14 +7471,30 @@ app.post('/api/v1/purchase-order-signed-pis/:id/email', async (req, res) => {
                 [sendInsert.insertId]
             );
             const sentAt = sentRow[0]?.sent_at?.toISOString?.() ?? sentRow[0]?.sent_at ?? null;
-            await linkReceiptToSend(conn, receiptToken, 'purchase_order_signed_pi_sends', sendInsert.insertId);
+            // On the Email Receipts page as a portal email: confirmed when the
+            // signed PI is opened on the portal, and reminded with the portal's
+            // address (action_url) until then.
+            await logSentEmail(conn, {
+                emailType: 'purchase_order_signed_pi', sentTo: toAddresses, subject: finalSubject,
+                confirmVia: 'portal', actionUrl: poUrl,
+                sendTable: 'purchase_order_signed_pi_sends', sendId: sendInsert.insertId,
+            });
 
             await recordAudit(conn, {
                 entityType: 'purchase_order',
                 entityId: doc.purchase_order_id,
                 action: 'signed_pi_emailed',
                 before: null,
-                after: { signedPiId: doc.id, sendId: sendInsert.insertId, to: toAddresses, subject: finalSubject, frontMessageUid },
+                after: {
+                    signedPiId: doc.id,
+                    sendId: sendInsert.insertId,
+                    to: toAddresses,
+                    subject: finalSubject,
+                    frontMessageUid,
+                    frontConversationId,
+                    portalUrl: poUrl,
+                    portalAccess,
+                },
                 userEmail: req.userEmail,
             });
 
@@ -7450,6 +7508,8 @@ app.post('/api/v1/purchase-order-signed-pis/:id/email', async (req, res) => {
                 sentAt,
                 frontMessageUid,
                 frontConversationId,
+                portalUrl: poUrl,
+                portalAccess,
             };
         });
 

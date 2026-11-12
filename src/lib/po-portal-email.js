@@ -6,6 +6,8 @@
 // users, and the fixed portal block appended under the editable template body.
 // The SQL is in src/services/portal-access.js; the route is
 // POST /api/v1/purchase-order-documents/:id/email in src/handlers/orders.js.
+// The signed-PI send (POST /api/v1/purchase-order-signed-pis/:id/email) goes
+// out the same way and shares all of it but the block's wording.
 
 // The portal's base URL from SUPPLIER_PORTAL_URL, '' when unset.
 const portalBaseOf = (env = process.env) =>
@@ -14,7 +16,8 @@ const portalBaseOf = (env = process.env) =>
 // The order's page on the portal (never the PDF's own address), opened on its
 // Emailed PDFs tab, where the supplier downloads it (portal:
 // web/src/screens/OrderDetailScreen.tsx). A signed-out visitor is sent to sign
-// in and brought back here (portal: web/src/lib/returnTo.ts).
+// in and brought back here (portal: web/src/lib/returnTo.ts). The order's
+// signed proforma invoices are on the same tab, so their email links here too.
 const poPortalUrl = (base, purchaseOrderId) =>
     `${base}/orders/${encodeURIComponent(purchaseOrderId)}?tab=pdfs`;
 
@@ -105,6 +108,37 @@ function portalBlockHtml({ poNumber, version, poUrl, registerUrl: regUrl, preapp
     const po = escapeHtml(poNumber);
     const v = version != null ? ` v${escapeHtml(version)}` : '';
     const vZh = version != null ? `（第 ${escapeHtml(version)} 版）` : '';
+    return blockHtml({
+        leadHtml: `<strong>PO ${po}${v}</strong> is on the supplier portal. Sign in, and download the PDF from the order's page.<br>采购订单 <strong>${po}</strong>${vZh}已发布在供应商门户。请登录门户，在该订单页面下载 PDF。`,
+        url: poUrl,
+        regUrl,
+        preapproved,
+        footHtml: 'No PDF is attached to this email: the PO is kept on the portal, so you always download the current version. / 本邮件不附带 PDF：采购订单保存在门户中，您下载的始终是最新版本。',
+    });
+}
+
+/**
+ * The same block for a signed proforma invoice (the signed-PI send,
+ * POST /api/v1/purchase-order-signed-pis/:id/email): the button goes to the
+ * same page of the order, where the signed PI is listed under the PO's PDFs.
+ * `filename` is the signed file's name as staff uploaded it.
+ */
+function signedPiPortalBlockHtml({ poNumber, filename, poUrl, registerUrl: regUrl, preapproved }) {
+    const po = escapeHtml(poNumber);
+    const file = filename ? ` (${escapeHtml(filename)})` : '';
+    const fileZh = filename ? `（${escapeHtml(filename)}）` : '';
+    return blockHtml({
+        leadHtml: `The <strong>signed proforma invoice</strong> for purchase order <strong>${po}</strong>${file} is on the supplier portal. Sign in, and download it from the order's page.<br>采购订单 <strong>${po}</strong> 的<strong>已签署形式发票</strong>${fileZh}已发布在供应商门户。请登录门户，在该订单页面下载。`,
+        url: poUrl,
+        regUrl,
+        preapproved,
+        footHtml: 'No file is attached to this email: the signed proforma invoice is kept on the portal. / 本邮件不附带文件：已签署的形式发票保存在门户中。',
+    });
+}
+
+// The frame both blocks share: the lead line, the button and its address as
+// text, how to get an account, and the "nothing is attached" line.
+function blockHtml({ leadHtml, url, regUrl, preapproved, footHtml }) {
     const reg = escapeHtml(regUrl);
     const regLink = `<a href="${reg}" style="color:#1f5fbf;word-break:break-all;">${reg}</a>`;
     const account = preapproved
@@ -118,11 +152,11 @@ function portalBlockHtml({ poNumber, version, poUrl, registerUrl: regUrl, preapp
         ];
     return [
         `<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:18px 0;"><tr><td style="padding:16px 18px 6px;border:1px solid ${BORDER};border-radius:8px;background:${CODE_BG};">`,
-        `<p style="margin:0 0 12px;font-family:${FONT};font-size:15px;line-height:1.6;color:${INK};"><strong>PO ${po}${v}</strong> is on the supplier portal. Sign in, and download the PDF from the order's page.<br>采购订单 <strong>${po}</strong>${vZh}已发布在供应商门户。请登录门户，在该订单页面下载 PDF。</p>`,
-        button(poUrl, 'Go to the supplier portal / 前往供应商门户'),
-        linkFallback(poUrl),
+        `<p style="margin:0 0 12px;font-family:${FONT};font-size:15px;line-height:1.6;color:${INK};">${leadHtml}</p>`,
+        button(url, 'Go to the supplier portal / 前往供应商门户'),
+        linkFallback(url),
         ...account,
-        `<p style="margin:0 0 10px;font-family:${FONT};font-size:12px;line-height:1.5;color:${MUTED};">No PDF is attached to this email: the PO is kept on the portal, so you always download the current version. / 本邮件不附带 PDF：采购订单保存在门户中，您下载的始终是最新版本。</p>`,
+        `<p style="margin:0 0 10px;font-family:${FONT};font-size:12px;line-height:1.5;color:${MUTED};">${footHtml}</p>`,
         '</td></tr></table>',
     ].join('');
 }
@@ -137,4 +171,5 @@ module.exports = {
     outcomeFor,
     GRANTED_OUTCOMES,
     portalBlockHtml,
+    signedPiPortalBlockHtml,
 };

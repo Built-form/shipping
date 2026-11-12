@@ -46,10 +46,20 @@ Code: `src/lib/po-portal-email.js` (pure rules, tested by `tools/test-po-portal-
 - `GET /api/v1/purchase-orders/:id/documents` adds `views: [{ email, firstViewedAt, lastViewedAt, count }]` to every document; the `GET /orders` PO bundle adds it to each PO's **newest** document only (the bundle is polled).
 - ShipLine: `LifecycleTicks` shows **SEEN** after **PO** once the latest version has been emailed: green when someone opened that version (hover lists who and when), hollow until then. A new version starts unseen. The DOCUMENTS list and the send dialog list "👁 opened on the portal by …" per version.
 
+## Signed PIs
+
+Since 2026-11-12 the **signed PI** send (`POST /api/v1/purchase-order-signed-pis/:id/email`, ShipLine's SIGNED PI → SEND) goes out the same way: no attachment, a link to the order on the portal. It replaces the old send, which attached the file; there is no choice between the two.
+
+- **Same link, same page.** The button goes to `${SUPPLIER_PORTAL_URL}/orders/<po id>?tab=pdfs`. The portal lists the order's signed PIs on that tab, under the PO's PDFs (`GET /api/supplier/purchase-orders/{id}/signed-pis`, portal README section 10). A signed PI is listed once it has a row in `purchase_order_signed_pi_sends`, so every signed PI sent before this change (as an attachment) is listed too.
+- **Same recipients rule and pre-approval.** `parseRecipients`, then `preapprovePortalUsers` for the PO's supplier and its lines' suppliers; `decided_note` reads "Pre-approved from ShipLine: signed PI for PO … emailed by …". `409 PORTAL_URL_UNSET` when the portal's address is not configured. The response and the `signed_pi_emailed` audit row carry `portalUrl` and `portalAccess`.
+- **The email.** Template `purchase_order_signed_pi`, reworded in place by `2026-11-12_30_reword_signed_pi_template.js` (it said "Please find attached"; a row ops had edited is left alone and named in the migration's log). Token `{poNumber}`, filled in for the stored template and for a body or subject edited in the send dialog alike (before, an edited body went out with the token unfilled). Under the body the sender appends `signedPiPortalBlockHtml`: the PO number and the file's name, the button, how to register, "no file is attached".
+- **Views.** The portal writes `jportal.signed_pi_views` when a supplier opens the file (`POST /api/supplier/signed-pis/{id}/viewed`). `loadSignedPiViews` reads it; `GET /api/v1/purchase-orders/:id/signed-pis` adds `views` to every signed PI (not the `GET /orders` bundle). ShipLine lists "👁 opened on the portal by …" on the signed PI's row and in its send dialog. There is no SEEN tick for it in the PO's lifecycle ticks.
+- **Email receipt.** Logged as `confirm_via = 'portal'` with the portal address as `action_url`: no "Confirm receipt" button, confirmed when that signed PI (or a later one of the same PO) is opened on the portal (`signed_pi_viewed` in `portalSyncSteps`), and reminded with the portal's address until then. Receipts of signed-PI emails sent before the change keep their button. The reminder sweep leaves signed-PI emails alone on a run where `signed_pi_views` could not be read (shipping deployed before the portal), and still chases PO emails.
+
 ## Rollout (test, then prod)
 
-1. Portal: `bash deploy.sh <stage>` in `portal` (migration creates `po_document_views`, re-applies `db/grants/jportal_app.sql`, deploys the `/viewed` route and the web build).
-2. Shipping: `bash deploy.sh <stage>` (seeds `purchase_order_portal`, deploys the route).
+1. Portal: `bash deploy.sh <stage>` in `portal` (migrations create `po_document_views` and `signed_pi_views`, re-apply `db/grants/jportal_app.sql`, deploy the `/viewed` routes and the web build).
+2. Shipping: `bash deploy.sh <stage>` (seeds `purchase_order_portal`, rewords `purchase_order_signed_pi`, deploys the routes).
 3. ShipLine: deploy as usual.
 
-Shipping before the portal is safe: views read as none. On test, remember the DB is rebuilt from prod every 3 days.
+Shipping before the portal is safe for the PO: views read as none. **Not for the signed PI**: its email would link to a page that does not list it yet, so deploy the portal first. On test, remember the DB is rebuilt from prod every 3 days.

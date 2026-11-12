@@ -4,17 +4,19 @@
 // (GET /api/v1/email-receipts, orders.js). confirm_via says how an email gets
 // confirmed (2026-11-12_10):
 //   'email'   it carries the "Confirm receipt" button: the delivery-quote
-//             request, the QA sheet, the signed PI, and a QC visit email with
-//             no link of its own. The two-step flow below.
+//             request, the QA sheet, and a QC visit email with no link of its
+//             own. The two-step flow below. (So did the signed PI while it
+//             went out as an attachment; those rows keep their button.)
 //   'portal'  it carries a link into the supplier portal or a no-login magic
 //             link, and NO confirm button, so the recipient is asked to do one
-//             thing, not two: the PO, the artwork request, the "a file is
-//             waiting" notice, a QC visit email with an availability or
-//             schedule link, JFPRO's quote request. What the recipient does
-//             through the link sets confirmed_at (syncPortalReceipts).
+//             thing, not two: the PO, the signed PI, the artwork request, the
+//             "a file is waiting" notice, a QC visit email with an
+//             availability or schedule link, JFPRO's quote request. What the
+//             recipient does through the link sets confirmed_at
+//             (syncPortalReceipts).
 //   'none'    a notice; nothing is asked: a PI decision, a portal approval.
-// Only an 'email' row, or a 'portal' row with an action_url (the PO), is chased
-// with reminders (src/services/receipt-reminders.js).
+// Only an 'email' row, or a 'portal' row with an action_url (the PO, the signed
+// PI), is chased with reminders (src/services/receipt-reminders.js).
 //
 // The confirm button's link points at a PUBLIC, no-login endpoint (served by
 // the dedicated emailReceiptApi Lambda, src/handlers/email-receipt.js) keyed by
@@ -288,12 +290,25 @@ const PORTAL_APPROVAL_SUBJECT = 'Your supplier portal account is approved / æ‚¨ç
 
 const PENDING_PORTAL = `r.confirm_via = 'portal' AND r.confirmed_at IS NULL`;
 
+// The portal emails that are chased (they store an action_url), by the send
+// table their receipt names, with the sync step that confirms each. A step that
+// failed this run leaves its emails unchased (receipt-reminders.js).
+const CHASED_PORTAL_STEPS = {
+    purchase_order_document_sends: 'po_viewed',
+    purchase_order_signed_pi_sends: 'signed_pi_viewed',
+};
+
 function portalSyncSteps(jp) {
     // The emailed version, or a later version of the same PO: a supplier who
     // downloaded v3 is not chased about the email for v2.
     const poView = `${jp}.po_document_views v
                  WHERE v.purchase_order_id = d.purchase_order_id
                    AND v.purchase_order_document_id >= d.id
+                   AND v.last_viewed_at >= r.created_at`;
+    // The emailed signed PI, or a later one of the same PO, for the same reason.
+    const signedPiView = `${jp}.signed_pi_views v
+                 WHERE v.purchase_order_id = d.purchase_order_id
+                   AND v.purchase_order_signed_pi_id >= d.id
                    AND v.last_viewed_at >= r.created_at`;
     const artworkTick = `artwork_confirmations c
                  WHERE c.purchase_order_id = q.purchase_order_id
@@ -314,6 +329,15 @@ function portalSyncSteps(jp) {
                                        FROM ${poView})
              WHERE ${PENDING_PORTAL} AND r.send_table = 'purchase_order_document_sends'
                AND EXISTS (SELECT 1 FROM ${poView})`],
+        // The signed PI email: a supplier's user opened that file on the portal.
+        ['signed_pi_viewed', `
+            UPDATE email_receipts r
+              JOIN purchase_order_signed_pi_sends s ON s.id = r.send_id
+              JOIN purchase_order_signed_pis d ON d.id = s.purchase_order_signed_pi_id
+               SET r.confirmed_at = (SELECT MIN(IF(v.first_viewed_at >= r.created_at, v.first_viewed_at, v.last_viewed_at))
+                                       FROM ${signedPiView})
+             WHERE ${PENDING_PORTAL} AND r.send_table = 'purchase_order_signed_pi_sends'
+               AND EXISTS (SELECT 1 FROM ${signedPiView})`],
         // The artwork request: the supplier ticked one of its items, through
         // the link or signed in.
         ['artwork_ticked', `
@@ -407,7 +431,7 @@ async function syncPortalReceipts(conn, { maxAgeMs = PORTAL_SYNC_MS } = {}) {
     } catch (e) {
         // JPORTAL_DB_SCHEMA is not a plain identifier: nothing can be read.
         log.warn('[email-receipt] portal sync skipped', { error: e.message });
-        return { failed: ['po_viewed', 'artwork_ticked', 'file_opened', 'qc_availability_answered', 'qc_schedule_opened', 'quote_answered', ...failed] };
+        return { failed: ['po_viewed', 'signed_pi_viewed', 'artwork_ticked', 'file_opened', 'qc_availability_answered', 'qc_schedule_opened', 'quote_answered', ...failed] };
     }
     for (const [name, sql] of steps) await run(name, () => conn.query(sql));
     return { failed };
@@ -562,6 +586,7 @@ module.exports = {
     linkReceiptToSend,
     appendReceiptLink,
     appendPortalLink,
+    CHASED_PORTAL_STEPS,
     portalSyncSteps,
     syncPortalReceipts,
     getReceiptForResend,

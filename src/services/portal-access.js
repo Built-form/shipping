@@ -11,7 +11,10 @@
 //     also writes (portal README section 4). A pre-provisioned row is unbound
 //     (cognito_sub NULL) and `active`; the portal binds it on the first
 //     sign-in with that verified email and keeps its status.
-//   - po_document_views, written by the portal (README section 10, "Views").
+//   - po_document_views and signed_pi_views, written by the portal (README
+//     section 10, "Views"): the PO PDFs and the signed proforma invoices a
+//     supplier opened there. The signed-PI send pre-approves its recipients
+//     exactly as the PO send does.
 // Shipping's login is `admin` on both stages, so there are no grants to keep.
 // An environment without the schema or a table answers as unavailable
 // (SOURCE_MISSING) instead of failing the send.
@@ -170,18 +173,32 @@ async function provisionOnce(conn, provision, suppliers, { jp, actor, decidedNot
  * firstViewedAt, lastViewedAt, count }]), first viewer first. Documents nobody
  * opened have no entry. Empty when the portal table is not here.
  */
-async function loadPoDocumentViews(conn, documentIds) {
+function loadPoDocumentViews(conn, documentIds) {
+    return loadViews(conn, 'po_document_views', 'purchase_order_document_id', documentIds);
+}
+
+/**
+ * The same for signed proforma invoices: Map(signedPiId -> [{ email,
+ * firstViewedAt, lastViewedAt, count }]), from the portal's signed_pi_views
+ * (portal README section 10, "Views"). Empty when the table is not here.
+ */
+function loadSignedPiViews(conn, signedPiIds) {
+    return loadViews(conn, 'signed_pi_views', 'purchase_order_signed_pi_id', signedPiIds);
+}
+
+// `table` and `idColumn` are the two literals above, never a caller's value.
+async function loadViews(conn, table, idColumn, wantedIds) {
     const out = new Map();
-    const ids = [...new Set((documentIds || []).filter(Boolean))];
+    const ids = [...new Set((wantedIds || []).filter(Boolean))];
     if (!ids.length) return out;
     let rows;
     try {
         [rows] = await conn.query(
-            `SELECT purchase_order_document_id, user_email, view_count,
+            `SELECT ${idColumn} AS viewed_id, user_email, view_count,
                     DATE_FORMAT(first_viewed_at, ${ISO_UTC}) AS first_viewed_at,
                     DATE_FORMAT(last_viewed_at, ${ISO_UTC}) AS last_viewed_at
-               FROM ${jportalSchema()}.po_document_views
-              WHERE purchase_order_document_id IN (${ids.map(() => '?').join(',')})
+               FROM ${jportalSchema()}.${table}
+              WHERE ${idColumn} IN (${ids.map(() => '?').join(',')})
               ORDER BY first_viewed_at, id`,
             ids
         );
@@ -190,7 +207,7 @@ async function loadPoDocumentViews(conn, documentIds) {
         throw e;
     }
     for (const r of rows) {
-        const key = Number(r.purchase_order_document_id);
+        const key = Number(r.viewed_id);
         if (!out.has(key)) out.set(key, []);
         out.get(key).push({
             email: r.user_email,
@@ -202,4 +219,4 @@ async function loadPoDocumentViews(conn, documentIds) {
     return out;
 }
 
-module.exports = { preapprovePortalUsers, loadPoDocumentViews };
+module.exports = { preapprovePortalUsers, loadPoDocumentViews, loadSignedPiViews };

@@ -92,16 +92,23 @@ const DEFAULT_EMAIL_TEMPLATES = [
         ].join(''),
     },
     {
+        // The signed-PI send no longer attaches the file either: the sender
+        // appends its portal block (signedPiPortalBlockHtml,
+        // src/lib/po-portal-email.js) under this body. Reworded in place by
+        // 2026-11-12_30_reword_signed_pi_template.js, which holds the wording
+        // it replaced ("Please find attached ...").
         key: 'purchase_order_signed_pi',
         name: 'Signed Proforma Invoice',
         category: 'Purchasing',
-        description: 'Emailed with a signed proforma invoice (PI_signed) attached. Tokens: {poNumber}.',
-        subject: 'Signed PI – {poNumber}',
+        description: 'Emailed to a supplier when a signed proforma invoice (PI_signed) is sent: no attachment, the file is on the supplier portal. A button to the order and registration instructions are appended automatically. Tokens: {poNumber}.',
+        subject: 'Signed PI – {poNumber} – on the supplier portal / 已签署的形式发票',
         bodyHtml: [
             '<div style="font-family:Helvetica,Arial,sans-serif;font-size:14px;color:#222;line-height:1.5;">',
             '<p>Greetings,</p>',
-            '<p>Please find attached the signed proforma invoice for your records.</p>',
-            '<p>Thank you.</p>',
+            '<p>We have signed the proforma invoice for purchase order <strong>{poNumber}</strong>. It is not attached to this email: please sign in to our supplier portal and download it from the order\'s page, for your records.</p>',
+            '<p>您好，</p>',
+            '<p>我们已签署采购订单 <strong>{poNumber}</strong> 的形式发票。本邮件不附带该文件：请登录我们的供应商门户，在该订单页面下载留存。</p>',
+            '<p>Thank you. / 谢谢。</p>',
             '<p>Kind Regards,<br>Operations Team.<br>JFA Medical Ltd.</p>',
             '</div>',
         ].join(''),
@@ -267,6 +274,9 @@ const QC_VISIT_TEMPLATE_KEYS = ['qc_visit_factory', 'qc_visit_inspector', 'qc_vi
 // The PO send's portal-link email (seeded by 2026-11-03_20_seed_po_portal_template.js).
 const PO_PORTAL_TEMPLATE_KEY = 'purchase_order_portal';
 
+// The signed-PI send's email (reworded by 2026-11-12_30_reword_signed_pi_template.js).
+const SIGNED_PI_TEMPLATE_KEY = 'purchase_order_signed_pi';
+
 // "A file is waiting for you on the portal" (src/services/file-transfer-routes.js;
 // seeded by 2026-11-04_20_seed_file_transfer_template.js). Kept apart from the
 // list above so the older seed migrations, which iterate it, never pick it up.
@@ -329,6 +339,7 @@ DEFAULT_EMAIL_TEMPLATES.push(ARTWORK_CONFIRMATION_TEMPLATE);
 
 module.exports = {
     DEFAULT_EMAIL_TEMPLATES, SUPPLIER_PI_TEMPLATE_KEYS, QC_VISIT_TEMPLATE_KEYS, PO_PORTAL_TEMPLATE_KEY,
+    SIGNED_PI_TEMPLATE_KEY,
     FILE_TRANSFER_TEMPLATE_KEY, FILE_TRANSFER_TEMPLATE,
     ARTWORK_CONFIRMATION_TEMPLATE_KEY, ARTWORK_CONFIRMATION_TEMPLATE,
 };

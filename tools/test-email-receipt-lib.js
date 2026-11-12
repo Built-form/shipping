@@ -145,18 +145,32 @@ test('sendReminderForReceipt: the confirm button for an email receipt, the porta
 test('portalSyncSteps: every step touches unconfirmed portal receipts only', () => {
     const steps = R.portalSyncSteps('`jportal`');
     assert.deepEqual(steps.map(s => s[0]), [
-        'po_viewed', 'artwork_ticked', 'file_opened', 'qc_availability_answered', 'qc_schedule_opened', 'quote_answered',
+        'po_viewed', 'signed_pi_viewed', 'artwork_ticked', 'file_opened', 'qc_availability_answered', 'qc_schedule_opened', 'quote_answered',
     ]);
     for (const [name, sql] of steps) {
         assert.match(sql, /^\s*UPDATE email_receipts r/, name);
         assert.match(sql, /r\.confirm_via = 'portal' AND r\.confirmed_at IS NULL/, name);
     }
+    const step = Object.fromEntries(steps);
     // What happened before the email went out does not confirm it.
-    assert.match(steps[0][1], /v\.last_viewed_at >= r\.created_at/);
-    assert.match(steps[3][1], /a\.answered_at >= r\.created_at/);
+    assert.match(step.po_viewed, /v\.last_viewed_at >= r\.created_at/);
+    assert.match(step.qc_availability_answered, /a\.answered_at >= r\.created_at/);
     // A fetched schedule page is an open, not a confirmation.
-    assert.match(steps[4][1], /SET r\.opened_at/);
-    assert.doesNotMatch(steps[4][1], /SET r\.confirmed_at/);
+    assert.match(step.qc_schedule_opened, /SET r\.opened_at/);
+    assert.doesNotMatch(step.qc_schedule_opened, /SET r\.confirmed_at/);
+    // The signed PI: its own sends and its own portal table, that file or a later one of the PO.
+    assert.match(step.signed_pi_viewed, /JOIN purchase_order_signed_pi_sends s ON s\.id = r\.send_id/);
+    assert.match(step.signed_pi_viewed, /r\.send_table = 'purchase_order_signed_pi_sends'/);
+    assert.match(step.signed_pi_viewed, /`jportal`\.signed_pi_views v/);
+    assert.match(step.signed_pi_viewed, /v\.purchase_order_signed_pi_id >= d\.id/);
+    assert.match(step.signed_pi_viewed, /v\.last_viewed_at >= r\.created_at/);
+    assert.doesNotMatch(step.signed_pi_viewed, /po_document_views/);
+    // Every chased portal email has the step that confirms it.
+    assert.deepEqual(R.CHASED_PORTAL_STEPS, {
+        purchase_order_document_sends: 'po_viewed',
+        purchase_order_signed_pi_sends: 'signed_pi_viewed',
+    });
+    for (const name of Object.values(R.CHASED_PORTAL_STEPS)) assert.ok(step[name], name);
 });
 
 test('syncPortalReceipts: a missing schema or a failing step is reported, not thrown; and it is throttled', async () => {
@@ -192,11 +206,23 @@ test('runReceiptReminders: portal emails are chased only when their views could 
     assert.ok(ok.queries.findIndex(q => /po_document_views/.test(q.sql)) < ok.queries.indexOf(pick(ok)));
 
     const blind = fakeConn((sql) => {
-        if (/po_document_views/.test(sql)) throw Object.assign(new Error('denied'), { errno: 1142 });
+        if (/po_document_views|signed_pi_views/.test(sql)) throw Object.assign(new Error('denied'), { errno: 1142 });
         return /COALESCE\(MAX\(send_id\)/.test(sql) ? [[{ last: 0 }]] : [[]];
     });
     summary = await runReceiptReminders({ getConnection: async () => blind }, { baseUrl: 'https://api.example.com' });
     assert.equal(summary.due, 0);
     assert.match(pick(blind).sql, /AND confirm_via = 'email' AND sent_to IS NOT NULL/);
     assert.doesNotMatch(pick(blind).sql, /action_url IS NOT NULL/);
+
+    // Only the signed PI's views are missing (shipping deployed before the
+    // portal's table exists): PO emails are still chased, signed-PI emails are not.
+    const half = fakeConn((sql) => {
+        if (/signed_pi_views/.test(sql)) throw Object.assign(new Error('no such table'), { errno: 1146 });
+        return /COALESCE\(MAX\(send_id\)/.test(sql) ? [[{ last: 0 }]] : [[]];
+    });
+    await runReceiptReminders({ getConnection: async () => half }, { baseUrl: 'https://api.example.com' });
+    assert.match(
+        pick(half).sql,
+        /\(confirm_via = 'email' OR \(confirm_via = 'portal' AND action_url IS NOT NULL AND send_table NOT IN \('purchase_order_signed_pi_sends'\)\)\)/
+    );
 });

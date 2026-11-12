@@ -7,9 +7,9 @@
 //
 // A portal email (confirm_via 'portal') has no confirm button and its reminder
 // has none either: it repeats the portal address the first email pointed at
-// (action_url) and stops once the portal shows the recipient opened it. Only
-// the PO email stores one today; a portal email without it, and a notice
-// ('none'), are never chased.
+// (action_url) and stops once the portal shows the recipient opened it. The PO
+// email and the signed-PI email store one; a portal email without it, and a
+// notice ('none'), are never chased.
 //
 // Two entry points share ONE send implementation (sendReminderForReceipt):
 //   • runReceiptReminders(pool) — the scheduled sweep (src/handlers/send-receipt-reminders.js).
@@ -18,7 +18,7 @@
 //   • the manual "resend" button — POST /api/v1/email-receipts/:id/resend (orders.js).
 const log = require('../lib/logger');
 const {
-    appendReceiptLink, appendPortalLink, confirmViaOf, canRemind, syncPortalReceipts,
+    appendReceiptLink, appendPortalLink, confirmViaOf, canRemind, syncPortalReceipts, CHASED_PORTAL_STEPS,
     renderReminderEmailHtml, recordReminderSend, parseRecipients,
 } = require('../lib/email-receipt');
 
@@ -110,12 +110,21 @@ async function runReceiptReminders(pool, opts = {}) {
         // What suppliers did on the portal since the last run, first: a PO
         // opened there is confirmed and must not be chased. If that could not
         // be read this run, portal emails are left alone rather than chased blind.
+        // Per kind: the signed PI's views live in their own portal table, so a
+        // server where only one of the two can be read still chases the other.
         const sync = await syncPortalReceipts(conn, { maxAgeMs: 0 });
-        const chasePortal = !sync.failed.includes('po_viewed');
-        if (!chasePortal) log.warn('[receipt-reminders] portal views could not be read; portal emails are not chased this run');
-        const chased = chasePortal
-            ? `(confirm_via = 'email' OR (confirm_via = 'portal' AND action_url IS NOT NULL))`
-            : `confirm_via = 'email'`;
+        const kinds = Object.keys(CHASED_PORTAL_STEPS);
+        const blind = kinds.filter(table => sync.failed.includes(CHASED_PORTAL_STEPS[table]));
+        if (blind.length) {
+            log.warn('[receipt-reminders] portal views could not be read; these portal emails are not chased this run', { sendTables: blind });
+        }
+        // The table names are the literals of CHASED_PORTAL_STEPS, safe to inline.
+        let chased = `(confirm_via = 'email' OR (confirm_via = 'portal' AND action_url IS NOT NULL))`;
+        if (blind.length === kinds.length) chased = `confirm_via = 'email'`;
+        else if (blind.length) {
+            chased = `(confirm_via = 'email' OR (confirm_via = 'portal' AND action_url IS NOT NULL`
+                + ` AND send_table NOT IN (${blind.map(t => `'${t}'`).join(', ')})))`;
+        }
 
         // intervalHours/limit are sanitized ints → safe to inline (INTERVAL and
         // LIMIT can't be bound params in MySQL). maxReminders is bound.

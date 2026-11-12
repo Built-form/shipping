@@ -2,15 +2,16 @@
 
 // Unit tests for src/lib/po-portal-email.js — the PO send's portal-link email
 // (docs/po-portal-send.md): portal links, parsing pasted recipients, the
-// outcome per portal user row, the appended portal block — plus
-// preapprovePortalUsers / loadPoDocumentViews from
-// src/services/portal-access.js against a fake connection. No database.
+// outcome per portal user row, the appended portal block (the PO's, and the
+// signed PI's, which is sent the same way) — plus preapprovePortalUsers /
+// loadPoDocumentViews / loadSignedPiViews from src/services/portal-access.js
+// against a fake connection. No database.
 //   node --test tools/test-po-portal-email-lib.js
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const P = require('../src/lib/po-portal-email');
-const { preapprovePortalUsers, loadPoDocumentViews } = require('../src/services/portal-access');
+const { preapprovePortalUsers, loadPoDocumentViews, loadSignedPiViews } = require('../src/services/portal-access');
 
 test('portal base and links', () => {
     assert.equal(P.portalBaseOf({ SUPPLIER_PORTAL_URL: ' https://portal.example.com// ' }), 'https://portal.example.com');
@@ -45,6 +46,22 @@ test('portalBlockHtml: link escaped, wording follows pre-approval', () => {
     const no = P.portalBlockHtml({ ...base, preapproved: false });
     assert.doesNotMatch(no, /already approved/);
     assert.match(no, /our team will approve/);
+});
+
+test('signedPiPortalBlockHtml: names the PO and the file, links to the order, says nothing is attached', () => {
+    const base = { poNumber: 'PO<1>', filename: 'PI_signed <x>.pdf', poUrl: 'https://p.example/orders/1?tab=pdfs', registerUrl: 'https://p.example/register' };
+    const yes = P.signedPiPortalBlockHtml({ ...base, preapproved: true });
+    assert.match(yes, /signed proforma invoice<\/strong> for purchase order <strong>PO&lt;1&gt;<\/strong> \(PI_signed &lt;x&gt;\.pdf\)/);
+    assert.match(yes, /已签署形式发票/);
+    assert.match(yes, /href="https:\/\/p\.example\/orders\/1\?tab=pdfs"/);
+    assert.match(yes, /No file is attached/);
+    assert.match(yes, /already approved/);
+    // The PO's own wording stays the PO's.
+    assert.doesNotMatch(yes, /download the PDF from the order/);
+    const no = P.signedPiPortalBlockHtml({ ...base, filename: null, preapproved: false });
+    assert.match(no, /for purchase order <strong>PO&lt;1&gt;<\/strong> is on the supplier portal/);
+    assert.match(no, /our team will approve/);
+    assert.doesNotMatch(no, /already approved/);
 });
 
 // A fake connection: just enough of supplier_users / user_supplier_access /
@@ -90,8 +107,16 @@ function fakeConn({ suppliers = [], users = [], missing = false, deadlocks = 0 }
                 return [{ affectedRows: added }];
             }
             if (/po_document_views/.test(sql)) {
+                assert.match(sql, /SELECT purchase_order_document_id AS viewed_id/);
                 return [[
-                    { purchase_order_document_id: 5, user_email: 'a@s.cn', view_count: 2, first_viewed_at: '2026-11-03T08:00:00Z', last_viewed_at: '2026-11-03T09:00:00Z' },
+                    { viewed_id: 5, user_email: 'a@s.cn', view_count: 2, first_viewed_at: '2026-11-03T08:00:00Z', last_viewed_at: '2026-11-03T09:00:00Z' },
+                ]];
+            }
+            if (/signed_pi_views/.test(sql)) {
+                assert.match(sql, /SELECT purchase_order_signed_pi_id AS viewed_id/);
+                return [[
+                    { viewed_id: 12, user_email: 'a@s.cn', view_count: 1, first_viewed_at: '2026-11-12T08:00:00Z', last_viewed_at: '2026-11-12T08:00:00Z' },
+                    { viewed_id: 12, user_email: 'b@s.cn', view_count: 3, first_viewed_at: '2026-11-12T09:00:00Z', last_viewed_at: '2026-11-13T09:00:00Z' },
                 ]];
             }
             throw new Error(`unexpected SQL: ${sql}`);
@@ -209,4 +234,15 @@ test('loadPoDocumentViews: grouped by document, empty when the table is missing'
     assert.equal(views.has(6), false);
     assert.equal((await loadPoDocumentViews(fakeConn({ missing: true }), [5])).size, 0);
     assert.equal((await loadPoDocumentViews(fakeConn(), [])).size, 0);
+});
+
+test('loadSignedPiViews: grouped by signed PI, first viewer first, empty when the table is missing', async () => {
+    const views = await loadSignedPiViews(fakeConn(), [12, 12, 13]);
+    assert.deepEqual(views.get(12), [
+        { email: 'a@s.cn', firstViewedAt: '2026-11-12T08:00:00Z', lastViewedAt: '2026-11-12T08:00:00Z', count: 1 },
+        { email: 'b@s.cn', firstViewedAt: '2026-11-12T09:00:00Z', lastViewedAt: '2026-11-13T09:00:00Z', count: 3 },
+    ]);
+    assert.equal(views.has(13), false);
+    assert.equal((await loadSignedPiViews(fakeConn({ missing: true }), [12])).size, 0);
+    assert.equal((await loadSignedPiViews(fakeConn(), [])).size, 0);
 });
