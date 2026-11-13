@@ -368,10 +368,36 @@ const REQUEST_TO_SEND_PORTAL_TEMPLATE = {
 };
 DEFAULT_EMAIL_TEMPLATES.push(REQUEST_TO_SEND_PORTAL_TEMPLATE);
 
+// The same email for a NEW VERSION of a request the supplier was already sent
+// (src/lib/request-to-send-portal.js requestUpdate; seeded by
+// 2026-11-13_40_seed_request_to_send_update_template.js). ShipLine's dialog
+// starts on it when the send is an update. The sender appends two fixed
+// blocks under this body: that this version replaces the earlier one and what
+// changed, then the button to the portal. {version} is this version's number.
+const REQUEST_TO_SEND_UPDATE_PORTAL_TEMPLATE_KEY = 'request_to_send_update_portal';
+const REQUEST_TO_SEND_UPDATE_PORTAL_TEMPLATE = {
+    key: REQUEST_TO_SEND_UPDATE_PORTAL_TEMPLATE_KEY,
+    name: 'Request to send: updated (supplier portal)',
+    category: 'Supplier Quote',
+    description: 'Emailed to a supplier when a packing list they were already sent has changed and is sent again: no attachment, the new version is on the supplier portal. A note saying which version it replaces and what changed, and a button to the portal, are appended automatically. Sender fields: [etd:date] [port:port]. Tokens: {draftContainerName} {version}.',
+    subject: 'UPDATED – Request to send – {draftContainerName} – version {version} / 发货通知已更新',
+    bodyHtml: [
+        '<div style="font-family:Helvetica,Arial,sans-serif;font-size:14px;color:#222;line-height:1.5;">',
+        '<p>Hi,</p>',
+        '<p>We have updated the packing list for the container with ETD <strong>[etd:date]</strong> (port of departure: [port:port]). The new version replaces the one we sent before: please work from it. It is not attached to this email: please sign in to our supplier portal and download it there.</p>',
+        '<p>您好，</p>',
+        '<p>预计开船日为 <strong>[etd:date]</strong>（起运港：[port:port]）的集装箱装箱单已更新。新版本取代此前发送的版本，请以新版本为准。本邮件不附带该文件：请登录我们的供应商门户下载。</p>',
+        '<p>Kind regards<br>JFA Medical LTD</p>',
+        '</div>',
+    ].join(''),
+};
+DEFAULT_EMAIL_TEMPLATES.push(REQUEST_TO_SEND_UPDATE_PORTAL_TEMPLATE);
+
 module.exports = {
     DEFAULT_EMAIL_TEMPLATES, SUPPLIER_PI_TEMPLATE_KEYS, QC_VISIT_TEMPLATE_KEYS, PO_PORTAL_TEMPLATE_KEY,
     SIGNED_PI_TEMPLATE_KEY,
     FILE_TRANSFER_TEMPLATE_KEY, FILE_TRANSFER_TEMPLATE,
     ARTWORK_CONFIRMATION_TEMPLATE_KEY, ARTWORK_CONFIRMATION_TEMPLATE,
     REQUEST_TO_SEND_PORTAL_TEMPLATE_KEY, REQUEST_TO_SEND_PORTAL_TEMPLATE,
+    REQUEST_TO_SEND_UPDATE_PORTAL_TEMPLATE_KEY, REQUEST_TO_SEND_UPDATE_PORTAL_TEMPLATE,
 };

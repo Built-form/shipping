@@ -13,7 +13,8 @@
 // with one difference: those are always a link. This one falls back to the old
 // email, PDF and CSV attached, when the portal would show the supplier nothing.
 
-const { escapeHtml } = require('./email-layout');
+const { FONT, INK, MUTED, escapeHtml, noteBox } = require('./email-layout');
+const drift = require('./request-to-send-drift');
 const { blockHtml } = require('./po-portal-email');
 const S = require('./shipments');
 
@@ -83,6 +84,9 @@ function requestNames({ name, supplierName, version }) {
 // so ShipLine offers it in the Request to send dialog). Seeded by
 // 2026-11-13_20_seed_request_to_send_portal_template.js.
 const TEMPLATE_KEY = 'request_to_send_portal';
+// The same for a new version of a request the supplier was already sent
+// (requestUpdate). Seeded by 2026-11-13_40_seed_request_to_send_update_template.js.
+const UPDATE_TEMPLATE_KEY = 'request_to_send_update_portal';
 
 const DELIVERIES = ['portal', 'attached'];
 
@@ -220,8 +224,8 @@ function requestPortalBlockHtml({ version, etd, port, url, registerUrl, preappro
     const facts = en.length ? `<br>${en.join(' · ')}` : '';
     const factsZh = zh.length ? `<br>${zh.join(' · ')}` : '';
     return blockHtml({
-        leadHtml: `Your <strong>packing list (Request to send)</strong>${v} is on the supplier portal.${facts}<br>Sign in, open <strong>Requests to send</strong>, and download the PDF or the CSV. You can upload your commercial invoice and packing list there too.`
-            + `<br><br>您的<strong>装箱单（发货通知）</strong>${vZh}已发布在供应商门户。${factsZh}<br>请登录门户，打开<strong>“发货通知”</strong>，下载 PDF 或 CSV。您也可以在门户上传商业发票和装箱单。`,
+        leadHtml: `Your <strong>packing list (Request to send)</strong>${v} is on the supplier portal.${facts}<br>Sign in, open <strong>Requests to send</strong>, and download the PDF or the CSV.`
+            + `<br><br>您的<strong>装箱单（发货通知）</strong>${vZh}已发布在供应商门户。${factsZh}<br>请登录门户，打开<strong>“发货通知”</strong>，下载 PDF 或 CSV。`,
         url,
         regUrl: registerUrl,
         preapproved,
@@ -240,6 +244,117 @@ const preapprovalNote = ({ ref, version, actor }) =>
  * row (request_etd already read as 'YYYY-MM-DD' text). A row from before the
  * columns existed went out attached and said nothing we kept.
  */
+// ── A new version of a request the supplier already has ─────────────────────
+// A supplier works from the last packing list they were sent. When the
+// container changes and the request is generated and sent again, the email
+// must say so: that this version replaces the earlier one, and what a supplier
+// acts on that is different (docs/request-to-send-portal.md, "Updates").
+
+/**
+ * Whether `doc` is an update, and of what. `previous` is the latest EARLIER
+ * version of the same request (same container and supplier) that was emailed
+ * to anyone: { version, lines_json }, or null when this is the first they are
+ * sent (the SQL is resolveUpdate in src/services/request-to-send-portal.js).
+ * → null (not an update), or { replacesVersion, changes }:
+ *   changes  what differs between the lines the two PDFs were printed from
+ *            (their lines_json snapshots), by the same rule that flags a request
+ *            STALE in ShipLine (src/lib/request-to-send-drift.js): an item added
+ *            or removed, its units, its lot. [] when none of that changed
+ *            (a carton size or a weight did). null when either version has no
+ *            snapshot, so what changed is not known.
+ */
+function requestUpdate(previous, doc) {
+    if (!previous) return null;
+    const replacesVersion = Number(previous.version);
+    const then = drift.parseRequestLines(previous.lines_json);
+    const now = drift.parseRequestLines(doc && doc.lines_json);
+    if (!then || !now) return { replacesVersion, changes: null };
+    return { replacesVersion, changes: drift.requestDrift(then.lines, now.lines).changes };
+}
+
+const CHANGE_KINDS = ['units', 'lot', 'added', 'removed'];
+const CHANGE_KEYS = ['kind', 'item', 'lot', 'lotWas', 'unitsWas', 'unitsNow'];
+
+/**
+ * An update as a send row keeps it (request_update, JSON) and as it is read
+ * back, from the column or from an object: { replacesVersion, changes } with
+ * only the keys and the kinds of change this code knows. Anything that is not
+ * an update → null.
+ */
+function storedUpdate(value) {
+    let v = value;
+    if (typeof v === 'string') {
+        try { v = JSON.parse(v); } catch { return null; }
+    }
+    if (!v || typeof v !== 'object' || Array.isArray(v)) return null;
+    if (!Number.isInteger(v.replacesVersion) || v.replacesVersion < 1) return null;
+    const changes = Array.isArray(v.changes)
+        ? v.changes
+            .filter(c => c && typeof c === 'object' && CHANGE_KINDS.includes(c.kind))
+            .map(c => Object.fromEntries(CHANGE_KEYS.filter(k => k in c).map(k => [k, c[k]])))
+        : null;
+    return { replacesVersion: v.replacesVersion, changes };
+}
+
+const count = v => Number(v).toLocaleString('en-GB');
+
+/** One change as a supplier reads it: { en, zh }, plain text. */
+function changeText(c) {
+    const lotEn = c.lot ? ` (lot ${c.lot})` : '';
+    const lotZh = c.lot ? `（批号 ${c.lot}）` : '';
+    switch (c.kind) {
+        case 'units':
+            return {
+                en: `${c.item}${lotEn}: ${count(c.unitsWas)} → ${count(c.unitsNow)} units`,
+                zh: `${c.item}${lotZh}：数量 ${count(c.unitsWas)} → ${count(c.unitsNow)}`,
+            };
+        case 'lot': {
+            const moved = c.unitsWas != null && c.unitsNow != null;
+            return {
+                en: `${c.item}: lot ${c.lotWas ?? 'none'} → ${c.lot ?? 'none'}${moved ? `, ${count(c.unitsWas)} → ${count(c.unitsNow)} units` : ''}`,
+                zh: `${c.item}：批号 ${c.lotWas ?? '无'} → ${c.lot ?? '无'}${moved ? `，数量 ${count(c.unitsWas)} → ${count(c.unitsNow)}` : ''}`,
+            };
+        }
+        case 'added':
+            return { en: `${c.item}${lotEn}: added, ${count(c.unitsNow)} units`, zh: `${c.item}${lotZh}：新增，数量 ${count(c.unitsNow)}` };
+        default:
+            return { en: `${c.item}${lotEn}: removed (was ${count(c.unitsWas)} units)`, zh: `${c.item}${lotZh}：已取消（原数量 ${count(c.unitsWas)}）` };
+    }
+}
+
+// As many changes as an email lists; the rest are counted.
+const MAX_CHANGES = 30;
+
+/**
+ * The fixed block an update's email carries under its body, whichever way it
+ * goes out: this is version N, it replaces version M, and what changed.
+ * English and Chinese. `update` is requestUpdate's answer.
+ */
+function updateBlockHtml({ version, replacesVersion, changes }) {
+    const v = escapeHtml(version);
+    const was = escapeHtml(replacesVersion);
+    const p = html => `<p style="margin:0 0 8px;font-family:${FONT};font-size:14px;line-height:1.55;color:${INK};">${html}</p>`;
+    const parts = [
+        p(`<strong>This is version ${v} of this request.</strong> It replaces version ${was}: please work from this one.<br>`
+            + `<strong>这是本通知的第 ${v} 版。</strong>它取代第 ${was} 版，请以本版为准。`),
+    ];
+    if (Array.isArray(changes) && changes.length) {
+        const shown = changes.slice(0, MAX_CHANGES).map(changeText);
+        parts.push(p('What changed / 变更内容：'));
+        parts.push(
+            `<ul style="margin:0 0 8px;padding-left:20px;font-family:${FONT};font-size:14px;line-height:1.5;color:${INK};">`
+            + shown.map(t => `<li style="margin:0 0 4px;">${escapeHtml(t.en)}<br><span style="color:${MUTED};">${escapeHtml(t.zh)}</span></li>`).join('')
+            + '</ul>'
+        );
+        const more = changes.length - shown.length;
+        if (more > 0) parts.push(p(`… and ${more} more: see the packing list. / 另有 ${more} 项，详见装箱单。`));
+    } else if (Array.isArray(changes)) {
+        parts.push(p(`The items, quantities and lots are the same as in version ${was}; other details were updated.<br>`
+            + `产品、数量和批号与第 ${was} 版相同，其他信息有更新。`));
+    }
+    return noteBox('Updated request / 通知已更新', parts.join(''));
+}
+
 function sendFactsOf(row) {
     const r = row || {};
     return {
@@ -251,6 +366,12 @@ function sendFactsOf(row) {
 
 module.exports = {
     TEMPLATE_KEY,
+    UPDATE_TEMPLATE_KEY,
+    requestUpdate,
+    storedUpdate,
+    changeText,
+    updateBlockHtml,
+    MAX_CHANGES,
     DELIVERIES,
     EMAIL_TYPE,
     emailTypeFor,

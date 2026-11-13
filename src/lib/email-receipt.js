@@ -349,6 +349,112 @@ function requestUploadSources(jp) {
     };
 }
 
+// ── When a Request to send is no longer worth chasing ───────────────────────
+// Its email is chased until the supplier answers it (above), and also stops,
+// with nothing confirmed, once chasing would be noise
+// (docs/request-to-send-portal.md, "When reminders stop"):
+//   'superseded'  a later version of the same request has been emailed: the
+//                 rule that makes that later send an update (resolveUpdate,
+//                 src/services/request-to-send-portal.js), read the other way;
+//   'shipped'     the shipment has left;
+//   'documents'   its packing list and its invoice are both filed.
+// The last two are the supplier portal's own rule for "this request is done"
+// (jportal src/handlers/sentDocuments.js, supplierQuoteProgressSql): the two
+// change together. Both ways a request goes out are covered, the link and the
+// attachments. A forwarder's quote, and every other kind of email, has no such
+// end. A reminder sent by hand (the resend route) is never stopped by this.
+const REMINDERS_STOPPED = ['superseded', 'shipped', 'documents'];
+
+// The reason as SQL, read beside `r` (an email_receipts row): one of
+// REMINDERS_STOPPED, or NULL while the email is still to be chased.
+function requestRemindersStoppedSql() {
+    const letters = column => `REGEXP_REPLACE(LOWER(CONVERT(${column} USING utf8mb4)), '[^[:alnum:]]', '')`;
+    // The supplier's name as typed on a filed document: letters and digits
+    // only, as the portal compares them (the rows often belong to different
+    // supplier records of one company).
+    const sameSupplier = column => `${letters(column)} = ${letters('d.supplier')} AND ${letters('d.supplier')} <> ''`;
+    return `(SELECT CASE
+                 WHEN EXISTS (SELECT 1 FROM draft_container_documents n
+                               WHERE n.type = 'supplier-quote' AND n.deleted_at IS NULL
+                                 AND n.id <> d.id AND n.version > d.version
+                                 AND n.supplier <=> d.supplier
+                                 AND (n.draft_container_name = d.draft_container_name
+                                      OR (n.shipment_id IS NOT NULL AND n.shipment_id = d.shipment_id))
+                                 AND EXISTS (SELECT 1 FROM draft_container_document_sends ns
+                                              WHERE ns.draft_container_document_id = n.id))
+                 THEN 'superseded'
+                 WHEN EXISTS (SELECT 1 FROM shipments sh
+                               WHERE sh.id = d.shipment_id AND sh.stage IN ('IN_TRANSIT', 'ARRIVED', 'CLOSED'))
+                   OR EXISTS (SELECT 1 FROM orders o
+                               WHERE o.shipment_id = d.shipment_id AND o.deleted_at IS NULL
+                                 AND o.status IN ('ON_SEA', 'ON_AIR', 'ARRIVED_AT_WAREHOUSE', 'RECEIVED', 'PARTIALLY_RECEIVED'))
+                 THEN 'shipped'
+                 WHEN EXISTS (SELECT 1 FROM packing_lists pl
+                               WHERE pl.deleted_at IS NULL AND pl.container_kind = 'booked'
+                                 AND pl.container_number = (SELECT sh.reference FROM shipments sh WHERE sh.id = d.shipment_id)
+                                 AND ${sameSupplier('pl.supplier_name')})
+                  AND EXISTS (SELECT 1 FROM shipment_payment_documents c
+                               WHERE c.deleted_at IS NULL AND c.doc_kind = 'balance_invoice'
+                                 AND c.shipment_id = d.shipment_id
+                                 AND ${sameSupplier('c.supplier_name')})
+                 THEN 'documents'
+             END
+               FROM draft_container_document_sends s
+               JOIN draft_container_documents d ON d.id = s.draft_container_document_id
+              WHERE r.send_table = 'draft_container_document_sends' AND s.id = r.send_id
+                AND d.type = 'supplier-quote')`;
+}
+
+/**
+ * Why the automatic reminders of a receipt row stopped (its `reminders_stopped`,
+ * as selectEmailReceipts reads it), or null: still chased, never chased, or
+ * confirmed (nothing was left to stop).
+ */
+function remindersStoppedOf(row) {
+    if (!row || row.confirmed_at || !canRemind(row)) return null;
+    return REMINDERS_STOPPED.includes(row.reminders_stopped) ? row.reminders_stopped : null;
+}
+
+// MySQL: a table or column of that rule is not on this server, or not for this
+// login (1054 unknown column, with the "source missing" set of ./jportal).
+const RULE_NOT_THERE = new Set([1049, 1054, 1142, 1143, 1146]);
+
+/**
+ * Runs `build(reason)`, a statement over `email_receipts r` that uses
+ * requestRemindersStoppedSql(). A server that cannot answer the rule (a
+ * migration behind) is asked again with `build(null)`: the statement as it was
+ * before the rule existed. Any other fault is thrown.
+ */
+async function queryWithRemindersStopped(conn, build, params = []) {
+    try {
+        return await conn.query(build(requestRemindersStoppedSql()), params);
+    } catch (e) {
+        if (!RULE_NOT_THERE.has(e && e.errno)) throw e;
+        log.warn('[email-receipt] when a Request to send stops being chased cannot be read here; every one is chased as before', { errno: e.errno });
+        return conn.query(build(null), params);
+    }
+}
+
+const RECEIPT_COLUMNS = `id, email_type, send_table, send_id, sent_to, subject,
+                created_at, opened_at, open_count, confirmed_at, confirmed_ip, confirmed_user_agent,
+                reminder_count, last_reminder_at, confirm_via, action_url`;
+
+/**
+ * The receipt rows the Email Receipts routes answer with (no token: it is a
+ * capability, not data), each with `reminders_stopped`. `tail` is the trusted
+ * rest of the statement (WHERE / ORDER BY / LIMIT, columns unqualified).
+ */
+async function selectEmailReceipts(conn, tail, params = []) {
+    const [rows] = await queryWithRemindersStopped(
+        conn,
+        reason => `SELECT ${RECEIPT_COLUMNS}, ${reason || 'NULL'} AS reminders_stopped
+                     FROM email_receipts r
+                     ${tail}`,
+        params
+    );
+    return rows;
+}
+
 function portalSyncSteps(jp) {
     // The emailed version, or a later version of the same PO: a supplier who
     // downloaded v3 is not chased about the email for v2.
@@ -683,6 +789,11 @@ module.exports = {
     CHASED_PORTAL_STEPS,
     portalSyncSteps,
     requestUploadSources,
+    REMINDERS_STOPPED,
+    requestRemindersStoppedSql,
+    remindersStoppedOf,
+    queryWithRemindersStopped,
+    selectEmailReceipts,
     syncPortalReceipts,
     getReceiptForResend,
     recordReminderSend,

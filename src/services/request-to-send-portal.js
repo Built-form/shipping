@@ -80,7 +80,7 @@ async function resolveDelivery(conn, doc, env = process.env) {
  * A pre-approval that FAILS never stops the email: it goes out as a link
  * without the "already approved" wording, and `portalAccess.status` is 'error'.
  */
-async function preparePortalSend(conn, { doc, plan, recipients, fields, bodyHtml, subject, actorEmail }, { preapprove = preapprovePortalUsers, logError = (m, meta) => log.error(m, meta) } = {}) {
+async function preparePortalSend(conn, { doc, plan, recipients, fields, bodyHtml, subject, actorEmail, update = null }, { preapprove = preapprovePortalUsers, logError = (m, meta) => log.error(m, meta) } = {}) {
     let portalAccess;
     try {
         portalAccess = await preapprove(conn, {
@@ -113,7 +113,80 @@ async function preparePortalSend(conn, { doc, plan, recipients, fields, bodyHtml
         registerUrl: plan.registerUrl,
         preapproved,
     });
-    return { portalAccess, preapproved, emailHtml: wrapEmail({ title: subject, bodyHtml: `${bodyHtml || ''}${block}` }) };
+    // An update says so first: that it replaces the earlier version and what
+    // changed, above the way to the portal.
+    const updateBlock = update ? L.updateBlockHtml({ version: doc.version, ...update }) : '';
+    return { portalAccess, preapproved, emailHtml: wrapEmail({ title: subject, bodyHtml: `${bodyHtml || ''}${updateBlock}${block}` }) };
+}
+
+/**
+ * Whether sending `doc` (id, type, version, supplier, draft_container_name,
+ * shipment_id, lines_json) is an UPDATE: an earlier version of the same request
+ * has already been emailed. → L.requestUpdate's answer ({ replacesVersion,
+ * changes }), or null for the first version anyone was sent, and for anything
+ * that is not a Request to send.
+ *
+ * "The same request" is the same supplier's request for the same container:
+ * the same name, or (a draft that was renamed, or booked since) the same
+ * shipment. A version that was generated and never emailed replaces nothing:
+ * the supplier never had it.
+ */
+async function resolveUpdate(conn, doc) {
+    if (doc.type !== 'supplier-quote') return null;
+    const [rows] = await conn.query(
+        `SELECT p.id, p.version, p.lines_json
+           FROM draft_container_documents p
+          WHERE p.type = 'supplier-quote' AND p.deleted_at IS NULL
+            AND p.id <> ? AND p.version < ?
+            AND p.supplier <=> ?
+            AND (p.draft_container_name = ? OR (p.shipment_id IS NOT NULL AND p.shipment_id = ?))
+            AND EXISTS (SELECT 1 FROM draft_container_document_sends s WHERE s.draft_container_document_id = p.id)
+          ORDER BY p.version DESC, p.id DESC
+          LIMIT 1`,
+        [doc.id, doc.version, doc.supplier ?? null, doc.draft_container_name, doc.shipment_id ?? null]
+    );
+    return L.requestUpdate(rows[0] || null, doc);
+}
+
+/**
+ * Keeps what an update's email said on its send row (request_update, JSON:
+ * { replacesVersion, changes }), which the portal shows beside the PDF. Not an
+ * update: nothing is written. A table without the column yet (2026-11-13_30):
+ * the send stands without it.
+ */
+async function saveSendUpdate(conn, sendId, update) {
+    if (!update || !sendId) return;
+    try {
+        await conn.query(
+            'UPDATE draft_container_document_sends SET request_update = ? WHERE id = ?',
+            [JSON.stringify(update), sendId]
+        );
+    } catch (e) {
+        if (e.errno !== ER_BAD_FIELD_ERROR) throw e;
+    }
+}
+
+/** Map(sendId -> { replacesVersion, changes }) for the sends of these documents that were updates. */
+async function loadSendUpdates(conn, documentIds) {
+    const out = new Map();
+    const ids = [...new Set((documentIds || []).filter(Boolean))];
+    if (!ids.length) return out;
+    let rows;
+    try {
+        [rows] = await conn.query(
+            `SELECT id, request_update FROM draft_container_document_sends
+              WHERE draft_container_document_id IN (${ids.map(() => '?').join(',')})`,
+            ids
+        );
+    } catch (e) {
+        if (e.errno === ER_BAD_FIELD_ERROR) return out;
+        throw e;
+    }
+    for (const r of rows) {
+        const update = L.storedUpdate(r.request_update);
+        if (update) out.set(Number(r.id), update);
+    }
+    return out;
 }
 
 /**
@@ -169,4 +242,4 @@ async function loadSendFacts(conn, documentIds) {
     return out;
 }
 
-module.exports = { resolveDelivery, preparePortalSend, insertSend, loadSendFacts };
+module.exports = { resolveDelivery, resolveUpdate, preparePortalSend, insertSend, loadSendFacts, saveSendUpdate, loadSendUpdates };

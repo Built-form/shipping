@@ -29,7 +29,7 @@ const {
     apiBaseUrlFromReq, createEmailReceipt, logSentEmail, discardEmailReceipt,
     linkReceiptToSend, appendReceiptLink,
     getReceiptForResend, recordReminderSend, listReminders,
-    confirmViaOf, canRemind, syncPortalReceipts,
+    confirmViaOf, canRemind, syncPortalReceipts, selectEmailReceipts, remindersStoppedOf,
 } = require('../lib/email-receipt');
 const { sendReminderForReceipt } = require('../services/receipt-reminders');
 const { receiveOrderStock, ReceiveError } = require('../services/order-receive');
@@ -3077,7 +3077,7 @@ app.get(/^\/api\/v1\/draft-containers\/(.+)\/documents\/?$/, async (req, res) =>
         const name = draftNameFromPath(req.params[0]);
         if (!name) return res.status(400).json({ error: 'draft container name required in path.' });
 
-        const { docs, sendsByDoc, sendFacts, views } = await withConnection(async (conn) => {
+        const { docs, sendsByDoc, sendFacts, sendUpdates, views } = await withConnection(async (conn) => {
             const [r] = await conn.query(
                 `SELECT id, draft_container_name, version, type, supplier, s3_key, public_url, file_size,
                         csv_s3_key, csv_public_url, csv_file_size,
@@ -3091,6 +3091,7 @@ app.get(/^\/api\/v1\/draft-containers\/(.+)\/documents\/?$/, async (req, res) =>
             // How each send went out and what it said, and who opened a Request
             // to send on the portal (docs/request-to-send-portal.md).
             const facts = await requestToSendSends.loadSendFacts(conn, ids);
+            const updates = await requestToSendSends.loadSendUpdates(conn, ids);
             const viewsByDoc = await loadSupplierQuoteViews(conn, r.filter(d => d.type === 'supplier-quote').map(d => d.id));
             const sendRows = ids.length
                 ? (await conn.query(
@@ -3107,7 +3108,7 @@ app.get(/^\/api\/v1\/draft-containers\/(.+)\/documents\/?$/, async (req, res) =>
                 if (!byDoc.has(s.draft_container_document_id)) byDoc.set(s.draft_container_document_id, []);
                 byDoc.get(s.draft_container_document_id).push(s);
             }
-            return { docs: r, sendsByDoc: byDoc, sendFacts: facts, views: viewsByDoc };
+            return { docs: r, sendsByDoc: byDoc, sendFacts: facts, sendUpdates: updates, views: viewsByDoc };
         });
 
         res.json({
@@ -3137,6 +3138,8 @@ app.get(/^\/api\/v1\/draft-containers\/(.+)\/documents\/?$/, async (req, res) =>
                     sentAt: s.sent_at?.toISOString?.() ?? s.sent_at,
                     // delivery ('portal' | 'attached'), etd, port.
                     ...(sendFacts.get(Number(s.id)) || requestToSendPortal.sendFactsOf(null)),
+                    // { replacesVersion, changes } when this send was an update.
+                    ...(sendUpdates.has(Number(s.id)) ? { update: sendUpdates.get(Number(s.id)) } : {}),
                 })),
                 // A Request to send only: who opened it on the supplier portal.
                 ...(r.type === 'supplier-quote' ? { views: views.get(Number(r.id)) || [] } : {}),
@@ -3206,7 +3209,7 @@ app.post('/api/v1/draft-container-documents/:id/email', async (req, res) => {
 
         const result = await withConnection(async (conn) => {
             const [docRows] = await conn.query(
-                `SELECT id, draft_container_name, version, s3_key, public_url, file_size, csv_s3_key, type, supplier, batch_id, shipment_id
+                `SELECT *
                    FROM draft_container_documents
                   WHERE id = ? AND deleted_at IS NULL`,
                 [id]
@@ -3223,6 +3226,13 @@ app.post('/api/v1/draft-container-documents/:id/email', async (req, res) => {
                 if (conflict) return { conflict };
             }
             const viaPortal = plan.delivery === 'portal';
+            // A new version of a request this supplier was already sent: the
+            // email says so, whichever way it goes out (which version it
+            // replaces, and what changed). Only for a caller that knows about
+            // it, as with the delivery.
+            const update = (doc.type === 'supplier-quote' && want.requested)
+                ? await requestToSendSends.resolveUpdate(conn, doc)
+                : null;
             // What the email said about the departure is kept for a Request to
             // send only, whichever way it goes out.
             const departure = doc.type === 'supplier-quote' ? sentFields : { etd: null, port: null };
@@ -3279,7 +3289,9 @@ app.post('/api/v1/draft-container-documents/:id/email', async (req, res) => {
                 attachments.push(item);
             }
 
-            const tpl = await getEmailTemplate(conn, viaPortal ? requestToSendPortal.TEMPLATE_KEY : 'draft_container_quote');
+            const tpl = await getEmailTemplate(conn, viaPortal
+                ? (update ? requestToSendPortal.UPDATE_TEMPLATE_KEY : requestToSendPortal.TEMPLATE_KEY)
+                : 'draft_container_quote');
             // A Request to send goes to a supplier: wherever its email names
             // the container it says the number, never the draft's internal
             // name (its stamp, other suppliers' names, an old ETD). That holds
@@ -3290,9 +3302,10 @@ app.post('/api/v1/draft-container-documents/:id/email', async (req, res) => {
             const toSupplier = doc.type === 'supplier-quote';
             const shownName = toSupplier ? requestToSendPortal.emailName(doc.draft_container_name) : doc.draft_container_name;
             const forSupplier = text => (toSupplier
-                ? requestToSendPortal.hideInternalName(renderTemplate(text, { draftContainerName: shownName }), doc.draft_container_name)
+                ? requestToSendPortal.hideInternalName(renderTemplate(text, { draftContainerName: shownName, version: doc.version }), doc.draft_container_name)
                 : text);
-            const vars = { draftContainerName: shownName };
+            const vars = { draftContainerName: shownName, version: doc.version };
+            const updateBlock = update ? requestToSendPortal.updateBlockHtml({ version: doc.version, ...update }) : '';
             const finalSubject = (typeof subject === 'string' && subject.trim())
                 ? forSupplier(subject.trim())
                 : (renderTemplate(tpl.subject, vars) || `${toSupplier ? 'Request to send' : 'Delivery Quote Request'} – ${shownName}`);
@@ -3311,7 +3324,7 @@ app.post('/api/v1/draft-container-documents/:id/email', async (req, res) => {
             if (viaPortal) {
                 const prepared = await requestToSendSends.preparePortalSend(conn, {
                     doc, plan, recipients: toAddresses, fields: departure,
-                    bodyHtml: htmlBody, subject: finalSubject, actorEmail: req.userEmail,
+                    bodyHtml: htmlBody, subject: finalSubject, actorEmail: req.userEmail, update,
                 });
                 if (prepared.conflict) return { conflict: prepared.conflict };
                 portalAccess = prepared.portalAccess;
@@ -3320,7 +3333,7 @@ app.post('/api/v1/draft-container-documents/:id/email', async (req, res) => {
                 receiptToken = await createEmailReceipt(conn, {
                     emailType, sentTo: toAddresses, subject: finalSubject,
                 });
-                emailBody = appendReceiptLink(htmlBody, receiptToken, apiBaseUrlFromReq(req));
+                emailBody = appendReceiptLink(`${htmlBody}${updateBlock}`, receiptToken, apiBaseUrlFromReq(req));
             }
 
             const form = new FormData();
@@ -3397,6 +3410,8 @@ app.post('/api/v1/draft-container-documents/:id/email', async (req, res) => {
             } else {
                 await linkReceiptToSend(conn, receiptToken, 'draft_container_document_sends', primarySendId);
             }
+            // What an update's email said, kept on its send row for the portal.
+            await requestToSendSends.saveSendUpdate(conn, primarySendId, update);
 
             // One email = one event, listing every PDF it carried: in the draft's
             // history while the document's shipment is open, else the shipment's
@@ -3416,6 +3431,7 @@ app.post('/api/v1/draft-container-documents/:id/email', async (req, res) => {
                 etd: departure.etd,
                 port: departure.port,
                 ...(viaPortal ? { portalUrl: plan.portalUrl, portalAccess } : {}),
+                ...(update ? { update } : {}),
             };
             const [[owner]] = doc.shipment_id
                 ? await conn.query(`SELECT id, stage FROM shipments WHERE id = ?`, [doc.shipment_id])
@@ -3462,6 +3478,9 @@ app.post('/api/v1/draft-container-documents/:id/email', async (req, res) => {
                 port: departure.port,
                 portalUrl: plan.portalUrl,
                 portalAccess,
+                // { replacesVersion, changes } when this was an update of a
+                // request already emailed, else null.
+                update,
             };
         });
 
@@ -3500,7 +3519,7 @@ app.get('/api/v1/draft-container-documents/:id/delivery', async (req, res) => {
         if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid document id.' });
         const out = await withConnection(async (conn) => {
             const [rows] = await conn.query(
-                `SELECT id, draft_container_name, version, type, supplier
+                `SELECT *
                    FROM draft_container_documents
                   WHERE id = ? AND deleted_at IS NULL`,
                 [id]
@@ -3521,6 +3540,11 @@ app.get('/api/v1/draft-container-documents/:id/delivery', async (req, res) => {
                 // name holds none. The dialog fills {draftContainerName} with
                 // it; the send does the same again on the server.
                 supplierRef: requestToSendPortal.supplierRef(doc.draft_container_name),
+                // An earlier version of this request was already emailed:
+                // { replacesVersion, changes } (changes null = not known), else
+                // null. The email then says so, and the dialog starts on the
+                // update template.
+                update: await requestToSendSends.resolveUpdate(conn, doc),
             };
         });
         if (!out) return res.status(404).json({ error: `Draft container document ${id} not found.` });
@@ -8480,6 +8504,10 @@ app.delete('/api/v1/purchase-order-payments/:id', async (req, res) => {
 //                 button (confirmVia 'portal'), did what the link asks there
 // confirmVia: 'email' (confirm button) | 'portal' (portal / magic link, no
 // button) | 'none' (a notice). canRemind: a reminder can be sent for it.
+// remindersStopped: why the AUTOMATIC reminders of an unconfirmed Request to
+// send have ended ('superseded' by a later version that was emailed | 'shipped'
+// | 'documents' filed), else null (docs/request-to-send-portal.md). A reminder
+// can still be sent by hand.
 // Filter by a specific send (sendTable+sendId, as recorded on the *_sends row),
 // by email_type, or by status ('sent'|'opened'|'confirmed'). Newest first.
 //   email_type ∈ purchase_order | purchase_order_signed_pi |
@@ -8500,6 +8528,7 @@ function rowToEmailReceipt(r) {
         subject: r.subject || null,
         confirmVia: confirmViaOf(r),
         canRemind: canRemind(r),
+        remindersStopped: remindersStoppedOf(r),
         status,
         createdAt: r.created_at?.toISOString?.() ?? r.created_at,
         openedAt: r.opened_at?.toISOString?.() ?? r.opened_at,
@@ -8536,17 +8565,13 @@ app.get('/api/v1/email-receipts', async (req, res) => {
             // Portal emails are confirmed by what the portal recorded: bring
             // them up to date first (at most every 20 s per container).
             await syncPortalReceipts(conn);
-            const [r] = await conn.query(
-                `SELECT id, email_type, send_table, send_id, sent_to, subject,
-                        created_at, opened_at, open_count, confirmed_at, confirmed_ip, confirmed_user_agent,
-                        reminder_count, last_reminder_at, confirm_via, action_url
-                   FROM email_receipts
-                   ${whereSql}
+            return selectEmailReceipts(
+                conn,
+                `${whereSql}
                   ORDER BY created_at DESC, id DESC
                   LIMIT ${limit} OFFSET ${offset}`,
                 params
             );
-            return r;
         });
         res.json({ data: rows.map(rowToEmailReceipt) });
     } catch (error) {
@@ -8610,13 +8635,7 @@ app.post('/api/v1/email-receipts/:id/resend', async (req, res) => {
                 frontConversationId: result.frontConversationId,
                 sentByEmail: req.userEmail || null,
             });
-            const [rows] = await conn.query(
-                `SELECT id, email_type, send_table, send_id, sent_to, subject,
-                        created_at, opened_at, open_count, confirmed_at, confirmed_ip, confirmed_user_agent,
-                        reminder_count, last_reminder_at, confirm_via, action_url
-                   FROM email_receipts WHERE id = ?`,
-                [id]
-            );
+            const rows = await selectEmailReceipts(conn, 'WHERE id = ?', [id]);
             await recordAudit(conn, {
                 entityType: 'email_receipt',
                 entityId: id,

@@ -240,3 +240,109 @@ test('runReceiptReminders: portal emails are chased only when their views could 
         /\(confirm_via = 'email' OR \(confirm_via = 'portal' AND action_url IS NOT NULL AND send_table NOT IN \('draft_container_document_sends'\)\)\)/
     );
 });
+
+// ── A Request to send whose chase is over (docs/request-to-send-portal.md) ────
+
+const flat = sql => String(sql).replace(/\s+/g, ' ').trim();
+const isPick = sql => /^\s*SELECT id, token, email_type/.test(sql);
+const DUE = { id: 5, token: 'f'.repeat(48), email_type: 'request_to_send', sent_to: '["a@x.com"]', subject: 'Request to send – 333', reminder_count: 0, confirm_via: 'email', action_url: null };
+
+/** Runs `fn` with Front configured and every call to it recorded. */
+async function withFront(fn) {
+    const realFetch = globalThis.fetch;
+    const saved = { c: process.env.FRONT_CHANNEL_ID, t: process.env.FRONT_API_TOKEN };
+    process.env.FRONT_CHANNEL_ID = 'cha_1';
+    process.env.FRONT_API_TOKEN = 'tok';
+    const sent = [];
+    globalThis.fetch = async (url, init) => {
+        sent.push(Object.fromEntries(init.body.entries()));
+        return { ok: true, status: 202, text: async () => JSON.stringify({ message_uid: 'm1' }) };
+    };
+    try {
+        return await fn(sent);
+    } finally {
+        globalThis.fetch = realFetch;
+        if (saved.c === undefined) delete process.env.FRONT_CHANNEL_ID; else process.env.FRONT_CHANNEL_ID = saved.c;
+        if (saved.t === undefined) delete process.env.FRONT_API_TOKEN; else process.env.FRONT_API_TOKEN = saved.t;
+    }
+}
+
+test('runReceiptReminders: a Request to send that was replaced, has shipped or has its documents is not picked', async () => {
+    const conn = fakeConn(sql => (/COALESCE\(MAX\(send_id\)/.test(sql) ? [[{ last: 0 }]] : [[]]));
+    await runReceiptReminders({ getConnection: async () => conn }, { baseUrl: 'https://api.example.com', maxReminders: 5 });
+    const picks = conn.queries.filter(q => isPick(q.sql));
+    assert.equal(picks.length, 1);
+    assert.match(picks[0].sql, /FROM email_receipts r WHERE confirmed_at IS NULL AND /);
+    // The reason must be NULL: any of the three leaves the email alone.
+    assert.ok(picks[0].sql.includes(` AND ${flat(R.requestRemindersStoppedSql())} IS NULL ORDER BY id ASC LIMIT 200`), picks[0].sql);
+    assert.deepEqual(picks[0].params, [5]);
+});
+
+test('runReceiptReminders: a server that cannot read that rule chases as it did before', async () => {
+    for (const errno of [1049, 1054, 1142, 1143, 1146]) {
+        const conn = fakeConn((sql) => {
+            if (isPick(sql) && /THEN 'superseded'/.test(sql)) throw Object.assign(new Error('not there'), { errno });
+            if (isPick(sql)) return [[DUE]];
+            return /COALESCE\(MAX\(send_id\)/.test(sql) ? [[{ last: 0 }]] : [[]];
+        });
+        await withFront(async (sent) => {
+            const summary = await runReceiptReminders({ getConnection: async () => conn }, { baseUrl: 'https://api.example.com', maxReminders: 5 });
+            assert.deepEqual(summary, { due: 1, sent: 1, failed: 0, skipped: 0 }, `errno ${errno}`);
+            assert.equal(sent.length, 1);
+            assert.equal(sent[0].subject, 'Reminder #1 / 第 1 次提醒: Request to send – 333');
+        });
+        const picks = conn.queries.filter(q => isPick(q.sql));
+        assert.equal(picks.length, 2, `errno ${errno}`);
+        // The second time without the rule, and otherwise the same question.
+        assert.doesNotMatch(picks[1].sql, /superseded|shipments|packing_lists/);
+        assert.equal(picks[1].sql, picks[0].sql.replace(` AND ${flat(R.requestRemindersStoppedSql())} IS NULL`, ''));
+        assert.deepEqual(picks[1].params, [5]);
+    }
+});
+
+test('runReceiptReminders: any other fault of that question is not swallowed', async () => {
+    const conn = fakeConn((sql) => {
+        if (isPick(sql)) throw Object.assign(new Error('Deadlock found'), { errno: 1213 });
+        return /COALESCE\(MAX\(send_id\)/.test(sql) ? [[{ last: 0 }]] : [[]];
+    });
+    await assert.rejects(
+        runReceiptReminders({ getConnection: async () => conn }, { baseUrl: 'https://api.example.com' }),
+        /Deadlock found/
+    );
+    assert.equal(conn.queries.filter(q => isPick(q.sql)).length, 1);
+});
+
+const RECEIPT_COLUMNS = 'id, email_type, send_table, send_id, sent_to, subject, created_at, opened_at, open_count,'
+    + ' confirmed_at, confirmed_ip, confirmed_user_agent, reminder_count, last_reminder_at, confirm_via, action_url';
+
+test('selectEmailReceipts: every row carries why its reminders stopped', async () => {
+    const conn = fakeConn(() => [[{ id: 7, reminders_stopped: 'shipped' }]]);
+    const rows = await R.selectEmailReceipts(conn, 'WHERE id = ?', [7]);
+    assert.deepEqual(rows, [{ id: 7, reminders_stopped: 'shipped' }]);
+    assert.equal(conn.queries.length, 1);
+    assert.equal(
+        conn.queries[0].sql,
+        `SELECT ${RECEIPT_COLUMNS}, ${flat(R.requestRemindersStoppedSql())} AS reminders_stopped FROM email_receipts r WHERE id = ?`
+    );
+    assert.deepEqual(conn.queries[0].params, [7]);
+});
+
+test('selectEmailReceipts: a server that cannot read the rule still lists them, with no reason', async () => {
+    for (const errno of [1049, 1054, 1142, 1143, 1146]) {
+        const conn = fakeConn((sql) => {
+            if (/THEN 'superseded'/.test(sql)) throw Object.assign(new Error('not there'), { errno });
+            return [[{ id: 7, reminders_stopped: null }]];
+        });
+        const rows = await R.selectEmailReceipts(conn, 'ORDER BY created_at DESC, id DESC LIMIT 100 OFFSET 0');
+        assert.deepEqual(rows, [{ id: 7, reminders_stopped: null }], `errno ${errno}`);
+        assert.equal(conn.queries.length, 2);
+        assert.equal(
+            conn.queries[1].sql,
+            `SELECT ${RECEIPT_COLUMNS}, NULL AS reminders_stopped FROM email_receipts r ORDER BY created_at DESC, id DESC LIMIT 100 OFFSET 0`
+        );
+        assert.deepEqual(conn.queries[1].params, []);
+    }
+    const broken = fakeConn(() => { throw Object.assign(new Error('Deadlock found'), { errno: 1213 }); });
+    await assert.rejects(R.selectEmailReceipts(broken, 'WHERE id = ?', [7]), /Deadlock found/);
+    assert.equal(broken.queries.length, 1);
+});

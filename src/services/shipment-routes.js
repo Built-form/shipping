@@ -24,7 +24,7 @@ const PL = require('./pl-results');
 const { requestDriftForShipment, requestToSendStatus } = require('./request-to-send-status');
 // How a Request to send went out, and who opened it on the supplier portal
 // (docs/request-to-send-portal.md).
-const { loadSendFacts } = require('./request-to-send-portal');
+const { loadSendFacts, loadSendUpdates } = require('./request-to-send-portal');
 const { sendFactsOf } = require('../lib/request-to-send-portal');
 const { loadSupplierQuoteViews } = require('./portal-access');
 
@@ -859,8 +859,9 @@ function registerShipmentRoutes(app, deps) {
                 const docSends = await sendsFor(conn, 'draft_container_document_sends', 'draft_container_document_id', docs.map(d => d.id));
                 const qaSends = await sendsFor(conn, 'quality_assurance_document_sends', 'quality_assurance_document_id', qa.map(d => d.id));
                 const sendFacts = await loadSendFacts(conn, docs.map(d => d.id));
+                const sendUpdates = await loadSendUpdates(conn, docs.map(d => d.id));
                 const views = await loadSupplierQuoteViews(conn, docs.filter(d => d.type === 'supplier-quote').map(d => d.id));
-                return { docs, qa, docSends, qaSends, drift, sendFacts, views };
+                return { docs, qa, docSends, qaSends, drift, sendFacts, sendUpdates, views };
             });
             if (!out) return res.status(404).json({ error: `Shipment ${id} not found.` });
             const parseJson = v => (typeof v === 'string' ? JSON.parse(v) : v);
@@ -885,6 +886,9 @@ function registerShipmentRoutes(app, deps) {
                     sends: (out.docSends.get(r.id) || []).map(s => ({
                         ...sendToJson(s),
                         ...(out.sendFacts.get(Number(s.id)) || sendFactsOf(null)),
+                        // { replacesVersion, changes } when this send was an update
+                        // of a request already emailed.
+                        ...(out.sendUpdates.has(Number(s.id)) ? { update: out.sendUpdates.get(Number(s.id)) } : {}),
                     })),
                     // A Request to send only: who opened it on the supplier portal.
                     ...(r.type === 'supplier-quote' ? { views: out.views.get(Number(r.id)) || [] } : {}),

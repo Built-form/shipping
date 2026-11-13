@@ -177,6 +177,9 @@ test('requestPortalBlockHtml: link, what was asked, and wording that follows pre
     assert.doesNotMatch(yes, /this order/);
     assert.doesNotMatch(yes, /此订单/);
     assert.match(yes, /No file is attached/);
+    // The page it links to shows the request; it does not take uploads (user, 2026-11-13).
+    assert.doesNotMatch(yes, /upload/i);
+    assert.doesNotMatch(yes, /上传/);
 
     const no = L.requestPortalBlockHtml({ ...base, preapproved: false });
     assert.doesNotMatch(no, /already approved/);
@@ -227,7 +230,7 @@ test('the portal template: bound to the Request to send dialog, asks for the ETD
 
 const missing = errno => Object.assign(new Error('missing'), { errno });
 
-function fakeConn({ suppliers = [], portal = 'ok', sendColumns = true, sends = [], views = [] } = {}) {
+function fakeConn({ suppliers = [], portal = 'ok', sendColumns = true, sends = [], views = [], earlier = [], updateColumn = true } = {}) {
     const queries = [];
     return {
         queries,
@@ -239,6 +242,16 @@ function fakeConn({ suppliers = [], portal = 'ok', sendColumns = true, sends = [
                 if (portal === 'missing') throw missing(1049);
                 if (portal === 'broken') throw new Error('boom');
                 return [[{ ok: 1 }]];
+            }
+            // The latest earlier version of a request that was emailed.
+            if (/FROM draft_container_documents p/.test(flat)) return [earlier.slice(0, 1)];
+            if (/^UPDATE draft_container_document_sends SET request_update/.test(flat)) {
+                if (!updateColumn) throw missing(1054);
+                return [{ affectedRows: 1 }];
+            }
+            if (/SELECT id, request_update FROM draft_container_document_sends/.test(flat)) {
+                if (!updateColumn) throw missing(1054);
+                return [sends];
             }
             if (/^INSERT INTO draft_container_document_sends/.test(flat)) {
                 if (/delivery/.test(flat) && !sendColumns) throw missing(1054);
@@ -365,6 +378,170 @@ test('preparePortalSend: the supplier or the portal went away since the check: h
     assert.equal(down.conflict.reason, 'portal_unavailable');
 });
 
+// ── A new version of a request the supplier already has ─────────────────────
+// (user, 2026-11-13: "very important to let them know about new changes or V2 of requests")
+
+const snap = lines => JSON.stringify({ v: 1, source: 'generate', lines });
+const V1 = { id: 30, version: 1, lines_json: snap([
+    { jfCode: 'JF1049', sku: 'Gloves', lot: 'L1', units: 500, supplier: 'Acme Co' },
+    { jfCode: 'JF2000', sku: 'Masks', lot: null, units: 1200, supplier: 'Acme Co' },
+    { jfCode: 'JF4000', sku: 'Caps', lot: 'C1', units: 80, supplier: 'Acme Co' },
+]) };
+const V2 = { id: 31, version: 2, lines_json: snap([
+    { jfCode: 'JF1049', sku: 'Gloves', lot: 'L1', units: 620, supplier: 'Acme Co' },
+    { jfCode: 'JF3000', sku: 'Wipes', lot: 'B7', units: 40, supplier: 'Acme Co' },
+    { jfCode: 'JF4000', sku: 'Caps', lot: 'C2', units: 80, supplier: 'Acme Co' },
+]) };
+const CHANGES = [
+    { kind: 'units', item: 'JF1049', lot: 'L1', unitsWas: 500, unitsNow: 620 },
+    { kind: 'removed', item: 'JF2000', lot: null, unitsWas: 1200 },
+    { kind: 'lot', item: 'JF4000', lotWas: 'C1', lot: 'C2' },
+    { kind: 'added', item: 'JF3000', lot: 'B7', unitsNow: 40 },
+];
+
+test('requestUpdate: which version it replaces, and what a supplier acts on that changed', () => {
+    assert.deepEqual(L.requestUpdate(V1, V2), { replacesVersion: 1, changes: CHANGES });
+    // Nothing they act on changed (a carton size, a weight): an update all the same, with an empty list.
+    assert.deepEqual(L.requestUpdate(V1, { ...V2, lines_json: V1.lines_json }), { replacesVersion: 1, changes: [] });
+    // No record of what either version printed: an update, with what changed unknown.
+    assert.deepEqual(L.requestUpdate({ ...V1, lines_json: null }, V2), { replacesVersion: 1, changes: null });
+    assert.deepEqual(L.requestUpdate(V1, { ...V2, lines_json: 'not json' }), { replacesVersion: 1, changes: null });
+    // The first version anyone was sent is not an update.
+    assert.equal(L.requestUpdate(null, V2), null);
+    assert.equal(L.requestUpdate(undefined, V2), null);
+});
+
+test('changeText: one change as a supplier reads it, in English and Chinese', () => {
+    assert.deepEqual(CHANGES.map(L.changeText), [
+        { en: 'JF1049 (lot L1): 500 → 620 units', zh: 'JF1049（批号 L1）：数量 500 → 620' },
+        { en: 'JF2000: removed (was 1,200 units)', zh: 'JF2000：已取消（原数量 1,200）' },
+        { en: 'JF4000: lot C1 → C2', zh: 'JF4000：批号 C1 → C2' },
+        { en: 'JF3000 (lot B7): added, 40 units', zh: 'JF3000（批号 B7）：新增，数量 40' },
+    ]);
+    // A lot that changed together with its quantity, and a lot that was not there before.
+    assert.deepEqual(L.changeText({ kind: 'lot', item: 'JF1', lotWas: null, lot: 'A', unitsWas: 10, unitsNow: 12 }),
+        { en: 'JF1: lot none → A, 10 → 12 units', zh: 'JF1：批号 无 → A，数量 10 → 12' });
+    assert.deepEqual(L.changeText({ kind: 'units', item: 'JF1', lot: null, unitsWas: 10, unitsNow: 12 }),
+        { en: 'JF1: 10 → 12 units', zh: 'JF1：数量 10 → 12' });
+});
+
+test('updateBlockHtml: says it replaces the earlier version, and lists what changed', () => {
+    const html = L.updateBlockHtml({ version: 2, replacesVersion: 1, changes: CHANGES });
+    assert.match(html, /This is version 2 of this request/);
+    assert.match(html, /replaces version 1/);
+    assert.match(html, /这是本通知的第 2 版/);
+    assert.match(html, /取代第 1 版/);
+    assert.match(html, /JF1049 \(lot L1\): 500 → 620 units/);
+    assert.match(html, /JF2000：已取消（原数量 1,200）/);
+    assert.equal(html.split('<li').length - 1, 4);
+    // An item's name is our own text: escaped.
+    assert.match(L.updateBlockHtml({ version: 2, replacesVersion: 1, changes: [{ kind: 'added', item: 'Gloves <XL>', lot: null, unitsNow: 5 }] }), /Gloves &lt;XL&gt;: added, 5 units/);
+
+    // Nothing they act on changed: said, so nobody goes looking for a difference.
+    const same = L.updateBlockHtml({ version: 3, replacesVersion: 2, changes: [] });
+    assert.match(same, /items, quantities and lots are the same as in version 2/);
+    assert.equal(same.split('<li').length - 1, 0);
+    // What changed is not known: only that it replaces the earlier one.
+    const unknown = L.updateBlockHtml({ version: 2, replacesVersion: 1, changes: null });
+    assert.match(unknown, /replaces version 1/);
+    assert.doesNotMatch(unknown, /are the same/);
+    assert.equal(unknown.split('<li').length - 1, 0);
+
+    // A long list is cut, and says by how much.
+    const many = Array.from({ length: 34 }, (_, i) => ({ kind: 'added', item: `JF${i}`, lot: null, unitsNow: 1 }));
+    const cut = L.updateBlockHtml({ version: 2, replacesVersion: 1, changes: many });
+    assert.equal(cut.split('<li').length - 1, 30);
+    assert.match(cut, /and 4 more/);
+    assert.match(cut, /另有 4 项/);
+});
+
+test('storedUpdate: what a send row keeps of it, and reads back', () => {
+    const update = { replacesVersion: 1, changes: CHANGES };
+    assert.deepEqual(L.storedUpdate(JSON.stringify(update)), update);
+    assert.deepEqual(L.storedUpdate(update), update);
+    assert.deepEqual(L.storedUpdate({ replacesVersion: 2, changes: null }), { replacesVersion: 2, changes: null });
+    // Anything that is not one reads as "not an update".
+    for (const bad of [null, undefined, '', 'x', '{}', { replacesVersion: 0 }, { replacesVersion: 'one' }, []]) assert.equal(L.storedUpdate(bad), null, JSON.stringify(bad));
+    // A change of a kind this code does not know is dropped, not shown as something else.
+    assert.deepEqual(L.storedUpdate({ replacesVersion: 1, changes: [{ kind: 'colour', item: 'x' }, CHANGES[0]] }), { replacesVersion: 1, changes: [CHANGES[0]] });
+});
+
+test('the update template: for the same dialog, says it is an update, promises no attachment', () => {
+    const t = DEFAULT_EMAIL_TEMPLATES.find(x => x.key === L.UPDATE_TEMPLATE_KEY);
+    assert.equal(L.UPDATE_TEMPLATE_KEY, 'request_to_send_update_portal');
+    assert.equal(t.category, 'Supplier Quote');
+    assert.match(t.subject, /^UPDATED/);
+    assert.match(t.subject, /\{draftContainerName\}/);
+    assert.match(t.subject, /\{version\}/);
+    assert.match(t.bodyHtml, /\[etd:date\]/);
+    assert.match(t.bodyHtml, /\[port:port\]/);
+    assert.match(t.bodyHtml, /replaces/);
+    assert.doesNotMatch(t.bodyHtml, /attached packing list|see attached|see the attached/i);
+});
+
+test('resolveUpdate: the latest EARLIER version of the same request that was emailed', async () => {
+    const doc = { ...DOC, id: 31, version: 2, shipment_id: 163, lines_json: V2.lines_json };
+    const conn = fakeConn({ earlier: [V1] });
+    assert.deepEqual(await S.resolveUpdate(conn, doc), { replacesVersion: 1, changes: CHANGES });
+    const q = conn.queries[0];
+    assert.match(q.sql, /p\.type = 'supplier-quote' AND p\.deleted_at IS NULL/);
+    // The same supplier's request for the same container: by its name, or by its shipment.
+    assert.match(q.sql, /p\.supplier <=> \?/);
+    assert.match(q.sql, /\(p\.draft_container_name = \? OR \(p\.shipment_id IS NOT NULL AND p\.shipment_id = \?\)\)/);
+    // Earlier, and really sent: a version nobody was emailed replaces nothing.
+    assert.match(q.sql, /p\.id <> \? AND p\.version < \?/);
+    assert.match(q.sql, /EXISTS \(SELECT 1 FROM draft_container_document_sends s WHERE s\.draft_container_document_id = p\.id\)/);
+    assert.match(q.sql, /ORDER BY p\.version DESC, p\.id DESC LIMIT 1$/);
+    assert.deepEqual(q.params, [31, 2, 'Acme Co', '328', 163]);
+
+    // Nothing earlier was sent: not an update.
+    assert.equal(await S.resolveUpdate(fakeConn(), doc), null);
+    // A forwarder quote is never one, and is not even looked up.
+    const fq = fakeConn({ earlier: [V1] });
+    assert.equal(await S.resolveUpdate(fq, { ...doc, type: 'forwarder-quote' }), null);
+    assert.equal(fq.queries.length, 0);
+});
+
+test('preparePortalSend: an update says so above the portal block', async () => {
+    const plan = { delivery: 'portal', reason: null, portalUrl: 'https://p.example/requests-to-send?doc=412', registerUrl: 'https://p.example/register', suppliers: [{ id: 7, name: 'Acme Co' }] };
+    const granted = async () => ({ status: 'ok', suppliers: plan.suppliers, poSupplierMatched: true, users: [{ email: 'a@acme.cn', outcome: 'already_active', suppliersAdded: 0 }] });
+    const input = { doc: DOC, plan, recipients: ['a@acme.cn'], fields: { etd: null, port: null }, bodyHtml: '<p>BODY</p>', subject: 'S' };
+    const r = await S.preparePortalSend({}, { ...input, update: { replacesVersion: 1, changes: CHANGES } }, { preapprove: granted });
+    const body = r.emailHtml.indexOf('<p>BODY</p>');
+    const note = r.emailHtml.indexOf('replaces version 1');
+    const link = r.emailHtml.indexOf('requests-to-send?doc=412');
+    assert.ok(body >= 0 && body < note && note < link, `order ${body} ${note} ${link}`);
+    // Not an update: nothing is said about versions.
+    const plain = await S.preparePortalSend({}, input, { preapprove: granted });
+    assert.doesNotMatch(plain.emailHtml, /replaces version/);
+});
+
+test('saveSendUpdate / loadSendUpdates: kept on the send row; a table without the column still works', async () => {
+    const update = { replacesVersion: 1, changes: CHANGES };
+    const conn = fakeConn();
+    await S.saveSendUpdate(conn, 77, update);
+    assert.match(conn.queries[0].sql, /^UPDATE draft_container_document_sends SET request_update = \? WHERE id = \?$/);
+    assert.deepEqual(conn.queries[0].params, [JSON.stringify(update), 77]);
+    // Not an update: nothing is written.
+    const none = fakeConn();
+    await S.saveSendUpdate(none, 77, null);
+    assert.equal(none.queries.length, 0);
+    // The column is not there yet: the send stands without it.
+    await S.saveSendUpdate(fakeConn({ updateColumn: false }), 77, update);
+    await assert.rejects(S.saveSendUpdate({ query: async () => { throw Object.assign(new Error('gone away'), { errno: 2006 }); } }, 77, update), /gone away/);
+
+    const read = fakeConn({ sends: [{ id: 5, request_update: JSON.stringify(update) }, { id: 6, request_update: null }] });
+    const got = await S.loadSendUpdates(read, [412, 412, null]);
+    assert.deepEqual(read.queries[0].params, [412]);
+    assert.deepEqual(got.get(5), update);
+    assert.equal(got.has(6), false);
+    assert.equal((await S.loadSendUpdates(fakeConn({ updateColumn: false }), [412])).size, 0);
+    await assert.rejects(S.loadSendUpdates({ query: async () => { throw Object.assign(new Error('gone away'), { errno: 2006 }); } }, [412]), /gone away/);
+    const empty = fakeConn();
+    assert.equal((await S.loadSendUpdates(empty, [])).size, 0);
+    assert.equal(empty.queries.length, 0);
+});
+
 test('insertSend: stores how it went out and what the email said; an unmigrated table still records the send', async () => {
     const row = {
         documentId: 412, sentTo: ['a@x.com'], subject: 'S', frontMessageUid: 'm', frontConversationId: 'c', sentByEmail: 'ops@x.com',
@@ -480,4 +657,89 @@ test('the receipt: an upload for that shipment confirms it too (a packing list o
     assert.match(ci, /u\.confirmed_shipment_id = d\.shipment_id/);
     assert.match(ci, /u\.confirmed_shipment_id IS NULL AND u\.match_confidence = 'confident' AND u\.suggested_shipment_id = d\.shipment_id/);
     assert.doesNotMatch(ci, /pl_submissions/);
+});
+
+// ── When the chase ends without the supplier doing anything ─────────────────
+
+const flat = sql => String(sql).replace(/\s+/g, ' ').trim();
+const LETTERS = column => `REGEXP_REPLACE(LOWER(CONVERT(${column} USING utf8mb4)), '[^[:alnum:]]', '')`;
+
+test('reminders stop: the reasons, in the order they are tried', () => {
+    assert.deepEqual(R.REMINDERS_STOPPED, ['superseded', 'shipped', 'documents']);
+    const sql = flat(R.requestRemindersStoppedSql());
+    const at = reason => sql.indexOf(`THEN '${reason}'`);
+    assert.ok(at('superseded') > 0, 'superseded');
+    assert.ok(at('superseded') < at('shipped'), 'superseded before shipped');
+    assert.ok(at('shipped') < at('documents'), 'shipped before documents');
+    // Nothing else is ever answered: three reasons, and no ELSE.
+    assert.equal(sql.split(' THEN ').length - 1, 3);
+    assert.doesNotMatch(sql, / ELSE /);
+});
+
+test('reminders stop: only for the email of a Request to send, read through its own send', () => {
+    const sql = flat(R.requestRemindersStoppedSql());
+    assert.ok(sql.startsWith('(SELECT CASE WHEN EXISTS (SELECT 1 FROM draft_container_documents n '), sql.slice(0, 80));
+    // One row at most (a send's id), and none for any other kind of email or a
+    // forwarder's document: the expression is then NULL and the email is chased.
+    assert.ok(sql.endsWith(
+        " THEN 'documents' END FROM draft_container_document_sends s"
+        + ' JOIN draft_container_documents d ON d.id = s.draft_container_document_id'
+        + " WHERE r.send_table = 'draft_container_document_sends' AND s.id = r.send_id AND d.type = 'supplier-quote')"
+    ), sql.slice(-260));
+});
+
+test('reminders stop: a later version of the same request has been emailed (the rule that makes it an update)', () => {
+    const sql = flat(R.requestRemindersStoppedSql());
+    assert.ok(sql.includes(
+        "WHEN EXISTS (SELECT 1 FROM draft_container_documents n WHERE n.type = 'supplier-quote' AND n.deleted_at IS NULL"
+        + ' AND n.id <> d.id AND n.version > d.version'
+        + ' AND n.supplier <=> d.supplier'
+        + ' AND (n.draft_container_name = d.draft_container_name OR (n.shipment_id IS NOT NULL AND n.shipment_id = d.shipment_id))'
+        + ' AND EXISTS (SELECT 1 FROM draft_container_document_sends ns WHERE ns.draft_container_document_id = n.id))'
+        + " THEN 'superseded'"
+    ), sql);
+});
+
+test('reminders stop: the shipment has left (the portal\'s own "shipped")', () => {
+    const sql = flat(R.requestRemindersStoppedSql());
+    assert.ok(sql.includes(
+        "WHEN EXISTS (SELECT 1 FROM shipments sh WHERE sh.id = d.shipment_id AND sh.stage IN ('IN_TRANSIT', 'ARRIVED', 'CLOSED'))"
+        + ' OR EXISTS (SELECT 1 FROM orders o WHERE o.shipment_id = d.shipment_id AND o.deleted_at IS NULL'
+        + " AND o.status IN ('ON_SEA', 'ON_AIR', 'ARRIVED_AT_WAREHOUSE', 'RECEIVED', 'PARTIALLY_RECEIVED'))"
+        + " THEN 'shipped'"
+    ), sql);
+});
+
+test('reminders stop: its packing list AND its invoice are filed for that shipment under that supplier', () => {
+    const sql = flat(R.requestRemindersStoppedSql());
+    const same = column => `${LETTERS(column)} = ${LETTERS('d.supplier')} AND ${LETTERS('d.supplier')} <> ''`;
+    assert.ok(sql.includes(
+        "WHEN EXISTS (SELECT 1 FROM packing_lists pl WHERE pl.deleted_at IS NULL AND pl.container_kind = 'booked'"
+        + ' AND pl.container_number = (SELECT sh.reference FROM shipments sh WHERE sh.id = d.shipment_id)'
+        + ` AND ${same('pl.supplier_name')})`
+        + " AND EXISTS (SELECT 1 FROM shipment_payment_documents c WHERE c.deleted_at IS NULL AND c.doc_kind = 'balance_invoice'"
+        + ' AND c.shipment_id = d.shipment_id'
+        + ` AND ${same('c.supplier_name')})`
+        + " THEN 'documents'"
+    ), sql);
+});
+
+test('remindersStoppedOf: what a receipt row tells ShipLine, and only while there is something to stop', () => {
+    const row = (reminders_stopped, more = {}) => ({ confirm_via: 'portal', action_url: 'https://p.example/requests-to-send?doc=1', confirmed_at: null, reminders_stopped, ...more });
+    assert.equal(R.remindersStoppedOf(row('superseded')), 'superseded');
+    assert.equal(R.remindersStoppedOf(row('shipped')), 'shipped');
+    assert.equal(R.remindersStoppedOf(row('documents')), 'documents');
+    // The attached kind (the confirm button) is chased too, so it stops too.
+    assert.equal(R.remindersStoppedOf({ confirm_via: 'email', confirmed_at: null, reminders_stopped: 'shipped' }), 'shipped');
+    // Still chased, or a server that could not say.
+    assert.equal(R.remindersStoppedOf(row(null)), null);
+    assert.equal(R.remindersStoppedOf(row(undefined)), null);
+    // Not one of the reasons: never passed on as typed.
+    assert.equal(R.remindersStoppedOf(row('whatever')), null);
+    // Confirmed: nothing was being sent, so nothing stopped.
+    assert.equal(R.remindersStoppedOf(row('shipped', { confirmed_at: new Date('2026-11-13T10:00:00Z') })), null);
+    // Never reminded in the first place (a notice, a link no reminder can repeat).
+    assert.equal(R.remindersStoppedOf(row('shipped', { confirm_via: 'none' })), null);
+    assert.equal(R.remindersStoppedOf(row('shipped', { action_url: null })), null);
+    assert.equal(R.remindersStoppedOf(null), null);
 });

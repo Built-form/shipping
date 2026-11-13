@@ -62,7 +62,7 @@ Response (both ways): the old fields, plus `delivery`, `deliveryReason`, `etd`, 
 What a portal delivery does, in order:
 
 1. **Pre-approves every recipient** (`preapprovePortalUsers`, its own committed transaction, before Front): the same per-address rules as the PO send (`invited` / `approved` / `already_active` / `blocked`), linked to the live supplier rows named exactly as the document's supplier and to nothing wider. `decided_note`: "Pre-approved from ShipLine: Request to send <ref> v<n> emailed by <sender>". If pre-approval finds the supplier row or the portal has gone since step 0, the answer is the same `409 DELIVERY_CHANGED`. If it **fails** (a database error), the email still goes as a link, without the "already approved" wording, and `portalAccess.status` is `error`.
-2. **Sends the email** through Front: the template body (stored `request_to_send_portal`, or the sender's edit), then the fixed bilingual portal block (`requestPortalBlockHtml`: what is waiting, the ETD and port if given, the button to `${SUPPLIER_PORTAL_URL}/requests-to-send?doc=<document id>`, how to register), inside the portal emails' frame. No attachment, no confirm button.
+2. **Sends the email** through Front: the template body (stored `request_to_send_portal`, or the sender's edit), then the fixed bilingual portal block (`requestPortalBlockHtml`: what is waiting, the ETD and port if given, the button to `${SUPPLIER_PORTAL_URL}/requests-to-send?doc=<document id>`, how to register), inside the portal emails' frame. No attachment, no confirm button. The block does not mention uploading: the page it opens shows the request and its files only (the supplier's own packing list and invoice go through the portal's two upload tabs, as before).
 3. **Writes the send row** with `delivery = 'portal'`, `request_etd`, `request_port`. The row is what lists the request on the portal, so the link works only because it is there.
 4. **Logs the email** in `email_receipts` as `confirm_via 'portal'` with `action_url` = the portal link.
 
@@ -76,11 +76,49 @@ There is no server-side role check on these routes, as on the PO send: ShipLine'
 
 - `email_type` is `request_to_send` for a Request to send from now on, whichever way it goes (earlier rows stay `draft_container_quote`, as every forwarder quote still is).
 - A link: `confirm_via 'portal'`, chased with reminders that repeat the portal link (`CHASED_PORTAL_STEPS`) until one of these confirms it (`syncPortalReceipts`, each only for what happened **after** the email went out):
-  - **`request_viewed`**: a row in the portal's `supplier_quote_views` for that document **or a later version for the same container and supplier**. The portal writes one when the supplier opens the PDF or the CSV, and when they arrive on the page through the email's link (signed in, on the row the link names): following the link is itself the acknowledgement, so nobody has to download anything to stop the reminders.
+  - **`request_viewed`**: a row in the portal's `supplier_quote_views` for that document **or a later version for the same container and supplier**. The portal writes one when the supplier opens the PDF or the CSV, and when they arrive on the page through the email's link (signed in, on the row the link names): following the link is itself the acknowledgement, so nobody has to download anything to stop the reminders. An arrival is recorded for the **newest** version of that request, whichever version the email named: the row shows the newest and what changed, so a supplier who follows an old email's link has answered the newer email too.
   - **`request_pl_uploaded`** / **`request_ci_uploaded`**: the supplier uploaded a packing list, or an invoice, **for that shipment** through the portal (`requestUploadSources`): sent to our team (any status but `draft` / `discarded`), filed by staff on that container or shipment or, while staff have not decided, matched to it by shipping's own check with `match_confidence = 'confident'`, and uploaded by someone whose suppliers include one named exactly as the request's. The supplier is never asked which shipment an upload is for, so an upload that matched nothing confirms nothing until staff file it.
   
   While the portal's view table cannot be read, these emails are not chased.
 - Attached: `confirm_via 'email'`, the confirm button, exactly as before.
+
+### When reminders stop with nothing confirmed
+
+A reminder is worth sending only while the supplier can still act on the request. The sweep (`runReceiptReminders`) leaves a Request to send's email alone, **whichever way it went out**, once one of these holds (`requestRemindersStoppedSql` in `src/lib/email-receipt.js`, tried in this order):
+
+| `remindersStopped` | When |
+|---|---|
+| `superseded` | a **later version of the same request has been emailed**: the rule of "Updates" below (`resolveUpdate`), read the other way. Same supplier, same container (the same name, or the same `shipment_id`), a higher version, and that version has a send. The supplier is chased about the newest version only. |
+| `shipped` | the shipment has left: the portal's own `shipped` ("When a request is done" below). |
+| `documents` | its packing list **and** its invoice are both filed: the portal's own `documents`. |
+
+- Nothing is written: the receipt stays unconfirmed (nobody confirmed anything), and the reason is worked out when it is asked. A shipment whose stage is put back is chased again.
+- `GET /api/v1/email-receipts` returns it as `remindersStopped` on each row (`selectEmailReceipts`, `remindersStoppedOf`): null while the email is still chased, once it is confirmed, and for every other kind of email. ShipLine prints "No more reminders: shipped" under such a row, so staff are not left waiting for reminders that will never go.
+- **A reminder sent by hand is never refused by this** (`POST /api/v1/email-receipts/:id/resend`): the button stays.
+- A forwarder's quote, and every other email, has no such end.
+- The last two rules are a copy of the portal's (`supplierQuoteProgressSql`, `requestDone`): **change the two together**. A read-only run on TEST on 2026-11-13 compared the expression with independent answers (the portal's own statement for `shipped` / `documents`; `superseded` worked out from the documents in code) for all 133 receipts of draft-container sends: none disagreed. Of the 10 Request to send receipts still unconfirmed there, 6 read `shipped`, 1 `documents`, 1 `superseded`, and 2 are still chased.
+- A server that cannot read the rule (a table or column of it is not there: errno 1049, 1054, 1142, 1143, 1146) is asked again without it: everyone is chased as before, and the page lists the receipts with `remindersStopped: null`. Any other fault is thrown.
+- Not covered: a cancelled or deleted draft's request is still chased to the cap (as it is still listed on the portal).
+
+## Updates: a new version of a request the supplier already has
+
+A supplier works from the last packing list they were sent. When a container changes and the request is generated and sent again, the email must say that this version replaces the earlier one, and what is different. ShipLine's STALE flag (`docs` of the drift: `src/lib/request-to-send-drift.js`) tells staff when to do that; this is what the supplier is then told.
+
+**Is it an update?** `resolveUpdate(conn, doc)`: the latest **earlier** version of the same request that was **emailed** (same supplier, and the same container: the same name, or the same `shipment_id` for a draft renamed or booked since). A version that was generated and never emailed replaces nothing. Sending the same version again is not an update. → `null`, or `{ replacesVersion, changes }`:
+
+- `changes`: what differs between the lines the two PDFs were printed from (their `lines_json` snapshots), by the rule that flags a request STALE: an item added or removed, its units, its lot. `[]` when none of that changed (a carton size or a weight did). `null` when either version has no snapshot, so it is not known.
+
+**What the email carries.** A fixed, bilingual note under the body (`updateBlockHtml`), **whichever way it goes out** (above the portal block for a link; above the confirm button when attached): "This is version N of this request. It replaces version M: please work from this one", then what changed, one line per change in English and Chinese (`changeText`; at most 30, the rest counted), or that items, quantities and lots are the same, or nothing more when it is not known. Only for a caller that sends `delivery` (an older ShipLine gets the old email).
+
+**The template.** A link that is an update starts from `request_to_send_update_portal` (category `Supplier Quote`, seeded by `2026-11-13_40`): subject `UPDATED – Request to send – {draftContainerName} – version {version}`. `{version}` is filled in by ShipLine and by the server.
+
+**Where else it shows.**
+
+- `GET …/:id/delivery` returns `update` (the same object, or null): ShipLine's dialog says "AN UPDATE: VERSION 2 REPLACES VERSION 1", lists what the email will say changed, and starts on the update template.
+- The send row keeps it (`request_update`, JSON; `saveSendUpdate`): what the email said, as it was said. `sends[].update` on both document lists; ShipLine marks the send "UPDATE OF v1".
+- The portal reads `request_update` of the newest version's latest send and shows the same note on the request's row, with an "Updated" mark until that user has opened the new version (a "New" mark for a first request). The response and the email are confirmed, and chased, as any other portal email of a Request to send.
+
+Checked read-only on TEST on 2026-11-13: request 333 for Suzhou Sunmed, version 2, reads as an update of version 1 with one change (`JF0164 (lot 0164016): 1,000 → 1,030 units`); requests from before line snapshots existed read as updates with what changed not known.
 
 ## When a request is done (the portal hides it)
 
@@ -102,7 +140,11 @@ Not covered, and so left open on the page: a cancelled or deleted draft's reques
 ## Schema
 
 - `2026-11-13_10_request_to_send_delivery.sql`: `draft_container_document_sends.delivery`, `.request_etd`, `.request_port`. The code answers a server without them as empty (a send is recorded without them), so the order of migration and deploy does not matter.
-- `2026-11-13_11_grant_request_to_send_to_jportal.js`: column grants for the portal's login: `csv_public_url` and `shipment_id` on the documents, `request_etd` / `request_port` on the sends, and for "done": `shipments (id, reference, stage)`, `orders (shipment_id)`, `packing_lists (container_kind, container_number, supplier_name, deleted_at)`, `shipment_payment_documents (shipment_id, supplier_name, doc_kind, deleted_at)`. The portal's `db/grants/jportal_app.sql` carries the same. Without them the portal's page still lists every request, all as open.
+- `2026-11-13_11_grant_request_to_send_to_jportal.js`: column grants for the portal's login: `csv_public_url` on the documents, `request_etd` / `request_port` on the sends.
+- `2026-11-13_12_grant_request_progress_to_jportal.js`: the grants for "done": `draft_container_documents (shipment_id)`, `shipments (id, reference, stage)`, `orders (shipment_id)`, `packing_lists (container_kind, container_number, supplier_name, deleted_at)`, `shipment_payment_documents (shipment_id, supplier_name, doc_kind, deleted_at)`. A file of its own because test had already applied `_11` when they were added, and an applied migration is never run again. Without them the portal's page still lists every request, all as open.
+- `2026-11-13_30_request_to_send_update.sql` and `_31_grant_request_update_to_jportal.js`: `draft_container_document_sends.request_update` (JSON) and its grant. Without the column a send is recorded without it and nothing reads as an update on the portal.
+- `2026-11-13_40_seed_request_to_send_update_template.js`: the `request_to_send_update_portal` template.
+- The portal's `db/grants/jportal_app.sql` carries the same grants, and the portal's own deploy applies that file.
 - `2026-11-13_20_seed_request_to_send_portal_template.js`: the `request_to_send_portal` template, category `Supplier Quote`. The templates ops wrote for the attached email stay, and are what the dialog offers when a request goes out attached. **A sender who picks an "attached" template for a link says "attached" with nothing attached**: the dialog defaults to the right one and warns.
 
 ## Rollout (test, then prod)
