@@ -337,9 +337,41 @@ const ARTWORK_CONFIRMATION_TEMPLATE = {
 };
 DEFAULT_EMAIL_TEMPLATES.push(ARTWORK_CONFIRMATION_TEMPLATE);
 
+// The Request to send (a supplier's packing list for one container) when it
+// goes out as a link to the supplier portal instead of attachments
+// (src/lib/request-to-send-portal.js, docs/request-to-send-portal.md; seeded by
+// 2026-11-13_20_seed_request_to_send_portal_template.js). Category 'Supplier
+// Quote' is what ShipLine's Request to send dialog offers templates by. The
+// sender appends a fixed block under this body: the button to the portal's
+// Requests to send page and how to register. [etd:date] and [port:port] are
+// fields the SENDER fills in before sending (ShipLine substitutes them, and
+// also sends them as `fields`, which is what the portal shows beside the PDF);
+// {draftContainerName} is filled in by ShipLine too.
+const REQUEST_TO_SEND_PORTAL_TEMPLATE_KEY = 'request_to_send_portal';
+const REQUEST_TO_SEND_PORTAL_TEMPLATE = {
+    key: REQUEST_TO_SEND_PORTAL_TEMPLATE_KEY,
+    name: 'Request to send (supplier portal)',
+    category: 'Supplier Quote',
+    description: 'Emailed to a supplier with their packing list for a container: no attachment, the PDF and CSV are on the supplier portal. A button to the portal and registration instructions are appended automatically. Used when the supplier is on the portal; otherwise the request goes out with the files attached and an "attached" template should be chosen. Sender fields: [etd:date] [port:port]. Tokens: {draftContainerName}.',
+    subject: 'Request to send – {draftContainerName} – on the supplier portal / 发货通知',
+    bodyHtml: [
+        '<div style="font-family:Helvetica,Arial,sans-serif;font-size:14px;color:#222;line-height:1.5;">',
+        '<p>Hi,</p>',
+        '<p>The packing list for the container with ETD <strong>[etd:date]</strong> is ready on our supplier portal. The port of departure is [port:port]. It is not attached to this email: please sign in to the portal and download it there.</p>',
+        '<p>Please send the CI and PL. You can upload both on the portal.</p>',
+        '<p>您好，</p>',
+        '<p>预计开船日为 <strong>[etd:date]</strong> 的集装箱装箱单已发布在我们的供应商门户，起运港为 [port:port]。本邮件不附带该文件：请登录门户下载。</p>',
+        '<p>请提供商业发票（CI）和装箱单（PL），两者均可在门户上传。</p>',
+        '<p>Kind regards<br>JFA Medical LTD</p>',
+        '</div>',
+    ].join(''),
+};
+DEFAULT_EMAIL_TEMPLATES.push(REQUEST_TO_SEND_PORTAL_TEMPLATE);
+
 module.exports = {
     DEFAULT_EMAIL_TEMPLATES, SUPPLIER_PI_TEMPLATE_KEYS, QC_VISIT_TEMPLATE_KEYS, PO_PORTAL_TEMPLATE_KEY,
     SIGNED_PI_TEMPLATE_KEY,
     FILE_TRANSFER_TEMPLATE_KEY, FILE_TRANSFER_TEMPLATE,
     ARTWORK_CONFIRMATION_TEMPLATE_KEY, ARTWORK_CONFIRMATION_TEMPLATE,
+    REQUEST_TO_SEND_PORTAL_TEMPLATE_KEY, REQUEST_TO_SEND_PORTAL_TEMPLATE,
 };

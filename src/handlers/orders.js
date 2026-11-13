@@ -35,8 +35,12 @@ const { sendReminderForReceipt } = require('../services/receipt-reminders');
 const { receiveOrderStock, ReceiveError } = require('../services/order-receive');
 // The PO send links to the PDF on the supplier portal and pre-approves its
 // recipients there; the portal records who opened it (docs/po-portal-send.md).
-const { preapprovePortalUsers, loadPoDocumentViews, loadSignedPiViews } = require('../services/portal-access');
+const { preapprovePortalUsers, loadPoDocumentViews, loadSignedPiViews, loadSupplierQuoteViews } = require('../services/portal-access');
 const poPortalEmail = require('../lib/po-portal-email');
+// A Request to send goes out the same way when the portal can show it to the
+// supplier, and attached otherwise (docs/request-to-send-portal.md).
+const requestToSendPortal = require('../lib/request-to-send-portal');
+const requestToSendSends = require('../services/request-to-send-portal');
 const { wrapEmail } = require('../lib/email-layout');
 const { listWarehousesWithLocations, listLocationsForWarehouse } = require('../services/mintsoft-locations');
 // Daily alerts (slide-out alert window). Generation logic lives in the service
@@ -2791,8 +2795,14 @@ async function generateDraftDocument(conn, { name, docType, supplierName, commen
     const draftMeta = { name, date: new Date(), originPorts, comments: comments || '', supplier: supplierName };
     let pdfBuffer, csvBuffer;
     if (docType === 'supplier-quote') {
-        pdfBuffer = await buildSupplierQuotePdf(draftMeta, lines);
-        csvBuffer = buildSupplierQuoteCsv(draftMeta, lines);
+        // A supplier reads this one. The draft's name is internal (its stamp,
+        // other suppliers' names, an old departure date), so "Ref:" prints the
+        // container's number and nothing else (docs/request-to-send-portal.md).
+        // The row below still stores the whole name: it is how the document is
+        // found again.
+        const supplierMeta = { ...draftMeta, name: requestToSendPortal.supplierRef(name) || '' };
+        pdfBuffer = await buildSupplierQuotePdf(supplierMeta, lines);
+        csvBuffer = buildSupplierQuoteCsv(supplierMeta, lines);
     } else if (docType === 'forwarder-quote') {
         pdfBuffer = await buildForwarderQuotePdf(draftMeta, lines);
         csvBuffer = buildForwarderQuoteCsv(draftMeta, lines);
@@ -2821,10 +2831,14 @@ async function generateDraftDocument(conn, { name, docType, supplierName, commen
     const supplierSlug = supplierName ? (supplierName.replace(/[^A-Za-z]/g, '') || 'supplier') : null;
     // The file name the email attaches: a supplier-quote is titled "Request to
     // send" on the page, so its file says so too (the type stays supplier-quote).
+    // A Request to send's file is named for the supplier who downloads it: the
+    // container's number, never the draft's name (requestNames).
     const filePrefix = docType === 'supplier-quote' ? 'request-to-send' : docType;
-    const fileBase = supplierSlug
-        ? `${filePrefix}-${supplierSlug}-${safeName}-v${version}`
-        : `${filePrefix}-${safeName}-v${version}`;
+    const fileBase = docType === 'supplier-quote'
+        ? requestToSendPortal.requestNames({ name, supplierName, version }).fileBase
+        : supplierSlug
+            ? `${filePrefix}-${supplierSlug}-${safeName}-v${version}`
+            : `${filePrefix}-${safeName}-v${version}`;
     const s3Key = `draft-containers/${token}/${fileBase}.pdf`;
     const publicUrl = publicS3Url(s3Key);
     // CSV sibling, same key prefix so it lives next to the PDF in S3.
@@ -3063,7 +3077,7 @@ app.get(/^\/api\/v1\/draft-containers\/(.+)\/documents\/?$/, async (req, res) =>
         const name = draftNameFromPath(req.params[0]);
         if (!name) return res.status(400).json({ error: 'draft container name required in path.' });
 
-        const { docs, sendsByDoc } = await withConnection(async (conn) => {
+        const { docs, sendsByDoc, sendFacts, views } = await withConnection(async (conn) => {
             const [r] = await conn.query(
                 `SELECT id, draft_container_name, version, type, supplier, s3_key, public_url, file_size,
                         csv_s3_key, csv_public_url, csv_file_size,
@@ -3074,6 +3088,10 @@ app.get(/^\/api\/v1\/draft-containers\/(.+)\/documents\/?$/, async (req, res) =>
                 [name]
             );
             const ids = r.map(d => d.id);
+            // How each send went out and what it said, and who opened a Request
+            // to send on the portal (docs/request-to-send-portal.md).
+            const facts = await requestToSendSends.loadSendFacts(conn, ids);
+            const viewsByDoc = await loadSupplierQuoteViews(conn, r.filter(d => d.type === 'supplier-quote').map(d => d.id));
             const sendRows = ids.length
                 ? (await conn.query(
                     `SELECT id, draft_container_document_id, sent_to, subject,
@@ -3089,7 +3107,7 @@ app.get(/^\/api\/v1\/draft-containers\/(.+)\/documents\/?$/, async (req, res) =>
                 if (!byDoc.has(s.draft_container_document_id)) byDoc.set(s.draft_container_document_id, []);
                 byDoc.get(s.draft_container_document_id).push(s);
             }
-            return { docs: r, sendsByDoc: byDoc };
+            return { docs: r, sendsByDoc: byDoc, sendFacts: facts, views: viewsByDoc };
         });
 
         res.json({
@@ -3117,7 +3135,11 @@ app.get(/^\/api\/v1\/draft-containers\/(.+)\/documents\/?$/, async (req, res) =>
                     frontConversationId: s.front_conversation_id || null,
                     sentByEmail: s.sent_by_email || null,
                     sentAt: s.sent_at?.toISOString?.() ?? s.sent_at,
+                    // delivery ('portal' | 'attached'), etd, port.
+                    ...(sendFacts.get(Number(s.id)) || requestToSendPortal.sendFactsOf(null)),
                 })),
+                // A Request to send only: who opened it on the supplier portal.
+                ...(r.type === 'supplier-quote' ? { views: views.get(Number(r.id)) || [] } : {}),
             })),
         });
     } catch (error) {
@@ -3139,12 +3161,39 @@ app.post('/api/v1/draft-container-documents/:id/email', async (req, res) => {
         // supplies a body (typically the template fetched via
         // GET /email-templates, then edited in the UI), it's used verbatim;
         // otherwise the stored `draft_container_quote` template is rendered.
-        const { to, subject, body } = req.body || {};
+        //
+        // A Request to send (type 'supplier-quote') goes out as a LINK to the
+        // supplier portal, nothing attached, when the portal can show it to
+        // the supplier (docs/request-to-send-portal.md). `delivery` is the way
+        // the caller told the sender it would go ('portal' | 'attached', from
+        // GET …/:id/delivery): if that is no longer true the answer is
+        // 409 DELIVERY_CHANGED and nothing is sent, because the wording
+        // depends on it. A caller that sends no `delivery` (a ShipLine from
+        // before this) gets the old email, attached. `fields` is what the
+        // email says about the departure ({ etd: 'YYYY-MM-DD', port }), kept on
+        // the send row and shown on the portal.
+        const { to, subject, body, delivery, fields } = req.body || {};
 
-        const toAddresses = (Array.isArray(to) ? to : [to])
-            .filter(x => typeof x === 'string')
-            .map(x => x.trim())
-            .filter(Boolean);
+        const want = requestToSendPortal.requestedDelivery(delivery);
+        if (!want.ok) return res.status(400).json({ error: want.error });
+        const sentFields = requestToSendPortal.parseSentFields(fields);
+        if (!sentFields.ok) return res.status(400).json({ error: sentFields.error });
+
+        let toAddresses;
+        if (want.requested === 'portal') {
+            // These addresses are also pre-approved on the portal, so each must
+            // be one clean address (as the PO send: parseRecipients).
+            const parsed = poPortalEmail.parseRecipients(to);
+            if (parsed.invalid.length) {
+                return res.status(400).json({ error: `Not a valid email address: ${parsed.invalid.map(a => `"${a}"`).join(', ')}`, invalid: parsed.invalid });
+            }
+            toAddresses = parsed.addresses;
+        } else {
+            toAddresses = (Array.isArray(to) ? to : [to])
+                .filter(x => typeof x === 'string')
+                .map(x => x.trim())
+                .filter(Boolean);
+        }
         if (toAddresses.length === 0 || toAddresses.some(a => !EMAIL_RE.test(a))) {
             return res.status(400).json({ error: 'A valid `to` email address (or array of addresses) is required.' });
         }
@@ -3164,6 +3213,19 @@ app.post('/api/v1/draft-container-documents/:id/email', async (req, res) => {
             );
             if (!docRows.length) return { notFound: true };
             const doc = docRows[0];
+
+            // Which way it goes out. Only asked when the caller said which way
+            // it expects; a change since the dialog opened is handed back.
+            let plan = { delivery: 'attached', reason: null, portalUrl: null, registerUrl: null, suppliers: [] };
+            if (want.requested) {
+                plan = await requestToSendSends.resolveDelivery(conn, doc);
+                const conflict = requestToSendPortal.deliveryConflict(want.requested, plan);
+                if (conflict) return { conflict };
+            }
+            const viaPortal = plan.delivery === 'portal';
+            // What the email said about the departure is kept for a Request to
+            // send only, whichever way it goes out.
+            const departure = doc.type === 'supplier-quote' ? sentFields : { etd: null, port: null };
 
             // Emailing a split forwarder-quote attaches the whole collection of
             // forwarder quotes — the main combined PDF (supplier NULL) first, then
@@ -3186,9 +3248,10 @@ app.post('/api/v1/draft-container-documents/:id/email', async (req, res) => {
             // Download each PDF + its stored CSV companion. Filenames = the S3
             // objects' basenames, which already encode the supplier (e.g.
             // supplier-quote-Acme-<draft>-v1.pdf / .csv) so the pair reads as a set.
+            // A portal delivery attaches nothing: the files stay on the portal.
             const safeName = String(doc.draft_container_name).replace(/[^A-Za-z0-9._-]/g, '_');
             const attachments = [];
-            for (const d of docsToSend) {
+            for (const d of (viaPortal ? [] : docsToSend)) {
                 const obj = await s3.send(new GetObjectCommand({ Bucket: PO_BUCKET, Key: d.s3_key }));
                 const bytes = Buffer.from(await obj.Body.transformToByteArray());
                 const filename = d.s3_key.split('/').pop() || `draft-${safeName}-v${d.version}.pdf`;
@@ -3216,24 +3279,54 @@ app.post('/api/v1/draft-container-documents/:id/email', async (req, res) => {
                 attachments.push(item);
             }
 
-            const tpl = await getEmailTemplate(conn, 'draft_container_quote');
-            const vars = { draftContainerName: doc.draft_container_name };
+            const tpl = await getEmailTemplate(conn, viaPortal ? requestToSendPortal.TEMPLATE_KEY : 'draft_container_quote');
+            // A Request to send goes to a supplier: wherever its email names
+            // the container it says the number, never the draft's internal
+            // name (its stamp, other suppliers' names, an old ETD). That holds
+            // for the stored template's {draftContainerName}, and for a subject
+            // or body the sender's screen already filled in with the whole
+            // name (a ShipLine from before 2026-11-13 does): hideInternalName.
+            // A forwarder's email is unchanged.
+            const toSupplier = doc.type === 'supplier-quote';
+            const shownName = toSupplier ? requestToSendPortal.emailName(doc.draft_container_name) : doc.draft_container_name;
+            const forSupplier = text => (toSupplier
+                ? requestToSendPortal.hideInternalName(renderTemplate(text, { draftContainerName: shownName }), doc.draft_container_name)
+                : text);
+            const vars = { draftContainerName: shownName };
             const finalSubject = (typeof subject === 'string' && subject.trim())
-                ? subject.trim()
-                : (renderTemplate(tpl.subject, vars) || `Delivery Quote Request – ${doc.draft_container_name}`);
+                ? forSupplier(subject.trim())
+                : (renderTemplate(tpl.subject, vars) || `${toSupplier ? 'Request to send' : 'Delivery Quote Request'} – ${shownName}`);
             const htmlBody = (typeof body === 'string' && body.trim())
-                ? body
+                ? forSupplier(body)
                 : renderTemplate(tpl.bodyHtml, vars);
+            const emailType = requestToSendPortal.emailTypeFor(doc.type);
 
-            const receiptToken = await createEmailReceipt(conn, {
-                emailType: 'draft_container_quote', sentTo: toAddresses, subject: finalSubject,
-            });
-            const bodyWithReceipt = appendReceiptLink(htmlBody, receiptToken, apiBaseUrlFromReq(req));
+            // Portal: the recipients are pre-approved there first, and the
+            // email carries the portal block and no "Confirm receipt" button
+            // (opening the request on the portal confirms it). Attached: the
+            // confirm button, as before.
+            let receiptToken = null;
+            let portalAccess = null;
+            let emailBody;
+            if (viaPortal) {
+                const prepared = await requestToSendSends.preparePortalSend(conn, {
+                    doc, plan, recipients: toAddresses, fields: departure,
+                    bodyHtml: htmlBody, subject: finalSubject, actorEmail: req.userEmail,
+                });
+                if (prepared.conflict) return { conflict: prepared.conflict };
+                portalAccess = prepared.portalAccess;
+                emailBody = prepared.emailHtml;
+            } else {
+                receiptToken = await createEmailReceipt(conn, {
+                    emailType, sentTo: toAddresses, subject: finalSubject,
+                });
+                emailBody = appendReceiptLink(htmlBody, receiptToken, apiBaseUrlFromReq(req));
+            }
 
             const form = new FormData();
             for (const addr of toAddresses) form.append('to[]', addr);
             form.append('subject', finalSubject);
-            form.append('body', bodyWithReceipt);
+            form.append('body', emailBody);
             form.append('body_format', 'html');
             form.append('options[archive]', 'false');
             for (const a of attachments) {
@@ -3268,31 +3361,42 @@ app.post('/api/v1/draft-container-documents/:id/email', async (req, res) => {
             const frontConversationId = conversationUrl ? conversationUrl.split('/').pop() : null;
             const frontMessageUid = parsed?.message_uid || parsed?.id || null;
 
-            // One send row per attached document (all share the Front message), so
-            // each PDF shows this email in its own sends history.
+            // One send row per document the email is about (all share the Front
+            // message), so each PDF shows this email in its own sends history:
+            // every attached one, or the one Request to send a portal email
+            // points at. The row is also what lists the request on the portal.
             let primarySendId = null;
-            for (const a of attachments) {
-                const [ins] = await conn.query(
-                    `INSERT INTO draft_container_document_sends
-                        (draft_container_document_id, sent_to, subject, front_message_uid, front_conversation_id, sent_by_email)
-                     VALUES (?, ?, ?, ?, ?, ?)`,
-                    [
-                        a.doc.id,
-                        JSON.stringify(toAddresses),
-                        finalSubject,
-                        frontMessageUid,
-                        frontConversationId,
-                        req.userEmail || null,
-                    ]
-                );
-                if (a.doc.id === doc.id) primarySendId = ins.insertId;
+            for (const d of (viaPortal ? [doc] : attachments.map(a => a.doc))) {
+                const sendId = await requestToSendSends.insertSend(conn, {
+                    documentId: d.id,
+                    sentTo: toAddresses,
+                    subject: finalSubject,
+                    frontMessageUid,
+                    frontConversationId,
+                    sentByEmail: req.userEmail || null,
+                    delivery: plan.delivery,
+                    etd: d.id === doc.id ? departure.etd : null,
+                    port: d.id === doc.id ? departure.port : null,
+                });
+                if (d.id === doc.id) primarySendId = sendId;
             }
             const [sentRow] = await conn.query(
                 `SELECT sent_at FROM draft_container_document_sends WHERE id = ?`,
                 [primarySendId]
             );
             const sentAt = sentRow[0]?.sent_at?.toISOString?.() ?? sentRow[0]?.sent_at ?? null;
-            await linkReceiptToSend(conn, receiptToken, 'draft_container_document_sends', primarySendId);
+            if (viaPortal) {
+                // On the Email Receipts page as a portal email: confirmed when
+                // the request is opened on the portal, and reminded with the
+                // portal's address (action_url) until then.
+                await logSentEmail(conn, {
+                    emailType, sentTo: toAddresses, subject: finalSubject,
+                    confirmVia: 'portal', actionUrl: plan.portalUrl,
+                    sendTable: 'draft_container_document_sends', sendId: primarySendId,
+                });
+            } else {
+                await linkReceiptToSend(conn, receiptToken, 'draft_container_document_sends', primarySendId);
+            }
 
             // One email = one event, listing every PDF it carried: in the draft's
             // history while the document's shipment is open, else the shipment's
@@ -3305,6 +3409,13 @@ app.post('/api/v1/draft-container-documents/:id/email', async (req, res) => {
                     documentId: a.doc.id, type: a.doc.type || 'quote', supplier: a.doc.supplier || null,
                     version: a.doc.version, filename: a.pdf.filename, csvFilename: a.csv ? a.csv.filename : null,
                 })),
+                // How it went out (a portal link carries no attachment), what
+                // it said about the departure, and, for a link, what
+                // pre-approving the recipients on the portal did.
+                delivery: plan.delivery,
+                etd: departure.etd,
+                port: departure.port,
+                ...(viaPortal ? { portalUrl: plan.portalUrl, portalAccess } : {}),
             };
             const [[owner]] = doc.shipment_id
                 ? await conn.query(`SELECT id, stage FROM shipments WHERE id = ?`, [doc.shipment_id])
@@ -3343,10 +3454,21 @@ app.post('/api/v1/draft-container-documents/:id/email', async (req, res) => {
                     filename: a.pdf.filename,
                     csvFilename: a.csv ? a.csv.filename : null,
                 })),
+                delivery: plan.delivery,
+                // Why it was attached although a link was possible in principle
+                // (null for a link, and for a caller that asked for nothing).
+                deliveryReason: plan.reason,
+                etd: departure.etd,
+                port: departure.port,
+                portalUrl: plan.portalUrl,
+                portalAccess,
             };
         });
 
         if (result.notFound) return res.status(404).json({ error: `Draft container document ${id} not found.` });
+        // The way it goes out changed since the sender was shown it: a business
+        // rule, with the way it would go now (`delivery`, `allowedNext`).
+        if (result.conflict) return res.status(409).json(result.conflict);
         if (result.frontError) {
             return res.status(502).json({
                 error: 'Front rejected the message.',
@@ -3357,6 +3479,54 @@ app.post('/api/v1/draft-container-documents/:id/email', async (req, res) => {
         res.status(200).json(result);
     } catch (error) {
         log.error('[POST /draft-container-documents/:id/email]', error);
+        res.status(500).json({ error: 'An internal error occurred.' });
+    }
+});
+
+// GET /api/v1/draft-container-documents/:id/delivery
+// Which way emailing this document would go out right now, for the send
+// dialog: `delivery` 'portal' (a link to the supplier portal, nothing attached;
+// a Request to send whose supplier is on the portal) or 'attached' (the PDF and
+// its CSV, with `reason`: not_request_to_send | portal_url_unset |
+// portal_unavailable | no_supplier). With a link: `portalUrl` (the page the
+// email's button opens) and `suppliers`, the portal supplier rows every
+// recipient will be linked to. The dialog words the email by it and passes
+// `delivery` back to the email route, which checks it again
+// (docs/request-to-send-portal.md). Reads only.
+app.get('/api/v1/draft-container-documents/:id/delivery', async (req, res) => {
+    try {
+        await draftContainerAllocationsSchemaReady;
+        const id = Number(req.params.id);
+        if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid document id.' });
+        const out = await withConnection(async (conn) => {
+            const [rows] = await conn.query(
+                `SELECT id, draft_container_name, version, type, supplier
+                   FROM draft_container_documents
+                  WHERE id = ? AND deleted_at IS NULL`,
+                [id]
+            );
+            if (!rows.length) return null;
+            const doc = rows[0];
+            const plan = await requestToSendSends.resolveDelivery(conn, doc);
+            return {
+                documentId: doc.id,
+                type: doc.type || 'quote',
+                supplier: doc.supplier || null,
+                delivery: plan.delivery,
+                reason: plan.reason,
+                portalUrl: plan.portalUrl,
+                suppliers: plan.suppliers,
+                // What the supplier is told the container is called: its
+                // number ('333', '126. Air Freight'), or null when the draft's
+                // name holds none. The dialog fills {draftContainerName} with
+                // it; the send does the same again on the server.
+                supplierRef: requestToSendPortal.supplierRef(doc.draft_container_name),
+            };
+        });
+        if (!out) return res.status(404).json({ error: `Draft container document ${id} not found.` });
+        res.json(out);
+    } catch (error) {
+        log.error('[GET /draft-container-documents/:id/delivery]', error);
         res.status(500).json({ error: 'An internal error occurred.' });
     }
 });

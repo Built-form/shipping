@@ -145,7 +145,7 @@ test('sendReminderForReceipt: the confirm button for an email receipt, the porta
 test('portalSyncSteps: every step touches unconfirmed portal receipts only', () => {
     const steps = R.portalSyncSteps('`jportal`');
     assert.deepEqual(steps.map(s => s[0]), [
-        'po_viewed', 'signed_pi_viewed', 'artwork_ticked', 'file_opened', 'qc_availability_answered', 'qc_schedule_opened', 'quote_answered',
+        'po_viewed', 'signed_pi_viewed', 'request_viewed', 'request_pl_uploaded', 'request_ci_uploaded', 'artwork_ticked', 'file_opened', 'qc_availability_answered', 'qc_schedule_opened', 'quote_answered',
     ]);
     for (const [name, sql] of steps) {
         assert.match(sql, /^\s*UPDATE email_receipts r/, name);
@@ -166,9 +166,11 @@ test('portalSyncSteps: every step touches unconfirmed portal receipts only', () 
     assert.match(step.signed_pi_viewed, /v\.last_viewed_at >= r\.created_at/);
     assert.doesNotMatch(step.signed_pi_viewed, /po_document_views/);
     // Every chased portal email has the step that confirms it.
+    // (The Request to send's step has its own tests: tools/test-request-to-send-portal-lib.js.)
     assert.deepEqual(R.CHASED_PORTAL_STEPS, {
         purchase_order_document_sends: 'po_viewed',
         purchase_order_signed_pi_sends: 'signed_pi_viewed',
+        draft_container_document_sends: 'request_viewed',
     });
     for (const name of Object.values(R.CHASED_PORTAL_STEPS)) assert.ok(step[name], name);
 });
@@ -206,7 +208,7 @@ test('runReceiptReminders: portal emails are chased only when their views could 
     assert.ok(ok.queries.findIndex(q => /po_document_views/.test(q.sql)) < ok.queries.indexOf(pick(ok)));
 
     const blind = fakeConn((sql) => {
-        if (/po_document_views|signed_pi_views/.test(sql)) throw Object.assign(new Error('denied'), { errno: 1142 });
+        if (/po_document_views|signed_pi_views|supplier_quote_views/.test(sql)) throw Object.assign(new Error('denied'), { errno: 1142 });
         return /COALESCE\(MAX\(send_id\)/.test(sql) ? [[{ last: 0 }]] : [[]];
     });
     summary = await runReceiptReminders({ getConnection: async () => blind }, { baseUrl: 'https://api.example.com' });
@@ -224,5 +226,17 @@ test('runReceiptReminders: portal emails are chased only when their views could 
     assert.match(
         pick(half).sql,
         /\(confirm_via = 'email' OR \(confirm_via = 'portal' AND action_url IS NOT NULL AND send_table NOT IN \('purchase_order_signed_pi_sends'\)\)\)/
+    );
+
+    // The same for a Request to send sent as a portal link: while the portal's
+    // supplier_quote_views is not there, those are left alone and the rest chased.
+    const noRequestViews = fakeConn((sql) => {
+        if (/supplier_quote_views/.test(sql)) throw Object.assign(new Error('no such table'), { errno: 1146 });
+        return /COALESCE\(MAX\(send_id\)/.test(sql) ? [[{ last: 0 }]] : [[]];
+    });
+    await runReceiptReminders({ getConnection: async () => noRequestViews }, { baseUrl: 'https://api.example.com' });
+    assert.match(
+        pick(noRequestViews).sql,
+        /\(confirm_via = 'email' OR \(confirm_via = 'portal' AND action_url IS NOT NULL AND send_table NOT IN \('draft_container_document_sends'\)\)\)/
     );
 });

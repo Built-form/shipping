@@ -186,7 +186,17 @@ function loadSignedPiViews(conn, signedPiIds) {
     return loadViews(conn, 'signed_pi_views', 'purchase_order_signed_pi_id', signedPiIds);
 }
 
-// `table` and `idColumn` are the two literals above, never a caller's value.
+/**
+ * The same for a Request to send (a supplier-quote draft_container_documents
+ * row): Map(documentId -> [...]), from the portal's supplier_quote_views
+ * (portal README section 10, "Views"; docs/request-to-send-portal.md). Empty
+ * when the table is not here.
+ */
+function loadSupplierQuoteViews(conn, documentIds) {
+    return loadViews(conn, 'supplier_quote_views', 'draft_container_document_id', documentIds);
+}
+
+// `table` and `idColumn` are the literals above, never a caller's value.
 async function loadViews(conn, table, idColumn, wantedIds) {
     const out = new Map();
     const ids = [...new Set((wantedIds || []).filter(Boolean))];
@@ -219,4 +229,4 @@ async function loadViews(conn, table, idColumn, wantedIds) {
     return out;
 }
 
-module.exports = { preapprovePortalUsers, loadPoDocumentViews, loadSignedPiViews };
+module.exports = { preapprovePortalUsers, loadPoDocumentViews, loadSignedPiViews, loadSupplierQuoteViews };

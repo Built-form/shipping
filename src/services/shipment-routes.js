@@ -22,6 +22,11 @@ const rename = require('./shipment-rename');
 const { SplitError } = require('./order-split');
 const PL = require('./pl-results');
 const { requestDriftForShipment, requestToSendStatus } = require('./request-to-send-status');
+// How a Request to send went out, and who opened it on the supplier portal
+// (docs/request-to-send-portal.md).
+const { loadSendFacts } = require('./request-to-send-portal');
+const { sendFactsOf } = require('../lib/request-to-send-portal');
+const { loadSupplierQuoteViews } = require('./portal-access');
 
 const { ShipmentError } = S;
 
@@ -853,7 +858,9 @@ function registerShipmentRoutes(app, deps) {
                       ORDER BY generated_at DESC, id DESC`, params);
                 const docSends = await sendsFor(conn, 'draft_container_document_sends', 'draft_container_document_id', docs.map(d => d.id));
                 const qaSends = await sendsFor(conn, 'quality_assurance_document_sends', 'quality_assurance_document_id', qa.map(d => d.id));
-                return { docs, qa, docSends, qaSends, drift };
+                const sendFacts = await loadSendFacts(conn, docs.map(d => d.id));
+                const views = await loadSupplierQuoteViews(conn, docs.filter(d => d.type === 'supplier-quote').map(d => d.id));
+                return { docs, qa, docSends, qaSends, drift, sendFacts, views };
             });
             if (!out) return res.status(404).json({ error: `Shipment ${id} not found.` });
             const parseJson = v => (typeof v === 'string' ? JSON.parse(v) : v);
@@ -872,7 +879,15 @@ function registerShipmentRoutes(app, deps) {
                     csvFileSize: r.csv_file_size ?? null,
                     generatedByEmail: r.generated_by_email || null,
                     generatedAt: r.generated_at?.toISOString?.() ?? r.generated_at,
-                    sends: (out.docSends.get(r.id) || []).map(sendToJson),
+                    // Each send also says how it went out: delivery ('portal' =
+                    // a link to the supplier portal | 'attached'), and the etd
+                    // and port the email gave.
+                    sends: (out.docSends.get(r.id) || []).map(s => ({
+                        ...sendToJson(s),
+                        ...(out.sendFacts.get(Number(s.id)) || sendFactsOf(null)),
+                    })),
+                    // A Request to send only: who opened it on the supplier portal.
+                    ...(r.type === 'supplier-quote' ? { views: out.views.get(Number(r.id)) || [] } : {}),
                     // Each supplier's latest Request to send only: { stale,
                     // changes, baseline }, or null when it has no line snapshot.
                     ...(out.drift.has(r.id) ? { drift: out.drift.get(r.id) } : {}),
