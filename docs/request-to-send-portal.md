@@ -62,7 +62,7 @@ Response (both ways): the old fields, plus `delivery`, `deliveryReason`, `etd`, 
 What a portal delivery does, in order:
 
 1. **Pre-approves every recipient** (`preapprovePortalUsers`, its own committed transaction, before Front): the same per-address rules as the PO send (`invited` / `approved` / `already_active` / `blocked`), linked to the live supplier rows named exactly as the document's supplier and to nothing wider. `decided_note`: "Pre-approved from ShipLine: Request to send <ref> v<n> emailed by <sender>". If pre-approval finds the supplier row or the portal has gone since step 0, the answer is the same `409 DELIVERY_CHANGED`. If it **fails** (a database error), the email still goes as a link, without the "already approved" wording, and `portalAccess.status` is `error`.
-2. **Sends the email** through Front: the template body (stored `request_to_send_portal`, or the sender's edit), then the fixed bilingual portal block (`requestPortalBlockHtml`: what is waiting, the ETD and port if given, the button to `${SUPPLIER_PORTAL_URL}/requests-to-send?doc=<document id>`, how to register), inside the portal emails' frame. No attachment, no confirm button. The block does not mention uploading: the page it opens shows the request and its files only (the supplier's own packing list and invoice go through the portal's two upload tabs, as before).
+2. **Sends the email** through Front: the template body (stored `request_to_send_portal`, or the sender's edit), then the fixed bilingual portal block (`requestPortalBlockHtml`: what is waiting, the ETD and port if given, the button to `${SUPPLIER_PORTAL_URL}/requests-to-send?doc=<document id>`, how to register), inside the portal emails' frame. No attachment, no confirm button. The block does not mention uploading: the page it opens shows the request, its files and, since 2026-11-16, which of the supplier's own packing list and invoice we already hold, with a button to the upload tab of one we do not ("What the portal says is still owed" below).
 3. **Writes the send row** with `delivery = 'portal'`, `request_etd`, `request_port`. The row is what lists the request on the portal, so the link works only because it is there.
 4. **Logs the email** in `email_receipts` as `confirm_via 'portal'` with `action_url` = the portal link.
 
@@ -132,6 +132,12 @@ The portal's Requests to send page keeps a request out of the way, behind "Show 
 The supplier is matched by name with everything but letters and digits dropped (`Co., Ltd` = `Co.,Ltd.`): the request carries the order lines' supplier text, a packing list a supplier id and a name, an invoice a name, and they often belong to different supplier rows of the same company. On TEST on 2026-11-13, of 141 emailed requests 124 read as shipped, 2 more as documents, 15 open.
 
 Not covered, and so left open on the page: a cancelled or deleted draft's request, and a draft's request whose `shipment_id` points at a shipment row that was since replaced.
+
+### What the portal says is still owed
+
+While a request is open, its row on the portal ends with two columns, the supplier's own packing list and their invoice: **Received** once staff have filed that document (the same two facts as `documents` above, read one at a time), and until then a button to its upload tab (portal README section 10, "What is still owed"; since 2026-11-16). Nothing in shipping changes for it, and the portal reads nothing new.
+
+An upload still waiting for staff is **not** shown on the request, by choice: tying an upload to a request needs where the check matched it or where staff filed it, and the portal's login is not granted those columns. So **filing an upload is the moment the supplier sees it on the request**; until then its state is on the upload's own tab ("Awaiting review", "Correction requested").
 
 ## Views
 
