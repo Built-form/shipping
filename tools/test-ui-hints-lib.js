@@ -96,7 +96,7 @@ test('link: both or neither; the path must be a ShipLine page', () => {
 
 test('link roots are exactly the ShipLine view paths, plus info', () => {
     assert.deepEqual([...L.LINK_ROOTS].sort(), [
-        'audit-log', 'bridge', 'delivered', 'draft', 'email-receipts', 'info', 'manifest', 'payments',
+        'audit-log', 'bridge', 'delivered', 'draft', 'email-receipts', 'freight', 'info', 'manifest', 'payments',
         'purchase-orders', 'qc-visits', 'shipments', 'supplier-portal', 'users', 'warehouse',
     ]);
 });

@@ -42,7 +42,7 @@ const HINT_KEY_RE = /^[a-z0-9][a-z0-9_-]{0,59}(\.[a-z0-9][a-z0-9_-]{0,59}){0,4}(
 // one of these. Old paths (/qc, /supplier-changes) still open in ShipLine but
 // are not offered: a new link names the page as it is called today.
 const LINK_ROOTS = Object.freeze([
-    'bridge', 'purchase-orders', 'manifest', 'draft', 'warehouse', 'delivered', 'qc-visits',
+    'bridge', 'purchase-orders', 'manifest', 'draft', 'warehouse', 'delivered', 'qc-visits', 'freight',
     'supplier-portal', 'shipments', 'payments', 'audit-log', 'email-receipts', 'users', 'info',
 ]);
 

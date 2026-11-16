@@ -7,9 +7,10 @@
 // and receipt-reminders.js build their own multipart requests and are left as
 // they are.
 //
-// `attachments` (optional): [{ filename, contentType, bytes }], files that ride
-// on the email (a payment's proof, src/services/payment-notices.js). Without
-// any, the request is exactly what it was before attachments existed.
+// `attachments` is optional: [{ bytes, filename, contentType }], files that ride
+// on the email (a payment's proof, src/services/payment-notices.js; the freight
+// contents email, src/services/freight-quote-routes.js). Without it the email
+// carries none, as before.
 //
 // → { ok: true, frontMessageUid, frontConversationId }
 //   { ok: false, reason: 'no_recipients' | 'front_not_configured' | 'front_error' | 'network_error', status?, detail? }
@@ -21,7 +22,7 @@ const log = require('../lib/logger');
 
 const SEND_TIMEOUT_MS = 15 * 1000;
 
-async function sendFrontMessage({ to, subject, html, attachments = [] }, { fetchImpl = globalThis.fetch, env = process.env } = {}) {
+async function sendFrontMessage({ to, subject, html, attachments }, { fetchImpl = globalThis.fetch, env = process.env } = {}) {
     try {
         const recipients = (Array.isArray(to) ? to : [to])
             .filter(x => typeof x === 'string').map(x => x.trim()).filter(Boolean);
@@ -34,8 +35,9 @@ async function sendFrontMessage({ to, subject, html, attachments = [] }, { fetch
         form.append('body', String(html || ''));
         form.append('body_format', 'html');
         form.append('options[archive]', 'false');
-        for (const a of attachments || []) {
-            form.append('attachments[]', new Blob([a.bytes], { type: a.contentType || 'application/octet-stream' }), a.filename);
+        for (const a of Array.isArray(attachments) ? attachments : []) {
+            if (!a || !a.bytes || !a.filename) continue;
+            form.append('attachments[]', new Blob([a.bytes], { type: a.contentType || 'application/octet-stream' }), String(a.filename));
         }
 
         const controller = new AbortController();

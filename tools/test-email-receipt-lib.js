@@ -147,6 +147,7 @@ test('portalSyncSteps: every step touches unconfirmed portal receipts only', () 
     assert.deepEqual(steps.map(s => s[0]), [
         'po_viewed', 'signed_pi_viewed', 'request_viewed', 'request_pl_uploaded', 'request_ci_uploaded', 'artwork_ticked', 'file_opened', 'qc_availability_answered', 'qc_schedule_opened', 'quote_answered',
         'payment_viewed',
+        'freight_quote_answered', 'freight_booking_answered',
     ]);
     for (const [name, sql] of steps) {
         assert.match(sql, /^\s*UPDATE email_receipts r/, name);
