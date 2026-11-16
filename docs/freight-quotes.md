@@ -143,12 +143,14 @@ The lines listed are kept on the booking (`contents_json`, the shape a Request t
 
 Set `SUPPLIER_PORTAL_URL` (already set for the other portal links). No new environment variable, no new Lambda.
 
-## Not proven without a deploy
+## The smoke check
 
-- Every SQL statement here against the real schema: the tests run the routes against an in-memory stand-in that answers the statements they send.
-- The column grants under `jportal_app`.
+`node tools/smoke-freight-quotes.js` walks the whole flow on the TEST database with both halves for real: the Express app in-process, and the portal's `availability` and `supplier` handlers in-process on a pool that logs in as the portal's own runtime login (`jportal_app`, from `../portal/.env`), so every portal statement runs under its column grants. Front is stubbed (nothing is emailed), the contents email goes without attachments (nothing is written to S3), and everything it writes is deleted at the end. It refuses to run unless both env files point at explorer-test. 43 checks, all passing on 2026-11-16.
+
+## Not proven by the tests or the smoke check
+
 - Front accepting the contents email with its attachments, and the time the whole call takes (PDF generation, S3 reads and the Front call share one API Gateway request).
-- A forwarder contact registering on the portal and seeing the Freight quotes tab.
+- The widened WAF rules, and a forwarder contact registering through Cognito and seeing the Freight quotes tab (the smoke check fabricates the claims).
 
 ## Not included
 
