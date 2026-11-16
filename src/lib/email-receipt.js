@@ -9,14 +9,16 @@
 //             went out as an attachment; those rows keep their button.)
 //   'portal'  it carries a link into the supplier portal or a no-login magic
 //             link, and NO confirm button, so the recipient is asked to do one
-//             thing, not two: the PO, the signed PI, the artwork request, the
-//             "a file is waiting" notice, a QC visit email with an
-//             availability or schedule link, JFPRO's quote request. What the
-//             recipient does through the link sets confirmed_at
-//             (syncPortalReceipts).
+//             thing, not two: the PO, the signed PI, a Request to send the
+//             portal can show (one that cannot goes out attached, as an
+//             'email' row), the artwork request, the "a file is waiting"
+//             notice, a QC visit email with an availability or schedule link,
+//             JFPRO's quote request. What the recipient does through the link
+//             sets confirmed_at (syncPortalReceipts).
 //   'none'    a notice; nothing is asked: a PI decision, a portal approval.
 // Only an 'email' row, or a 'portal' row with an action_url (the PO, the signed
-// PI), is chased with reminders (src/services/receipt-reminders.js).
+// PI, the Request to send), is chased with reminders
+// (src/services/receipt-reminders.js).
 //
 // The confirm button's link points at a PUBLIC, no-login endpoint (served by
 // the dedicated emailReceiptApi Lambda, src/handlers/email-receipt.js) keyed by
@@ -296,7 +298,162 @@ const PENDING_PORTAL = `r.confirm_via = 'portal' AND r.confirmed_at IS NULL`;
 const CHASED_PORTAL_STEPS = {
     purchase_order_document_sends: 'po_viewed',
     purchase_order_signed_pi_sends: 'signed_pi_viewed',
+    // Only the sends that went out as a portal link: a forwarder quote, and a
+    // Request to send that fell back to attachments, keep the confirm button
+    // (confirm_via 'email') and are chased as before.
+    draft_container_document_sends: 'request_viewed',
 };
+
+// A supplier's own uploads through the portal that answer a Request to send
+// (docs/request-to-send-portal.md, "Email Receipts"): FROM … WHERE … for a
+// packing list (`pl`) and for an invoice (`ci`), each row aliased `u`, to be
+// read beside `r` (the email's receipt) and `d` (the request's document).
+//
+// An upload counts when all of this holds:
+//   - it was sent to our team (any status but a draft never sent, or one the
+//     supplier discarded) AFTER the email went out;
+//   - it is for the request's shipment: the container or shipment our team
+//     filed it on, or, while they have not decided, the one shipping's own
+//     check matched it to with confidence. A packing list names a booked
+//     container by its reference and a draft by its registry row
+//     (draft_containers.id); an invoice names the shipment's id;
+//   - it came from someone who could see the request: the uploader's suppliers
+//     (supplier_id, or the whole group in group_supplier_ids) include a live
+//     supplier named EXACTLY as the request's, the portal's own rule for
+//     listing it.
+// The supplier is never asked which shipment an upload is for, so an upload
+// that matched nothing confirms nothing until our team file it.
+function requestUploadSources(jp) {
+    const BIN = 'COLLATE utf8mb4_0900_bin';
+    const sentAfter = `u.status NOT IN ('draft', 'discarded')
+                   AND u.submitted_at >= r.created_at`;
+    const canSeeRequest = `EXISTS (SELECT 1 FROM suppliers sup
+                                WHERE sup.deleted_at IS NULL
+                                  AND CONVERT(sup.name USING utf8mb4) ${BIN} = CONVERT(d.supplier USING utf8mb4) ${BIN}
+                                  AND (u.supplier_id = sup.id OR JSON_CONTAINS(COALESCE(u.group_supplier_ids, JSON_ARRAY()), CAST(sup.id AS JSON))))`;
+    const reference = '(SELECT sh.reference FROM shipments sh WHERE sh.id = d.shipment_id)';
+    const draftRows = '(SELECT dc.id FROM draft_containers dc WHERE dc.shipment_id = d.shipment_id OR dc.name = d.draft_container_name)';
+    return {
+        pl: `${jp}.pl_submissions u
+                 WHERE ${sentAfter}
+                   AND (   (u.confirmed_kind = 'booked' AND u.confirmed_container_number = ${reference})
+                        OR (u.confirmed_kind = 'draft' AND u.confirmed_draft_id IN ${draftRows})
+                        OR (u.confirmed_kind IS NULL AND u.match_confidence = 'confident' AND u.suggested_kind = 'booked' AND u.suggested_container_number = ${reference})
+                        OR (u.confirmed_kind IS NULL AND u.match_confidence = 'confident' AND u.suggested_kind = 'draft' AND u.suggested_draft_id IN ${draftRows}))
+                   AND ${canSeeRequest}`,
+        ci: `${jp}.ci_submissions u
+                 WHERE ${sentAfter}
+                   AND (   u.confirmed_shipment_id = d.shipment_id
+                        OR (u.confirmed_shipment_id IS NULL AND u.match_confidence = 'confident' AND u.suggested_shipment_id = d.shipment_id))
+                   AND ${canSeeRequest}`,
+    };
+}
+
+// ── When a Request to send is no longer worth chasing ───────────────────────
+// Its email is chased until the supplier answers it (above), and also stops,
+// with nothing confirmed, once chasing would be noise
+// (docs/request-to-send-portal.md, "When reminders stop"):
+//   'superseded'  a later version of the same request has been emailed: the
+//                 rule that makes that later send an update (resolveUpdate,
+//                 src/services/request-to-send-portal.js), read the other way;
+//   'shipped'     the shipment has left;
+//   'documents'   its packing list and its invoice are both filed.
+// The last two are the supplier portal's own rule for "this request is done"
+// (jportal src/handlers/sentDocuments.js, supplierQuoteProgressSql): the two
+// change together. Both ways a request goes out are covered, the link and the
+// attachments. A forwarder's quote, and every other kind of email, has no such
+// end. A reminder sent by hand (the resend route) is never stopped by this.
+const REMINDERS_STOPPED = ['superseded', 'shipped', 'documents'];
+
+// The reason as SQL, read beside `r` (an email_receipts row): one of
+// REMINDERS_STOPPED, or NULL while the email is still to be chased.
+function requestRemindersStoppedSql() {
+    const letters = column => `REGEXP_REPLACE(LOWER(CONVERT(${column} USING utf8mb4)), '[^[:alnum:]]', '')`;
+    // The supplier's name as typed on a filed document: letters and digits
+    // only, as the portal compares them (the rows often belong to different
+    // supplier records of one company).
+    const sameSupplier = column => `${letters(column)} = ${letters('d.supplier')} AND ${letters('d.supplier')} <> ''`;
+    return `(SELECT CASE
+                 WHEN EXISTS (SELECT 1 FROM draft_container_documents n
+                               WHERE n.type = 'supplier-quote' AND n.deleted_at IS NULL
+                                 AND n.id <> d.id AND n.version > d.version
+                                 AND n.supplier <=> d.supplier
+                                 AND (n.draft_container_name = d.draft_container_name
+                                      OR (n.shipment_id IS NOT NULL AND n.shipment_id = d.shipment_id))
+                                 AND EXISTS (SELECT 1 FROM draft_container_document_sends ns
+                                              WHERE ns.draft_container_document_id = n.id))
+                 THEN 'superseded'
+                 WHEN EXISTS (SELECT 1 FROM shipments sh
+                               WHERE sh.id = d.shipment_id AND sh.stage IN ('IN_TRANSIT', 'ARRIVED', 'CLOSED'))
+                   OR EXISTS (SELECT 1 FROM orders o
+                               WHERE o.shipment_id = d.shipment_id AND o.deleted_at IS NULL
+                                 AND o.status IN ('ON_SEA', 'ON_AIR', 'ARRIVED_AT_WAREHOUSE', 'RECEIVED', 'PARTIALLY_RECEIVED'))
+                 THEN 'shipped'
+                 WHEN EXISTS (SELECT 1 FROM packing_lists pl
+                               WHERE pl.deleted_at IS NULL AND pl.container_kind = 'booked'
+                                 AND pl.container_number = (SELECT sh.reference FROM shipments sh WHERE sh.id = d.shipment_id)
+                                 AND ${sameSupplier('pl.supplier_name')})
+                  AND EXISTS (SELECT 1 FROM shipment_payment_documents c
+                               WHERE c.deleted_at IS NULL AND c.doc_kind = 'balance_invoice'
+                                 AND c.shipment_id = d.shipment_id
+                                 AND ${sameSupplier('c.supplier_name')})
+                 THEN 'documents'
+             END
+               FROM draft_container_document_sends s
+               JOIN draft_container_documents d ON d.id = s.draft_container_document_id
+              WHERE r.send_table = 'draft_container_document_sends' AND s.id = r.send_id
+                AND d.type = 'supplier-quote')`;
+}
+
+/**
+ * Why the automatic reminders of a receipt row stopped (its `reminders_stopped`,
+ * as selectEmailReceipts reads it), or null: still chased, never chased, or
+ * confirmed (nothing was left to stop).
+ */
+function remindersStoppedOf(row) {
+    if (!row || row.confirmed_at || !canRemind(row)) return null;
+    return REMINDERS_STOPPED.includes(row.reminders_stopped) ? row.reminders_stopped : null;
+}
+
+// MySQL: a table or column of that rule is not on this server, or not for this
+// login (1054 unknown column, with the "source missing" set of ./jportal).
+const RULE_NOT_THERE = new Set([1049, 1054, 1142, 1143, 1146]);
+
+/**
+ * Runs `build(reason)`, a statement over `email_receipts r` that uses
+ * requestRemindersStoppedSql(). A server that cannot answer the rule (a
+ * migration behind) is asked again with `build(null)`: the statement as it was
+ * before the rule existed. Any other fault is thrown.
+ */
+async function queryWithRemindersStopped(conn, build, params = []) {
+    try {
+        return await conn.query(build(requestRemindersStoppedSql()), params);
+    } catch (e) {
+        if (!RULE_NOT_THERE.has(e && e.errno)) throw e;
+        log.warn('[email-receipt] when a Request to send stops being chased cannot be read here; every one is chased as before', { errno: e.errno });
+        return conn.query(build(null), params);
+    }
+}
+
+const RECEIPT_COLUMNS = `id, email_type, send_table, send_id, sent_to, subject,
+                created_at, opened_at, open_count, confirmed_at, confirmed_ip, confirmed_user_agent,
+                reminder_count, last_reminder_at, confirm_via, action_url`;
+
+/**
+ * The receipt rows the Email Receipts routes answer with (no token: it is a
+ * capability, not data), each with `reminders_stopped`. `tail` is the trusted
+ * rest of the statement (WHERE / ORDER BY / LIMIT, columns unqualified).
+ */
+async function selectEmailReceipts(conn, tail, params = []) {
+    const [rows] = await queryWithRemindersStopped(
+        conn,
+        reason => `SELECT ${RECEIPT_COLUMNS}, ${reason || 'NULL'} AS reminders_stopped
+                     FROM email_receipts r
+                     ${tail}`,
+        params
+    );
+    return rows;
+}
 
 function portalSyncSteps(jp) {
     // The emailed version, or a later version of the same PO: a supplier who
@@ -310,6 +467,18 @@ function portalSyncSteps(jp) {
                  WHERE v.purchase_order_id = d.purchase_order_id
                    AND v.purchase_order_signed_pi_id >= d.id
                    AND v.last_viewed_at >= r.created_at`;
+    // The emailed Request to send, or a later version of it for the same
+    // container and supplier (docs/request-to-send-portal.md): a supplier who
+    // downloaded v3 is not chased about the email for v2.
+    const requestView = `${jp}.supplier_quote_views v
+                 WHERE v.last_viewed_at >= r.created_at
+                   AND v.draft_container_document_id IN (
+                       SELECT d2.id FROM draft_container_documents d2
+                        WHERE d2.type = 'supplier-quote'
+                          AND d2.draft_container_name = d.draft_container_name
+                          AND d2.supplier <=> d.supplier
+                          AND d2.id >= d.id)`;
+    const { pl: requestPl, ci: requestCi } = requestUploadSources(jp);
     const artworkTick = `artwork_confirmations c
                  WHERE c.purchase_order_id = q.purchase_order_id
                    AND c.created_at >= r.created_at
@@ -338,6 +507,37 @@ function portalSyncSteps(jp) {
                                        FROM ${signedPiView})
              WHERE ${PENDING_PORTAL} AND r.send_table = 'purchase_order_signed_pi_sends'
                AND EXISTS (SELECT 1 FROM ${signedPiView})`],
+        // The Request to send email that went out as a portal link: a
+        // supplier's user opened its PDF or CSV on the portal.
+        ['request_viewed', `
+            UPDATE email_receipts r
+              JOIN draft_container_document_sends s ON s.id = r.send_id
+              JOIN draft_container_documents d ON d.id = s.draft_container_document_id
+               SET r.confirmed_at = (SELECT MIN(IF(v.first_viewed_at >= r.created_at, v.first_viewed_at, v.last_viewed_at))
+                                       FROM ${requestView})
+             WHERE ${PENDING_PORTAL} AND r.send_table = 'draft_container_document_sends'
+               AND EXISTS (SELECT 1 FROM ${requestView})`],
+        // ... or the supplier answered it without opening the file: they
+        // uploaded a packing list, or an invoice, for that shipment through the
+        // portal after the email went out (requestUploadSources). Doing what
+        // the email asks for is as good a sign as reading it, and they are not
+        // chased after it.
+        ['request_pl_uploaded', `
+            UPDATE email_receipts r
+              JOIN draft_container_document_sends s ON s.id = r.send_id
+              JOIN draft_container_documents d ON d.id = s.draft_container_document_id
+               SET r.confirmed_at = (SELECT MIN(u.submitted_at) FROM ${requestPl})
+             WHERE ${PENDING_PORTAL} AND r.send_table = 'draft_container_document_sends'
+               AND d.type = 'supplier-quote'
+               AND EXISTS (SELECT 1 FROM ${requestPl})`],
+        ['request_ci_uploaded', `
+            UPDATE email_receipts r
+              JOIN draft_container_document_sends s ON s.id = r.send_id
+              JOIN draft_container_documents d ON d.id = s.draft_container_document_id
+               SET r.confirmed_at = (SELECT MIN(u.submitted_at) FROM ${requestCi})
+             WHERE ${PENDING_PORTAL} AND r.send_table = 'draft_container_document_sends'
+               AND d.type = 'supplier-quote'
+               AND EXISTS (SELECT 1 FROM ${requestCi})`],
         // The artwork request: the supplier ticked one of its items, through
         // the link or signed in.
         ['artwork_ticked', `
@@ -445,7 +645,7 @@ async function syncPortalReceipts(conn, { maxAgeMs = PORTAL_SYNC_MS } = {}) {
     } catch (e) {
         // JPORTAL_DB_SCHEMA is not a plain identifier: nothing can be read.
         log.warn('[email-receipt] portal sync skipped', { error: e.message });
-        return { failed: ['po_viewed', 'signed_pi_viewed', 'artwork_ticked', 'file_opened', 'qc_availability_answered', 'qc_schedule_opened', 'quote_answered', 'freight_quote_answered', 'freight_booking_answered', ...failed] };
+        return { failed: ['po_viewed', 'signed_pi_viewed', 'request_viewed', 'request_pl_uploaded', 'request_ci_uploaded', 'artwork_ticked', 'file_opened', 'qc_availability_answered', 'qc_schedule_opened', 'quote_answered', 'freight_quote_answered', 'freight_booking_answered', ...failed] };
     }
     for (const [name, sql] of steps) await run(name, () => conn.query(sql));
     return { failed };
@@ -602,6 +802,12 @@ module.exports = {
     appendPortalLink,
     CHASED_PORTAL_STEPS,
     portalSyncSteps,
+    requestUploadSources,
+    REMINDERS_STOPPED,
+    requestRemindersStoppedSql,
+    remindersStoppedOf,
+    queryWithRemindersStopped,
+    selectEmailReceipts,
     syncPortalReceipts,
     getReceiptForResend,
     recordReminderSend,

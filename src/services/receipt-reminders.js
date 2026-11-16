@@ -19,7 +19,7 @@
 const log = require('../lib/logger');
 const {
     appendReceiptLink, appendPortalLink, confirmViaOf, canRemind, syncPortalReceipts, CHASED_PORTAL_STEPS,
-    renderReminderEmailHtml, recordReminderSend, parseRecipients,
+    renderReminderEmailHtml, recordReminderSend, parseRecipients, queryWithRemindersStopped,
 } = require('../lib/email-receipt');
 
 // How long to wait between reminders for a given email, and the cap on how many
@@ -128,14 +128,20 @@ async function runReceiptReminders(pool, opts = {}) {
 
         // intervalHours/limit are sanitized ints → safe to inline (INTERVAL and
         // LIMIT can't be bound params in MySQL). maxReminders is bound.
-        const [rows] = await conn.query(
-            `SELECT id, token, email_type, sent_to, subject, reminder_count, confirm_via, action_url
-               FROM email_receipts
+        // A Request to send that was replaced by a later version, has shipped,
+        // or has its documents filed is left alone (`stopped`: the reason, NULL
+        // while it is still to be chased). On a server that cannot read that,
+        // the question is asked without it and everyone is chased as before.
+        const [rows] = await queryWithRemindersStopped(
+            conn,
+            stopped => `SELECT id, token, email_type, sent_to, subject, reminder_count, confirm_via, action_url
+               FROM email_receipts r
               WHERE confirmed_at IS NULL
                 AND ${chased}
                 AND sent_to IS NOT NULL
                 AND reminder_count < ?
                 AND COALESCE(last_reminder_at, created_at) <= (NOW() - INTERVAL ${intervalHours} HOUR)
+                ${stopped ? `AND ${stopped} IS NULL` : ''}
               ORDER BY id ASC
               LIMIT ${limit}`,
             [maxReminders]

@@ -1229,12 +1229,13 @@ function registerFreightQuoteRoutes(app, deps) {
                 [JSON.stringify(addresses), JSON.stringify(F.contentsSnapshot(lines)), id]
             );
             // Each attached PDF shows this email in its own sends history, as a
-            // forwarder quote emailed from the draft does.
+            // forwarder quote emailed from the draft does. `delivery` (2026-11-13_10):
+            // the files were attached, as every forwarder quote's are.
             for (const d of docs) {
                 await conn.query(
                     `INSERT INTO draft_container_document_sends
-                        (draft_container_document_id, sent_to, subject, front_message_uid, front_conversation_id, sent_by_email)
-                     VALUES (?, ?, ?, ?, ?, ?)`,
+                        (draft_container_document_id, sent_to, subject, front_message_uid, front_conversation_id, sent_by_email, delivery)
+                     VALUES (?, ?, ?, ?, ?, ?, 'attached')`,
                     [d.id, JSON.stringify(addresses), finalSubject, sent.frontMessageUid, sent.frontConversationId, req.userEmail || null]
                 );
             }

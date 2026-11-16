@@ -136,15 +136,18 @@ function signedPiPortalBlockHtml({ poNumber, filename, poUrl, registerUrl: regUr
     });
 }
 
-// The frame both blocks share: the lead line, the button and its address as
-// text, how to get an account, and the "nothing is attached" line.
-function blockHtml({ leadHtml, url, regUrl, preapproved, footHtml }) {
+// The frame the blocks share: the lead line, the button and its address as
+// text, how to get an account, and the "nothing is attached" line. `seeEn` /
+// `seeZh` name what a pre-approved address will see once signed in (plain
+// text): the order for the two PO emails; the Request to send email
+// (src/lib/request-to-send-portal.js) passes its own.
+function blockHtml({ leadHtml, url, regUrl, preapproved, footHtml, seeEn = 'this order', seeZh = '此订单' }) {
     const reg = escapeHtml(regUrl);
     const regLink = `<a href="${reg}" style="color:#1f5fbf;word-break:break-all;">${reg}</a>`;
     const account = preapproved
         ? [
-            small(`<strong style="color:${INK};">New to the portal?</strong> Register at ${regLink} with the email address this message was sent to. That address is already approved for your company, so you will see this order as soon as you sign in. There is no approval to wait for.`),
-            small(`<strong style="color:${INK};">首次使用门户？</strong>请使用接收本邮件的邮箱地址在 ${regLink} 注册。该邮箱已获批准，登录后即可查看此订单，无需等待审核。`),
+            small(`<strong style="color:${INK};">New to the portal?</strong> Register at ${regLink} with the email address this message was sent to. That address is already approved for your company, so you will see ${escapeHtml(seeEn)} as soon as you sign in. There is no approval to wait for.`),
+            small(`<strong style="color:${INK};">首次使用门户？</strong>请使用接收本邮件的邮箱地址在 ${regLink} 注册。该邮箱已获批准，登录后即可查看${escapeHtml(seeZh)}，无需等待审核。`),
         ]
         : [
             small(`<strong style="color:${INK};">New to the portal?</strong> Register at ${regLink} with the email address this message was sent to, and our team will approve your access.`),
@@ -172,4 +175,5 @@ module.exports = {
     GRANTED_OUTCOMES,
     portalBlockHtml,
     signedPiPortalBlockHtml,
+    blockHtml,
 };

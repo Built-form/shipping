@@ -1,0 +1,22 @@
+-- draft_container_document_sends.request_update: what an UPDATE email said
+-- (docs/request-to-send-portal.md, "Updates").
+--
+-- Set when a Request to send is emailed and an earlier version of the same
+-- request (same container and supplier) had already been emailed:
+--   { "replacesVersion": 1,
+--     "changes": [ { "kind": "units" | "lot" | "added" | "removed", "item", "lot",
+--                    "lotWas", "unitsWas", "unitsNow" } ] | null }
+-- `changes` is what differs between the lines the two PDFs were printed from
+-- (src/lib/request-to-send-drift.js): [] when nothing a supplier acts on
+-- changed, null when either version has no line snapshot. NULL = not an update
+-- (the first version anyone was sent), or a send from before this column.
+--
+-- What the email said, kept as it was said, like request_etd / request_port:
+-- the supplier portal shows the same note beside the PDF (2026-11-13_31 grants
+-- it), so it is never worked out again later.
+--
+-- The code answers a server without the column as "not an update"
+-- (src/services/request-to-send-portal.js), so this may run after the deploy.
+-- tools/migrate.js tolerates "column exists" (1060), so it is safe to re-run.
+
+ALTER TABLE draft_container_document_sends ADD COLUMN request_update JSON NULL AFTER request_port;
