@@ -161,7 +161,7 @@ Set `SUPPLIER_PORTAL_URL` (already set for the other portal links). No new envir
 
 ## The smoke check
 
-`node tools/smoke-freight-quotes.js` walks the whole flow on the TEST database with both halves for real: the Express app in-process, and the portal's `availability` and `supplier` handlers in-process on a pool that logs in as the portal's own runtime login (`jportal_app`, from `../portal/.env`), so every portal statement runs under its column grants. Front is stubbed (nothing is emailed), the contents email goes without attachments (nothing is written to S3), and everything it writes is deleted at the end. It refuses to run unless both env files point at explorer-test. 43 checks passed on 2026-11-16; the checks added since for the delivery option list, stock movements (the portal reading them under its column grant) and an edited email have NOT been run yet: they need `2026-11-16_30` to `_32` applied to TEST.
+`node tools/smoke-freight-quotes.js` walks the whole flow on the TEST database with both halves for real: the Express app in-process, and the portal's `availability` and `supplier` handlers in-process on a pool that logs in as the portal's own runtime login (`jportal_app`, from `../portal/.env`), so every portal statement runs under its column grants. Front is stubbed (nothing is emailed), the contents email goes without attachments (nothing is written to S3), and everything it writes is deleted at the end. It refuses to run unless both env files point at explorer-test. 51 checks, all passing on 2026-11-16, including the delivery option list, stock movements read by the portal under its column grant, and an email edited by staff.
 
 ## Not proven by the tests or the smoke check
 
