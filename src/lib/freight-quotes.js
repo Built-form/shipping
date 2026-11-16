@@ -23,6 +23,12 @@ const isToken = v => typeof v === 'string' && TOKEN_RE.test(v);
 /** The page on the supplier portal (no sign-in). `base` has no trailing slash. */
 const freightUrl = (base, token) => `${base}/freight/${encodeURIComponent(token)}`;
 
+// What a request asks to be quoted is a list of DELIVERY OPTIONS staff keep
+// themselves (freight_delivery_options, ShipLine's FREIGHT > DELIVERY OPTIONS):
+// free text. A request stores the text of the ones chosen (`services`) and an
+// option names one of them (`service`). SERVICES are the four codes requests
+// held before 2026-11-16_30; they, and their English names typed as text, keep
+// their Chinese translation wherever a delivery option is shown.
 const SERVICES = ['door_to_door', 'door_to_port', 'port_to_port', 'port_to_door'];
 const SERVICE_LABELS = {
     door_to_door: 'Door to door',
@@ -36,6 +42,8 @@ const SERVICE_LABELS_ZH = {
     port_to_port: '港到港',
     port_to_door: '港到门',
 };
+/** The list's first entries (seeded by 2026-11-16_32). */
+const DEFAULT_DELIVERY_OPTIONS = SERVICES.map(s => SERVICE_LABELS[s]);
 const CONTAINER_SIZES = ['20GP', '40GP', '40HQ'];
 const CURRENCIES = ['USD', 'GBP', 'EUR', 'CNY'];
 
@@ -52,6 +60,12 @@ const MAX_OPTIONS = 40;
 const ANSWER_LIMIT = 20;
 const MAX_FORWARDERS_PER_SEND = 10;
 const MAX_CONTACTS = 10;
+/** Delivery options one request may ask about, and the list's own size. */
+const MAX_SERVICES = 12;
+const MAX_DELIVERY_OPTIONS = 60;
+const SERVICE_MAX = 100;
+/** Stock movements one request may carry. */
+const MAX_MOVEMENTS = 30;
 
 const BOOKING_STATUSES = ['requested', 'confirmed', 'declined', 'cancelled'];
 /** A booking that holds its request: no other booking, no new answer. */
@@ -65,6 +79,9 @@ const PORT_MAX = 100;
 const REF_MAX = 100;
 const TRANSIT_MAX_DAYS = 120;
 const PRICE_RE = /^\d{1,7}(\.\d{1,2})?$/;
+// A movement's volume (up to 9999.999 CBM) and gross weight (up to 9,999,999.99 kg).
+const CBM_RE = /^\d{1,4}(\.\d{1,3})?$/;
+const WEIGHT_RE = /^\d{1,7}(\.\d{1,2})?$/;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 // Control and invisible format characters: never part of a name, a port or a reference.
 const UNPRINTABLE = /[\p{Cc}\p{Cf}]/u;
@@ -117,8 +134,46 @@ function jsonArray(value) {
     try { const parsed = JSON.parse(value); return Array.isArray(parsed) ? parsed : []; } catch { return []; }
 }
 
-/** The services of a request row, in the vocabulary's order. */
-const servicesOf = value => SERVICES.filter(s => jsonArray(value).includes(s));
+/** The delivery options of a request row (its `services` column), as stored: text, in the order chosen. */
+const servicesOf = value => jsonArray(value).filter(s => typeof s === 'string' && s.trim() !== '');
+
+/**
+ * The old code behind a delivery option, when it is one of the four: the code
+ * itself ('door_to_port'), or its English name as text ('Door to port', any
+ * case). Null for anything else.
+ */
+function serviceCode(value) {
+    const code = String(value ?? '').trim().toLowerCase().replace(/[\s-]+/g, '_');
+    return SERVICES.includes(code) ? code : null;
+}
+
+/** A delivery option in English: the name of one of the four, else the text as typed. */
+function serviceName(value) {
+    const code = serviceCode(value);
+    return code ? SERVICE_LABELS[code] : String(value ?? '').trim();
+}
+
+/** A stock_movements column as a clean list: [{ from, to, cbm, weightKg }]. */
+function movementsOf(value) {
+    return jsonArray(value)
+        .filter(m => m && typeof m === 'object' && !Array.isArray(m))
+        .map(m => ({
+            from: String(m.from ?? ''),
+            to: String(m.to ?? ''),
+            cbm: Number(m.cbm) || 0,
+            weightKg: Number(m.weightKg) || 0,
+        }));
+}
+
+/** What a list of movements adds up to: { count, cbm, weightKg }. */
+function movementTotals(movements) {
+    const list = movements || [];
+    return {
+        count: list.length,
+        cbm: Number(list.reduce((n, m) => n + (Number(m.cbm) || 0), 0).toFixed(3)),
+        weightKg: Number(list.reduce((n, m) => n + (Number(m.weightKg) || 0), 0).toFixed(2)),
+    };
+}
 
 const bad = (field, error) => ({ code: 'BAD_FIELD', field, error });
 
@@ -175,11 +230,82 @@ function validateForwarder(body) {
     return { value: { name: name.value, notes: notes.value, contacts } };
 }
 
+// ── delivery options and stock movements ────────────────────────────────────
+
+/**
+ * One entry of the delivery option list as its form sends it: { label }, one
+ * line of free text. → { value: { label } } or { code, field, error }.
+ */
+function validateDeliveryOption(body) {
+    if (!body || typeof body !== 'object' || Array.isArray(body)) return bad('body', 'A delivery option is required.');
+    const label = requiredLine(body.label, 'label', SERVICE_MAX);
+    if (label.code) return label;
+    return { value: { label: label.value } };
+}
+
+/**
+ * The delivery options a request asks about: 1 to MAX_SERVICES lines of text
+ * (the text of the list's entries as the dialog showed them; an old code is
+ * still taken). The same one twice, in any case, counts once.
+ * → { value: [text] } or { code, field, error }.
+ */
+function validateServices(raw) {
+    if (!Array.isArray(raw) || !raw.length) return bad('services', 'Choose at least one delivery option.');
+    if (raw.length > MAX_SERVICES) return bad('services', `One request asks about at most ${MAX_SERVICES} delivery options.`);
+    const services = [];
+    const seen = new Set();
+    for (const item of raw) {
+        const line = requiredLine(item, 'services', SERVICE_MAX);
+        if (line.code) return bad('services', 'Each delivery option must be one line of text, at most 100 characters.');
+        const key = line.value.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        services.push(line.value);
+    }
+    return { value: services };
+}
+
+// An amount above zero in the shape `re` allows, as a number; null otherwise.
+function amount(value, re) {
+    const text = typeof value === 'number' && Number.isFinite(value) ? String(value) : String(value ?? '').trim();
+    return re.test(text) && Number(text) > 0 ? Number(text) : null;
+}
+
+/**
+ * The stock movements of a request: [{ from, to, cbm, weightKg }], none
+ * allowed. `from` is the factory, `to` the port or consolidation point, one
+ * line each; `cbm` a volume above zero with at most three decimals; `weightKg`
+ * a gross weight above zero with at most two.
+ * → { value: [{ from, to, cbm, weightKg }] } or { code, field, error }.
+ */
+function validateMovements(raw) {
+    if (raw === undefined || raw === null) return { value: [] };
+    if (!Array.isArray(raw)) return bad('stockMovements', 'stockMovements must be a list.');
+    if (raw.length > MAX_MOVEMENTS) return bad('stockMovements', `A request carries at most ${MAX_MOVEMENTS} stock movements.`);
+    const movements = [];
+    for (let i = 0; i < raw.length; i++) {
+        const m = raw[i];
+        const at = name => `stockMovements[${i}].${name}`;
+        if (!m || typeof m !== 'object' || Array.isArray(m)) return bad(`stockMovements[${i}]`, 'Each stock movement must be an object.');
+        const from = requiredLine(m.from, at('from'), NAME_MAX);
+        if (from.code) return bad(at('from'), `Stock movement ${i + 1}: say which factory the goods come from.`);
+        const to = requiredLine(m.to, at('to'), NAME_MAX);
+        if (to.code) return bad(at('to'), `Stock movement ${i + 1}: say which port or consolidation point the goods go to.`);
+        const cbm = amount(m.cbm, CBM_RE);
+        if (cbm === null) return bad(at('cbm'), `Stock movement ${i + 1}: the CBM must be above zero, with at most three decimals.`);
+        const weightKg = amount(m.weightKg, WEIGHT_RE);
+        if (weightKg === null) return bad(at('weightKg'), `Stock movement ${i + 1}: the weight (kg) must be above zero, with at most two decimals.`);
+        movements.push({ from: from.value, to: to.value, cbm, weightKg });
+    }
+    return { value: movements };
+}
+
 // ── requests ────────────────────────────────────────────────────────────────
 
 /**
  * The send dialog's body: { forwarderIds, batchId?, windowStart, windowEnd,
- * origin?, destination?, containerSize?, services, note?, expiryDays? }.
+ * origin?, destination?, containerSize?, services, stockMovements?, note?,
+ * expiryDays? }. `services` are the delivery options asked about, as text.
  * `today` is 'YYYY-MM-DD' (UK): the range may not lie wholly in the past.
  * → { value } or { code, field, error }.
  */
@@ -213,9 +339,10 @@ function validateRequest(body, today) {
         ? '40HQ' : String(body.containerSize);
     if (!CONTAINER_SIZES.includes(containerSize)) return bad('containerSize', `containerSize must be one of ${CONTAINER_SIZES.join(', ')}.`);
 
-    if (!Array.isArray(body.services) || !body.services.length) return bad('services', 'Choose at least one service.');
-    if (body.services.some(s => !SERVICES.includes(s))) return bad('services', `services must be from ${SERVICES.join(', ')}.`);
-    const services = SERVICES.filter(s => body.services.includes(s));
+    const services = validateServices(body.services);
+    if (services.code) return services;
+    const stockMovements = validateMovements(body.stockMovements);
+    if (stockMovements.code) return stockMovements;
 
     const note = optionalText(body.note, 'note', NOTE_MAX);
     if (note.code) return note;
@@ -232,7 +359,8 @@ function validateRequest(body, today) {
         value: {
             forwarderIds, batchId, windowStart, windowEnd,
             origin: origin.value || 'China', destination: destination.value || 'UK',
-            containerSize, services, note: note.value, expiryDays,
+            containerSize, services: services.value, stockMovements: stockMovements.value,
+            note: note.value, expiryDays,
         },
     };
 }
@@ -301,7 +429,9 @@ function validateOptions(raw, request) {
         const portTo = requiredLine(o.portTo, at('portTo'), PORT_MAX);
         if (portTo.code) return portTo;
 
-        if (!request.services.includes(o.service)) return bad(at('service'), 'The service must be one of those asked for.');
+        if (typeof o.service !== 'string' || !request.services.includes(o.service)) {
+            return bad(at('service'), 'The delivery option must be one of those asked for.');
+        }
 
         const containerSize = o.containerSize === undefined || o.containerSize === null || o.containerSize === ''
             ? request.containerSize : String(o.containerSize);
@@ -363,7 +493,11 @@ function money(price, currency) {
     return `${currency || ''} ${whole.replace(/\B(?=(\d{3})+(?!\d))/g, ',')}.${cents}`.trim();
 }
 
-const serviceLabel = s => (SERVICE_LABELS[s] ? `${SERVICE_LABELS[s]} / ${SERVICE_LABELS_ZH[s]}` : String(s || ''));
+/** A delivery option as the emails show it: one of the four in English and Chinese, else the text as typed. */
+function serviceLabel(value) {
+    const code = serviceCode(value);
+    return code ? `${SERVICE_LABELS[code]} / ${SERVICE_LABELS_ZH[code]}` : String(value ?? '').trim();
+}
 
 const boxOpen = `<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:18px 0;"><tr><td style="padding:16px 18px 6px;border:1px solid ${BORDER};border-radius:8px;background:${CODE_BG};">`;
 const boxClose = '</td></tr></table>';
@@ -377,10 +511,43 @@ function requestFacts(request) {
         ['From / 起运地', escapeHtml(request.origin || '')],
         ['To / 目的地', escapeHtml(request.destination || '')],
         ['Container / 柜型', escapeHtml(request.containerSize)],
-        ['Service / 服务方式', (request.services || []).map(s => escapeHtml(serviceLabel(s))).join('<br>')],
+        ['Delivery / 交货方式', (request.services || []).map(s => escapeHtml(serviceLabel(s))).join('<br>')],
     ];
     if (request.note) rows.push(['Note / 备注', escapeHtml(request.note).replace(/\r?\n/g, '<br>')]);
     return facts(rows);
+}
+
+const trimNumber = (n, places) => String(Number(Number(n || 0).toFixed(places)));
+
+/**
+ * The stock movements of a request as a table for the quote request email:
+ * factory, port or consolidation point, CBM and kg, with a total row when
+ * there is more than one. '' when the request has none.
+ */
+function movementsHtml(movements) {
+    const list = movements || [];
+    if (!list.length) return '';
+    const totals = movementTotals(list);
+    const cell = (html, extra = '') => `<td style="${TD}${extra}">${html}</td>`;
+    const bold = 'font-weight:700;';
+    const rows = list.map(m => `<tr>${[
+        cell(escapeHtml(m.from)),
+        cell(escapeHtml(m.to)),
+        cell(trimNumber(m.cbm, 3), NUM),
+        cell(trimNumber(m.weightKg, 2), NUM),
+    ].join('')}</tr>`).join('');
+    const total = list.length > 1
+        ? `<tr><td colspan="2" style="${TD}${bold}">Total / 合计</td>${cell(trimNumber(totals.cbm, 3), NUM + bold)}${cell(trimNumber(totals.weightKg, 2), NUM + bold)}</tr>`
+        : '';
+    return [
+        `<p style="margin:14px 0 6px;font-family:${FONT};font-size:14px;line-height:1.4;font-weight:700;color:${INK};">Stock movements to include / 需包含的提货安排</p>`,
+        '<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="border-collapse:collapse;margin:0 0 12px;">',
+        `<tr><th style="${TH}">From factory / 工厂</th><th style="${TH}">To port or consolidation / 送至港口或集货点</th>`
+            + `<th style="${TH}${NUM}">CBM</th><th style="${TH}${NUM}">Kg</th></tr>`,
+        rows,
+        total,
+        '</table>',
+    ].join('');
 }
 
 /**
@@ -396,6 +563,7 @@ function quoteBlockHtml({ request, url, expiresOn, registerUrl }) {
         boxOpen,
         lead('<strong>Freight quote request</strong> / <strong>海运报价请求</strong>'),
         requestFacts(request),
+        movementsHtml(request.stockMovements),
         button(url, 'Enter your quote / 填写报价'),
         linkFallback(url),
         small('Open the page and add one line per sailing you can offer: loading date, sailing date, transit time, ports, service and price. No sign-in is needed. You can come back and change your answer until we book.'),
@@ -415,7 +583,7 @@ function optionFacts(option) {
         ['Transit / 航程', `${escapeHtml(option.transitDays)} days / 天${arrives ? ` (arrives ${escapeHtml(arrives)})` : ''}`],
         ['From / 起运港', escapeHtml(option.portFrom)],
         ['To / 目的港', escapeHtml(option.portTo)],
-        ['Service / 服务方式', escapeHtml(serviceLabel(option.service))],
+        ['Delivery / 交货方式', escapeHtml(serviceLabel(option.service))],
         ['Container / 柜型', escapeHtml(option.containerSize)],
         ['Price / 价格', `<strong>${escapeHtml(money(option.price, option.currency))}</strong>`],
     ];
@@ -560,13 +728,15 @@ function contentsDrift(snapshot, lines) {
 
 module.exports = {
     TOKEN_RE, newToken, isToken, freightUrl,
-    SERVICES, SERVICE_LABELS, SERVICE_LABELS_ZH, CONTAINER_SIZES, CURRENCIES,
+    SERVICES, SERVICE_LABELS, SERVICE_LABELS_ZH, DEFAULT_DELIVERY_OPTIONS, CONTAINER_SIZES, CURRENCIES,
     EXPIRY_DAYS, EXPIRY_MIN_DAYS, EXPIRY_MAX_DAYS, WINDOW_MAX_DAYS, SAILING_MARGIN_DAYS, MAX_OPTIONS,
-    ANSWER_LIMIT, MAX_FORWARDERS_PER_SEND, MAX_CONTACTS,
+    ANSWER_LIMIT, MAX_FORWARDERS_PER_SEND, MAX_CONTACTS, MAX_SERVICES, MAX_DELIVERY_OPTIONS, MAX_MOVEMENTS,
     BOOKING_STATUSES, LIVE_BOOKING_STATUSES, REVOKE_REASONS, NOTE_MAX,
-    isYmd, toYmd, addDays, daysBetween, arrivalDate, jsonArray, servicesOf,
-    validateForwarder, validateRequest, requestState, isEditable, validateOptions, validateStaffAnswer,
+    isYmd, toYmd, addDays, daysBetween, arrivalDate, jsonArray, servicesOf, serviceCode, serviceName,
+    movementsOf, movementTotals,
+    validateForwarder, validateDeliveryOption, validateServices, validateMovements, validateRequest,
+    requestState, isEditable, validateOptions, validateStaffAnswer,
     validateBookingRef, optionalText,
-    money, serviceLabel, requestFacts, quoteBlockHtml, optionFacts, bookingBlockHtml,
+    money, serviceLabel, requestFacts, movementsHtml, quoteBlockHtml, optionFacts, bookingBlockHtml,
     groupContentsBySupplier, contentsHtml, contentsSnapshot, contentsDrift,
 };

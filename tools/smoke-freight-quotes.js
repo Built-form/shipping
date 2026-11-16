@@ -100,6 +100,12 @@ const TAG = `smk${Date.now().toString(36)}`;
 const DOM = `${TAG}.invalid`;
 const addr = who => `${who}@${DOM}`;
 const forwarderIds = [];
+// A delivery option in staff's own words, and the goods to be collected.
+const DELIVERY = `Deliver to Unit 5, tail-lift ${TAG}`;
+const MOVEMENTS = [
+    { from: `Acme Medical ${TAG}`, to: 'Ningbo port', cbm: 12.5, weightKg: 2400 },
+    { from: 'Best Gloves', to: 'Ningbo consolidation', cbm: '3.25', weightKg: '610.5' },
+];
 
 async function q(sql, params) { return (await getPool().query(sql, params))[0]; }
 
@@ -159,10 +165,22 @@ async function main() {
     const windowEnd = F.addDays(today, 50);
     const option = (over = {}) => ({
         loadingDate: F.addDays(today, 24), sailingDate: F.addDays(today, 28), transitDays: 32, portFrom: 'Ningbo', portTo: 'Felixstowe',
-        service: 'door_to_port', price: '1850', currency: 'USD', ...over,
+        service: DELIVERY, price: '1850', currency: 'USD', ...over,
     });
 
     try {
+        // ── 0. the delivery option list ──────────────────────────────────────
+        console.log('0. Delivery options');
+        const listBefore = await api('GET', '/api/v1/freight-delivery-options');
+        check('the list is read (the four seeded entries, unless staff changed them)', listBefore.status === 200 && Array.isArray(listBefore.body?.deliveryOptions), listBefore);
+        const addedOption = await api('POST', '/api/v1/freight-delivery-options', { label: `  Smoke option ${TAG} ` });
+        const myOption = addedOption.body?.deliveryOptions?.find(o => o.label === `Smoke option ${TAG}`);
+        check('a delivery option is added, trimmed', addedOption.status === 201 && Boolean(myOption), addedOption);
+        check('the same text again is refused', (await api('POST', '/api/v1/freight-delivery-options', { label: `smoke OPTION ${TAG}` })).body?.code === 'DUPLICATE');
+        const reworded = await api('PATCH', `/api/v1/freight-delivery-options/${myOption?.id}`, { label: DELIVERY });
+        check('it is reworded', reworded.status === 200 && reworded.body.deliveryOptions.some(o => o.id === myOption.id && o.label === DELIVERY), reworded);
+
+
         // ── 1. forwarders ────────────────────────────────────────────────────
         console.log('1. Forwarders');
         const f1 = await api('POST', '/api/v1/forwarders', { name: `Smoke One ${TAG}`, contacts: [{ name: 'Amy', email: addr('amy').toUpperCase() }] });
@@ -180,7 +198,8 @@ async function main() {
 
         // ── 2. the send, and its retry ───────────────────────────────────────
         console.log('\n2. Send a quote request to both');
-        const send = { forwarderIds: [F1, F2], batchId: crypto.randomUUID(), windowStart, windowEnd, origin: 'Ningbo', services: ['door_to_door', 'door_to_port'], note: `smoke ${TAG}` };
+        const send = { forwarderIds: [F1, F2], batchId: crypto.randomUUID(), windowStart, windowEnd, origin: 'Ningbo', services: ['Door to door', DELIVERY], stockMovements: MOVEMENTS, note: `smoke ${TAG}`,
+            subject: `Smoke quote for {forwarder} ${TAG}`, body: '<p>Edited by staff for {forwarder}: {services}.</p>' };
         const sent = await api('POST', '/api/v1/freight-quotes', send);
         check('both forwarders: sent', sent.status === 200 && sent.body?.results?.every(r => r.outcome === 'sent'), sent.body?.results ?? sent);
         check('one email each, to that forwarder\'s contacts', frontCalls.length === 2 && frontCalls[0].to.includes(addr('amy')) && frontCalls[0].to.includes(addr('ops')) && frontCalls[1].to.join() === addr('bo'), frontCalls.map(c => c.to));
@@ -188,6 +207,9 @@ async function main() {
         const R1 = rows.find(r => r.forwarder_id === F1); const R2 = rows.find(r => r.forwarder_id === F2);
         check('each request has its own token, in its own email', rows.length === 2 && F.isToken(R1?.token) && R1.token !== R2?.token
             && frontCalls[0].body.includes(`/freight/${R1.token}`) && !frontCalls[0].body.includes(R2.token) && rows.every(r => r.sent_at), rows.length);
+        check('the email is the one staff edited, with the stock movements under it',
+            frontCalls[0].subject === `Smoke quote for Smoke One ${TAG} ${TAG}` && frontCalls[0].body.includes(`Edited by staff for Smoke One ${TAG}: Door to door, ${DELIVERY}.`)
+            && frontCalls[0].body.includes(`Acme Medical ${TAG}`) && frontCalls[0].body.includes('15.75'), frontCalls[0].subject);
         const again = await api('POST', '/api/v1/freight-quotes', send);
         check('the same send again emails nobody', again.status === 200 && again.body?.results?.every(r => r.outcome === 'already_sent') && frontCalls.length === 2, again.body?.results ?? again);
         const users = await q(`SELECT email, status, cognito_sub FROM ${JP}.supplier_users WHERE email LIKE ?`, [`%@${DOM}`]);
@@ -197,18 +219,22 @@ async function main() {
         console.log('\n3. The forwarder\'s page, by the emailed link');
         const opened = await link('GET', R1.token);
         check('GET: the request, open, nothing answered', opened.status === 200 && opened.data?.state === 'open' && opened.data.options.length === 0 && opened.data.containerSize === '40HQ', opened);
+        check('the page is given the delivery options as written, and the stock movements (the column grant)',
+            opened.data?.services?.join('|') === `Door to door|${DELIVERY}` && opened.data?.stockMovements?.length === 2
+            && opened.data.stockMovements[0].from === `Acme Medical ${TAG}` && opened.data.stockMovements[1].weightKg === 610.5, opened.data?.stockMovements ?? opened);
         check('an unknown token is 404', (await link('GET', 'f'.repeat(48))).status === 404);
         const answered = await link('PUT', R1.token, { rowVersion: opened.data?.rowVersion, declined: false, name: 'Amy', options: [option(), option({ sailingDate: F.addDays(today, 35), loadingDate: F.addDays(today, 31), price: '1790.50', containerSize: '40GP' })] });
         check('PUT: two options saved', answered.status === 200 && answered.data?.state === 'answered' && answered.data.options.length === 2 && answered.data.options[1].price === '1790.50' && answered.data.options[1].containerSize === '40GP', answered);
         const stale = await link('PUT', R1.token, { rowVersion: opened.data?.rowVersion, declined: false, options: [option()] });
         check('a stale save is 409 with the current view', stale.status === 409 && stale.code === 'CONFLICT' && stale.details?.options?.length === 2, stale);
         const badOption = await link('PUT', R1.token, { rowVersion: answered.data?.rowVersion, declined: false, options: [option({ service: 'port_to_port' })] });
-        check('a service that was not asked for is 400', badOption.status === 400 && badOption.details?.field === 'options[0].service', badOption);
+        check('a delivery option that was not asked for is 400', badOption.status === 400 && badOption.details?.field === 'options[0].service', badOption);
 
         // ── 4. staff see it, and type in the other forwarder's answer ─────────
         console.log('\n4. ShipLine reads the board; staff enter an emailed answer');
         let board = await api('GET', '/api/v1/freight-quotes');
         const b1 = () => board.body.requests.find(r => r.id === R1.id); const b2 = () => board.body.requests.find(r => r.id === R2.id);
+        check('the board carries the stock movements and the option\'s delivery option', b1()?.stockMovements?.length === 2 && b1().stockMovements[1].cbm === 3.25 && b1().options[0].service === DELIVERY, b1()?.stockMovements);
         check('the board shows the answer', board.status === 200 && b1()?.state === 'answered' && b1().options.length === 2 && b1().answerSource === 'link' && b1().answeredBy === 'Amy', b1());
         const summary = await api('GET', '/api/v1/freight-quotes/summary');
         check('the badge counts the send', summary.status === 200 && summary.body.answered >= 1, summary);
@@ -301,6 +327,9 @@ async function main() {
         const marked = await api('PATCH', `/api/v1/freight-bookings/${second.body?.bookingId}`, { status: 'confirmed', bookingRef: `ST-${TAG}` });
         board = marked;
         check('staff mark it confirmed themselves', marked.status === 200 && board.body.bookings.find(b => b.id === second.body.bookingId)?.responseSource === 'staff' && b1()?.revokeReason === 'filled', marked.body?.error ?? b1());
+        const dropped = await api('DELETE', `/api/v1/freight-delivery-options/${myOption?.id}`);
+        check('the delivery option is removed from the list; the request keeps its text', dropped.status === 200 && !dropped.body.deliveryOptions.some(o => o.id === myOption.id)
+            && (await api('GET', '/api/v1/freight-quotes')).body.requests.find(r => r.id === R1.id)?.services.includes(DELIVERY), dropped);
         const removed = await api('DELETE', `/api/v1/forwarders/${F1}`);
         check('removing a forwarder works', removed.status === 200 && removed.body?.ok === true, removed);
         const gone = await signedIn(claims, 'GET', '/api/supplier/freight-quotes');
@@ -335,6 +364,11 @@ async function cleanup() {
         await q(`DELETE FROM audit_log WHERE entity_type = 'forwarder' AND entity_id IN (?)`, [ids]);
         await q('DELETE FROM forwarder_contacts WHERE forwarder_id IN (?)', [ids]);
         await q('DELETE FROM forwarders WHERE id IN (?)', [ids]);
+    }
+    const options = (await q('SELECT id FROM freight_delivery_options WHERE label LIKE ?', [`%${TAG}%`])).map(o => Number(o.id));
+    if (options.length) {
+        await q(`DELETE FROM audit_log WHERE entity_type = 'freight_delivery_option' AND entity_id IN (?)`, [options]);
+        await q('DELETE FROM freight_delivery_options WHERE id IN (?)', [options]);
     }
     const users = (await q(`SELECT id FROM ${JP}.supplier_users WHERE email LIKE ?`, [`%@${DOM}`])).map(u => Number(u.id));
     if (users.length) {

@@ -32,6 +32,7 @@ function harness({ userType = 'standard', frontOk = () => true } = {}) {
             { id: 2, forwarder_id: 2, name: null, email: 'ops@savino.com', deleted_at: null },
         ],
         requests: [], options: [], bookings: [],
+        deliveryOptions: [{ id: 1, label: 'Door to door', deleted_at: null }, { id: 2, label: 'Door to port', deleted_at: null }],
         shipments: [{ id: 50, name: 'Draft 12', reference: null, stage: 'DRAFT', deleted_at: null, merged_into_id: null }],
         audits: [], receipts: [], sent: [], preapproved: [],
     };
@@ -54,17 +55,34 @@ function harness({ userType = 'standard', frontOk = () => true } = {}) {
             if (s.startsWith('SELECT email FROM forwarder_contacts')) {
                 return [db.contacts.filter(c => !c.deleted_at && c.forwarder_id === params[0])];
             }
+            // delivery options
+            if (s.startsWith('SELECT id, label FROM freight_delivery_options WHERE deleted_at IS NULL')) {
+                return [db.deliveryOptions.filter(o => !o.deleted_at)];
+            }
+            if (s.startsWith('INSERT INTO freight_delivery_options (label, created_by_email)')) {
+                const id = db.deliveryOptions.length + 1;
+                db.deliveryOptions.push({ id, label: params[0], deleted_at: null });
+                return [{ insertId: id }];
+            }
+            if (s.startsWith('UPDATE freight_delivery_options SET label = ? WHERE id = ?')) {
+                db.deliveryOptions.find(o => o.id === params[1]).label = params[0];
+                return ok(1);
+            }
+            if (s.startsWith('UPDATE freight_delivery_options SET deleted_at = UTC_TIMESTAMP() WHERE id = ?')) {
+                db.deliveryOptions.find(o => o.id === params[0]).deleted_at = NOW();
+                return ok(1);
+            }
             // requests
             if (s.startsWith('SELECT id, sent_at, revoked_at FROM freight_quote_requests WHERE batch_id = ? AND forwarder_id = ?')) {
                 return [db.requests.filter(r => r.batch_id === params[0] && r.forwarder_id === params[1])];
             }
             if (s.startsWith('INSERT INTO freight_quote_requests')) {
                 const [token, batch_id, forwarder_id, forwarder_name, window_start_date, window_end_date, origin, destination,
-                    container_size, services, staff_note, sent_to, subject, created_by_email, days] = params;
+                    container_size, services, stock_movements, staff_note, sent_to, subject, created_by_email, days] = params;
                 const id = db.requests.length + 1;
                 db.requests.push({
                     id, token, batch_id, forwarder_id, forwarder_name, window_start_date, window_end_date, origin, destination,
-                    container_size, services, staff_note, sent_to, subject, created_by_email, created_at: NOW(), sent_at: null,
+                    container_size, services, stock_movements, staff_note, sent_to, subject, created_by_email, created_at: NOW(), sent_at: null,
                     expires_at: future(days), revoked_at: null, revoke_reason: null, answer_count: 0, answered_at: null,
                     answered_by_name: null, answered_by_email: null, answer_source: null, answer_note: null, declined: 0, row_version: 1,
                 });
@@ -277,6 +295,100 @@ test('send: one row, one link and one email per forwarder; the same batchId agai
     assert.deepEqual(again.body.results.map(r => r.outcome), ['already_sent', 'already_sent']);
     assert.equal(h.db.sent.length, 2);
     assert.equal(h.db.requests.length, 2);
+});
+
+test('send: delivery options as free text, stock movements, and the email as staff edited it', async () => {
+    const h = harness();
+    const out = await h.call('POST', '/api/v1/freight-quotes', {
+        ...SEND, forwarderIds: [1],
+        services: ['Door to port', 'Deliver to Unit 5, tail-lift', 'door to port'],
+        stockMovements: [
+            { from: 'Acme Medical, Ningbo', to: 'Ningbo port', cbm: '12.5', weightKg: 2400 },
+            { from: 'Best Gloves <Shanghai>', to: 'Ningbo consolidation', cbm: 3.25, weightKg: '610.5' },
+        ],
+        subject: 'Quote please, {forwarder}: {containerSize}',
+        body: '<p>Dear {forwarder}, our own words. Options: {services}.</p>',
+    });
+    assert.equal(out.status, 200);
+    const request = out.body.requests[0];
+    // The same option twice (in any case) counts once; the text is kept as typed.
+    assert.deepEqual(request.services, ['Door to port', 'Deliver to Unit 5, tail-lift']);
+    assert.deepEqual(request.stockMovements, [
+        { from: 'Acme Medical, Ningbo', to: 'Ningbo port', cbm: 12.5, weightKg: 2400 },
+        { from: 'Best Gloves <Shanghai>', to: 'Ningbo consolidation', cbm: 3.25, weightKg: 610.5 },
+    ]);
+    const mail = h.db.sent[0];
+    assert.equal(mail.subject, 'Quote please, DCG: 40HQ');
+    assert.match(mail.html, /Dear DCG, our own words\. Options: Door to port, Deliver to Unit 5, tail-lift\./);
+    assert.doesNotMatch(mail.html, /Body for DCG/);
+    // The fixed block still follows the edited text: the link, the options, the movements.
+    assert.match(mail.html, /https:\/\/portal\.example\/freight\/[a-f0-9]{48}/);
+    assert.match(mail.html, /Door to port \/ 门到港/);
+    assert.match(mail.html, /Deliver to Unit 5, tail-lift/);
+    assert.match(mail.html, /Best Gloves &lt;Shanghai&gt;/);
+    assert.match(mail.html, /15\.75/); // total CBM
+    assert.match(mail.html, /3010\.5/); // total kg
+
+    // An option must name one of the delivery options asked about, exactly.
+    const option = { ...OPTION, service: 'Deliver to Unit 5, tail-lift' };
+    assert.equal((await h.call('POST', '/api/v1/freight-quotes/1/options', { options: [option] })).status, 200);
+    assert.equal((await h.call('POST', '/api/v1/freight-quotes/1/options', { options: [{ ...OPTION, service: 'door_to_door' }] })).body.field, 'options[0].service');
+
+    const bad = body => h.call('POST', '/api/v1/freight-quotes', { ...SEND, batchId: undefined, forwarderIds: [2], ...body }).then(r => r.body.field);
+    assert.equal(await bad({ stockMovements: [{ from: '', to: 'Port', cbm: 1, weightKg: 1 }] }), 'stockMovements[0].from');
+    assert.equal(await bad({ stockMovements: [{ from: 'A', to: 'Port', cbm: 0, weightKg: 1 }] }), 'stockMovements[0].cbm');
+    assert.equal(await bad({ stockMovements: [{ from: 'A', to: 'Port', cbm: 1, weightKg: 'heavy' }] }), 'stockMovements[0].weightKg');
+    assert.equal(await bad({ services: ['x'.repeat(101)] }), 'services');
+});
+
+test('delivery options: list, add, reword, remove; no duplicates; read-only refused', async () => {
+    const h = harness();
+    assert.deepEqual((await h.call('GET', '/api/v1/freight-delivery-options')).body.deliveryOptions.map(o => o.label), ['Door to door', 'Door to port']);
+    const added = await h.call('POST', '/api/v1/freight-delivery-options', { label: '  Deliver to Unit 5  ' });
+    assert.equal(added.status, 201);
+    assert.deepEqual(added.body.deliveryOptions[2], { id: 3, label: 'Deliver to Unit 5' });
+    assert.equal((await h.call('POST', '/api/v1/freight-delivery-options', { label: 'door to DOOR' })).body.code, 'DUPLICATE');
+    assert.equal((await h.call('POST', '/api/v1/freight-delivery-options', { label: ' ' })).body.field, 'label');
+
+    const reworded = await h.call('PATCH', '/api/v1/freight-delivery-options/3', { label: 'Deliver to Unit 5, tail-lift' });
+    assert.equal(reworded.body.deliveryOptions[2].label, 'Deliver to Unit 5, tail-lift');
+    assert.equal((await h.call('PATCH', '/api/v1/freight-delivery-options/3', { label: 'Door to port' })).body.code, 'DUPLICATE');
+    assert.equal((await h.call('PATCH', '/api/v1/freight-delivery-options/9', { label: 'X' })).status, 404);
+
+    const removed = await h.call('DELETE', '/api/v1/freight-delivery-options/1');
+    assert.deepEqual(removed.body.deliveryOptions.map(o => o.id), [2, 3]);
+    assert.equal((await h.call('DELETE', '/api/v1/freight-delivery-options/1')).status, 200); // twice is a no-op
+    // A removed entry's text can be added again.
+    assert.equal((await h.call('POST', '/api/v1/freight-delivery-options', { label: 'Door to door' })).status, 201);
+    assert.deepEqual(h.db.audits.map(a => `${a.entityType}:${a.action}`), [
+        'freight_delivery_option:create', 'freight_delivery_option:update', 'freight_delivery_option:delete', 'freight_delivery_option:create',
+    ]);
+
+    const reader = harness({ userType: 'accountant' });
+    assert.equal((await reader.call('POST', '/api/v1/freight-delivery-options', { label: 'X' })).body.code, 'READ_ONLY');
+    assert.equal((await reader.call('GET', '/api/v1/freight-delivery-options')).status, 200);
+});
+
+test('booking and contents: the subject and body staff edited are what is sent', async () => {
+    const h = harness();
+    await answered(h);
+    await h.call('POST', '/api/v1/freight-quotes/options/1/book', {
+        shipmentId: 50, subject: 'Please book {sailingDate}', body: '<p>Edited booking words for {forwarder}.</p>', to: 'amy@dcg.com, second@dcg.com',
+    });
+    const booking = h.db.sent[h.db.sent.length - 1];
+    assert.equal(booking.subject, 'Please book 2026-12-10');
+    assert.deepEqual(booking.to, ['amy@dcg.com', 'second@dcg.com']);
+    assert.match(booking.html, /Edited booking words for DCG\./);
+    assert.match(booking.html, /Confirm or decline/);
+
+    const rowVersion = h.db.bookings[0].row_version;
+    await h.call('POST', '/api/v1/freight-bookings/1/contents-email', {
+        rowVersion, attachDocuments: false, subject: 'Contents of {containerName}', body: '<p>Edited contents words.</p>',
+    });
+    const contents = h.db.sent[h.db.sent.length - 1];
+    assert.equal(contents.subject, 'Contents of Draft 12');
+    assert.match(contents.html, /Edited contents words\./);
+    assert.match(contents.html, /Acme/);
 });
 
 test('send: a Front failure revokes that forwarder\'s link and the other still goes', async () => {

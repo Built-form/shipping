@@ -77,7 +77,8 @@ test('validateRequest: forwarders, a range, services; defaults filled in', () =>
     assert.deepEqual(ok.value, {
         forwarderIds: [3, 7], batchId: 'a1b2c3d4-0000-4000-8000-000000000001',
         windowStart: '2026-12-01', windowEnd: '2026-12-31', origin: 'China', destination: 'UK',
-        containerSize: '40HQ', services: ['door_to_door', 'port_to_port'], note: null, expiryDays: 30,
+        // The delivery options as text, in the order chosen; no stock movements.
+        containerSize: '40HQ', services: ['port_to_port', 'door_to_door'], stockMovements: [], note: null, expiryDays: 30,
     });
     const bad = (patch, today = '2026-11-16') => F.validateRequest({ ...body, ...patch }, today).field;
     assert.equal(bad({ forwarderIds: [] }), 'forwarderIds');
@@ -90,9 +91,78 @@ test('validateRequest: forwarders, a range, services; defaults filled in', () =>
     assert.equal(bad({}, '2027-01-05'), 'windowEnd');                      // wholly in the past
     assert.equal(bad({ containerSize: '45HQ' }), 'containerSize');
     assert.equal(bad({ services: [] }), 'services');
-    assert.equal(bad({ services: ['by_air'] }), 'services');
+    assert.equal(bad({ services: [42] }), 'services');
+    assert.equal(bad({ services: ['two\nlines'] }), 'services');
+    assert.equal(bad({ services: Array.from({ length: 13 }, (_, i) => `Option ${i}`) }), 'services');
     assert.equal(bad({ expiryDays: 3 }), 'expiryDays');
     assert.equal(F.validateRequest({ ...body, batchId: undefined }, '2026-11-16').value.batchId, null);
+});
+
+test('delivery options are free text; the four old services keep their translation', () => {
+    assert.deepEqual(F.validateServices([' Door to port ', 'Deliver to Unit 5', 'DOOR TO PORT']).value, ['Door to port', 'Deliver to Unit 5']);
+    assert.deepEqual(F.validateDeliveryOption({ label: '  Port to door, tail-lift ' }).value, { label: 'Port to door, tail-lift' });
+    assert.equal(F.validateDeliveryOption({ label: '' }).field, 'label');
+    assert.equal(F.validateDeliveryOption({ label: 'x'.repeat(101) }).field, 'label');
+    assert.equal(F.validateDeliveryOption(null).field, 'body');
+    assert.deepEqual(F.DEFAULT_DELIVERY_OPTIONS, ['Door to door', 'Door to port', 'Port to port', 'Port to door']);
+
+    // A code from an old request, and its English name typed as text, read the same.
+    assert.equal(F.serviceCode('door_to_port'), 'door_to_port');
+    assert.equal(F.serviceCode(' Door to Port '), 'door_to_port');
+    assert.equal(F.serviceCode('Door to port (Felixstowe)'), null);
+    assert.equal(F.serviceName('door_to_port'), 'Door to port');
+    assert.equal(F.serviceName('Deliver to Unit 5'), 'Deliver to Unit 5');
+    assert.equal(F.serviceLabel('Door to port'), 'Door to port / 门到港');
+    assert.equal(F.serviceLabel('Deliver to Unit 5'), 'Deliver to Unit 5');
+    assert.deepEqual(F.servicesOf('["door_to_door","Deliver to Unit 5",""]'), ['door_to_door', 'Deliver to Unit 5']);
+
+    // An option names one of the request's own delivery options, exactly.
+    const request = { ...REQUEST, services: ['Deliver to Unit 5'] };
+    assert.equal(F.validateOptions([{ ...OPTION, service: 'Deliver to Unit 5' }], request).options[0].service, 'Deliver to Unit 5');
+    assert.equal(F.validateOptions([{ ...OPTION, service: 'deliver to unit 5' }], request).field, 'options[0].service');
+    assert.equal(F.validateOptions([{ ...OPTION, service: 7 }], request).field, 'options[0].service');
+});
+
+test('stock movements: a factory, a port or consolidation point, CBM and weight', () => {
+    const ok = F.validateMovements([
+        { from: ' Acme Medical ', to: 'Ningbo port', cbm: '12.5', weightKg: 2400 },
+        { from: 'Best Gloves', to: 'Ningbo consolidation', cbm: 3.255, weightKg: '610.55' },
+    ]);
+    assert.deepEqual(ok.value, [
+        { from: 'Acme Medical', to: 'Ningbo port', cbm: 12.5, weightKg: 2400 },
+        { from: 'Best Gloves', to: 'Ningbo consolidation', cbm: 3.255, weightKg: 610.55 },
+    ]);
+    assert.deepEqual(F.movementTotals(ok.value), { count: 2, cbm: 15.755, weightKg: 3010.55 });
+    assert.deepEqual(F.validateMovements(undefined).value, []);
+    assert.deepEqual(F.validateMovements([]).value, []);
+
+    const good = { from: 'A', to: 'B', cbm: 1, weightKg: 1 };
+    const field = patch => F.validateMovements([good, { ...good, ...patch }]).field;
+    assert.equal(field({ from: ' ' }), 'stockMovements[1].from');
+    assert.equal(field({ to: undefined }), 'stockMovements[1].to');
+    assert.equal(field({ cbm: 0 }), 'stockMovements[1].cbm');
+    assert.equal(field({ cbm: '1.2345' }), 'stockMovements[1].cbm');
+    assert.equal(field({ cbm: -2 }), 'stockMovements[1].cbm');
+    assert.equal(field({ weightKg: '' }), 'stockMovements[1].weightKg');
+    assert.equal(field({ weightKg: '12.345' }), 'stockMovements[1].weightKg');
+    assert.equal(F.validateMovements('no').field, 'stockMovements');
+    assert.equal(F.validateMovements(Array.from({ length: 31 }, () => good)).field, 'stockMovements');
+    assert.equal(F.validateMovements([null]).field, 'stockMovements[0]');
+
+    // As stored and read back; rubbish in the column reads as nothing.
+    assert.deepEqual(F.movementsOf(JSON.stringify(ok.value)), ok.value);
+    assert.deepEqual(F.movementsOf(null), []);
+    assert.deepEqual(F.movementsOf('{"not":"a list"}'), []);
+
+    assert.equal(F.movementsHtml([]), '');
+    const one = F.movementsHtml([{ from: 'Acme <Ningbo>', to: 'Port', cbm: 12.5, weightKg: 2400 }]);
+    assert.match(one, /Acme &lt;Ningbo&gt;/);
+    assert.match(one, />12\.5</);
+    assert.doesNotMatch(one, /Total/);                           // one row needs no total
+    const two = F.movementsHtml(ok.value);
+    assert.match(two, /Total \/ 合计/);
+    assert.match(two, />15\.755</);
+    assert.match(two, />3010\.55</);
 });
 
 test('requestState: revoked > expired > booked > answered > open', () => {
@@ -165,9 +235,15 @@ test('money and the emails\' fixed blocks', () => {
     assert.equal(F.money(1234567.5, 'GBP'), 'GBP 1,234,567.50');
 
     const quote = F.quoteBlockHtml({
-        request: { ...REQUEST, origin: 'Ningbo <factory>', destination: 'UK', note: 'Two pallets\nextra' },
+        request: {
+            ...REQUEST, origin: 'Ningbo <factory>', destination: 'UK', note: 'Two pallets\nextra',
+            stockMovements: [{ from: 'Acme Medical', to: 'Ningbo port', cbm: 12.5, weightKg: 2400 }],
+        },
         url: 'https://p.example/freight/abc', expiresOn: '2026-12-16', registerUrl: 'https://p.example/register',
     });
+    assert.match(quote, /Stock movements to include/);
+    assert.match(quote, /Acme Medical/);
+    assert.ok(quote.indexOf('Acme Medical') < quote.indexOf('Enter your quote'));   // above the button
     assert.match(quote, /href="https:\/\/p\.example\/freight\/abc"/);
     assert.match(quote, /Ningbo &lt;factory&gt;/);           // escaped
     assert.match(quote, /Two pallets<br>extra/);

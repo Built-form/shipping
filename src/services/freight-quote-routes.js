@@ -1,8 +1,8 @@
 'use strict';
 
-// /api/v1/forwarders, /api/v1/freight-quotes, /api/v1/freight-bookings —
-// asking freight forwarders for sailings and prices, booking one, and sending
-// the container's contents (docs/freight-quotes.md).
+// /api/v1/forwarders, /api/v1/freight-delivery-options, /api/v1/freight-quotes,
+// /api/v1/freight-bookings — asking freight forwarders for sailings and prices,
+// booking one, and sending the container's contents (docs/freight-quotes.md).
 //
 // Staff keep a list of forwarders (name + contacts). A request goes to one or
 // more of them for a date range: each gets its own row and its own no-login
@@ -60,7 +60,7 @@ const LIVE = F.LIVE_BOOKING_STATUSES;
 const isLive = b => Boolean(b) && LIVE.includes(b.status);
 
 const REQUEST_COLUMNS = `r.id, r.token, r.batch_id, r.forwarder_id, r.forwarder_name, r.window_start_date,
-        r.window_end_date, r.origin, r.destination, r.container_size, r.services, r.staff_note, r.sent_to,
+        r.window_end_date, r.origin, r.destination, r.container_size, r.services, r.stock_movements, r.staff_note, r.sent_to,
         r.subject, r.created_by_email, r.created_at, r.sent_at, r.expires_at, r.revoked_at, r.revoke_reason,
         r.answer_count, r.answered_at, r.answered_by_name, r.answered_by_email, r.answer_source, r.answer_note,
         r.declined, r.row_version, (r.expires_at <= UTC_TIMESTAMP()) AS expired`;
@@ -94,7 +94,9 @@ function requestFactsOf(row) {
         origin: row.origin || '',
         destination: row.destination || '',
         containerSize: row.container_size,
+        // The delivery options asked about, as text (an old request holds the four codes).
         services: F.servicesOf(row.services),
+        stockMovements: F.movementsOf(row.stock_movements),
         note: row.staff_note || null,
     };
 }
@@ -293,6 +295,109 @@ function registerFreightQuoteRoutes(app, deps) {
             return { ok: true, revoked: upd.affectedRows || 0 };
         }));
         res.json(out);
+    }));
+
+    // ── delivery options ────────────────────────────────────────────────────
+    // The list a request's delivery options are ticked from: free text, kept by
+    // staff. A request stores the text of the ones chosen, so rewording or
+    // removing an entry here never changes a request already sent.
+
+    async function loadDeliveryOptions(conn) {
+        const [rows] = await conn.query(
+            'SELECT id, label FROM freight_delivery_options WHERE deleted_at IS NULL ORDER BY id ASC'
+        );
+        return rows.map(r => ({ id: Number(r.id), label: r.label }));
+    }
+
+    // The same text twice (in any case) would be two boxes nobody can tell apart.
+    function refuseDuplicate(list, label, exceptId = null) {
+        const key = label.toLowerCase();
+        if (list.some(o => o.id !== exceptId && o.label.toLowerCase() === key)) {
+            throw new Fail(409, 'DUPLICATE', `"${label}" is already in the list.`, { field: 'label' });
+        }
+    }
+
+    // ── GET /api/v1/freight-delivery-options ────────────────────────────────
+    // { deliveryOptions: [{ id, label }] }, in the order they were added.
+    app.get('/api/v1/freight-delivery-options', route('GET /freight-delivery-options', async (req, res) => {
+        const deliveryOptions = await withConnection(async (conn) => {
+            try {
+                return await loadDeliveryOptions(conn);
+            } catch (e) {
+                if (e.errno !== TABLE_MISSING) throw e;
+                return [];
+            }
+        });
+        res.json({ deliveryOptions });
+    }));
+
+    // ── POST /api/v1/freight-delivery-options ───────────────────────────────
+    // Body { label } → { deliveryOptions } (the whole list again).
+    app.post('/api/v1/freight-delivery-options', route('POST /freight-delivery-options', async (req, res) => {
+        refuseReadOnly(req);
+        const v = F.validateDeliveryOption(req.body);
+        if (v.code) throw invalid(v);
+        const deliveryOptions = await withConnection(conn => inTransaction(conn, async () => {
+            const list = await loadDeliveryOptions(conn);
+            if (list.length >= F.MAX_DELIVERY_OPTIONS) {
+                throw new Fail(409, 'LIST_FULL', `The list holds at most ${F.MAX_DELIVERY_OPTIONS} delivery options. Remove one first.`);
+            }
+            refuseDuplicate(list, v.value.label);
+            const [ins] = await conn.query(
+                'INSERT INTO freight_delivery_options (label, created_by_email) VALUES (?, ?)',
+                [v.value.label, req.userEmail || null]
+            );
+            await recordAudit(conn, {
+                entityType: 'freight_delivery_option', entityId: Number(ins.insertId), action: 'create',
+                before: null, after: v.value, userEmail: req.userEmail,
+            });
+            return loadDeliveryOptions(conn);
+        }));
+        res.status(201).json({ deliveryOptions });
+    }));
+
+    // ── PATCH /api/v1/freight-delivery-options/:id ──────────────────────────
+    // Body { label } → { deliveryOptions }. Requests already sent keep the old text.
+    app.patch('/api/v1/freight-delivery-options/:id(\\d+)', route('PATCH /freight-delivery-options/:id', async (req, res) => {
+        refuseReadOnly(req);
+        const id = Number(req.params.id);
+        const v = F.validateDeliveryOption(req.body);
+        if (v.code) throw invalid(v);
+        const deliveryOptions = await withConnection(conn => inTransaction(conn, async () => {
+            const list = await loadDeliveryOptions(conn);
+            const before = list.find(o => o.id === id);
+            if (!before) throw new Fail(404, 'NOT_FOUND', `Delivery option ${id} not found.`);
+            refuseDuplicate(list, v.value.label, id);
+            if (before.label !== v.value.label) {
+                await conn.query('UPDATE freight_delivery_options SET label = ? WHERE id = ?', [v.value.label, id]);
+                await recordAudit(conn, {
+                    entityType: 'freight_delivery_option', entityId: id, action: 'update',
+                    before: { label: before.label }, after: v.value, userEmail: req.userEmail,
+                });
+            }
+            return loadDeliveryOptions(conn);
+        }));
+        res.json({ deliveryOptions });
+    }));
+
+    // ── DELETE /api/v1/freight-delivery-options/:id ─────────────────────────
+    // Soft. Requests already sent keep the text. Removing one twice is a no-op.
+    // → { deliveryOptions }
+    app.delete('/api/v1/freight-delivery-options/:id(\\d+)', route('DELETE /freight-delivery-options/:id', async (req, res) => {
+        refuseReadOnly(req);
+        const id = Number(req.params.id);
+        const deliveryOptions = await withConnection(conn => inTransaction(conn, async () => {
+            const before = (await loadDeliveryOptions(conn)).find(o => o.id === id);
+            if (before) {
+                await conn.query('UPDATE freight_delivery_options SET deleted_at = UTC_TIMESTAMP() WHERE id = ?', [id]);
+                await recordAudit(conn, {
+                    entityType: 'freight_delivery_option', entityId: id, action: 'delete',
+                    before: { label: before.label }, after: null, userEmail: req.userEmail,
+                });
+            }
+            return loadDeliveryOptions(conn);
+        }));
+        res.json({ deliveryOptions });
     }));
 
     // ── reading requests, options and bookings ──────────────────────────────
@@ -570,7 +675,11 @@ function registerFreightQuoteRoutes(app, deps) {
 
     // ── POST /api/v1/freight-quotes ─────────────────────────────────────────
     // Body { forwarderIds, batchId?, windowStart, windowEnd, origin?, destination?,
-    //        containerSize?, services, note?, expiryDays?, subject?, body? }.
+    //        containerSize?, services, stockMovements?, note?, expiryDays?,
+    //        subject?, body? }. `services` are the delivery options asked about,
+    //        as text; `stockMovements` [{ from, to, cbm, weightKg }]; `subject`
+    //        and `body` the email as staff edited it in the dialog ({tokens}
+    //        still filled in per forwarder), the template's when left out.
     // One request row, one link and one email per forwarder, all sharing
     // `batchId` (the send dialog makes it once). SAFE TO RETRY with the same
     // batchId: a forwarder that already has a row for it is reported as it
@@ -626,7 +735,7 @@ function registerFreightQuoteRoutes(app, deps) {
                 const vars = {
                     forwarder: fw.name, windowStart: want.windowStart, windowEnd: want.windowEnd,
                     origin: want.origin, destination: want.destination, containerSize: want.containerSize,
-                    services: want.services.map(s => F.SERVICE_LABELS[s]).join(', '),
+                    services: want.services.map(F.serviceName).join(', '),
                 };
                 const finalSubject = ((typeof subject === 'string' && subject.trim())
                     ? renderTemplate(subject.trim(), vars)
@@ -639,11 +748,13 @@ function registerFreightQuoteRoutes(app, deps) {
                     const [ins] = await conn.query(
                         `INSERT INTO freight_quote_requests
                             (token, batch_id, forwarder_id, forwarder_name, window_start_date, window_end_date, origin,
-                             destination, container_size, services, staff_note, sent_to, subject, created_by_email, expires_at)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP() + INTERVAL ? DAY)`,
+                             destination, container_size, services, stock_movements, staff_note, sent_to, subject,
+                             created_by_email, expires_at)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP() + INTERVAL ? DAY)`,
                         [
                             token, batchId, fw.id, fw.name, want.windowStart, want.windowEnd, want.origin,
-                            want.destination, want.containerSize, JSON.stringify(want.services), want.note,
+                            want.destination, want.containerSize, JSON.stringify(want.services),
+                            want.stockMovements.length ? JSON.stringify(want.stockMovements) : null, want.note,
                             JSON.stringify(addresses), finalSubject, req.userEmail || null, want.expiryDays,
                         ]
                     );
@@ -705,7 +816,7 @@ function registerFreightQuoteRoutes(app, deps) {
                         batchId, forwarderId: fw.id, forwarder: fw.name, to: addresses, subject: finalSubject,
                         windowStart: want.windowStart, windowEnd: want.windowEnd, origin: want.origin,
                         destination: want.destination, containerSize: want.containerSize, services: want.services,
-                        expiresOn, frontMessageUid: sent.frontMessageUid, frontConversationId: sent.frontConversationId,
+                        stockMovements: want.stockMovements, expiresOn, frontMessageUid: sent.frontMessageUid, frontConversationId: sent.frontConversationId,
                     },
                     userEmail: req.userEmail,
                 });
@@ -906,7 +1017,7 @@ function registerFreightQuoteRoutes(app, deps) {
                 const tpl = await getEmailTemplate(conn, FREIGHT_BOOKING_REQUEST_TEMPLATE_KEY);
                 const vars = {
                     forwarder: request.forwarder_name || '', sailingDate: o.sailingDate, loadingDate: o.loadingDate,
-                    portFrom: o.portFrom, portTo: o.portTo, service: F.SERVICE_LABELS[o.service] || o.service,
+                    portFrom: o.portFrom, portTo: o.portTo, service: F.serviceName(o.service),
                     containerSize: o.containerSize, price: F.money(o.price, o.currency),
                 };
                 const finalSubject = ((typeof subject === 'string' && subject.trim())
