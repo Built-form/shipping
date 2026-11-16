@@ -1,19 +1,27 @@
 'use strict';
 
-// Sends one plain HTML email through Front (/channels/{FRONT_CHANNEL_ID}/messages),
-// no attachments, and NEVER throws: the caller records the outcome. Used by the
-// supplier-portal PI decision email (src/services/pi-submission-routes.js); the
-// older document-send handlers in orders.js and receipt-reminders.js build
-// their own multipart requests and are left as they are.
+// Sends one HTML email through Front (/channels/{FRONT_CHANNEL_ID}/messages)
+// and NEVER throws: the caller records the outcome. Used by the
+// supplier-portal PI decision email (src/services/pi-submission-routes.js) and
+// the others that followed it; the older document-send handlers in orders.js
+// and receipt-reminders.js build their own multipart requests and are left as
+// they are.
+//
+// `attachments` (optional): [{ filename, contentType, bytes }], files that ride
+// on the email (a payment's proof, src/services/payment-notices.js). Without
+// any, the request is exactly what it was before attachments existed.
 //
 // → { ok: true, frontMessageUid, frontConversationId }
 //   { ok: false, reason: 'no_recipients' | 'front_not_configured' | 'front_error' | 'network_error', status?, detail? }
+// 'front_error' is Front ANSWERING with a refusal: nothing was sent.
+// 'network_error' is no answer at all (a timeout, a dropped connection): the
+// email may or may not have gone.
 
 const log = require('../lib/logger');
 
 const SEND_TIMEOUT_MS = 15 * 1000;
 
-async function sendFrontMessage({ to, subject, html }, { fetchImpl = globalThis.fetch, env = process.env } = {}) {
+async function sendFrontMessage({ to, subject, html, attachments = [] }, { fetchImpl = globalThis.fetch, env = process.env } = {}) {
     try {
         const recipients = (Array.isArray(to) ? to : [to])
             .filter(x => typeof x === 'string').map(x => x.trim()).filter(Boolean);
@@ -26,6 +34,9 @@ async function sendFrontMessage({ to, subject, html }, { fetchImpl = globalThis.
         form.append('body', String(html || ''));
         form.append('body_format', 'html');
         form.append('options[archive]', 'false');
+        for (const a of attachments || []) {
+            form.append('attachments[]', new Blob([a.bytes], { type: a.contentType || 'application/octet-stream' }), a.filename);
+        }
 
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), SEND_TIMEOUT_MS);

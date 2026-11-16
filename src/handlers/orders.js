@@ -80,6 +80,11 @@ const { registerArtworkConfirmationRoutes } = require('../services/artwork-confi
 // Bank-detail verification on portal PIs: the positive payment gate (isPayable).
 const bankVerification = require('../lib/bank-verification');
 const { registerPaymentDueDateRoutes } = require('../services/payment-due-date-routes');
+// "Send to supplier" on a recorded payment (docs/payment-proof-send.md).
+const paymentNotices = require('../services/payment-notices');
+const { registerPaymentNoticeRoutes } = require('../services/payment-notice-routes');
+// Telex releases: filed per supplier per shipment (docs/telex-releases.md).
+const { registerTelexReleaseRoutes, telexSummaries } = require('../services/telex-release-routes');
 const { registerUiHintRoutes } = require('../services/ui-hint-routes');
 const extrasLib = require('../lib/payment-extras');
 const { correctBalance } = require('../lib/balance-correction');
@@ -8606,6 +8611,15 @@ app.post('/api/v1/email-receipts/:id/resend', async (req, res) => {
         if (!canRemind(receipt)) {
             return res.status(422).json({ error: 'There is no reminder for this email: it asks for nothing by email.' });
         }
+        // A payment email is not reminded about once its payment is deleted or
+        // belongs to another supplier: the reminder would point the old
+        // recipients at something they can no longer open
+        // (docs/payment-proof-send.md). Every other reminder goes as before.
+        const stale = await withConnection(conn => paymentNotices.reminderRefusal(conn, receipt));
+        if (stale) {
+            const { status, ...body } = stale;
+            return res.status(status).json(body);
+        }
 
         // Same send path the auto-reminder sweep uses (reuses the original
         // token, shows the reminder count).
@@ -11326,6 +11340,35 @@ async function loadSupplierPaymentById(conn, id) {
     return (await hydrateSupplierPayments(conn, rows))[0] || null;
 }
 
+// `notices` on each transfer the API hands back: whether its deposit part and
+// its balance part have been sent to the supplier (docs/payment-proof-send.md;
+// [{ kind, state, lastSentAt, delivery }]). null on a server without the send
+// log, which is how ShipLine knows to hide the feature. Added to the response
+// only, after the audit snapshot is taken: it is not part of the transfer.
+// A fault reading it is logged and answered as null: it must never take the
+// payments list down.
+async function withPaymentNotices(conn, transfers) {
+    let notices = null;
+    try {
+        notices = await paymentNotices.noticeSummaries(conn, transfers);
+    } catch (e) {
+        log.warn('[supplier-payments] the send state of these payments could not be read', { error: e.message, errno: e.errno });
+    }
+    for (const t of transfers) t.notices = notices ? (notices.get(t.id) || []) : null;
+    // `telex`: each container a balance line of the transfer paid, and whether
+    // its telex release is in (docs/telex-releases.md; [{ shipmentId, reference,
+    // state, releases, submissionId, note }]). null on a server without the
+    // table, and when it could not be read: the list never fails over it.
+    let telex = null;
+    try {
+        telex = await telexSummaries(conn, transfers);
+    } catch (e) {
+        log.warn('[supplier-payments] the telex releases of these payments could not be read', { error: e.message, errno: e.errno });
+    }
+    for (const t of transfers) t.telex = telex ? (telex.get(t.id) || []) : null;
+    return transfers;
+}
+
 // Validates a transfer body. `partial` (PUT) checks only what was sent.
 function parseSupplierPaymentBody(body, { partial = false } = {}) {
     const b = body && typeof body === 'object' ? body : {};
@@ -11840,7 +11883,7 @@ app.get('/api/v1/supplier-payments', async (req, res) => {
         }
         const out = await withConnection(async (conn) => {
             const [rows] = await conn.query(`SELECT sp.* FROM supplier_payments sp WHERE ${where.join(' AND ')} ORDER BY sp.paid_on DESC, sp.id DESC`, params);
-            const data = await hydrateSupplierPayments(conn, rows);
+            const data = await withPaymentNotices(conn, await hydrateSupplierPayments(conn, rows));
             const docWhere = [
                 'd.deleted_at IS NULL', 'd.supplier_payment_id IS NULL', 'd.payment_id IS NULL',
                 // A proof: a remittance, or anything on the supplier alone — except
@@ -12181,6 +12224,7 @@ app.post('/api/v1/supplier-payments', async (req, res) => {
                 const json = await loadSupplierPaymentById(conn, paymentId);
                 await recordAudit(conn, { entityType: 'supplier_payment', entityId: paymentId, action: 'create', before: null, after: json, userEmail: req.userEmail });
                 await conn.commit();
+                await withPaymentNotices(conn, [json]);
                 return { json, warnings };
             } catch (e) {
                 await conn.rollback().catch(() => {});
@@ -12266,6 +12310,7 @@ app.put('/api/v1/supplier-payments/:id(\\d+)', async (req, res) => {
                 const json = await loadSupplierPaymentById(conn, id);
                 await recordAudit(conn, { entityType: 'supplier_payment', entityId: id, action: 'update', before, after: json, userEmail: req.userEmail });
                 await conn.commit();
+                await withPaymentNotices(conn, [json]);
                 return { json, warnings };
             } catch (e) {
                 await conn.rollback().catch(() => {});
@@ -12324,6 +12369,45 @@ app.delete('/api/v1/supplier-payments/:id(\\d+)', async (req, res) => {
         log.error('[DELETE /supplier-payments/:id]', error);
         res.status(500).json({ error: 'An internal error occurred.' });
     }
+});
+
+// ── A recorded payment sent to its supplier ──────────────────────────────
+// /api/v1/supplier-payments/:id/notices[/:kind/email] and
+// /api/v1/supplier-payment-sends/:sendId/resolve: the proof of a payment
+// emailed to the supplier as a link to the portal's Payments page, or attached
+// where the supplier is not on the portal. The send takes the same locks an
+// edit of the payment does (lockSupplierPaymentTargets above), which is why it
+// is handed over. docs/payment-proof-send.md.
+registerPaymentNoticeRoutes(app, {
+    withConnection,
+    ready: async () => {
+        await shipmentPaymentsSchemaReady;
+        await auditLogSchemaReady;
+        await emailTemplatesSchemaReady;
+        await emailReceiptsSchemaReady;
+    },
+    s3,
+    bucket: () => PO_BUCKET,
+    lockSupplierPaymentTargets,
+    getEmailTemplate,
+    recordAudit,
+    log,
+});
+
+// Telex releases: /api/v1/telex-releases (filed per supplier per shipment, by
+// our team or accepted from the portal) and /api/v1/telex-submissions (what
+// suppliers uploaded on the portal's Payments page). docs/telex-releases.md.
+registerTelexReleaseRoutes(app, {
+    withConnection,
+    ready: async () => {
+        await shipmentsSchemaReady;
+        await auditLogSchemaReady;
+    },
+    s3,
+    poBucket: PO_BUCKET,
+    publicS3Url,
+    recordAudit,
+    log,
 });
 
 // ── Shipments (/api/v1/shipments) ────────────────────────────────────────

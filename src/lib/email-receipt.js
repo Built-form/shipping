@@ -142,8 +142,10 @@ async function linkReceiptToSend(conn, token, sendTable, sendId) {
 // it's already confirmed. Returns null for an unknown id.
 async function getReceiptForResend(conn, id) {
     if (!Number.isFinite(Number(id))) return null;
+    // send_table, send_id: which send the email belongs to, for a guard that
+    // must look at it before a reminder goes (a payment's, in orders.js).
     const [rows] = await conn.query(
-        `SELECT id, token, email_type, sent_to, subject, confirmed_at, reminder_count, confirm_via, action_url
+        `SELECT id, token, email_type, sent_to, subject, confirmed_at, reminder_count, confirm_via, action_url, send_table, send_id
            FROM email_receipts WHERE id = ?`,
         [Number(id)]
     );
@@ -291,6 +293,14 @@ const JFPRO_AUDIT = 'jfpro.audit_log';
 const PORTAL_APPROVAL_SUBJECT = 'Your supplier portal account is approved / 您的供应商门户账户已获批准';
 
 const PENDING_PORTAL = `r.confirm_via = 'portal' AND r.confirmed_at IS NULL`;
+
+// Emails the scheduled sweep never reminds about, whichever way they went out
+// (a portal link, or attached with the confirm button): a payment sent to a
+// supplier (docs/payment-proof-send.md; the user chose no automatic reminders
+// for these, 2026-11-16). By type, not by send table, so a receipt minted
+// before its send row exists is left alone too. The manual "Send reminder"
+// still works for them. The names are literals, inlined into the sweep's SQL.
+const NEVER_SWEPT_TYPES = ['payment_proof'];
 
 // The portal emails that are chased (they store an action_url), by the send
 // table their receipt names, with the sync step that confirms each. A step that
@@ -488,6 +498,9 @@ function portalSyncSteps(jp) {
     const availabilityAnswer = `${jp}.qc_availability_requests a
                  WHERE a.visit_id = s.visit_id AND a.party = s.audience
                    AND a.answered_at >= r.created_at`;
+    const paymentView = `${jp}.payment_views v
+                 WHERE v.supplier_payment_id = s.supplier_payment_id
+                   AND v.last_viewed_at >= r.created_at`;
     return [
         // The PO email: a supplier's user opened that PDF on the portal.
         ['po_viewed', `
@@ -578,6 +591,16 @@ function portalSyncSteps(jp) {
                SET r.confirmed_at = q.answered_at
              WHERE ${PENDING_PORTAL} AND r.send_table = '${JFPRO_AUDIT}' AND r.email_type = 'quote_request'
                AND q.answered_at IS NOT NULL`],
+        // A payment sent as a portal link (docs/payment-proof-send.md): a
+        // supplier's user opened that payment on the portal after the email
+        // (the portal's own payment_views; opening a proof records one too).
+        ['payment_viewed', `
+            UPDATE email_receipts r
+              JOIN supplier_payment_sends s ON s.id = r.send_id
+               SET r.confirmed_at = (SELECT MIN(IF(v.first_viewed_at >= r.created_at, v.first_viewed_at, v.last_viewed_at))
+                                       FROM ${paymentView})
+             WHERE ${PENDING_PORTAL} AND r.send_table = 'supplier_payment_sends'
+               AND EXISTS (SELECT 1 FROM ${paymentView})`],
     ];
 }
 
@@ -631,7 +654,7 @@ async function syncPortalReceipts(conn, { maxAgeMs = PORTAL_SYNC_MS } = {}) {
     } catch (e) {
         // JPORTAL_DB_SCHEMA is not a plain identifier: nothing can be read.
         log.warn('[email-receipt] portal sync skipped', { error: e.message });
-        return { failed: ['po_viewed', 'signed_pi_viewed', 'request_viewed', 'request_pl_uploaded', 'request_ci_uploaded', 'artwork_ticked', 'file_opened', 'qc_availability_answered', 'qc_schedule_opened', 'quote_answered', ...failed] };
+        return { failed: ['po_viewed', 'signed_pi_viewed', 'request_viewed', 'request_pl_uploaded', 'request_ci_uploaded', 'artwork_ticked', 'file_opened', 'qc_availability_answered', 'qc_schedule_opened', 'quote_answered', 'payment_viewed', ...failed] };
     }
     for (const [name, sql] of steps) await run(name, () => conn.query(sql));
     return { failed };
@@ -787,6 +810,7 @@ module.exports = {
     appendReceiptLink,
     appendPortalLink,
     CHASED_PORTAL_STEPS,
+    NEVER_SWEPT_TYPES,
     portalSyncSteps,
     requestUploadSources,
     REMINDERS_STOPPED,
