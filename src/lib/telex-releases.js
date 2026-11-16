@@ -2,9 +2,12 @@
 
 // Telex releases (docs/telex-releases.md): the telex-released bill of lading a
 // supplier sends once a container's balance is paid. One per supplier per
-// shipment, as a packing list or an invoice is. Filed by our team from the
-// payment, or uploaded by the supplier on the portal's Payments page and
-// accepted here.
+// shipment, as a packing list or an invoice is. Filed by our team, or uploaded
+// by the supplier on the portal's Payments page and accepted here.
+//
+// They are shown where a shipment's other papers are: a TELEX tab on the
+// shipment card and the container card, one block a supplier, as its packing
+// lists are (the user, 2026-11-16: there, not on the Payments page).
 //
 // They live in their OWN table (shipment_telex_releases), not as another
 // doc_kind of shipment_payment_documents: some thirty readers of that table
@@ -12,8 +15,8 @@
 // invoice check, offered to pay, shown as a balance's invoice file), and one
 // of them rewrites a row to a proof of payment when a document reads like one.
 //
-// These are the rules, pure: which containers of a transfer are owed one, the
-// state of each, what a file must be, and who may file, accept, send back or
+// These are the rules, pure: a shipment's suppliers with where each one's
+// release stands, what a file must be, and who may file, accept, send back or
 // delete. The SQL and the routes are in src/services/telex-release-routes.js.
 
 const PI = require('./pi-submissions');
@@ -34,23 +37,6 @@ const sameName = (a, b) => typeof a === 'string' && typeof b === 'string' && a !
 const refusal = (status, code, error, extra = {}) => ({ status, code, error, ...extra });
 const CANNOT_FILE = () => refusal(403, 'CANNOT_FILE', 'Your role cannot file or delete a telex release: admin and standard users do.');
 
-/**
- * The containers of a transfer that are owed a telex release: one per
- * shipment a live `balance` line paid (a top-up is a balance too), each once,
- * in the order met. `transfer` is a supplier payment as the API hands it out
- * (lines with kind, shipmentId, shipmentReference, targetMissing).
- * A PI paid through containers names them by reference only, so it asks for
- * none here: our team file that one from the shipment.
- */
-function slotsFor(transfer) {
-    const out = [];
-    for (const l of (transfer && transfer.lines) || []) {
-        if (l.kind !== 'balance' || l.shipmentId == null || l.targetMissing) continue;
-        if (!out.some(s => s.shipmentId === l.shipmentId)) out.push({ shipmentId: l.shipmentId, reference: l.shipmentReference ?? null });
-    }
-    return out;
-}
-
 const later = (a, b) => String(b.createdAt).localeCompare(String(a.createdAt)) || (b.id - a.id);
 
 /**
@@ -69,26 +55,41 @@ function stateOf(releases, submissions) {
 }
 
 /**
- * A transfer's containers with the state of each, for the transfer's own
- * supplier (by exact name): what the Payments page shows on a balance.
- * `releases`: live filed rows; `submissions`: the portal's rows.
+ * One shipment's suppliers, each with where its telex release stands: what the
+ * shipment card's TELEX tab lists, a block a supplier.
+ *   onBoard      the suppliers of the shipment's order lines;
+ *   balances     the suppliers its balance records are filed under (the name
+ *                the portal knows a paid balance by);
+ *   releases     the shipment's live filed rows; submissions: the portal's.
+ * A supplier is whoever any of the four names, each once, by EXACT name: two
+ * spellings are two blocks, which is how a release filed under the wrong one
+ * gets seen. Those on the shipment or with a balance come first, by name.
+ * `upload`: the supplier's upload still waiting for us (shown even when a
+ * release is already filed), else the one we last sent back.
  */
-function summariesFor(transfer, releases, submissions) {
-    return slotsFor(transfer).map((slot) => {
-        const mine = r => r.shipmentId === slot.shipmentId && sameName(r.supplierName, transfer.supplierName);
-        const filed = (releases || []).filter(mine);
-        const uploads = (submissions || []).filter(mine);
-        const state = stateOf(filed, uploads);
-        const latest = uploads.filter(s => s.sent && (s.status === 'open' || s.status === 'rejected')).sort(later)[0] || null;
+function suppliersOf({ onBoard = [], balances = [], releases = [], submissions = [] } = {}) {
+    const names = [];
+    const add = (name) => { if (typeof name === 'string' && name !== '' && !names.includes(name)) names.push(name); };
+    onBoard.forEach(add);
+    balances.forEach(add);
+    releases.forEach(r => add(r.supplierName));
+    submissions.forEach(s => add(s.supplierName));
+    const rows = names.map((name) => {
+        const filed = releases.filter(r => sameName(r.supplierName, name));
+        const reached = submissions.filter(s => sameName(s.supplierName, name) && s.sent && (s.status === 'open' || s.status === 'rejected')).sort(later);
+        const state = stateOf(filed, reached);
+        const waiting = reached.find(s => s.status === 'open') || null;
         return {
-            shipmentId: slot.shipmentId,
-            reference: slot.reference,
+            supplierName: name,
+            onBoard: onBoard.includes(name),
+            balance: balances.includes(name),
             state,
-            releases: filed.map(r => ({ id: r.id, filename: r.filename, url: r.url, createdAt: r.createdAt })),
-            submissionId: state === 'uploaded' || state === 'rejected' ? latest.id : null,
-            note: state === 'rejected' ? (latest.note ?? null) : null,
+            releases: filed,
+            upload: waiting || (state === 'rejected' ? reached[0] : null),
         };
     });
+    const here = r => (r.onBoard || r.balance ? 0 : 1);
+    return rows.sort((a, b) => here(a) - here(b) || a.supplierName.localeCompare(b.supplierName, 'en'));
 }
 
 // ── A file ──────────────────────────────────────────────────────────────────
@@ -157,6 +158,6 @@ function decisionRefusal(submission, { userType, action, note }) {
 
 module.exports = {
     MAX_BYTES, FILE_ROLES, NOTE_MAX,
-    mayFile, sameName, slotsFor, stateOf, summariesFor,
+    mayFile, sameName, stateOf, suppliersOf,
     typeOf, uploadRefusal, s3KeyFor, deleteRefusal, cleanNote, decisionRefusal,
 };

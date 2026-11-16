@@ -9,7 +9,7 @@
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { registerTelexReleaseRoutes, telexSummaries } = require('../src/services/telex-release-routes');
+const { registerTelexReleaseRoutes } = require('../src/services/telex-release-routes');
 
 process.env.PI_UPLOADS_BUCKET = 'portal-bucket';
 const SUPPLIER = 'Acme Medical Co., Ltd';
@@ -311,29 +311,80 @@ test('the supplier\'s file: a short link to the portal\'s copy, only once it has
     assert.equal(noCopy.s3Calls.length, 0);
 });
 
-const transfer = (lines, over = {}) => ({ id: 45, supplierName: SUPPLIER, lines, ...over });
-const balance = (shipmentId, reference) => ({ kind: 'balance', amount: 100, shipmentId, shipmentReference: reference, targetMissing: false });
+const LIST = 'GET /api/v1/telex-releases';
+const OTHER = 'Other Factory Ltd';
+const listRules = (over = {}) => [
+    [/^SELECT id, reference FROM shipments WHERE id = \?$/, over.shipment ?? [[{ id: 61, reference: '333' }]]],
+    [/^SELECT DISTINCT o\.supplier AS name FROM orders o/, over.onBoard ?? [[{ name: SUPPLIER }, { name: OTHER }]]],
+    [/^SELECT DISTINCT p\.supplier_name AS name FROM shipment_payments p/, over.balances ?? [[{ name: SUPPLIER }]]],
+    [/FROM shipment_telex_releases r WHERE r\.deleted_at IS NULL AND r\.shipment_id IN \(\?\)/, over.releases ?? [[RELEASE_ROW()]]],
+    [/FROM `jportal`\.telex_submissions t .* WHERE t\.shipment_id IN \(\?\) AND t\.transfer_id IS NOT NULL/, over.uploads ?? [[SUBMISSION_ROW({ supplier_name: OTHER })]]],
+];
 
-test('telexSummaries: null on a server without the table, else each transfer\'s containers', async () => {
-    const none = scripted([[/FROM shipment_telex_releases/, err(1146)]]);
-    assert.equal(await telexSummaries(none.conn, [transfer([balance(61, '333')])]), null);
-    assert.equal(await telexSummaries(none.conn, [transfer([])]), null, 'even with nothing to look up');
+test('the shipment\'s list: a block a supplier, from its lines and its balances, with what is filed and what the supplier uploaded', async () => {
+    const t = build(listRules());
+    const r = await t.call(LIST, { query: { shipmentId: '61' } });
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.body, {
+        shipmentId: 61, reference: '333', canFile: true,
+        suppliers: [
+            {
+                supplierName: SUPPLIER, onBoard: true, balance: true, state: 'received', upload: null,
+                releases: [{
+                    id: 9, shipmentId: 61, shipmentReference: '333', supplierName: SUPPLIER, filename: 'telex.pdf', url: 'https://po.example/telex-releases/u/telex.pdf',
+                    contentType: 'application/pdf', fileSize: PDF.length, source: 'staff', portalSubmissionId: null, notes: null, uploadedByEmail: 'ops@us.com', createdAt: '2026-11-16T10:00:00Z',
+                }],
+            },
+            {
+                supplierName: OTHER, onBoard: true, balance: false, state: 'uploaded', releases: [],
+                upload: {
+                    id: 3, status: 'open', sent: true, supplierPaymentId: 45, shipmentId: 61, shipmentReference: '333', shipmentLive: true, containerRef: '333', supplierName: OTHER,
+                    uploadedByEmail: 'factory@acme.example', createdAt: '2026-11-16T09:00:00Z', note: null, decidedBy: null, decidedAt: null, releaseId: null,
+                    file: { transferId: 800, filename: 'TLX 333.pdf', contentType: 'application/pdf', fileSize: PDF.length, sentAt: '2026-11-16T09:01:00Z' },
+                },
+            },
+        ],
+    });
+    // Who is on the shipment: its live order lines, booked (orders.shipment_id) or still planned (shipment_lines).
+    const [, onBoard, balances] = t.db.asked;
+    assert.equal(onBoard.sql, "SELECT DISTINCT o.supplier AS name FROM orders o WHERE o.deleted_at IS NULL AND o.status <> 'DESTROYED'"
+        + " AND o.supplier IS NOT NULL AND o.supplier <> '' AND (o.shipment_id = ? OR o.id IN (SELECT sl.order_id FROM shipment_lines sl WHERE sl.shipment_id = ?))");
+    assert.deepEqual(onBoard.params, [61, 61]);
+    assert.equal(balances.sql, "SELECT DISTINCT p.supplier_name AS name FROM shipment_payments p WHERE p.shipment_id = ? AND p.deleted_at IS NULL AND p.supplier_name IS NOT NULL AND p.supplier_name <> ''");
+    assert.deepEqual(balances.params, [61]);
+    assert.equal(t.db.wrote(/^(INSERT|UPDATE|DELETE)/).length, 0, 'a read writes nothing');
+});
 
-    const some = scripted([
-        [/FROM shipment_telex_releases r WHERE r\.deleted_at IS NULL AND r\.shipment_id IN \(\?\)/, [[RELEASE_ROW()]]],
-        [/FROM `jportal`\.telex_submissions t .* WHERE t\.shipment_id IN \(\?\) AND t\.transfer_id IS NOT NULL/, [[SUBMISSION_ROW({ shipment_id: 62, shipment_reference: '334' })]]],
+test('the shipment\'s list: anyone may read it, only some may file; no shipment, no list', async () => {
+    const viewer = build(listRules());
+    assert.equal((await viewer.call(LIST, { query: { shipmentId: '61' }, userType: 'viewer' })).body.canFile, false);
+    assert.equal((await viewer.call(LIST, { query: { shipmentId: '61' }, userType: 'accountant' })).body.canFile, false);
+
+    const none = build(listRules({ shipment: [[]] }));
+    assert.deepEqual(await none.call(LIST, { query: { shipmentId: '61' } }), { status: 404, body: { code: 'NO_SUCH_SHIPMENT', error: 'That shipment does not exist.' } });
+    for (const shipmentId of [undefined, '', 'abc', '0', '-3', '1.5']) {
+        const bad = build([]);
+        assert.deepEqual(await bad.call(LIST, { query: { shipmentId } }), { status: 400, body: { error: 'shipmentId is required.', code: 'BAD_FIELD' } }, String(shipmentId));
+        assert.equal(bad.db.asked.length, 0);
+    }
+});
+
+test('the shipment\'s list: a server without the portal lists what is filed; one without the table says so', async () => {
+    const noPortal = build(listRules({ uploads: err(1142) }));
+    const r = await noPortal.call(LIST, { query: { shipmentId: '61' } });
+    assert.deepEqual(r.body.suppliers.map(x => [x.supplierName, x.state, x.upload]), [[SUPPLIER, 'received', null], [OTHER, 'awaiting', null]]);
+
+    const noTable = build(listRules({ releases: err(1146) }));
+    assert.deepEqual(await noTable.call(LIST, { query: { shipmentId: '61' } }),
+        { status: 503, body: { error: 'Telex releases are not set up on this server yet: their table has not been migrated.', code: 'NOT_MIGRATED' } });
+});
+
+test('the shipment\'s list: a shipment with nothing filed still lists who is on it, and a deleted release is not read', async () => {
+    const t = build(listRules({ balances: [[]], releases: [[]], uploads: [[]] }));
+    const r = await t.call(LIST, { query: { shipmentId: '61' } });
+    assert.deepEqual(r.body.suppliers, [
+        { supplierName: SUPPLIER, onBoard: true, balance: false, state: 'awaiting', releases: [], upload: null },
+        { supplierName: OTHER, onBoard: true, balance: false, state: 'awaiting', releases: [], upload: null },
     ]);
-    const out = await telexSummaries(some.conn, [transfer([balance(61, '333'), balance(62, '334')]), transfer([], { id: 46 })]);
-    assert.deepEqual(out.get(45).map(s => [s.shipmentId, s.state, s.submissionId]), [[61, 'received', null], [62, 'uploaded', 3]]);
-    assert.deepEqual(out.get(46), []);
-    assert.deepEqual(some.asked[0].params, [[61, 62]]);
-
-    const noPortal = scripted([
-        [/FROM shipment_telex_releases r WHERE/, [[]]],
-        [/FROM `jportal`\.telex_submissions t/, err(1142)],
-    ]);
-    assert.deepEqual((await telexSummaries(noPortal.conn, [transfer([balance(61, '333')])])).get(45).map(s => s.state), ['awaiting']);
-
-    const empty = scripted([[/^SELECT 1 FROM shipment_telex_releases LIMIT 0/, [[]]]]);
-    assert.deepEqual([...(await telexSummaries(empty.conn, [transfer([])])).entries()], [[45, []]]);
+    assert.match(t.db.asked.find(a => /FROM shipment_telex_releases r/.test(a.sql)).sql, /WHERE r\.deleted_at IS NULL AND r\.shipment_id IN \(\?\) ORDER BY r\.created_at DESC, r\.id DESC$/);
 });

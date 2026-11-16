@@ -27,26 +27,33 @@ Each could be guarded, and every reader written later would have to be too. A ta
 
 More than one row per supplier and shipment is allowed (a corrected copy); the newest is listed first.
 
-## Which containers ask for one
+## Where they are shown
 
-One per shipment a live **`balance`** line of a transfer paid (a top-up is a balance too), for the transfer's own supplier. `GET /api/v1/supplier-payments`, and the transfer returned by `POST` and `PUT`, carry:
+On the **shipment card and the container card**, in a **TELEX** tab next to PACKING LISTS and laid out as it is: one block a supplier, its files under it. Not on the Payments page (the first build put a chip and a block there; the user moved it the same day, 2026-11-16: a telex release is a paper of the shipment, as a packing list is).
+
+`GET /api/v1/telex-releases?shipmentId=N` is what the tab lists:
 
 ```json
-"telex": [{ "shipmentId": 61, "reference": "333", "state": "uploaded",
-            "releases": [{ "id": 9, "filename": "…", "url": "…", "createdAt": "…" }],
-            "submissionId": 3, "note": null }]
+{ "shipmentId": 61, "reference": "333", "canFile": true,
+  "suppliers": [{
+    "supplierName": "…", "onBoard": true, "balance": true, "state": "uploaded",
+    "releases": [{ "id": 9, "filename": "…", "url": "…", "source": "staff", "uploadedByEmail": "…", "createdAt": "…" }],
+    "upload": { "id": 3, "status": "open", "note": null, "uploadedByEmail": "…", "file": { "filename": "…", "sentAt": "…" } }
+  }] }
 ```
+
+Who gets a block: every supplier with a live order line on the shipment (`onBoard`: `orders.shipment_id`, or `shipment_lines` while it is a draft or planned), every supplier a balance record of the shipment is filed under (`balance`: `shipment_payments.supplier_name`, the name the portal knows a paid balance by), and anyone a release is filed for or an upload came from. By **exact** name: two spellings of one company are two blocks, which is how a release filed under the wrong one gets seen. Those on the shipment or with a balance come first, by name.
 
 | `state` | |
 |---|---|
 | `received` | a release is filed for that shipment and exactly that supplier |
-| `uploaded` | the supplier's latest upload is waiting for us (`submissionId`) |
-| `rejected` | we sent their latest upload back; `note` is what we told them |
+| `uploaded` | the supplier's latest upload is waiting for us |
+| `rejected` | we sent their latest upload back |
 | `awaiting` | nothing yet |
 
-`[]` when the transfer paid no balance; **`null` on a server without the table**, and when it could not be read: the payments list never fails over it, and ShipLine hides the feature.
+`upload` is the supplier's upload still waiting for us (shown even when a release is already filed, so it can still be decided), else the one we last sent back, whose `note` is what we told them.
 
-Not covered: a PI paid through containers (`pi` line with `paidWith`). It names its containers by reference only, so it gets no slot; file that one yourself.
+ShipLine offers the tab on a booked shipment. Our team can file a release there for **any** supplier in the list, whatever was paid and however: that covers a PI paid through containers, which the portal cannot offer an upload for.
 
 ## Routes
 
@@ -54,7 +61,7 @@ All under the greedy `/api/v1/{proxy+}` route. Filing, deleting, accepting and s
 
 | Route | |
 |---|---|
-| `GET /api/v1/telex-releases?shipmentId=N[&supplierName=…]` | the releases filed for a shipment. `{ data, canFile }` |
+| `GET /api/v1/telex-releases?shipmentId=N` | the shipment's suppliers, each with its state, its filed releases and the supplier's upload (above). `404 NO_SUCH_SHIPMENT` |
 | `POST /api/v1/telex-releases` | `{ shipmentId, supplierName, filename, dataBase64, notes? }`: file one ourselves. `201 { release }` |
 | `DELETE /api/v1/telex-releases/:id` | an admin, or whoever filed it (`403 NOT_YOURS`) |
 | `GET /api/v1/telex-submissions[?status=all]` | suppliers' uploads: those waiting for us, or all. `{ data, unavailable, canFile }` |
@@ -110,7 +117,7 @@ No new right for the portal's login on any table of ours.
 
 1. **Shipping**: `bash deploy.sh <stage>` creates `shipment_telex_releases`. Filing from ShipLine works from here.
 2. **Portal**: its deploy creates `telex_submissions`, applies its grants file, and brings the upload on the Payments page.
-3. **ShipLine**: the chips, the payment's Telex section and SUPPLIER PORTAL > Telex.
+3. **ShipLine**: the TELEX tab on the shipment card and the container card, and SUPPLIER PORTAL > Telex.
 
 Any order is safe: each side shows nothing until the other is there.
 

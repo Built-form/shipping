@@ -637,7 +637,7 @@ itself (`GET /supplier-payments/:id/notices`, `POST …/notices/:kind/email`,
 `POST /supplier-payment-sends/:sendId/resolve`) is in
 [payment-proof-send.md](payment-proof-send.md).
 
-Each transfer also carries `telex`: the containers its balance paid and where each one's telex release stands (`docs/telex-releases.md`); `null` on a server without the table.
+The telex release a balance asks the supplier for is not on a transfer: it is the shipment's, listed by `GET /api/v1/telex-releases?shipmentId=` (`docs/telex-releases.md`).
 
 ### `GET /api/v1/supplier-payments/open-items?supplier=&currency=`
 

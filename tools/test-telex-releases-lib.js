@@ -1,9 +1,9 @@
 'use strict';
 
 // Unit tests for the telex release rules (src/lib/telex-releases.js;
-// docs/telex-releases.md): which containers of a transfer are owed a telex
-// release, the state of each, what a file must be to be filed, and who may
-// file, accept, send back or delete one. Pure: no database, no network.
+// docs/telex-releases.md): a shipment's suppliers with where each one's telex
+// release stands, what a file must be to be filed, and who may file, accept,
+// send back or delete one. Pure: no database, no network.
 //
 //   npm run test:unit
 
@@ -17,8 +17,6 @@ const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0]);
 const JPG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0]);
 const EXE = Buffer.from('MZ\x90\x00 this is a program');
 
-const line = (kind, over = {}) => ({ kind, amount: 100, shipmentId: null, shipmentReference: null, targetMissing: false, ...over });
-const transfer = (lines, over = {}) => ({ id: 45, supplierName: SUPPLIER, lines, ...over });
 const release = (over = {}) => ({ id: 9, shipmentId: 61, supplierName: SUPPLIER, filename: 'telex.pdf', url: 'https://f/telex.pdf', createdAt: '2026-11-16T10:00:00Z', ...over });
 const submission = (over = {}) => ({ id: 3, shipmentId: 61, supplierName: SUPPLIER, status: 'open', sent: true, note: null, createdAt: '2026-11-16T09:00:00Z', ...over });
 
@@ -29,24 +27,6 @@ test('roles: admin and standard users file, accept and send back; nobody else', 
     assert.equal(T.mayFile('accountant'), false);
     assert.equal(T.mayFile('viewer'), false);
     assert.equal(T.mayFile(undefined), false);
-});
-
-test('slotsFor: one per container a balance line paid, each once, in the order met', () => {
-    assert.deepEqual(T.slotsFor(transfer([
-        line('balance', { shipmentId: 61, shipmentReference: '333' }),
-        line('qc'),
-        line('balance', { shipmentId: 62, shipmentReference: '126. Air Freight' }),
-        line('balance', { shipmentId: 61, shipmentReference: '333' }),
-    ])), [{ shipmentId: 61, reference: '333' }, { shipmentId: 62, reference: '126. Air Freight' }]);
-});
-
-test('slotsFor: nothing but a live balance on a shipment asks for a telex release', () => {
-    assert.deepEqual(T.slotsFor(transfer([line('po_deposit'), line('pi'), line('qc'), line('repackaged'), line('extra', { shipmentId: 61, shipmentReference: '333' })])), []);
-    assert.deepEqual(T.slotsFor(transfer([line('balance', { shipmentId: null, shipmentReference: '333' })])), [], 'a balance with no shipment');
-    assert.deepEqual(T.slotsFor(transfer([line('balance', { shipmentId: 61, shipmentReference: '333', targetMissing: true })])), [], 'a balance deleted since');
-    assert.deepEqual(T.slotsFor(transfer([])), []);
-    assert.deepEqual(T.slotsFor({ id: 1, supplierName: SUPPLIER }), []);
-    assert.deepEqual(T.slotsFor(transfer([line('balance', { shipmentId: 61, shipmentReference: null })])), [{ shipmentId: 61, reference: null }]);
 });
 
 test('stateOf: received outranks everything, then the supplier\'s latest upload', () => {
@@ -70,27 +50,64 @@ test('stateOf: the latest upload decides between sent back and sent again', () =
     assert.equal(T.stateOf([], [submission({ id: 5, status: 'rejected' }), submission({ id: 6, status: 'open' })]), 'uploaded');
 });
 
-test('summariesFor: each container\'s state for this transfer\'s supplier, by exact name', () => {
-    const pm = transfer([line('balance', { shipmentId: 61, shipmentReference: '333' }), line('balance', { shipmentId: 62, shipmentReference: '334' }), line('balance', { shipmentId: 63, shipmentReference: '335' })]);
-    const releases = [release({ id: 9, shipmentId: 61 }), release({ id: 10, shipmentId: 62, supplierName: 'Acme Medical Co., Ltd.' }), release({ id: 11, shipmentId: 99 })];
-    const submissions = [submission({ id: 3, shipmentId: 63 }), submission({ id: 4, shipmentId: 62, supplierName: 'acme medical co., ltd' })];
-    assert.deepEqual(T.summariesFor(pm, releases, submissions), [
-        { shipmentId: 61, reference: '333', state: 'received', releases: [{ id: 9, filename: 'telex.pdf', url: 'https://f/telex.pdf', createdAt: '2026-11-16T10:00:00Z' }], submissionId: null, note: null },
-        { shipmentId: 62, reference: '334', state: 'awaiting', releases: [], submissionId: null, note: null },
-        { shipmentId: 63, reference: '335', state: 'uploaded', releases: [], submissionId: 3, note: null },
+test('suppliersOf: one block a supplier, from the shipment\'s lines, its balances, and whatever is filed or uploaded', () => {
+    const OTHER = 'Other Factory Ltd';
+    const out = T.suppliersOf({
+        onBoard: [SUPPLIER, OTHER],
+        balances: [SUPPLIER],
+        releases: [release({ id: 9 }), release({ id: 12, supplierName: 'Gone Co' })],
+        submissions: [submission({ id: 3, supplierName: OTHER })],
+    });
+    assert.deepEqual(out, [
+        { supplierName: SUPPLIER, onBoard: true, balance: true, state: 'received', releases: [release({ id: 9 })], upload: null },
+        { supplierName: OTHER, onBoard: true, balance: false, state: 'uploaded', releases: [], upload: submission({ id: 3, supplierName: OTHER }) },
+        // Filed for a supplier with nothing on the shipment any more: still listed, last.
+        { supplierName: 'Gone Co', onBoard: false, balance: false, state: 'received', releases: [release({ id: 12, supplierName: 'Gone Co' })], upload: null },
     ]);
 });
 
-test('summariesFor: a release sent back says why; nothing owed is an empty list', () => {
-    const pm = transfer([line('balance', { shipmentId: 61, shipmentReference: '333' })]);
-    assert.deepEqual(T.summariesFor(pm, [], [submission({ id: 7, status: 'rejected', note: 'This is the draft, not the release' })]), [
-        { shipmentId: 61, reference: '333', state: 'rejected', releases: [], submissionId: 7, note: 'This is the draft, not the release' },
-    ]);
-    assert.deepEqual(T.summariesFor(transfer([line('po_deposit')]), [release()], [submission()]), []);
-    assert.deepEqual(T.summariesFor(pm, [], [submission({ id: 8, status: 'open', note: 'left over from an earlier answer' })]), [
-        { shipmentId: 61, reference: '333', state: 'uploaded', releases: [], submissionId: 8, note: null },
-    ], 'a note is only said for an upload we sent back');
-    assert.deepEqual(T.summariesFor(pm, undefined, undefined), [{ shipmentId: 61, reference: '333', state: 'awaiting', releases: [], submissionId: null, note: null }]);
+test('suppliersOf: names are compared exactly, each once; a blank one is nobody', () => {
+    const out = T.suppliersOf({
+        onBoard: [SUPPLIER, SUPPLIER, '', null, 'Acme Medical Co., Ltd.'],
+        balances: ['acme medical co., ltd'],
+        releases: [release({ supplierName: 'Acme Medical Co., Ltd.' })],
+        submissions: [],
+    });
+    assert.deepEqual(out.map(r => [r.supplierName, r.onBoard, r.balance, r.state]), [
+        ['acme medical co., ltd', false, true, 'awaiting'],
+        ['Acme Medical Co., Ltd', true, false, 'awaiting'],
+        ['Acme Medical Co., Ltd.', true, false, 'received'],
+    ], 'three spellings are three blocks, in the order a reader expects');
+});
+
+test('suppliersOf: on the shipment or with a balance first, by name; the rest after', () => {
+    const out = T.suppliersOf({
+        onBoard: ['Zeta Ltd'],
+        balances: ['Beta Ltd'],
+        releases: [release({ supplierName: 'Alpha Ltd' })],
+        submissions: [submission({ supplierName: 'Aardvark Ltd', status: 'rejected' })],
+    });
+    assert.deepEqual(out.map(r => r.supplierName), ['Beta Ltd', 'Zeta Ltd', 'Aardvark Ltd', 'Alpha Ltd']);
+});
+
+test('suppliersOf: the upload shown is the one waiting for us, else the one we sent back', () => {
+    const one = (releases, submissions) => T.suppliersOf({ onBoard: [SUPPLIER], balances: [], releases, submissions })[0];
+    const sentBack = submission({ id: 3, status: 'rejected', note: 'This is the draft B/L', createdAt: '2026-11-15T09:00:00Z' });
+    const waiting = submission({ id: 4, createdAt: '2026-11-16T09:00:00Z' });
+    assert.deepEqual([one([], [sentBack]).state, one([], [sentBack]).upload], ['rejected', sentBack]);
+    assert.deepEqual([one([], [sentBack, waiting]).state, one([], [sentBack, waiting]).upload], ['uploaded', waiting]);
+    // One was filed here while an upload was still waiting: it is still there to decide.
+    assert.deepEqual([one([release()], [waiting]).state, one([release()], [waiting]).upload], ['received', waiting]);
+    // Received, and the only upload was sent back long ago: nothing left to show.
+    assert.equal(one([release()], [sentBack]).upload, null);
+    // An upload whose file never arrived, a void one, our own marker: nothing.
+    assert.equal(one([], [submission({ sent: false })]).upload, null);
+    assert.equal(one([], [submission({ status: 'void' })]).upload, null);
+    assert.equal(one([], [submission({ status: 'received' })]).upload, null);
+    // Sent back, and a later void row beside it: the one sent back is the one shown.
+    const voided = submission({ id: 9, status: 'void', createdAt: '2026-11-17T09:00:00Z' });
+    assert.deepEqual([one([], [sentBack, voided]).state, one([], [sentBack, voided]).upload], ['rejected', sentBack]);
+    assert.deepEqual(T.suppliersOf({}), []);
 });
 
 test('uploadRefusal: what a file must be to be filed', () => {

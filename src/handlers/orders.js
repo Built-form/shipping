@@ -85,7 +85,7 @@ const { registerPaymentDueDateRoutes } = require('../services/payment-due-date-r
 const paymentNotices = require('../services/payment-notices');
 const { registerPaymentNoticeRoutes } = require('../services/payment-notice-routes');
 // Telex releases: filed per supplier per shipment (docs/telex-releases.md).
-const { registerTelexReleaseRoutes, telexSummaries } = require('../services/telex-release-routes');
+const { registerTelexReleaseRoutes } = require('../services/telex-release-routes');
 const { registerUiHintRoutes } = require('../services/ui-hint-routes');
 const extrasLib = require('../lib/payment-extras');
 const { correctBalance } = require('../lib/balance-correction');
@@ -11356,17 +11356,6 @@ async function withPaymentNotices(conn, transfers) {
         log.warn('[supplier-payments] the send state of these payments could not be read', { error: e.message, errno: e.errno });
     }
     for (const t of transfers) t.notices = notices ? (notices.get(t.id) || []) : null;
-    // `telex`: each container a balance line of the transfer paid, and whether
-    // its telex release is in (docs/telex-releases.md; [{ shipmentId, reference,
-    // state, releases, submissionId, note }]). null on a server without the
-    // table, and when it could not be read: the list never fails over it.
-    let telex = null;
-    try {
-        telex = await telexSummaries(conn, transfers);
-    } catch (e) {
-        log.warn('[supplier-payments] the telex releases of these payments could not be read', { error: e.message, errno: e.errno });
-    }
-    for (const t of transfers) t.telex = telex ? (telex.get(t.id) || []) : null;
     return transfers;
 }
 

@@ -4,8 +4,10 @@
 // supplier sends once a container's balance is paid, filed per supplier per
 // shipment in shipment_telex_releases.
 //
-//   GET    /api/v1/telex-releases?shipmentId=N[&supplierName=…]
-//          the releases filed for a shipment. Any signed-in user.
+//   GET    /api/v1/telex-releases?shipmentId=N
+//          a shipment's suppliers, each with where its telex release stands,
+//          the files filed and the supplier's upload waiting for us: what the
+//          TELEX tab of the shipment card lists. Any signed-in user.
 //   POST   /api/v1/telex-releases
 //          { shipmentId, supplierName, filename, dataBase64, notes? }: our team
 //          file one themselves (PDF, PNG or JPEG, at most 15 MB).
@@ -45,7 +47,6 @@ const { jportalSchema, isSourceMissing } = require('../lib/jportal');
 const ER_NO_SUCH_TABLE = 1146;
 const ER_DUP_ENTRY = 1062;
 const ISO = "'%Y-%m-%dT%H:%i:%sZ'";
-const BIN = 'COLLATE utf8mb4_0900_bin';
 const VIEW_SECONDS = 300;
 const NOT_MIGRATED = { error: 'Telex releases are not set up on this server yet: their table has not been migrated.', code: 'NOT_MIGRATED' };
 
@@ -141,22 +142,17 @@ async function loadFor(conn, shipmentIds, env = process.env) {
     };
 }
 
-/**
- * `telex` for each transfer the API hands back: its containers and the state
- * of each (src/lib/telex-releases.js summariesFor). → Map id → list, or null
- * on a server without the releases table (ShipLine then hides the feature).
- */
-async function telexSummaries(conn, transfers, env = process.env) {
-    const slots = transfers.flatMap(t => T.slotsFor(t));
-    if (!slots.length) {
-        // Nothing to look up, but say whether the feature is here at all.
-        try { await conn.query('SELECT 1 FROM shipment_telex_releases LIMIT 0'); } catch (e) { if (e && e.errno === ER_NO_SUCH_TABLE) return null; throw e; }
-        return new Map(transfers.map(t => [t.id, []]));
-    }
-    const loaded = await loadFor(conn, slots.map(s => s.shipmentId), env);
-    if (!loaded) return null;
-    return new Map(transfers.map(t => [t.id, T.summariesFor(t, loaded.releases, loaded.submissions)]));
-}
+// Who a shipment's telex releases are for. Its order lines: a booked shipment's
+// are the live orders pointing at it, a draft's or a planned one's are its
+// shipment_lines. And its balance records, whose supplier_name is the one the
+// portal knows a paid balance by.
+const ON_BOARD_SQL = `SELECT DISTINCT o.supplier AS name
+      FROM orders o
+     WHERE o.deleted_at IS NULL AND o.status <> 'DESTROYED' AND o.supplier IS NOT NULL AND o.supplier <> ''
+       AND (o.shipment_id = ? OR o.id IN (SELECT sl.order_id FROM shipment_lines sl WHERE sl.shipment_id = ?))`;
+const BALANCES_SQL = `SELECT DISTINCT p.supplier_name AS name
+      FROM shipment_payments p
+     WHERE p.shipment_id = ? AND p.deleted_at IS NULL AND p.supplier_name IS NOT NULL AND p.supplier_name <> ''`;
 
 function registerTelexReleaseRoutes(app, deps) {
     const { withConnection, ready, s3, poBucket, publicS3Url, recordAudit, log } = deps;
@@ -191,18 +187,27 @@ function registerTelexReleaseRoutes(app, deps) {
     app.get('/api/v1/telex-releases', handle('GET /telex-releases', async (req) => {
         const shipmentId = Number(req.query.shipmentId);
         if (!Number.isInteger(shipmentId) || shipmentId <= 0) return answer(400, { error: 'shipmentId is required.', code: 'BAD_FIELD' });
-        const supplierName = typeof req.query.supplierName === 'string' && req.query.supplierName !== '' ? req.query.supplierName : null;
-        const rows = await withConnection(async (conn) => {
-            const [found] = await conn.query(
-                `SELECT ${RELEASE_COLUMNS} FROM shipment_telex_releases r
-                  WHERE r.deleted_at IS NULL AND r.shipment_id = ?
-                    ${supplierName ? `AND CONVERT(r.supplier_name USING utf8mb4) ${BIN} = CONVERT(? USING utf8mb4) ${BIN}` : ''}
-                  ORDER BY r.created_at DESC, r.id DESC`,
-                supplierName ? [shipmentId, supplierName] : [shipmentId]
-            );
-            return found;
+        const out = await withConnection(async (conn) => {
+            const [shipments] = await conn.query('SELECT id, reference FROM shipments WHERE id = ?', [shipmentId]);
+            if (!shipments.length) return { none: true };
+            const [onBoard] = await conn.query(ON_BOARD_SQL, [shipmentId, shipmentId]);
+            const [balances] = await conn.query(BALANCES_SQL, [shipmentId]);
+            const loaded = await loadFor(conn, [shipmentId]);
+            return { shipment: shipments[0], onBoard, balances, loaded };
         });
-        return answer(200, { data: rows.map(releaseJson), canFile: T.mayFile(req.userType) });
+        if (out.none) return refused(T.uploadRefusal({ shipment: null }));
+        if (!out.loaded) return answer(503, NOT_MIGRATED);
+        return answer(200, {
+            shipmentId: out.shipment.id,
+            reference: out.shipment.reference || null,
+            suppliers: T.suppliersOf({
+                onBoard: out.onBoard.map(r => r.name),
+                balances: out.balances.map(r => r.name),
+                releases: out.loaded.releases,
+                submissions: out.loaded.submissions,
+            }),
+            canFile: T.mayFile(req.userType),
+        });
     }));
 
     app.post('/api/v1/telex-releases', handle('POST /telex-releases', async (req) => {
@@ -473,4 +478,4 @@ function registerTelexReleaseRoutes(app, deps) {
     }));
 }
 
-module.exports = { registerTelexReleaseRoutes, telexSummaries, loadFor, releaseJson, submissionJson };
+module.exports = { registerTelexReleaseRoutes, loadFor, releaseJson, submissionJson };
