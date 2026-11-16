@@ -140,6 +140,10 @@ flowchart TB
 
 Staff email a supplier the "Artwork Confirmed" request from a PO in ShipLine. Its link opens a no-login page on the supplier portal where the supplier ticks each item; a tick fills that line's `artwork_confirmed_by_supplier` (a field of its own, apart from the staff-set `artwork_confirmed_date`) and, when the supplier requires no deposit or the deposit has been paid, moves a `PO_SENT` line to `IN_PRODUCTION` (the `jportal-artwork-confirmed-<env>` Lambda). See [docs/artwork-confirmations.md](docs/artwork-confirmations.md).
 
+### Freight quotes from forwarders
+
+Staff ask freight forwarders (a list kept in ShipLine, FREIGHT > FORWARDERS) for sailings and prices in a date range. Each forwarder's email links to a no-login page on the supplier portal where it lists its options: loading date, sailing date, transit time, ports, service, container size and an all-in price. ShipLine shows the options in a calendar and a list; staff request a booking on one, the forwarder confirms it on the same page with a booking reference, and staff attach a draft container and email its contents by supplier with the forwarder quote PDFs attached. Routes under `/api/v1/forwarders`, `/freight-quotes` and `/freight-bookings` (`src/services/freight-quote-routes.js`); tables `forwarders`, `forwarder_contacts`, `freight_quote_requests`, `freight_quote_options`, `freight_bookings`. See [docs/freight-quotes.md](docs/freight-quotes.md).
+
 ### Order status lifecycle
 
 ```mermaid

@@ -104,6 +104,36 @@ async function preapprovePortalUsers(conn, { recipients, poSupplier, lineSupplie
     }
 }
 
+/**
+ * Pre-approves `emails` on the portal with NO supplier linked: the contacts of
+ * a freight forwarder, before a freight quote request is emailed to them
+ * (docs/freight-quotes.md). Registering with that address then needs no
+ * approval, and the portal shows the forwarder's requests by matching the
+ * signed-in address against forwarder_contacts; the account sees no supplier's
+ * orders. The same per-address outcomes as preapprovePortalUsers.
+ *
+ * Returns { status, users } where status is 'ok', 'none' (no addresses) or
+ * 'unavailable' (no portal schema here).
+ */
+async function preapprovePortalAddresses(conn, { emails, actorEmail, note }) {
+    const provision = P.provisionList(emails);
+    if (!provision.length) return { status: 'none', users: [] };
+    const ctx = {
+        jp: jportalSchema(),
+        actor: actorEmail || 'shipline',
+        decidedNote: String(note || '').slice(0, NOTE_MAX) || null,
+    };
+    for (let attempt = 1; ; attempt++) {
+        try {
+            return { status: 'ok', users: await provisionOnce(conn, provision, [], ctx) };
+        } catch (e) {
+            if (isSourceMissing(e)) return { status: 'unavailable', users: [] };
+            if (e.errno === ER_LOCK_DEADLOCK && attempt < MAX_ATTEMPTS) continue;
+            throw e;
+        }
+    }
+}
+
 // One attempt, in one READ COMMITTED transaction; rolled back on any error.
 async function provisionOnce(conn, provision, suppliers, { jp, actor, decidedNote }) {
     const users = [];
@@ -150,7 +180,8 @@ async function provisionOnce(conn, provision, suppliers, { jp, actor, decidedNot
             }
 
             let suppliersAdded = 0;
-            if (P.GRANTED_OUTCOMES.has(outcome) && userId) {
+            // No suppliers: a freight forwarder's contact (preapprovePortalAddresses).
+            if (P.GRANTED_OUTCOMES.has(outcome) && userId && suppliers.length) {
                 const [r] = await conn.query(
                     `INSERT IGNORE INTO ${jp}.user_supplier_access (user_id, supplier_id, supplier_name, created_by)
                      VALUES ${suppliers.map(() => '(?, ?, ?, ?)').join(', ')}`,
@@ -219,4 +250,4 @@ async function loadViews(conn, table, idColumn, wantedIds) {
     return out;
 }
 
-module.exports = { preapprovePortalUsers, loadPoDocumentViews, loadSignedPiViews };
+module.exports = { preapprovePortalUsers, preapprovePortalAddresses, loadPoDocumentViews, loadSignedPiViews };

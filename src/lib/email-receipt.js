@@ -378,6 +378,20 @@ function portalSyncSteps(jp) {
                SET r.confirmed_at = q.answered_at
              WHERE ${PENDING_PORTAL} AND r.send_table = '${JFPRO_AUDIT}' AND r.email_type = 'quote_request'
                AND q.answered_at IS NOT NULL`],
+        // The freight quote request: the forwarder (or staff for them) answered.
+        ['freight_quote_answered', `
+            UPDATE email_receipts r
+              JOIN freight_quote_requests q ON q.id = r.send_id
+               SET r.confirmed_at = q.answered_at
+             WHERE ${PENDING_PORTAL} AND r.send_table = 'freight_quote_requests'
+               AND r.email_type = 'freight_quote_request' AND q.answered_at IS NOT NULL`],
+        // The freight booking request: the forwarder confirmed or declined it.
+        ['freight_booking_answered', `
+            UPDATE email_receipts r
+              JOIN freight_bookings b ON b.id = r.send_id
+               SET r.confirmed_at = b.responded_at
+             WHERE ${PENDING_PORTAL} AND r.send_table = 'freight_bookings'
+               AND r.email_type = 'freight_booking_request' AND b.responded_at IS NOT NULL`],
     ];
 }
 
@@ -431,7 +445,7 @@ async function syncPortalReceipts(conn, { maxAgeMs = PORTAL_SYNC_MS } = {}) {
     } catch (e) {
         // JPORTAL_DB_SCHEMA is not a plain identifier: nothing can be read.
         log.warn('[email-receipt] portal sync skipped', { error: e.message });
-        return { failed: ['po_viewed', 'signed_pi_viewed', 'artwork_ticked', 'file_opened', 'qc_availability_answered', 'qc_schedule_opened', 'quote_answered', ...failed] };
+        return { failed: ['po_viewed', 'signed_pi_viewed', 'artwork_ticked', 'file_opened', 'qc_availability_answered', 'qc_schedule_opened', 'quote_answered', 'freight_quote_answered', 'freight_booking_answered', ...failed] };
     }
     for (const [name, sql] of steps) await run(name, () => conn.query(sql));
     return { failed };

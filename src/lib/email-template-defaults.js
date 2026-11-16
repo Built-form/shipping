@@ -337,7 +337,76 @@ const ARTWORK_CONFIRMATION_TEMPLATE = {
 };
 DEFAULT_EMAIL_TEMPLATES.push(ARTWORK_CONFIRMATION_TEMPLATE);
 
+// Freight quotes (src/services/freight-quote-routes.js, docs/freight-quotes.md;
+// seeded by 2026-11-16_20_seed_freight_templates.js), category 'Freight'. Sent
+// from ShipLine's FREIGHT page to a freight forwarder. Each is the INSIDE of
+// the card: the sender appends a fixed block under it (the request's facts and
+// the "Enter your quote" button; the chosen sailing and the "Confirm the
+// booking" button; the contents by supplier) and wraps the whole in the portal
+// layout. Every token is HTML-escaped by the sender.
+const FREIGHT_GREETING = '<div style="font-family:Helvetica,Arial,sans-serif;font-size:14px;color:#222;line-height:1.5;">';
+const FREIGHT_SIGNOFF = '<p>Kind regards, / 此致敬礼<br>Operations Team.<br>JFA Medical Ltd.</p></div>';
+
+const FREIGHT_QUOTE_REQUEST_TEMPLATE_KEY = 'freight_quote_request';
+const FREIGHT_BOOKING_REQUEST_TEMPLATE_KEY = 'freight_booking_request';
+const FREIGHT_BOOKING_CONTENTS_TEMPLATE_KEY = 'freight_booking_contents';
+
+const FREIGHT_TEMPLATES = [
+    {
+        key: FREIGHT_QUOTE_REQUEST_TEMPLATE_KEY,
+        name: 'Freight quote request',
+        category: 'Freight',
+        description: 'Emailed to a freight forwarder to ask for sailings and prices in a date range. The request’s details and an "Enter your quote" button are appended automatically: the button opens a page on the supplier portal (no sign-in) where they list each option. Tokens: {forwarder} {windowStart} {windowEnd} {origin} {destination} {containerSize} {services}.',
+        subject: 'Freight quote request – {containerSize} – sailing {windowStart} to {windowEnd} / 海运报价请求',
+        bodyHtml: [
+            FREIGHT_GREETING,
+            '<p>Greetings,</p>',
+            '<p>We would like your available sailings and prices for one <strong>{containerSize}</strong> container from <strong>{origin}</strong> to <strong>{destination}</strong>, sailing between <strong>{windowStart}</strong> and <strong>{windowEnd}</strong>.</p>',
+            '<p>Please use the button below to enter each option: loading date, sailing date, transit time, ports, service and price.</p>',
+            '<p>您好，</p>',
+            '<p>我们需要一个 <strong>{containerSize}</strong> 集装箱从 <strong>{origin}</strong> 到 <strong>{destination}</strong> 的可用船期与价格，开船日期在 <strong>{windowStart}</strong> 至 <strong>{windowEnd}</strong> 之间。</p>',
+            '<p>请点击下方按钮逐项填写：装柜日期、开船日期、航程天数、港口、服务方式和价格。</p>',
+            FREIGHT_SIGNOFF,
+        ].join(''),
+    },
+    {
+        key: FREIGHT_BOOKING_REQUEST_TEMPLATE_KEY,
+        name: 'Freight booking request',
+        category: 'Freight',
+        description: 'Emailed to a freight forwarder to ask them to book one of the sailings they quoted. The sailing’s details and a "Confirm the booking" button are appended automatically: the button opens the same page on the supplier portal, where they confirm with a booking reference or decline. Tokens: {forwarder} {sailingDate} {loadingDate} {portFrom} {portTo} {service} {containerSize} {price}.',
+        subject: 'Booking request – {containerSize} – sailing {sailingDate} {portFrom} to {portTo} / 订舱请求',
+        bodyHtml: [
+            FREIGHT_GREETING,
+            '<p>Greetings,</p>',
+            '<p>Thank you for your quote. We would like to book the sailing below. Please confirm it with your booking reference using the button, or decline it if the space is no longer available.</p>',
+            '<p>您好，</p>',
+            '<p>感谢您的报价。我们希望预订以下船期。请点击按钮填写订舱号以确认；如舱位已无法提供，请选择拒绝。</p>',
+            FREIGHT_SIGNOFF,
+        ].join(''),
+    },
+    {
+        key: FREIGHT_BOOKING_CONTENTS_TEMPLATE_KEY,
+        name: 'Freight booking contents',
+        category: 'Freight',
+        description: 'Emailed to a freight forwarder with the contents of the container attached to a booking, broken down by supplier. The breakdown is appended automatically, and the forwarder quote PDFs and CSVs are attached. Tokens: {forwarder} {bookingRef} {sailingDate} {containerName}.',
+        subject: 'Container contents – {containerName} – sailing {sailingDate} / 集装箱货物明细',
+        bodyHtml: [
+            FREIGHT_GREETING,
+            '<p>Greetings,</p>',
+            '<p>Please find below the contents of our container for the sailing of <strong>{sailingDate}</strong>, listed by supplier so each collection can be arranged. The same details are attached as PDF and CSV.</p>',
+            '<p>您好，</p>',
+            '<p>以下为我方 <strong>{sailingDate}</strong> 船期集装箱的货物明细，按供应商列出，以便安排各家提货。相同内容另附 PDF 与 CSV。</p>',
+            FREIGHT_SIGNOFF,
+        ].join(''),
+    },
+];
+// In the list too, so getEmailTemplate's in-code fallback knows them before
+// the seed has run.
+DEFAULT_EMAIL_TEMPLATES.push(...FREIGHT_TEMPLATES);
+
 module.exports = {
+    FREIGHT_TEMPLATES, FREIGHT_QUOTE_REQUEST_TEMPLATE_KEY, FREIGHT_BOOKING_REQUEST_TEMPLATE_KEY,
+    FREIGHT_BOOKING_CONTENTS_TEMPLATE_KEY,
     DEFAULT_EMAIL_TEMPLATES, SUPPLIER_PI_TEMPLATE_KEYS, QC_VISIT_TEMPLATE_KEYS, PO_PORTAL_TEMPLATE_KEY,
     SIGNED_PI_TEMPLATE_KEY,
     FILE_TRANSFER_TEMPLATE_KEY, FILE_TRANSFER_TEMPLATE,

@@ -73,6 +73,7 @@ const { registerCiSubmissionRoutes } = require('../services/ci-submission-routes
 const { registerPaymentDocumentRefileRoutes } = require('../services/payment-document-refile-routes');
 const { registerFileTransferRoutes } = require('../services/file-transfer-routes');
 const { registerArtworkConfirmationRoutes } = require('../services/artwork-confirmation-routes');
+const { registerFreightQuoteRoutes } = require('../services/freight-quote-routes');
 // Bank-detail verification on portal PIs: the positive payment gate (isPayable).
 const bankVerification = require('../lib/bank-verification');
 const { registerPaymentDueDateRoutes } = require('../services/payment-due-date-routes');
@@ -12394,6 +12395,28 @@ registerArtworkConfirmationRoutes(app, {
     },
     recordAudit,
     getEmailTemplate, renderTemplate,
+    log,
+});
+
+// ── Freight quotes (/api/v1/forwarders, /freight-quotes, /freight-bookings) ──
+// The forwarder list; a request for sailings and prices, emailed with a
+// no-login link into the supplier portal where the forwarder answers; the
+// booking of one option; and the attached container's contents by supplier,
+// emailed with the forwarder quote PDFs. docs/freight-quotes.md.
+registerFreightQuoteRoutes(app, {
+    withConnection,
+    ready: async () => {
+        await auditLogSchemaReady;
+        await emailTemplatesSchemaReady;
+        await shipmentsSchemaReady;
+        await draftRegistryReady;
+    },
+    recordAudit,
+    getEmailTemplate, renderTemplate,
+    loadForwarderQuoteForPdf,
+    generateDraftDocumentSet,
+    s3,
+    poBucket: () => PO_BUCKET,
     log,
 });
 

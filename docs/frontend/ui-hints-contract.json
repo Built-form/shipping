@@ -20,6 +20,7 @@
     "warehouse",
     "delivered",
     "qc-visits",
+    "freight",
     "supplier-portal",
     "shipments",
     "payments",
