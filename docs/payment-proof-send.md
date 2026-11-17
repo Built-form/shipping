@@ -10,7 +10,7 @@ A transfer (`supplier_payments` + its lines) is told to its supplier as one or t
 
 | Notice | Made of | Asks for |
 |---|---|---|
-| `deposit` | `po_deposit` lines; `pi` lines of type `deposit`; a 100% PI whose money was ticked against no container; extras riding `deposit` | the estimated ready dates |
+| `deposit` | `po_deposit` lines; `pi` lines of type `deposit`; a 100% PI whose money was ticked against no container; extras riding `deposit` | the estimated ready dates, entered on the portal |
 | `balance` | `balance` lines (top-ups included), `qc`, `repackaged`; `pi` lines of type `balance`; a 100% PI ticked against containers (`paidWith`); extras riding `balance` | the telex release |
 
 - A transfer that paid both gets two emails. QC units ride in the balance email.
@@ -21,7 +21,7 @@ A transfer (`supplier_payments` + its lines) is told to its supplier as one or t
 Each email goes out one of two ways (`delivery`):
 
 - **`portal`**: a link to the supplier portal's Payments page (`/payments?payment=<id>`), nothing attached. Recipients are pre-approved on the portal for the transfer's supplier, as the PO email does. A deposit also carries a button to each order's page (`/orders/<po id>`), where the ready dates are entered.
-- **`attached`**: the proof files ride on the email, with the "Confirm receipt" button. Used when a link cannot work, and the dialog says which:
+- **`attached`**: the proof files ride on the email, with the "Confirm receipt" button. A deposit still carries a button to each order's ready dates where the portal can open the order (next section). Used when a link to the payment cannot work, and the dialog says which:
 
 | `reason` | Meaning |
 |---|---|
@@ -31,6 +31,19 @@ Each email goes out one of two ways (`delivery`):
 | `no_supplier` | no live supplier is named **exactly** as the transfer's `supplier_name` |
 
 `PAYMENT_PROOF_PORTAL` is off by default so that shipping can be deployed before the portal's page exists. Turn it on once the portal is live on that stage; turn it off to roll back.
+
+### The ready dates are entered on the portal, never by reply
+
+Decided by the user on 2026-11-17, on the first deposit email sent: its wording asked the supplier to "reply to this email with the estimated ready date of each item". No email asks for that any more. A deposit's ready dates are entered on each order's page of the portal (`/orders/<po id>`), whichever way the proof goes out.
+
+- `readyDatesFor(notice, delivery)` (`src/lib/payment-notices.js`) is the one rule for the preview and both sends: one link per order of the deposit, **only** where `SUPPLIER_PORTAL_URL` is set and a live supplier is named exactly as the transfer. The switch and the `payment_views` table do not matter here: the order pages exist without the Payments page.
+- A `portal` deposit carries the buttons under the portal block, as before.
+- An `attached` deposit carries a second box under the "proof is attached" one: the ask, a button per order, and how to get an account.
+- **An attached send approves nobody on the portal.** Its account lines are the ones for an address still to be approved ("register … and our team will approve your access"). An address new to the portal registers and waits for JFPRO → Portal users. Only a `portal` send pre-approves.
+- Where the portal can open none of the orders (`portal_url_unset`, `no_supplier`) the email carries no button and its box says nothing of the portal. The stored wording still names the portal, so ShipLine's dialog warns the sender to reword it.
+- A balance never carries them.
+
+The stored wording: `payment_proof_deposit_attached` now reads "… and enter the estimated ready date of each item on our supplier portal." `2026-11-17_10_reword_payment_proof_deposit_attached.js` replaces the body on a server that still holds the seeded one, **exactly** as seeded. A template someone has edited is left as it is and named in the migration's log; reword it by hand in the template editor.
 
 ## What a supplier is told about a line
 
@@ -94,6 +107,7 @@ What the dialog shows. Any signed-in user.
 ```
 
 - `lines[].type`: `deposit`, `pi_deposit`, `pi_balance`, `pi_full`, `balance`, `top_up`, `qc`, `repackaged`, `extra`, `credit`.
+- `notices[].readyDates`: the buttons the email will carry, for a deposit, under either delivery. `[]` for a balance, and for a deposit whose orders the portal cannot open for this supplier. `portalUrl` stays `null` when the proof goes out attached.
 - `notices[].state`: `not_sent`, `sending`, `sent`, `unknown`. `sent` means a send went out to the transfer's **current** supplier name; a transfer moved to another supplier reads `not_sent` again.
 - `503 NOT_MIGRATED` on a server without the send log.
 
@@ -189,6 +203,7 @@ The proof link is the file's public, unguessable S3 address, as a PO PDF's is. H
 - `2026-11-16_21_portal_payment_views.sql`: the three views.
 - `2026-11-16_22_grant_portal_payment_views_to_jportal.js`: `SELECT` on the views for the portal's login.
 - `2026-11-16_30_seed_payment_proof_templates.js`: four templates, category `Payment proof`: `payment_proof_{deposit,balance}_{portal,attached}`. Tokens `{amount} {currency} {paidOn} {paidFor}`.
+- `2026-11-17_10_reword_payment_proof_deposit_attached.js`: the attached deposit wording, from "reply to this email" to "enter … on our supplier portal". Touches only a row still holding the seeded body.
 - `2026-11-16_10_grant_request_departure_to_jportal.js` belongs to the Requests to send page (`docs/request-to-send-portal.md`).
 
 ## Rollout (test, then prod; all user-triggered)
@@ -203,7 +218,8 @@ The proof link is the file's public, unguessable S3 address, as a PO PDF's is. H
 
 ## Not verified
 
-- A real send through Front, either way; the reminder of one.
-- The routes against a real database: the send log and the views are not migrated anywhere yet. The views' `SELECT`s were run read-only on TEST with the join to `portal_payments_v` swapped for the live transfers (101 lines, all resolved; 26 proofs).
+- A real send through Front as a portal link; the reminder of one. One attached deposit email, sent by the user, was seen on 2026-11-17 (it is what showed the "reply to this email" wording); the reworded one, with its buttons, has not been sent.
+- The attached deposit's buttons in a real mail client, and an address new to the portal following one: it registers, waits for approval, and only then reaches the order.
+- The routes against a real database, by anything in this repo. When this was written (2026-11-16) the send log and the views were migrated nowhere; the user's attached send since then means the send log is on at least that stage. The views' `SELECT`s were run read-only on TEST with the join to `portal_payments_v` swapped for the live transfers (101 lines, all resolved; 26 proofs).
 - No HTTP suite and no two-connection race test exist yet: both need the migrated table. The lock order and the guarded updates are checked against a scripted connection only.
 - What Front offers for idempotency: not looked into. The send relies on its own key and on never retrying.
