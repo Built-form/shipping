@@ -203,10 +203,30 @@ test('stock movements: added later, priced one by one, totals by currency', () =
     assert.match(block, /2026-12-17/);
 });
 
-test('requestState: revoked > expired > booked > answered > open', () => {
+test('bookingFinished: confirmed, and due to arrive more than a fortnight ago', () => {
+    const option = { sailing_date: '2026-10-01', transit_days: 30 }; // arrives 2026-10-31
+    const confirmed = { status: 'confirmed' };
+    assert.equal(F.bookingFinished(confirmed, option, '2026-11-14'), false); // the fourteenth day
+    assert.equal(F.bookingFinished(confirmed, option, '2026-11-15'), true);
+    // The option as JSON reads the same.
+    assert.equal(F.bookingFinished(confirmed, { sailingDate: '2026-10-01', transitDays: 30 }, '2026-11-15'), true);
+    // Only a confirmed booking finishes; one whose option cannot be read never does.
+    assert.equal(F.bookingFinished({ status: 'requested' }, option, '2027-01-01'), false);
+    assert.equal(F.bookingFinished({ status: 'cancelled' }, option, '2027-01-01'), false);
+    assert.equal(F.bookingFinished(confirmed, null, '2027-01-01'), false);
+    assert.equal(F.bookingFinished(confirmed, { sailing_date: null, transit_days: 30 }, '2027-01-01'), false);
+    assert.equal(F.bookingFinished(confirmed, option, 'soon'), false);
+});
+
+test('requestState: revoked > booked > expired > answered > open', () => {
     const at = new Date();
     assert.equal(F.requestState({ revoked_at: at, expired: 1, answered_at: at }, true), 'revoked');
-    assert.equal(F.requestState({ revoked_at: null, expired: 1, answered_at: at }, true), 'expired');
+    // A booking that stands outranks the link's expiry: the forwarder still needs the page.
+    assert.equal(F.requestState({ revoked_at: null, expired: 1, answered_at: at }, true), 'booked');
+    assert.equal(F.requestState({ revoked_at: null, expired: 1, answered_at: at }, false), 'expired');
+    // A finished booking no longer holds the link open, but still holds the request while the link lasts.
+    assert.equal(F.requestState({ revoked_at: null, expired: 1, answered_at: at }, true, true), 'expired');
+    assert.equal(F.requestState({ revoked_at: null, expired: 0, answered_at: at }, true, true), 'booked');
     assert.equal(F.requestState({ revoked_at: null, expired: 0, answered_at: at }, true), 'booked');
     assert.equal(F.requestState({ revoked_at: null, expired: 0, answered_at: at }, false), 'answered');
     assert.equal(F.requestState({ revoked_at: null, expired: 0, answered_at: null }, false), 'open');

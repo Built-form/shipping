@@ -7,8 +7,8 @@
 // blocks of the three emails, and the contents of a container by supplier.
 // The SQL is in src/services/freight-quote-routes.js. The portal mirrors
 // TOKEN_RE, the vocabularies, requestState and the option rules in its
-// src/lib/freightQuotes.js; ShipLine mirrors requestState in
-// src/components/freight/freightQuotes.ts.
+// src/lib/freightQuotes.js (and bookingFinished); ShipLine takes a request's
+// state from the API.
 
 const crypto = require('crypto');
 const { FONT, INK, MUTED, BORDER, CODE_BG, escapeHtml, button, linkFallback, small, facts } = require('./email-layout');
@@ -71,6 +71,14 @@ const BOOKING_STATUSES = ['requested', 'confirmed', 'declined', 'cancelled'];
 /** A booking that holds its request: no other booking, no new answer. */
 const LIVE_BOOKING_STATUSES = ['requested', 'confirmed'];
 const REVOKE_REASONS = ['staff', 'send_failed', 'filled', 'forwarder_removed'];
+/**
+ * A confirmed booking is finished this many days after its sailing was due to
+ * arrive: it no longer keeps its link open, is no longer compared with its
+ * container, and no longer stops its forwarder being removed.
+ */
+const FINISHED_AFTER_DAYS = 14;
+/** A reminder keeps the link open at least this long. */
+const REMINDER_EXTENDS_DAYS = 14;
 
 const NAME_MAX = 255;
 const NOTE_MAX = 1000;
@@ -417,15 +425,33 @@ function validateRequest(body, today) {
 }
 
 /**
+ * Whether a booking is finished: confirmed, and its sailing was due to arrive
+ * more than FINISHED_AFTER_DAYS ago. Derived, never stored (the row stays
+ * `confirmed`). `option` is the booking's option, as a row (sailing_date,
+ * transit_days) or as JSON (sailingDate, transitDays); `today` 'YYYY-MM-DD'.
+ * A booking whose option cannot be read is never finished. The portal mirrors it.
+ */
+function bookingFinished(booking, option, today) {
+    if (!booking || booking.status !== 'confirmed' || !option || !isYmd(today)) return false;
+    const arrives = arrivalDate(option.sailing_date ?? option.sailingDate, option.transit_days ?? option.transitDays);
+    return arrives !== null && addDays(arrives, FINISHED_AFTER_DAYS) < today;
+}
+
+/**
  * The state of a request, one precedence shared with the portal and ShipLine:
- * revoked > expired > booked > answered > open. `booked` = a booking on it is
- * requested or confirmed. Derived, never stored: a cancelled or declined
- * booking puts the request back to `answered` with nothing to undo.
+ * revoked > booked > expired > answered > open. `booked` = a booking on it is
+ * requested or confirmed. A booking that still stands outranks expiry: the
+ * forwarder needs the page until the container has arrived, long after the
+ * link's own 30 days. A FINISHED booking (`bookingIsFinished`) no longer holds
+ * the link open, so its request reads `expired` once the link has run out, and
+ * `booked` until then. Derived, never stored: a cancelled or declined booking
+ * puts the request back to `answered` with nothing to undo.
  * `row` = { revoked_at, expired, answered_at }, `expired` being the database's
  * own answer to `expires_at <= UTC_TIMESTAMP()`.
  */
-function requestState(row, hasLiveBooking) {
+function requestState(row, hasLiveBooking, bookingIsFinished = false) {
     if (row.revoked_at) return 'revoked';
+    if (hasLiveBooking && !bookingIsFinished) return 'booked';
     if (row.expired === true || Number(row.expired) === 1) return 'expired';
     if (hasLiveBooking) return 'booked';
     return row.answered_at ? 'answered' : 'open';
@@ -804,12 +830,12 @@ module.exports = {
     SERVICES, SERVICE_LABELS, SERVICE_LABELS_ZH, DEFAULT_DELIVERY_OPTIONS, CONTAINER_SIZES, CURRENCIES,
     EXPIRY_DAYS, EXPIRY_MIN_DAYS, EXPIRY_MAX_DAYS, WINDOW_MAX_DAYS, SAILING_MARGIN_DAYS, MAX_OPTIONS,
     ANSWER_LIMIT, MAX_FORWARDERS_PER_SEND, MAX_CONTACTS, MAX_SERVICES, MAX_DELIVERY_OPTIONS, MAX_MOVEMENTS,
-    BOOKING_STATUSES, LIVE_BOOKING_STATUSES, REVOKE_REASONS, NOTE_MAX,
+    BOOKING_STATUSES, LIVE_BOOKING_STATUSES, REVOKE_REASONS, FINISHED_AFTER_DAYS, REMINDER_EXTENDS_DAYS, NOTE_MAX,
     isYmd, toYmd, addDays, daysBetween, arrivalDate, jsonArray, servicesOf, serviceCode, serviceName,
     movementTotals, movementPriceTotals,
     validateForwarder, validateDeliveryOption, validateServices, validateMovements, validateMovementAdd,
     validateMovementPrice, validateRequest,
-    requestState, isEditable, validateOptions, validateStaffAnswer,
+    bookingFinished, requestState, isEditable, validateOptions, validateStaffAnswer,
     validateBookingRef, optionalText,
     money, serviceLabel, requestFacts, movementsHtml, movementBlockHtml, quoteBlockHtml, optionFacts, bookingBlockHtml,
     groupContentsBySupplier, contentsHtml, contentsSnapshot, contentsDrift,
