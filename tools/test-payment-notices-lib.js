@@ -317,13 +317,57 @@ test('the portal block: the button to the payment, registration, and on a deposi
     assert.ok(bal.includes('our team will approve your access'));
 });
 
-test('the attached block names the files and says nothing of the portal', () => {
+test('the attached block names the files, and with no order to send anyone to says nothing of the portal', () => {
     const html = N.attachedBlockHtml({ filenames: ['proof.pdf', 'b<i>.pdf'] });
     assert.ok(html.includes('proof.pdf'));
     assert.ok(html.includes('b&lt;i&gt;.pdf'));
     assert.ok(html.includes('attached'));
     assert.ok(html.includes('附件'));
     assert.equal(/portal|门户|register/i.test(html), false);
+    assert.equal(N.attachedBlockHtml({ filenames: ['proof.pdf'], readyDates: [], registerUrl: 'https://portal.example/register' }), N.attachedBlockHtml({ filenames: ['proof.pdf'] }));
+});
+
+// The ready dates are entered on the portal, never asked for by reply (the
+// user, 2026-11-17, on the first deposit email that went out attached).
+test('the attached block of a deposit sends the supplier to each order on the portal for its ready dates', () => {
+    const html = N.attachedBlockHtml({
+        filenames: ['proof.pdf'], registerUrl: 'https://portal.example/register',
+        readyDates: [{ poNumber: 'PO_001J', url: 'https://portal.example/orders/101' }, { poNumber: 'PO_<b>2', url: 'https://portal.example/orders/102' }],
+    });
+    // Still the attached box first: the proof rides on this email.
+    assert.ok(html.startsWith(N.attachedBlockHtml({ filenames: ['proof.pdf'] })));
+    assert.ok(html.includes('href="https://portal.example/orders/101"'));
+    assert.ok(html.includes('href="https://portal.example/orders/102"'));
+    assert.ok(html.includes('Enter ready dates: PO_001J / 填写预计完成日期'));
+    assert.ok(html.includes('Please enter the <strong>estimated ready date</strong> of each item on the order\'s page of our supplier portal.'));
+    assert.ok(html.includes('请在供应商门户的订单页面填写各产品的<strong>预计完成日期</strong>。'));
+    // A PO number is text, never markup.
+    assert.ok(html.includes('PO_&lt;b&gt;2'));
+    assert.equal(html.includes('PO_<b>2'), false);
+    // This email approved nobody on the portal: an address new to it registers and waits.
+    assert.ok(html.includes('https://portal.example/register'));
+    assert.ok(html.includes('our team will approve your access'));
+    assert.equal(html.includes('There is no approval to wait for'), false);
+    // It never says the proof is on the portal, or that nothing is attached.
+    assert.equal(/No file is attached|payments\?payment=/.test(html), false);
+});
+
+test('ready-date links: wherever the portal can open the order, whichever way the proof goes', () => {
+    const BASE = 'https://portal.example';
+    const notice = { kind: 'deposit', readyDatePos: [{ id: 101, poNumber: 'PO_001J' }, { id: 102, poNumber: 'PO_002J' }] };
+    const links = [{ poNumber: 'PO_001J', url: `${BASE}/orders/101` }, { poNumber: 'PO_002J', url: `${BASE}/orders/102` }];
+    const matched = [{ id: 900001, name: SUPPLIER }];
+    assert.deepEqual(N.readyDatesFor(notice, { delivery: 'portal', reason: null, portalBase: BASE, suppliers: matched }), links);
+    // Attached only because the Payments page is not switched on, or its table is not there: the orders are on the portal all the same.
+    assert.deepEqual(N.readyDatesFor(notice, { delivery: 'attached', reason: 'portal_switch_off', portalBase: BASE, suppliers: matched }), links);
+    assert.deepEqual(N.readyDatesFor(notice, { delivery: 'attached', reason: 'portal_unavailable', portalBase: BASE, suppliers: matched }), links);
+    // No supplier of exactly that name: nobody on the portal can open these orders.
+    assert.deepEqual(N.readyDatesFor(notice, { delivery: 'attached', reason: 'no_supplier', portalBase: BASE, suppliers: [] }), []);
+    // No portal address on this server: no link to make.
+    assert.deepEqual(N.readyDatesFor(notice, { delivery: 'attached', reason: 'portal_url_unset', portalBase: null, suppliers: matched }), []);
+    // A balance asks for no ready dates.
+    assert.deepEqual(N.readyDatesFor({ kind: 'balance', readyDatePos: [] }, { delivery: 'portal', reason: null, portalBase: BASE, suppliers: matched }), []);
+    assert.deepEqual(N.readyDatesFor({ kind: 'balance' }, { delivery: 'portal', reason: null, portalBase: BASE, suppliers: matched }), []);
 });
 
 // ── Delivery ──────────────────────────────────────────────────────────────
@@ -417,15 +461,29 @@ test('the wording asks for what each payment is owed in return, and never contra
         assert.ok(t[key].includes('电放'), key);
         assert.equal(/ready date/i.test(t[key]), false, key);
     }
-    // A link says nothing is attached; an attached email does not send anyone to the portal.
+    // A link says nothing is attached. An attached email never says so; a balance's sends
+    // nobody to the portal, a deposit's does, for the ready dates.
     for (const key of ['payment_proof_deposit_portal', 'payment_proof_balance_portal']) {
         assert.match(t[key], /not attached/i, key);
         assert.match(t[key], /supplier portal/i, key);
     }
     for (const key of ['payment_proof_deposit_attached', 'payment_proof_balance_attached']) {
         assert.match(t[key], /attached/i, key);
-        assert.equal(/not attached|portal|门户/i.test(t[key]), false, key);
+        assert.equal(/not attached/i.test(t[key]), false, key);
     }
+    assert.equal(/portal|门户/i.test(t.payment_proof_balance_attached), false);
+    // The ready dates are entered on the portal, whichever way the proof goes: never by a
+    // reply to the email (the user, 2026-11-17).
+    assert.ok(t.payment_proof_deposit_attached.includes('enter the estimated ready date of each item on our supplier portal'));
+    assert.ok(t.payment_proof_deposit_attached.includes('在我们的供应商门户填写各产品的预计完成日期'));
+    for (const key of ['payment_proof_deposit_portal', 'payment_proof_deposit_attached']) {
+        assert.equal(/reply to this email/i.test(t[key]), false, key);
+        assert.equal(t[key].includes('回复本邮件'), false, key);
+        assert.match(t[key], /portal/i, key);
+    }
+    // What the template editor says of it, too.
+    const about = PAYMENT_PROOF_TEMPLATES.find(x => x.key === 'payment_proof_deposit_attached').description;
+    assert.match(about, /button to each order's ready dates on the supplier portal/);
 });
 
 // ── The state of a notice ─────────────────────────────────────────────────
@@ -501,4 +559,44 @@ test('who may send, and what a refusal looks like', () => {
     assert.deepEqual([c.status, c.code, Array.isArray(c.allowedNext)], [409, 'NO_PROOF', true]);
     assert.ok(c.error.length > 10);
     assert.equal(N.refusal('SEND_OUTCOME_UNKNOWN').status, 502);
+});
+
+// ── The wording already stored on a server ────────────────────────────────
+
+const reword = require('../src/db/migrate/2026-11-17_10_reword_payment_proof_deposit_attached');
+
+// A connection that answers the UPDATE with `affected` rows and the SELECT with `rows`.
+function templateConn(affected, rows = []) {
+    const asked = [];
+    return {
+        asked,
+        query: async (sql, params) => {
+            asked.push({ sql: String(sql).replace(/\s+/g, ' ').trim(), params });
+            return /^UPDATE/.test(String(sql).trim()) ? [{ affectedRows: affected }] : [rows];
+        },
+    };
+}
+const runReword = async (conn) => { const said = []; await reword.up(conn, { log: m => said.push(m) }); return said; };
+
+test('the reword of the stored deposit wording: only the text this app seeded is replaced', async () => {
+    const now = PAYMENT_PROOF_TEMPLATES.find(t => t.key === 'payment_proof_deposit_attached');
+    // What it looks for is the old ask, word for word; what it writes is today's.
+    assert.ok(reword.OLD_BODY.includes('reply to this email with the estimated ready date of each item'));
+    assert.ok(reword.OLD_BODY.includes('回复本邮件告知各产品的预计完成日期'));
+    assert.notEqual(reword.OLD_BODY, now.bodyHtml);
+
+    const seeded = templateConn(1);
+    assert.deepEqual(await runReword(seeded), ['payment_proof_deposit_attached reworded']);
+    assert.equal(seeded.asked.length, 1);
+    assert.equal(seeded.asked[0].sql, 'UPDATE email_templates SET body_html = ?, description = ? WHERE template_key = ? AND deleted_at IS NULL AND body_html = ?');
+    assert.deepEqual(seeded.asked[0].params, [now.bodyHtml, now.description, 'payment_proof_deposit_attached', reword.OLD_BODY]);
+});
+
+test('the reword leaves an edited template alone and says so; a missing or already reworded one is said too', async () => {
+    const now = PAYMENT_PROOF_TEMPLATES.find(t => t.key === 'payment_proof_deposit_attached');
+    const edited = templateConn(0, [{ body_html: '<p>Our own words</p>' }]);
+    assert.deepEqual(await runReword(edited), ['payment_proof_deposit_attached has been edited since it was seeded and was left as it is: check it asks for the ready dates on the portal, not by reply']);
+    assert.equal(edited.asked.filter(a => /^UPDATE/.test(a.sql)).length, 1, 'nothing is written a second time');
+    assert.deepEqual(await runReword(templateConn(0, [{ body_html: now.bodyHtml }])), ['payment_proof_deposit_attached already holds the new wording']);
+    assert.deepEqual(await runReword(templateConn(0, [])), ['payment_proof_deposit_attached not found; nothing to reword']);
 });

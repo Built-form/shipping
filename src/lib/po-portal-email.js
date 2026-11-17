@@ -141,7 +141,11 @@ function signedPiPortalBlockHtml({ poNumber, filename, poUrl, registerUrl: regUr
 // `seeZh` name what a pre-approved address will see once signed in (plain
 // text): the order for the two PO emails; the Request to send email
 // (src/lib/request-to-send-portal.js) passes its own.
-function blockHtml({ leadHtml, url, regUrl, preapproved, footHtml, seeEn = 'this order', seeZh = '此订单' }) {
+// How to get an account, in English and Chinese: two small lines. Said one way
+// to an address this email approved (`preapproved`), another to one it did
+// not. Also used by an email that links to the portal without this frame (a
+// deposit whose proof is attached, src/lib/payment-notices.js).
+function accountHtml({ regUrl, preapproved, seeEn = 'this order', seeZh = '此订单' }) {
     const reg = escapeHtml(regUrl);
     const regLink = `<a href="${reg}" style="color:#1f5fbf;word-break:break-all;">${reg}</a>`;
     const account = preapproved
@@ -153,12 +157,16 @@ function blockHtml({ leadHtml, url, regUrl, preapproved, footHtml, seeEn = 'this
             small(`<strong style="color:${INK};">New to the portal?</strong> Register at ${regLink} with the email address this message was sent to, and our team will approve your access.`),
             small(`<strong style="color:${INK};">首次使用门户？</strong>请使用接收本邮件的邮箱地址在 ${regLink} 注册，我们的团队将审核并开通您的访问权限。`),
         ];
+    return account.join('');
+}
+
+function blockHtml({ leadHtml, url, regUrl, preapproved, footHtml, seeEn = 'this order', seeZh = '此订单' }) {
     return [
         `<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:18px 0;"><tr><td style="padding:16px 18px 6px;border:1px solid ${BORDER};border-radius:8px;background:${CODE_BG};">`,
         `<p style="margin:0 0 12px;font-family:${FONT};font-size:15px;line-height:1.6;color:${INK};">${leadHtml}</p>`,
         button(url, 'Go to the supplier portal / 前往供应商门户'),
         linkFallback(url),
-        ...account,
+        accountHtml({ regUrl, preapproved, seeEn, seeZh }),
         `<p style="margin:0 0 10px;font-family:${FONT};font-size:12px;line-height:1.5;color:${MUTED};">${footHtml}</p>`,
         '</td></tr></table>',
     ].join('');
@@ -176,4 +184,5 @@ module.exports = {
     portalBlockHtml,
     signedPiPortalBlockHtml,
     blockHtml,
+    accountHtml,
 };

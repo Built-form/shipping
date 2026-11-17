@@ -37,6 +37,8 @@ const sourceOf = (lines = [depositLine()], over = {}) => ({
 });
 const PORTAL_DELIVERY = { delivery: 'portal', reason: null, portalBase: PORTAL, portalUrl: `${PORTAL}/payments?payment=45`, registerUrl: `${PORTAL}/register`, suppliers: [{ id: 900001, name: SUPPLIER }] };
 const ATTACHED_DELIVERY = { delivery: 'attached', reason: 'no_supplier', portalBase: PORTAL, portalUrl: null, registerUrl: null, suppliers: [] };
+// Attached only because the portal's Payments page is not switched on for the stage: the supplier is on the portal.
+const SWITCH_OFF_DELIVERY = { delivery: 'attached', reason: 'portal_switch_off', portalBase: PORTAL, portalUrl: null, registerUrl: null, suppliers: [{ id: 900001, name: SUPPLIER }] };
 
 // The store in memory. Its transitions are the ones the real store's guarded
 // UPDATEs make (checked against the SQL below).
@@ -164,6 +166,43 @@ test('an attached send: the receipt is minted before the email is built, the pro
     assert.equal(store.rows[0].delivery, 'attached');
     // No second receipt: the one minted is the email's.
     assert.equal(store.calls.includes('logReceipt'), false);
+});
+
+// The ready dates are entered on the portal, never asked for by reply (the
+// user, 2026-11-17): the way there goes out with an attached proof too.
+test('an attached deposit still sends the supplier to the portal for the ready dates, and approves nobody', async () => {
+    const store = memoryStore({ delivery: SWITCH_OFF_DELIVERY });
+    const front = [];
+    const r = await send(store, frontOk(front), await requestFor(store));
+    assert.equal(r.status, 200);
+    const html = front[0].html;
+    assert.ok(html.includes(`href="${PORTAL}/orders/101"`));
+    assert.ok(html.includes('Enter ready dates: PO_001J'));
+    assert.ok(html.includes('of each item on the order\'s page of our supplier portal'));
+    // Nobody was approved by this email: an address new to the portal registers and waits.
+    assert.equal(store.calls.includes('preapprove'), false);
+    assert.ok(html.includes(`${PORTAL}/register`));
+    assert.ok(html.includes('our team will approve your access'));
+    assert.equal(html.includes('There is no approval to wait for'), false);
+    // The proof is on the email, not on the portal: nothing links to the payment there.
+    assert.equal(/payments\?payment=/.test(html), false);
+    assert.ok(html.includes('The <strong>proof of payment</strong> is attached to this email: proof.pdf'));
+    assert.deepEqual(front[0].attachments.map(a => a.filename), ['proof.pdf']);
+    assert.ok(html.includes('https://api.example/api/v1/confirm-receipt/tok-1'));
+    // The ready dates come before the confirm button, under the wording.
+    assert.ok(html.indexOf(`${PORTAL}/orders/101`) < html.indexOf('confirm-receipt/tok-1'));
+});
+
+test('an attached balance, and a deposit nobody on the portal can open the orders of, say nothing of the portal', async () => {
+    const balance = memoryStore({ delivery: SWITCH_OFF_DELIVERY, source: sourceOf([depositLine(), balanceLine()]) });
+    const front = [];
+    assert.equal((await send(balance, frontOk(front), await requestFor(balance, 'balance'), 'balance')).status, 200);
+    assert.equal(balance.rows[0].noticeKind, 'balance');
+    assert.equal(/\/orders\/|\/register|portal\.example/.test(front[0].html), false);
+    // No supplier of exactly that name: no order to send them to.
+    const unmatched = memoryStore({ delivery: ATTACHED_DELIVERY });
+    assert.equal((await send(unmatched, frontOk(front), await requestFor(unmatched))).status, 200);
+    assert.equal(/\/orders\/|\/register|portal\.example/.test(front[1].html), false);
 });
 
 test('a blank subject or body falls back to the stored template for that notice and delivery', async () => {
@@ -528,6 +567,13 @@ test('the preview: figures, each notice with its wording to start from, its stat
     assert.deepEqual(a.delivery, { delivery: 'attached', reason: 'no_supplier', portalSupplier: false });
     assert.deepEqual(a.notices.map(n => [n.templateKey, n.portalUrl, n.readyDates]), [['payment_proof_deposit_attached', null, []], ['payment_proof_balance_attached', null, []]]);
     assert.notEqual(a.previewToken, p.previewToken);
+    // Attached while the supplier is on the portal: no link to the payment, but the deposit's orders are still linked for their ready dates.
+    const off = await S.previewOf(source, SWITCH_OFF_DELIVERY, [], NOW);
+    assert.deepEqual(off.delivery, { delivery: 'attached', reason: 'portal_switch_off', portalSupplier: true });
+    assert.deepEqual(off.notices.map(n => [n.templateKey, n.portalUrl, n.readyDates]), [
+        ['payment_proof_deposit_attached', null, [{ poNumber: 'PO_001J', url: `${PORTAL}/orders/101` }]],
+        ['payment_proof_balance_attached', null, []],
+    ]);
 });
 
 test('the preview of a transfer that cannot be sent says why, and of an attached one whose proofs cannot be attached', async () => {
@@ -828,6 +874,14 @@ test('delivery from the database: the supplier matched exactly, the portal\'s ow
     assert.deepEqual(reasons, ['no_supplier', 'portal_switch_off', 'portal_unavailable', 'portal_url_unset']);
     const off = await S.resolveNoticeDelivery(withSupplier(), pay, { ...env, PAYMENT_PROOF_PORTAL: 'off' });
     assert.deepEqual([off.delivery, off.portalUrl, off.registerUrl, off.suppliers.length], ['attached', null, null, 2]);
+    // Attached or not, it still says where the portal is and who is on it: a deposit's
+    // ready dates are entered there whichever way the proof goes.
+    assert.equal(off.portalBase, PORTAL);
+    assert.deepEqual(N.readyDatesFor({ readyDatePos: [{ id: 101, poNumber: 'PO_001J' }] }, off), [{ poNumber: 'PO_001J', url: `${PORTAL}/orders/101` }]);
+    const noTable = await S.resolveNoticeDelivery(scripted([[/FROM suppliers s WHERE/, [[{ id: 1, name: SUPPLIER }]]], [/payment_views/, Object.assign(new Error('no table'), { errno: 1146 })]]), pay, env);
+    assert.deepEqual([noTable.delivery, noTable.portalBase, noTable.suppliers], ['attached', PORTAL, [{ id: 1, name: SUPPLIER }]]);
+    // Nobody of that name on the portal: no order of theirs can be opened there.
+    assert.deepEqual(N.readyDatesFor({ readyDatePos: [{ id: 101, poNumber: 'PO_001J' }] }, await S.resolveNoticeDelivery(scripted(), pay, env)), []);
     // The portal's table failing for any other reason is a fault, not "no portal".
     await assert.rejects(S.resolveNoticeDelivery(scripted([[/payment_views/, Object.assign(new Error('gone away'), { errno: 2006 })]]), pay, env));
 });

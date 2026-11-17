@@ -399,9 +399,9 @@ DEFAULT_EMAIL_TEMPLATES.push(REQUEST_TO_SEND_UPDATE_PORTAL_TEMPLATE);
 // the supplier portal's Payments page or, where the supplier is not on the
 // portal, with the proof attached: four wordings, because what an email asks
 // for and whether it says "attached" depend on both. The sender appends a
-// fixed block under the body (the button to the portal and how to register,
-// plus the way to the ready dates on a deposit; or the names of the attached
-// files). The figures are tokens the send fills in from the payment itself:
+// fixed block under the body (the button to the portal and how to register;
+// or the names of the attached files; and on a deposit, either way, the way to
+// each order's ready dates on the portal). The figures are tokens the send fills in from the payment itself:
 // {amount} {currency} {paidOn} and {paidFor} (the PO numbers or container
 // numbers the supplier may be told, or a dash).
 const PAYMENT_PROOF_WRAP = body => [
@@ -445,11 +445,13 @@ const PAYMENT_PROOF_TEMPLATES = [
         key: 'payment_proof_deposit_attached',
         name: 'Deposit paid (proof attached)',
         category: 'Payment proof',
-        description: 'Emailed to a supplier when a deposit has been paid and the proof of payment goes out attached to the email (the supplier is not on the portal, or the portal is not available). The names of the attached files and a "Confirm receipt" button are appended automatically. Tokens: {amount} {currency} {paidOn} {paidFor}.',
+        description: 'Emailed to a supplier when a deposit has been paid and the proof of payment goes out attached to the email (the portal cannot show them the payment). The names of the attached files, a button to each order\'s ready dates on the supplier portal (where the portal can open the order for them) and a "Confirm receipt" button are appended automatically. Tokens: {amount} {currency} {paidOn} {paidFor}.',
         subject: 'Deposit paid – {currency} {amount} – {paidFor} / 定金已付',
         bodyHtml: paymentProofBody('deposit', [
-            'The proof of payment is attached. Please confirm you have received the payment, and reply to this email with the estimated ready date of each item.',
-            '付款凭证见附件。请确认收款，并回复本邮件告知各产品的预计完成日期。',
+            // The ready dates are entered on the portal, never asked for by reply (the
+            // user, 2026-11-17): the send appends a button to each order's page.
+            'The proof of payment is attached. Please confirm you have received the payment, and enter the estimated ready date of each item on our supplier portal.',
+            '付款凭证见附件。请确认收款，并在我们的供应商门户填写各产品的预计完成日期。',
         ]),
     },
     {

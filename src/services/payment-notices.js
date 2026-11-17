@@ -98,7 +98,9 @@ function previewOf(source, delivery, sends = [], now = new Date()) {
             tokens: N.tokensFor(built, n),
             // null when it goes out attached (resolveNoticeDelivery).
             portalUrl: delivery.portalUrl,
-            readyDates: attached ? [] : n.readyDatePos.map(p => ({ poNumber: p.poNumber, url: N.readyDatesUrl(delivery.portalBase, p.id) })),
+            // A deposit's orders on the portal, for their ready dates: linked whichever way
+            // the proof goes, wherever the portal can open them for this supplier.
+            readyDates: N.readyDatesFor(n, delivery),
             state: states[i].state,
             lastSentAt: states[i].lastSentAt,
             sends: sends.filter(s => s.noticeKind === n.kind).map(s => sendJson(s, now)),
@@ -237,7 +239,7 @@ async function sendNotice(ctx, { paymentId, kind, actor, body }) {
                 url: delivery.portalUrl,
                 registerUrl: delivery.registerUrl,
                 preapproved,
-                readyDates: notice.readyDatePos.map(p => ({ poNumber: p.poNumber, url: N.readyDatesUrl(delivery.portalBase, p.id) })),
+                readyDates: N.readyDatesFor(notice, delivery),
             });
             html = wrapEmail({ title: subject, bodyHtml: `${bodyHtml}${block}` });
         } else {
@@ -247,7 +249,14 @@ async function sendNotice(ctx, { paymentId, kind, actor, body }) {
             await store.setReceiptToken(send.id, token);
             attachments = [];
             for (const doc of source.documents) attachments.push(await store.readProof(doc));
-            const inner = `${bodyHtml}${N.attachedBlockHtml({ filenames: attachments.map(a => a.filename) })}`;
+            // The ready dates are entered on the portal, never asked for by reply: the
+            // way to each order goes out here too. Nobody is approved on the portal by
+            // an attached send; an address new to it registers and waits.
+            const inner = `${bodyHtml}${N.attachedBlockHtml({
+                filenames: attachments.map(a => a.filename),
+                readyDates: N.readyDatesFor(notice, delivery),
+                registerUrl: delivery.portalBase ? P.registerUrl(delivery.portalBase) : null,
+            })}`;
             html = wrapEmail({ title: subject, bodyHtml: R.appendReceiptLink(inner, token, ctx.apiBaseUrl) });
         }
     } catch (e) {

@@ -398,18 +398,45 @@ function portalBlockHtml({ kind, url, registerUrl, preapproved, readyDates = [] 
         seeEn: 'this payment', seeZh: '此付款',
     });
     if (kind !== 'deposit' || !readyDates.length) return block;
-    // button() treats its label as plain text and escapes it.
-    const orders = readyDates.map(r => [
-        button(r.url, `Enter ready dates: ${r.poNumber} / 填写预计完成日期`),
-        linkFallback(r.url),
-    ].join('')).join('');
-    return `${block}${BOX_OPEN}${lead('Please enter the <strong>estimated ready date</strong> of each item on the order\'s page.<br>请在订单页面填写各产品的<strong>预计完成日期</strong>。')}${orders}${BOX_CLOSE}`;
+    return `${block}${BOX_OPEN}${lead('Please enter the <strong>estimated ready date</strong> of each item on the order\'s page.<br>请在订单页面填写各产品的<strong>预计完成日期</strong>。')}${orderButtons(readyDates)}${BOX_CLOSE}`;
 }
 
-/** Under an attached email's wording: that the proof rides on this email. Nothing of the portal. */
-function attachedBlockHtml({ filenames = [] }) {
+// A button to each order's own page, where its lines' estimated ready dates
+// are entered. button() treats its label as plain text and escapes it.
+const orderButtons = readyDates => readyDates.map(r => [
+    button(r.url, `Enter ready dates: ${r.poNumber} / 填写预计完成日期`),
+    linkFallback(r.url),
+].join('')).join('');
+
+/**
+ * Where a deposit's estimated ready dates are entered: each of its orders'
+ * own page on the portal. The ready dates are ALWAYS asked for there, never by
+ * a reply to the email (the user, 2026-11-17), so the links go out whichever
+ * way the proof does, wherever the portal can open the order for this
+ * supplier: it has an address here, and a supplier of exactly the transfer's
+ * name is on it. `delivery` is resolveNoticeDelivery's answer. A balance has
+ * none (`readyDatePos` is a deposit's).
+ */
+function readyDatesFor(notice, delivery) {
+    const orders = (notice && notice.readyDatePos) || [];
+    if (!delivery || !delivery.portalBase || !(delivery.suppliers || []).length) return [];
+    return orders.map(p => ({ poNumber: p.poNumber, url: readyDatesUrl(delivery.portalBase, p.id) }));
+}
+
+/**
+ * Under an attached email's wording: that the proof rides on this email. And,
+ * for a deposit whose orders the portal can open (`readyDates`, from
+ * readyDatesFor), a second box with the way to each order's ready dates and
+ * how to get an account. This email approves nobody on the portal, so the
+ * account lines are the ones for an address that still has to be approved.
+ * With no such order it says nothing of the portal.
+ */
+function attachedBlockHtml({ filenames = [], readyDates = [], registerUrl = null }) {
     const names = filenames.map(escapeHtml).join(', ');
-    return `${BOX_OPEN}${lead(`The <strong>proof of payment</strong> is attached to this email${names ? `: ${names}` : ''}.<br><strong>付款凭证</strong>见本邮件附件。`)}${foot('Please keep it for your records. / 请留存备查。')}${BOX_CLOSE}`;
+    const proof = `${BOX_OPEN}${lead(`The <strong>proof of payment</strong> is attached to this email${names ? `: ${names}` : ''}.<br><strong>付款凭证</strong>见本邮件附件。`)}${foot('Please keep it for your records. / 请留存备查。')}${BOX_CLOSE}`;
+    if (!readyDates.length) return proof;
+    const account = registerUrl ? P.accountHtml({ regUrl: registerUrl, preapproved: false }) : '';
+    return `${proof}${BOX_OPEN}${lead('Please enter the <strong>estimated ready date</strong> of each item on the order\'s page of our supplier portal.<br>请在供应商门户的订单页面填写各产品的<strong>预计完成日期</strong>。')}${orderButtons(readyDates)}${account}${BOX_CLOSE}`;
 }
 
 /** The note pre-approval leaves on a portal user it creates or approves. */
@@ -420,7 +447,7 @@ module.exports = {
     NOTICE_KINDS, EMAIL_TYPE, SEND_TABLE, TEMPLATE_CATEGORY, TEMPLATE_KEYS, DELIVERIES, SEND_ROLES,
     DEADLINE_SECONDS, MAX_ATTACHED_FILES, MAX_ATTACHED_BYTES,
     toCents, noticeKindOfLine, noticeKindsOf, buildNotices, attachRefusal, tokensFor,
-    paymentPortalUrl, readyDatesUrl,
+    paymentPortalUrl, readyDatesUrl, readyDatesFor,
     portalSwitchOn, deliveryFor, deliveryConflict,
     previewToken, requestHash, mayCallFront,
     effectiveStatus, noticeStates,
