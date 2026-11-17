@@ -592,6 +592,19 @@ function portalSyncSteps(jp) {
                SET r.confirmed_at = b.responded_at
              WHERE ${PENDING_PORTAL} AND r.send_table = 'freight_bookings'
                AND r.email_type = 'freight_booking_request' AND b.responded_at IS NOT NULL`],
+        // The price request for stock movements added to a freight request
+        // later: every movement on the request now carries a price, the newest
+        // of them given after the email went.
+        ['freight_movements_priced', `
+            UPDATE email_receipts r
+               SET r.confirmed_at = (SELECT MAX(m.priced_at) FROM freight_stock_movements m
+                                      WHERE m.request_id = r.send_id AND m.deleted_at IS NULL)
+             WHERE ${PENDING_PORTAL} AND r.send_table = 'freight_quote_requests'
+               AND r.email_type = 'freight_movement_request'
+               AND EXISTS (SELECT 1 FROM freight_stock_movements m
+                            WHERE m.request_id = r.send_id AND m.deleted_at IS NULL AND m.priced_at >= r.created_at)
+               AND NOT EXISTS (SELECT 1 FROM freight_stock_movements m
+                                WHERE m.request_id = r.send_id AND m.deleted_at IS NULL AND m.price IS NULL)`],
     ];
 }
 
@@ -645,7 +658,7 @@ async function syncPortalReceipts(conn, { maxAgeMs = PORTAL_SYNC_MS } = {}) {
     } catch (e) {
         // JPORTAL_DB_SCHEMA is not a plain identifier: nothing can be read.
         log.warn('[email-receipt] portal sync skipped', { error: e.message });
-        return { failed: ['po_viewed', 'signed_pi_viewed', 'request_viewed', 'request_pl_uploaded', 'request_ci_uploaded', 'artwork_ticked', 'file_opened', 'qc_availability_answered', 'qc_schedule_opened', 'quote_answered', 'freight_quote_answered', 'freight_booking_answered', ...failed] };
+        return { failed: ['po_viewed', 'signed_pi_viewed', 'request_viewed', 'request_pl_uploaded', 'request_ci_uploaded', 'artwork_ticked', 'file_opened', 'qc_availability_answered', 'qc_schedule_opened', 'quote_answered', 'freight_quote_answered', 'freight_booking_answered', 'freight_movements_priced', ...failed] };
     }
     for (const [name, sql] of steps) await run(name, () => conn.query(sql));
     return { failed };

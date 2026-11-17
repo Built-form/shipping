@@ -406,6 +406,7 @@ const FREIGHT_SIGNOFF = '<p>Kind regards, / 此致敬礼<br>Operations Team.<br>
 const FREIGHT_QUOTE_REQUEST_TEMPLATE_KEY = 'freight_quote_request';
 const FREIGHT_BOOKING_REQUEST_TEMPLATE_KEY = 'freight_booking_request';
 const FREIGHT_BOOKING_CONTENTS_TEMPLATE_KEY = 'freight_booking_contents';
+const FREIGHT_MOVEMENT_REQUEST_TEMPLATE_KEY = 'freight_movement_request';
 
 const FREIGHT_TEMPLATES = [
     {
@@ -455,6 +456,22 @@ const FREIGHT_TEMPLATES = [
             FREIGHT_SIGNOFF,
         ].join(''),
     },
+    {
+        // Seeded by 2026-11-17_23_seed_freight_movement_template.js.
+        key: FREIGHT_MOVEMENT_REQUEST_TEMPLATE_KEY,
+        name: 'Freight stock movement price request',
+        category: 'Freight',
+        description: 'Emailed to a freight forwarder when stock movements (collections from a factory) are added to a quote request after it was sent, quoted or booked. The movements and a "Price the stock movements" button are appended automatically: the button opens the same page on the supplier portal, where they enter a price for each one. Tokens: {forwarder} {count} {windowStart} {windowEnd} {origin} {destination} {containerSize}.',
+        subject: 'Stock movement price request – {containerSize} – sailing {windowStart} to {windowEnd} / 提货报价请求',
+        bodyHtml: [
+            FREIGHT_GREETING,
+            '<p>Greetings,</p>',
+            '<p>We have added the stock movements below to our request for one <strong>{containerSize}</strong> container from <strong>{origin}</strong> to <strong>{destination}</strong>. Please use the button to give us a price for each one.</p>',
+            '<p>您好，</p>',
+            '<p>我们为 <strong>{origin}</strong> 至 <strong>{destination}</strong> 的 <strong>{containerSize}</strong> 集装箱报价请求新增了以下提货安排。请点击下方按钮，为每一项分别报价。</p>',
+            FREIGHT_SIGNOFF,
+        ].join(''),
+    },
 ];
 // In the list too, so getEmailTemplate's in-code fallback knows them before
 // the seed has run.
@@ -462,7 +479,7 @@ DEFAULT_EMAIL_TEMPLATES.push(...FREIGHT_TEMPLATES);
 
 module.exports = {
     FREIGHT_TEMPLATES, FREIGHT_QUOTE_REQUEST_TEMPLATE_KEY, FREIGHT_BOOKING_REQUEST_TEMPLATE_KEY,
-    FREIGHT_BOOKING_CONTENTS_TEMPLATE_KEY,
+    FREIGHT_BOOKING_CONTENTS_TEMPLATE_KEY, FREIGHT_MOVEMENT_REQUEST_TEMPLATE_KEY,
     DEFAULT_EMAIL_TEMPLATES, SUPPLIER_PI_TEMPLATE_KEYS, QC_VISIT_TEMPLATE_KEYS, PO_PORTAL_TEMPLATE_KEY,
     SIGNED_PI_TEMPLATE_KEY,
     FILE_TRANSFER_TEMPLATE_KEY, FILE_TRANSFER_TEMPLATE,

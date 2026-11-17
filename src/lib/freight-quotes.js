@@ -153,18 +153,6 @@ function serviceName(value) {
     return code ? SERVICE_LABELS[code] : String(value ?? '').trim();
 }
 
-/** A stock_movements column as a clean list: [{ from, to, cbm, weightKg }]. */
-function movementsOf(value) {
-    return jsonArray(value)
-        .filter(m => m && typeof m === 'object' && !Array.isArray(m))
-        .map(m => ({
-            from: String(m.from ?? ''),
-            to: String(m.to ?? ''),
-            cbm: Number(m.cbm) || 0,
-            weightKg: Number(m.weightKg) || 0,
-        }));
-}
-
 /** What a list of movements adds up to: { count, cbm, weightKg }. */
 function movementTotals(movements) {
     const list = movements || [];
@@ -272,11 +260,13 @@ function amount(value, re) {
 }
 
 /**
- * The stock movements of a request: [{ from, to, cbm, weightKg }], none
- * allowed. `from` is the factory, `to` the port or consolidation point, one
- * line each; `cbm` a volume above zero with at most three decimals; `weightKg`
- * a gross weight above zero with at most two.
- * → { value: [{ from, to, cbm, weightKg }] } or { code, field, error }.
+ * Stock movements as a form sends them: [{ from, cbm, weightKg }], none
+ * allowed. `from` is the factory the goods are collected from, one line (there
+ * is no "to": the forwarder knows where it consolidates); `cbm` a volume above
+ * zero with at most three decimals; `weightKg` a gross weight above zero with
+ * at most two. Anything else on an entry (the `to` of an older client) is
+ * ignored.
+ * → { value: [{ from, cbm, weightKg }] } or { code, field, error }.
  */
 function validateMovements(raw) {
     if (raw === undefined || raw === null) return { value: [] };
@@ -289,15 +279,76 @@ function validateMovements(raw) {
         if (!m || typeof m !== 'object' || Array.isArray(m)) return bad(`stockMovements[${i}]`, 'Each stock movement must be an object.');
         const from = requiredLine(m.from, at('from'), NAME_MAX);
         if (from.code) return bad(at('from'), `Stock movement ${i + 1}: say which factory the goods come from.`);
-        const to = requiredLine(m.to, at('to'), NAME_MAX);
-        if (to.code) return bad(at('to'), `Stock movement ${i + 1}: say which port or consolidation point the goods go to.`);
         const cbm = amount(m.cbm, CBM_RE);
         if (cbm === null) return bad(at('cbm'), `Stock movement ${i + 1}: the CBM must be above zero, with at most three decimals.`);
         const weightKg = amount(m.weightKg, WEIGHT_RE);
         if (weightKg === null) return bad(at('weightKg'), `Stock movement ${i + 1}: the weight (kg) must be above zero, with at most two decimals.`);
-        movements.push({ from: from.value, to: to.value, cbm, weightKg });
+        movements.push({ from: from.value, cbm, weightKg });
     }
     return { value: movements };
+}
+
+/**
+ * Movements added to a request after it was sent: { addKey?, stockMovements }.
+ * At least one movement. `addKey` is an id the dialog makes once, so a retried
+ * call adds (and emails) nothing twice.
+ * → { value: { addKey, stockMovements } } or { code, field, error }.
+ */
+function validateMovementAdd(body) {
+    if (!body || typeof body !== 'object' || Array.isArray(body)) return bad('body', 'The stock movements to add are required.');
+    let addKey = null;
+    if (body.addKey !== undefined && body.addKey !== null && body.addKey !== '') {
+        if (typeof body.addKey !== 'string' || !UUID_RE.test(body.addKey)) return bad('addKey', 'addKey must be a UUID.');
+        addKey = body.addKey.toLowerCase();
+    }
+    const stockMovements = validateMovements(body.stockMovements);
+    if (stockMovements.code) return stockMovements;
+    if (!stockMovements.value.length) return bad('stockMovements', 'Add at least one stock movement.');
+    return { value: { addKey, stockMovements: stockMovements.value } };
+}
+
+/**
+ * The price of one stock movement, as the forwarder gives it on the portal or
+ * staff type it in: { price, currency, note? }. Each movement is priced on its
+ * own, apart from the sailing. `price: null` (or '') takes a price back off.
+ * The same rules on the portal.
+ * → { value: { price ('1234.50' or null), currency, note } } or { code, field, error }.
+ */
+function validateMovementPrice(body) {
+    if (!body || typeof body !== 'object' || Array.isArray(body)) return bad('body', 'A price is required.');
+    if (body.price === null || body.price === undefined || body.price === '') {
+        return { value: { price: null, currency: null, note: null } };
+    }
+    const priceText = typeof body.price === 'number' && Number.isFinite(body.price) ? String(body.price) : String(body.price).trim();
+    if (!PRICE_RE.test(priceText) || Number(priceText) <= 0) {
+        return bad('price', 'The price must be an amount above zero with at most two decimals.');
+    }
+    if (!CURRENCIES.includes(body.currency)) return bad('currency', `The currency must be one of ${CURRENCIES.join(', ')}.`);
+    const note = optionalText(body.note, 'note', OPTION_NOTE_MAX);
+    if (note.code) return note;
+    return { value: { price: Number(priceText).toFixed(2), currency: body.currency, note: note.value } };
+}
+
+/**
+ * What the priced movements among `movements` come to, by currency (in the
+ * list's order of currencies), and how many have no price yet. Prices in
+ * different currencies are never added together.
+ * → { priced, unpriced, totals: [{ currency, amount }] }
+ */
+function movementPriceTotals(movements) {
+    const sums = new Map();
+    let priced = 0;
+    let unpriced = 0;
+    for (const m of movements || []) {
+        if (m.price === null || m.price === undefined || !m.currency) { unpriced++; continue; }
+        priced++;
+        sums.set(m.currency, (sums.get(m.currency) || 0) + Math.round(Number(m.price) * 100));
+    }
+    const rank = c => { const i = CURRENCIES.indexOf(c); return i < 0 ? CURRENCIES.length : i; };
+    const totals = [...sums.entries()]
+        .sort(([a], [b]) => rank(a) - rank(b) || a.localeCompare(b))
+        .map(([currency, cents]) => ({ currency, amount: cents / 100 }));
+    return { priced, unpriced, totals };
 }
 
 // ── requests ────────────────────────────────────────────────────────────────
@@ -520,9 +571,9 @@ function requestFacts(request) {
 const trimNumber = (n, places) => String(Number(Number(n || 0).toFixed(places)));
 
 /**
- * The stock movements of a request as a table for the quote request email:
- * factory, port or consolidation point, CBM and kg, with a total row when
- * there is more than one. '' when the request has none.
+ * Stock movements as a table for an email: the factory, CBM and kg, with a
+ * total row when there is more than one. Each is priced on its own on the
+ * page, so the heading asks for that. '' when there are none.
  */
 function movementsHtml(movements) {
     const list = movements || [];
@@ -532,21 +583,40 @@ function movementsHtml(movements) {
     const bold = 'font-weight:700;';
     const rows = list.map(m => `<tr>${[
         cell(escapeHtml(m.from)),
-        cell(escapeHtml(m.to)),
         cell(trimNumber(m.cbm, 3), NUM),
         cell(trimNumber(m.weightKg, 2), NUM),
     ].join('')}</tr>`).join('');
     const total = list.length > 1
-        ? `<tr><td colspan="2" style="${TD}${bold}">Total / 合计</td>${cell(trimNumber(totals.cbm, 3), NUM + bold)}${cell(trimNumber(totals.weightKg, 2), NUM + bold)}</tr>`
+        ? `<tr><td style="${TD}${bold}">Total / 合计</td>${cell(trimNumber(totals.cbm, 3), NUM + bold)}${cell(trimNumber(totals.weightKg, 2), NUM + bold)}</tr>`
         : '';
     return [
-        `<p style="margin:14px 0 6px;font-family:${FONT};font-size:14px;line-height:1.4;font-weight:700;color:${INK};">Stock movements to include / 需包含的提货安排</p>`,
+        `<p style="margin:14px 0 6px;font-family:${FONT};font-size:14px;line-height:1.4;font-weight:700;color:${INK};">Stock movements, each priced separately / 提货安排（请逐项单独报价）</p>`,
         '<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="border-collapse:collapse;margin:0 0 12px;">',
-        `<tr><th style="${TH}">From factory / 工厂</th><th style="${TH}">To port or consolidation / 送至港口或集货点</th>`
+        `<tr><th style="${TH}">From factory / 工厂</th>`
             + `<th style="${TH}${NUM}">CBM</th><th style="${TH}${NUM}">Kg</th></tr>`,
         rows,
         total,
         '</table>',
+    ].join('');
+}
+
+/**
+ * The fixed block under the body of the email that asks for the price of
+ * movements added after the request was sent: those movements, the button,
+ * the link as text.
+ */
+function movementBlockHtml({ movements, url, expiresOn }) {
+    const until = escapeHtml(expiresOn || '');
+    return [
+        boxOpen,
+        lead('<strong>Stock movements to price</strong> / <strong>待报价的提货安排</strong>'),
+        movementsHtml(movements),
+        button(url, 'Price the stock movements / 填写提货报价'),
+        linkFallback(url),
+        small('Open the page and enter a price for each stock movement, apart from the price of the sailing. No sign-in is needed.'),
+        small('打开页面后，请为每一项提货安排单独填写价格（不含在船期价格内）。无需登录。'),
+        until ? foot(`This link works until ${until}. / 此链接有效期至 ${until}。`) : '',
+        boxClose,
     ].join('');
 }
 
@@ -568,6 +638,9 @@ function quoteBlockHtml({ request, url, expiresOn, registerUrl }) {
         linkFallback(url),
         small('Open the page and add one line per sailing you can offer: loading date, sailing date, transit time, ports, service and price. No sign-in is needed. You can come back and change your answer until we book.'),
         small('打开页面后，请为每个可提供的船期添加一行：装柜日期、开船日期、航程天数、港口、服务方式和价格。无需登录。在我们订舱之前，您可以随时回来修改。'),
+        (request.stockMovements || []).length
+            ? small('Please also enter a price for each stock movement on the same page. Those prices are separate from the price of the sailing. / 请在同一页面为每一项提货安排单独报价，该价格不含在船期价格内。')
+            : '',
         regLink ? small(`To see all our requests in one place, register at ${regLink} with the email address this message was sent to. / 如需集中查看我们的全部请求，请使用接收本邮件的邮箱地址在 ${regLink} 注册。`) : '',
         until ? foot(`This link works until ${until}. / 此链接有效期至 ${until}。`) : '',
         boxClose,
@@ -733,10 +806,11 @@ module.exports = {
     ANSWER_LIMIT, MAX_FORWARDERS_PER_SEND, MAX_CONTACTS, MAX_SERVICES, MAX_DELIVERY_OPTIONS, MAX_MOVEMENTS,
     BOOKING_STATUSES, LIVE_BOOKING_STATUSES, REVOKE_REASONS, NOTE_MAX,
     isYmd, toYmd, addDays, daysBetween, arrivalDate, jsonArray, servicesOf, serviceCode, serviceName,
-    movementsOf, movementTotals,
-    validateForwarder, validateDeliveryOption, validateServices, validateMovements, validateRequest,
+    movementTotals, movementPriceTotals,
+    validateForwarder, validateDeliveryOption, validateServices, validateMovements, validateMovementAdd,
+    validateMovementPrice, validateRequest,
     requestState, isEditable, validateOptions, validateStaffAnswer,
     validateBookingRef, optionalText,
-    money, serviceLabel, requestFacts, movementsHtml, quoteBlockHtml, optionFacts, bookingBlockHtml,
+    money, serviceLabel, requestFacts, movementsHtml, movementBlockHtml, quoteBlockHtml, optionFacts, bookingBlockHtml,
     groupContentsBySupplier, contentsHtml, contentsSnapshot, contentsDrift,
 };
