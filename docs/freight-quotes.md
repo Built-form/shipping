@@ -2,12 +2,14 @@
 
 Containers from China to the UK used to be arranged by email. Now:
 
-1. **Request.** Staff pick one or more freight forwarders, a date range and the delivery options to quote on ShipLine's FREIGHT page (header tab 09), list any stock movements (goods to be moved from a factory to the port or a consolidation point, with CBM and weight), read and edit the email, and send. Each forwarder gets its own email and its own link.
+1. **Request.** Staff pick one or more freight forwarders, a date range and the delivery options to quote on ShipLine's FREIGHT page (header tab 09), list any stock movements (goods to be collected from a factory, with CBM and weight), read and edit the email, and send. Each forwarder gets its own email and its own link.
 2. **Answer.** The link opens a page on the supplier portal with **no sign-in**, where the forwarder lists its options: loading date, sailing date, transit time, port A, port B, service, container size, all-in price. A forwarder contact who signs in to the portal sees the same requests under **Freight quotes**.
 3. **Compare and book.** The options show in ShipLine as a month calendar and as a list. Staff open one and press **Request booking**; the forwarder gets a second email and confirms on the same page with a booking reference (or declines). Staff can also mark a booking confirmed themselves.
 4. **Contents.** Staff attach a draft container to the booking and email the forwarder its contents **broken down by supplier**, with the forwarder quote PDFs and CSVs attached.
 
-Code: `src/lib/freight-quotes.js` (pure rules), tested by `tools/test-freight-quotes-lib.js`; `src/services/freight-quote-routes.js` (the staff routes, registered from `src/handlers/orders.js`), tested by `tools/test-freight-quote-routes.js`; both in `npm run test:unit`. Portal side: `portal/src/handlers/freightQuotes.js`, `portal/src/lib/freightQuotes.js`, `portal/web/src/screens/FreightQuoteScreen.tsx`, `FreightQuotesScreen.tsx` (portal README section 20). ShipLine: `src/components/freight/` (`FreightView.tsx`, `QuotesTab.tsx`, `RequestsTab.tsx`, `BookingsTab.tsx`, `ForwardersTab.tsx`, `DeliveryOptionsTab.tsx`, `FreightEmail.tsx`, `freightQuotes.ts`, `freightCalendar.ts`).
+**Stock movements** run alongside all four. Each is priced by the forwarder **on its own line**, apart from the sailing's all-in price, on the same page. Staff can add one at any time while the link is not closed, after the quote and after the booking too, and the forwarder is emailed to price it.
+
+Code: `src/lib/freight-quotes.js` (pure rules), tested by `tools/test-freight-quotes-lib.js`; `src/services/freight-quote-routes.js` (the staff routes, registered from `src/handlers/orders.js`), tested by `tools/test-freight-quote-routes.js`; both in `npm run test:unit`. Portal side: `portal/src/handlers/freightQuotes.js`, `portal/src/lib/freightQuotes.js`, `portal/web/src/screens/FreightQuoteScreen.tsx`, `FreightQuotesScreen.tsx` (portal README section 20). ShipLine: `src/components/freight/` (`FreightView.tsx`, `QuotesTab.tsx`, `RequestsTab.tsx`, `BookingsTab.tsx`, `StockMovementsModal.tsx`, `ForwardersTab.tsx`, `DeliveryOptionsTab.tsx`, `FreightEmail.tsx`, `freightQuotes.ts`, `freightCalendar.ts`).
 
 ## Decisions
 
@@ -22,27 +24,33 @@ Code: `src/lib/freight-quotes.js` (pure rules), tested by `tools/test-freight-qu
 - **One live booking per request**, enforced by a unique key on a generated column (`live_request_id`).
 - **A confirmation closes the other forwarders' links** of the same send as `filled`, so nobody quotes for a container that is booked. Not earlier: until then a decline must leave the next forwarder bookable. Cancelling a confirmed booking reopens them.
 - **Delivery options are staff's own list, as free text** (`freight_delivery_options`, ShipLine's FREIGHT > DELIVERY OPTIONS; seeded with Door to door, Door to port, Port to port, Port to door). A request stores the **text** of the options ticked (`services`), as it stood when sent, and each option the forwarder offers names one of them exactly (`service`). Rewording or removing a list entry therefore changes the next request only. Requests from before 2026-11-16_30 hold four codes (`door_to_door` …) instead; every reader still takes them, and they and their English names keep their Chinese translation in the emails and on the portal (`serviceCode`, `serviceLabel`).
-- **Stock movements ride on the request** as JSON (`stock_movements`: `[{ from, to, cbm, weightKg }]`), as sent. They are listed in the quote request email under the request's details and on the forwarder's page. They are information for the quote: nothing prices them separately and nothing links them to a draft container.
-- **Every email can be edited before it goes.** Each of the three send dialogs shows the template's subject and body and sends them back as `subject` and `body`; the routes render `{tokens}` in whatever arrives and still append their fixed block (the details and the button with the link), which is not editable. Left out, the stored template is used.
+- **A stock movement is a row of its own** (`freight_stock_movements`, 2026-11-17_20): the factory the goods are collected from, CBM and weight. There is **no "to"**: the forwarder knows where it consolidates. Until 2026-11-17 they were JSON on the request (`stock_movements`, with a `to`), listed for information and priced inside the sailing; that column is no longer read or written, and `2026-11-17_22` copied what it held into the table.
+- **Each stock movement has its own price** (`price`, `currency`, `price_note`), given by the forwarder on its page or typed in by staff, **never bundled into an option's price**. The price belongs to the movement, not to a sailing: it is the same whichever option is booked. ShipLine adds prices up per currency only.
+- **Stock movements can be added after the request has gone**: while it waits, once it is quoted, and after a booking is requested or confirmed (never on a closed link). The addition keeps the link open another 30 days and emails the forwarder the new movements with the link to the same page. It does **not** bump the request's `row_version`: a price says nothing about the options, so a forwarder with the options form open is not refused because of it. Each movement carries its own `row_version`.
+- **A movement's price stays open under a booking.** The options are frozen once a booking is live; the movement prices are not, because that is exactly when one may be added. Every price change is in the audit log (the portal's `audit_logs`, action `movement_prices`; staff's as `price_entered` / `price_cleared`).
+- **Every email can be edited before it goes.** Each of the four send dialogs shows the template's subject and body and sends them back as `subject` and `body`; the routes render `{tokens}` in whatever arrives and still append their fixed block (the details and the button with the link), which is not editable. Left out, the stored template is used.
 - **Sends are safe to retry.** See "Retries" below.
 - **Opening the link answers nothing.** The portal's read never writes and every write is a `PUT` with the portal's CSRF header, so a mail scanner that follows the link changes nothing.
-- **No "I've read it" receipt button** on the two link emails. They are listed on ShipLine's Email Receipts page (`confirm_via='portal'`) and show as confirmed once the forwarder answers (`src/lib/email-receipt.js`: `freight_quote_answered`, `freight_booking_answered`). The contents email is a notice (`confirm_via='none'`).
+- **No "I've read it" receipt button** on the two link emails. They are listed on ShipLine's Email Receipts page (`confirm_via='portal'`) and show as confirmed once the forwarder answers (`src/lib/email-receipt.js`: `freight_quote_answered`, `freight_booking_answered`). The price request for stock movements added later is listed the same way and shows as confirmed once every movement on the request has a price (`freight_movements_priced`). The contents email is a notice (`confirm_via='none'`).
 
 ## Tables (this schema)
 
-`src/db/migrate/2026-11-16_10_freight_quotes.sql`, and `2026-11-16_30_freight_delivery_options_and_movements.sql` (the delivery option list, `stock_movements`, `freight_quote_options.service` widened from 16 to 100 characters; `_32` seeds the list). No foreign keys, no ENUMs, UTC.
+`src/db/migrate/2026-11-16_10_freight_quotes.sql`, and `2026-11-16_30_freight_delivery_options_and_movements.sql` (the delivery option list, `stock_movements`, `freight_quote_options.service` widened from 16 to 100 characters; `_32` seeds the list), and `2026-11-17_20_freight_stock_movements.sql` (stock movements as rows). No foreign keys, no ENUMs, UTC.
 
 | table | columns | written by |
 |---|---|---|
 | `forwarders` | `name`, `notes`, `deleted_at` | shipping |
 | `forwarder_contacts` | `forwarder_id`, `name`, `email` (trimmed, lower-case), `deleted_at`; unique per forwarder while live | shipping |
 | `freight_delivery_options` | `label` (free text, 100), `created_by_email`, `deleted_at` | shipping; never read by the portal |
-| `freight_quote_requests` | `token` (48 hex, unique), `batch_id`, `forwarder_id`, `forwarder_name`, `window_start_date`, `window_end_date`, `origin`, `destination`, `container_size`, `services` (JSON: the delivery options as text), `stock_movements` (JSON, nullable), `staff_note`, `sent_to`, `subject`, `created_by_email`, `sent_at`, `expires_at`, the Front ids, `revoked_at`, `revoke_reason` (`staff` \| `send_failed` \| `filled` \| `forwarder_removed`) | shipping |
+| `freight_quote_requests` | `token` (48 hex, unique), `batch_id`, `forwarder_id`, `forwarder_name`, `window_start_date`, `window_end_date`, `origin`, `destination`, `container_size`, `services` (JSON: the delivery options as text), `stock_movements` (JSON; no longer read or written), `staff_note`, `sent_to`, `subject`, `created_by_email`, `sent_at`, `expires_at`, the Front ids, `revoked_at`, `revoke_reason` (`staff` \| `send_failed` \| `filled` \| `forwarder_removed`) | shipping |
 | | `answer_count`, `answered_at`, `answered_by_name`, `answered_by_email`, `answer_source` (`link` \| `portal` \| `staff`), `answer_note`, `declined`, `answer_ip` | the portal (shipping for a staff-entered answer) |
 | | `row_version` | both |
 | `freight_quote_options` | `request_id`, `answer_no`, `line_no`, `loading_date`, `sailing_date`, `transit_days`, `port_from`, `port_to`, `service`, `container_size`, `price`, `currency`, `carrier`, `valid_until`, `note` | INSERT only: the portal, or shipping for a staff-entered answer |
-| `freight_bookings` | `request_id`, `option_id`, `status` (`requested` \| `confirmed` \| `declined` \| `cancelled`), `requested_by_email`, `requested_at`, `request_note`, `sent_to`, `subject`, the Front ids, `shipment_id`, `draft_container_name`, `cancelled_at`, `cancelled_by_email`, `cancel_reason`, `contents_sent_at`, `contents_sent_to`, `contents_json` | shipping |
+| `freight_bookings` | `request_id`, `option_id`, `status` (`requested` \| `confirmed` \| `declined` \| `cancelled`), `requested_by_email`, `requested_at`, `request_note`, `sent_to`, `subject`, the Front ids, `shipment_id`, `draft_container_name`, `cancelled_at`, `cancelled_by_email`, `cancel_reason`, `contents_sent_at`, `contents_sent_to`, `contents_json`, `contents_document_ids` (JSON: the `draft_container_documents` ids the contents email attached) | shipping |
 | | `booking_ref`, `response_note`, `responded_at`, `responded_by_name`, `responded_by_email`, `response_source`, `response_ip` | the portal (shipping when staff mark it) |
+| | `row_version` | both |
+| `freight_stock_movements` | `request_id`, `add_key` (the call that added it: the send's `batch_id`, or a new id per later addition), `line_no`, `factory`, `cbm`, `weight_kg`, `created_by_email`, `deleted_at`, `deleted_by_email`; unique on (`request_id`, `add_key`, `line_no`) | shipping |
+| | `price`, `currency`, `price_note`, `priced_at`, `priced_by_name`, `priced_by_email`, `price_source` (`link` \| `portal` \| `staff`), `price_ip` | the portal (shipping for a staff-entered price) |
 | | `row_version` | both |
 
 The token is never written to the audit log.
@@ -78,28 +86,49 @@ GRANT SELECT (forwarder_id, email, deleted_at) ON jfa.forwarder_contacts TO 'jpo
 GRANT SELECT (stock_movements) ON jfa.freight_quote_requests TO 'jportal_app'@'%';
 ```
 
-The portal never reads who a request or a booking was emailed to, who sent it, or the address an answer came from, and never writes the revoke columns, a cancellation, the attached container or the contents columns.
+`2026-11-17_11_grant_freight_contents_documents_to_jportal.js` adds two to the booking's, so the forwarder's page can list the documents the contents email attached (the documents' own columns were already granted, for Requests to send):
+
+```sql
+GRANT SELECT (contents_sent_at, contents_document_ids) ON jfa.freight_bookings TO 'jportal_app'@'%';
+```
+
+`2026-11-17_21_grant_freight_stock_movement_rows_to_jportal.js` lets the page list a request's stock movements and save a price for each:
+
+```sql
+GRANT SELECT (id, request_id, line_no, factory, cbm, weight_kg, created_at, deleted_at,
+              price, currency, price_note, priced_at, priced_by_name, price_source, row_version)
+             ON jfa.freight_stock_movements TO 'jportal_app'@'%';
+GRANT UPDATE (price, currency, price_note, priced_at, priced_by_name, priced_by_email,
+              price_source, price_ip, row_version)
+             ON jfa.freight_stock_movements TO 'jportal_app'@'%';
+```
+
+Of a movement the portal writes the price columns only: never the factory, the volume, the weight or `deleted_at`.
+
+The portal never reads who a request or a booking was emailed to, who sent it, or the address an answer came from, and never writes the revoke columns, a cancellation, the attached container or the contents columns. Of the contents it reads only when they were sent and which documents went with them: not who they went to, the lines, or the container.
 
 ## Rules (`src/lib/freight-quotes.js`)
 
 - **Vocabularies.** Sizes `20GP`, `40GP`, `40HQ`; currencies `USD`, `GBP`, `EUR`, `CNY`. Delivery options are free text (one line, at most 100 characters; at most 60 in the list, no two alike in any case).
-- **A stock movement**: `from` (the factory) and `to` (the port or consolidation point), one line each; `cbm` above zero with at most three decimals; `weightKg` above zero with at most two. At most 30 per request; none is fine.
+- **A stock movement**: `from` (the factory), one line; `cbm` above zero with at most three decimals; `weightKg` above zero with at most two. At most 30 live on a request, those added later included; none is fine. A `to` sent by an older client is ignored.
+- **A stock movement's price**: an amount above zero with at most two decimals, in a currency from the list, and an optional note of at most 500 characters. No price (`null`) takes one back off.
 - **A request**: 1 to 10 forwarders; a range of at most 92 days that is not wholly in the past; 1 to 12 delivery options (the same text twice counts once); `origin` defaults to `China`, `destination` to `UK`, the size to `40HQ`; the link lasts 30 days (7 to 90 on request).
 - **An option**: loading and sailing dates real days, loading on or before sailing; sailing inside the range give or take 14 days; transit 1 to 120 whole days; ports one line each; the delivery option exactly one of those asked about; the size from the list; the price above zero with at most two decimals. At most 40 options per answer, and 20 answers per link.
 - **An answer** is either at least one option, or `declined` ("cannot quote") with none.
-- The portal's `src/lib/freightQuotes.js` mirrors the token shape, the vocabularies, the limits, `requestState` and the option rules; ShipLine takes `state` from the API.
+- The portal's `src/lib/freightQuotes.js` mirrors the token shape, the vocabularies, the limits, `requestState`, the option rules and the price of a stock movement; ShipLine takes `state` from the API.
 
-## The three emails
+## The four emails
 
-Templates `freight_quote_request`, `freight_booking_request` and `freight_booking_contents` (category `Freight`; `src/lib/email-template-defaults.js`, seeded by `2026-11-16_20_seed_freight_templates.js`), editable in ShipLine's Email Templates. Each is the inside of the card: the sender appends a fixed block and wraps the whole with `wrapEmail`. English and Chinese.
+Templates `freight_quote_request`, `freight_booking_request`, `freight_booking_contents` and `freight_movement_request` (category `Freight`; `src/lib/email-template-defaults.js`, seeded by `2026-11-16_20_seed_freight_templates.js` and, for the fourth, `2026-11-17_23_seed_freight_movement_template.js`), editable in ShipLine's Email Templates. Each is the inside of the card: the sender appends a fixed block and wraps the whole with `wrapEmail`. English and Chinese.
 
 | email | tokens | fixed block |
 |---|---|---|
-| quote request | `{forwarder} {windowStart} {windowEnd} {origin} {destination} {containerSize} {services}` | what is asked, the stock movements (a table with a total row), the **Enter your quote** button, the link as text, how to register on the portal, when the link stops working |
+| quote request | `{forwarder} {windowStart} {windowEnd} {origin} {destination} {containerSize} {services}` | what is asked, the stock movements (a table of factory, CBM and kg with a total row, headed "each priced separately"), the **Enter your quote** button, the link as text, how to register on the portal, when the link stops working |
 | booking request | `{forwarder} {sailingDate} {loadingDate} {portFrom} {portTo} {service} {containerSize} {price}` | the option, staff's note, the **Confirm or decline the booking** button |
 | contents | `{forwarder} {bookingRef} {sailingDate} {containerName}` | totals, then one table per supplier (port and PO numbers in its heading, a subtotal row) |
+| stock movement price request | `{forwarder} {count} {windowStart} {windowEnd} {origin} {destination} {containerSize}` | the movements just added (the same table), the **Price the stock movements** button, the link as text, when the link stops working |
 
-**Editing before sending.** ShipLine's three send dialogs load the `Freight` templates (`FreightEmail.tsx`), open on their own by key, and let staff pick another, change the subject and rewrite the body. For the booking request and the contents email every token is known in the dialog, so it is filled in there and the text reads as it will be sent; for the quote request the tokens stay as `{tokens}` and are filled in here per forwarder. If the templates cannot be read the dialog sends without `subject` and `body` and the stored template is used. EMAIL TEMPLATES in the page header opens the template manager.
+**Editing before sending.** ShipLine's four send dialogs load the `Freight` templates (`FreightEmail.tsx`), open on their own by key, and let staff pick another, change the subject and rewrite the body. For the booking request and the contents email every token is known in the dialog, so it is filled in there and the text reads as it will be sent; for the quote request, and the stock movement price request (which can go to several forwarders of one send), the tokens stay as `{tokens}` and are filled in here per forwarder. If the templates cannot be read the dialog sends without `subject` and `body` and the stored template is used. EMAIL TEMPLATES in the page header opens the template manager.
 
 All go through Front (`sendFrontMessage`), to the forwarder's live contacts. `sendFrontMessage` gained an optional `attachments` list for the contents email.
 
@@ -119,15 +148,18 @@ All under the staff sign-in (`/api/v1/{proxy+}`). Reads are open to every staff 
 | `DELETE /freight-delivery-options/:id` | soft; twice is a no-op. → `{ deliveryOptions }`. Requests already sent keep the text |
 | `GET /freight-quotes?from=&to=` | the **board**: `{ enabled, requests, bookings }`. Without a range, every request whose range ended within the last 120 days |
 | `GET /freight-quotes/summary` | `{ answered }`: sends with a quote in and nothing booked yet (the tab's badge). A send counts once; a declined, closed or expired request and a removed forwarder do not count |
-| `POST /freight-quotes` | `{ forwarderIds, batchId?, windowStart, windowEnd, origin?, destination?, containerSize?, services, stockMovements?, note?, expiryDays?, subject?, body? }` (`services`: the delivery options as text; `stockMovements`: `[{ from, to, cbm, weightKg }]`) → `{ batchId, results: [{ forwarderId, forwarderName, outcome, requestId?, error? }], …board }`. `outcome`: `sent` \| `already_sent` \| `send_unconfirmed` \| `failed` \| `no_contacts`. `409 PORTAL_URL_UNSET` |
+| `POST /freight-quotes` | `{ forwarderIds, batchId?, windowStart, windowEnd, origin?, destination?, containerSize?, services, stockMovements?, note?, expiryDays?, subject?, body? }` (`services`: the delivery options as text; `stockMovements`: `[{ from, cbm, weightKg }]`, a row each per forwarder) → `{ batchId, results: [{ forwarderId, forwarderName, outcome, requestId?, error? }], …board }`. `outcome`: `sent` \| `already_sent` \| `send_unconfirmed` \| `failed` \| `no_contacts`. `409 PORTAL_URL_UNSET` |
 | `POST /freight-quotes/:id/revoke` | closes a link. `409 HAS_BOOKING` while a booking on it is live. → the board |
 | `POST /freight-quotes/:id/options` | staff type in an emailed answer: `{ options, declined?, note? }`, the same rules. Allowed on an expired link, never on a closed one or under a live booking. → the board |
 | `POST /freight-quotes/options/:optionId/book` | `{ note?, shipmentId?, to?, subject?, body? }` → `{ ok, bookingId, …board }`. `409 ALREADY_BOOKED` \| `STALE_OPTION` \| `REVOKED` \| `NO_CONTACTS` \| `CONTAINER_TAKEN`; `502 FRONT_ERROR` (the booking is then cancelled as `send_failed`) |
 | `PATCH /freight-bookings/:id` | any of `{ shipmentId: id \| null }`, `{ status: 'confirmed', bookingRef, note? }`, `{ status: 'cancelled' }`. `409 NOT_LIVE` for a declined or cancelled booking. → the board |
 | `GET /freight-bookings/:id/contents` | `{ containerName, groups, totals, missingLots, sentAt, changedSinceSent, changes }` |
 | `POST /freight-bookings/:id/contents-email` | `{ rowVersion, to?, subject?, body?, attachDocuments? }` → the board. `409 STALE` \| `NO_CONTAINER` \| `NO_LINES` \| `NOT_LIVE` |
+| `POST /freight-quotes/:id/stock-movements` | adds stock movements to a request that is already out, in any state but a closed link: `{ stockMovements: [{ from, cbm, weightKg }], addKey?, notify?, to?, subject?, body? }` → `{ ok, added, alreadyAdded, …board }`. Emails the forwarder the link unless `notify` is false. `409 REVOKED` \| `TOO_MANY` \| `NO_CONTACTS` \| `PORTAL_URL_UNSET`; `502 FRONT_ERROR` (the rows are then taken back out) |
+| `PATCH /freight-stock-movements/:id` | staff type in the price a forwarder gave by email or phone: `{ price, currency, note? }`, or `{ price: null }` to take it off. Records `price_source = 'staff'`. → the board |
+| `DELETE /freight-stock-movements/:id` | soft; the movement leaves the forwarder's page. Twice is a no-op. → the board |
 
-**The board.** A request: `{ id, batchId, forwarderId, forwarderName, state, revokeReason, windowStart, windowEnd, origin, destination, containerSize, services, stockMovements, note, sentTo, subject, createdAt, sentAt, sentByEmail, expiresAt, revokedAt, answerCount, answeredAt, answeredBy, answerSource, answerNote, declined, rowVersion, url, options }`. An option: `{ id, requestId, lineNo, loadingDate, sailingDate, transitDays, arrivalDate, portFrom, portTo, service, containerSize, price, currency, carrier, validUntil, note }`. A booking: `{ id, requestId, optionId, status, forwarderId, forwarderName, option, requestedByEmail, requestedAt, requestNote, sentTo, shipmentId, containerName, containerStage, bookingRef, responseNote, respondedAt, respondedBy, responseSource, cancelledAt, cancelReason, contentsSentAt, contentsSentTo, contentsChanged, rowVersion }`. `enabled` is false when `SUPPLIER_PORTAL_URL` is unset or the tables are not on this server.
+**The board.** A request: `{ id, batchId, forwarderId, forwarderName, state, revokeReason, windowStart, windowEnd, origin, destination, containerSize, services, stockMovements, note, sentTo, subject, createdAt, sentAt, sentByEmail, expiresAt, revokedAt, answerCount, answeredAt, answeredBy, answerSource, answerNote, declined, rowVersion, url, options }`. A stock movement (in `stockMovements`, in the order added): `{ id, requestId, from, cbm, weightKg, addedAt, addedByEmail, price, currency, priceNote, pricedAt, pricedBy, priceSource, rowVersion }`, `price` null until one is given. An option: `{ id, requestId, lineNo, loadingDate, sailingDate, transitDays, arrivalDate, portFrom, portTo, service, containerSize, price, currency, carrier, validUntil, note }`. A booking: `{ id, requestId, optionId, status, forwarderId, forwarderName, option, requestedByEmail, requestedAt, requestNote, sentTo, shipmentId, containerName, containerStage, bookingRef, responseNote, respondedAt, respondedBy, responseSource, cancelledAt, cancelReason, contentsSentAt, contentsSentTo, contentsChanged, rowVersion }`. `enabled` is false when `SUPPLIER_PORTAL_URL` is unset or the tables are not on this server.
 
 **Staff marking a booking.** These routes sit behind the staff sign-in and never use the forwarder's token, so there is no override flag: `PATCH … { status: 'confirmed', bookingRef }` records `response_source = 'staff'`. It also corrects the reference of a confirmed booking.
 
@@ -140,6 +172,7 @@ All under the staff sign-in (`/api/v1/{proxy+}`). Reads are open to every staff 
 - **The quote request.** ShipLine's dialog makes one `batchId` and sends it with every attempt. `(batch_id, forwarder_id)` is unique, and a forwarder that already has a row for the batch is reported as it stands (`already_sent`, or `send_unconfirmed` when Front never answered) and is never emailed again. A Front refusal revokes that forwarder's row as `send_failed`; the others still go.
 - **The booking request.** One live booking per request: a second call is `409 ALREADY_BOOKED`.
 - **The contents email.** The body carries the booking's `rowVersion`; the route claims it (`UPDATE … WHERE row_version = ?`) before sending, so a retry of a call that did send is `409 STALE`.
+- **Adding stock movements.** ShipLine's dialog makes one `addKey` and sends it with every attempt, to each forwarder it asks. A request that already holds rows for that key adds and emails nothing (`alreadyAdded`); (`request_id`, `add_key`, `line_no`) is unique underneath. A Front refusal deletes the rows just added, so the same call can go again.
 
 ## A booking and a new answer at the same moment
 
@@ -151,17 +184,21 @@ The booking route locks the request row, checks the option belongs to the curren
 
 The lines listed are kept on the booking (`contents_json`, the shape a Request to send keeps). `contentsDrift` compares them with the container now using `src/lib/request-to-send-drift.js`: a line added or removed, units or LOT changed. Carton spec, CBM and weight do not count. ShipLine shows **CONTENTS CHANGED** and offers **RESEND UPDATED CONTENTS**. Attaching another container clears the snapshot.
 
+The ids of the documents attached are kept too (`contents_document_ids`, the combined document first; `NULL` when the email went without documents). A resend replaces them with the new set, and attaching another container clears them. The portal lists those documents, PDF and CSV, on the forwarder's page once signed in (`/freight-quotes/<id>`): only ids that are still live `forwarder-quote` rows, and only while the booking is requested or confirmed. The emailed link's page (`/freight/<token>`) does not list them: that page carries no link out. `2026-11-17_12_backfill_freight_contents_documents.js` filled the column for the emails sent before it existed, from each document's `draft_container_document_sends` row.
+
 ## Deploy order
 
-1. **Shipping**: the migrations (five tables; then the delivery option list, `stock_movements` and the wider `service`), the grants where `jportal_app` exists, the three templates, the seeded delivery options, the routes.
+1. **Shipping**: the migrations (five tables; then the delivery option list, `stock_movements` and the wider `service`; then `contents_document_ids` with its backfill; then `freight_stock_movements` with its backfill from the JSON column), the grants where `jportal_app` exists, the four templates, the seeded delivery options, the routes.
 2. **The portal**: full deploy (routes on two Lambdas, two WAF rules, the grants file).
 3. **ShipLine**.
+
+The order matters more than before for stock movements: the old portal reads the JSON column and the old ShipLine sends a `to`. Shipping ignores the `to`, and a portal that cannot read the new table yet shows the request with no movements rather than failing, so nothing breaks between the steps; movements only show again on the forwarder's page once the portal is deployed.
 
 Set `SUPPLIER_PORTAL_URL` (already set for the other portal links). No new environment variable, no new Lambda.
 
 ## The smoke check
 
-`node tools/smoke-freight-quotes.js` walks the whole flow on the TEST database with both halves for real: the Express app in-process, and the portal's `availability` and `supplier` handlers in-process on a pool that logs in as the portal's own runtime login (`jportal_app`, from `../portal/.env`), so every portal statement runs under its column grants. Front is stubbed (nothing is emailed), the contents email goes without attachments (nothing is written to S3), and everything it writes is deleted at the end. It refuses to run unless both env files point at explorer-test. 51 checks, all passing on 2026-11-16, including the delivery option list, stock movements read by the portal under its column grant, and an email edited by staff.
+`node tools/smoke-freight-quotes.js` walks the whole flow on the TEST database with both halves for real: the Express app in-process, and the portal's `availability` and `supplier` handlers in-process on a pool that logs in as the portal's own runtime login (`jportal_app`, from `../portal/.env`), so every portal statement runs under its column grants. Front is stubbed (nothing is emailed), the contents email goes without attachments (nothing is written to S3), and everything it writes is deleted at the end. It refuses to run unless both env files point at explorer-test. 51 checks, all passing on 2026-11-16, including the delivery option list, stock movements read by the portal under its column grant, and an email edited by staff. The stock movement checks were rewritten on 2026-11-17 for rows with their own prices (a price saved through the link under the column grant, a movement added after the booking with its one email and its retry, a price typed in by staff, a removal); they and three more added the same day have not been run yet (they need the 2026-11-17 migrations on TEST): the signed-in page says when the contents were sent, lists a document the booking names (an existing forwarder quote stands in, since the smoke email attaches none), and the emailed link's page lists none.
 
 ## Not proven by the tests or the smoke check
 
@@ -171,6 +208,8 @@ Set `SUPPLIER_PORTAL_URL` (already set for the other portal links). No new envir
 ## Not included
 
 - An email to staff when a forwarder answers (the tab's badge shows it).
-- Automatic reminders to forwarders who have not answered.
+- Automatic reminders to forwarders who have not answered, or who have not priced a stock movement.
+- A badge or an email to staff when a forwarder prices a stock movement: the Requests tab shows how many are priced, and the Email Receipts page shows the price request as confirmed.
+- A price per sailing for a stock movement: it has one price, whichever option is booked.
 - An email to the forwarder when staff cancel a booking, or to the others when a request is filled.
 - Currency conversion, air freight, and more than one live booking per request.

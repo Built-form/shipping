@@ -18,9 +18,11 @@
 // It walks the whole flow: two forwarders, one send to both (and its retry),
 // the forwarder's answer through the link, an answer typed in by staff, a
 // booking, the forwarder's confirmation closing the other link as filled, the
-// signed-in list, a container's contents by supplier and the contents email
-// (and its retry), the cancel that reopens everything, and removing a
-// forwarder.
+// stock movements (each priced on its own through the link, one added after
+// the booking with its email and its retry, a price typed in by staff, a
+// removal), the signed-in list, a container's contents by supplier and the contents email
+// (and its retry), the documents sent as the forwarder's signed-in page lists
+// them, the cancel that reopens everything, and removing a forwarder.
 //
 // NOTHING LEAVES THIS MACHINE: global fetch is replaced, the Front call is
 // answered by a stub (recording what would have been sent) and any other
@@ -102,9 +104,10 @@ const addr = who => `${who}@${DOM}`;
 const forwarderIds = [];
 // A delivery option in staff's own words, and the goods to be collected.
 const DELIVERY = `Deliver to Unit 5, tail-lift ${TAG}`;
+// The first still carries the "to" an older ShipLine sends: it is ignored.
 const MOVEMENTS = [
     { from: `Acme Medical ${TAG}`, to: 'Ningbo port', cbm: 12.5, weightKg: 2400 },
-    { from: 'Best Gloves', to: 'Ningbo consolidation', cbm: '3.25', weightKg: '610.5' },
+    { from: 'Best Gloves', cbm: '3.25', weightKg: '610.5' },
 ];
 
 async function q(sql, params) { return (await getPool().query(sql, params))[0]; }
@@ -124,9 +127,11 @@ const parsePortal = (res) => {
     return { status: res.statusCode, data: parsed?.data, code: parsed?.code, details: parsed?.details, raw: String(res.body).slice(0, 300) };
 };
 // The emailed link: no claims, the token is the permission.
-async function link(method, token, body, booking = false) {
+// `part`: true or 'booking' for the booking answer, 'stock-movements' for the prices.
+async function link(method, token, body, part = false) {
+    const suffix = part === true ? '/booking' : (part ? `/${part}` : '');
     return parsePortal(await portalLink.handler({
-        httpMethod: method, resource: booking ? '/api/freight/{token}/booking' : '/api/freight/{token}',
+        httpMethod: method, resource: `/api/freight/{token}${suffix}`,
         pathParameters: { token }, queryStringParameters: null,
         headers: { 'user-agent': 'smoke-freight-quotes', 'X-Requested-With': 'jportal' },
         requestContext: { requestId: `${TAG}-${++seq}` },
@@ -219,9 +224,17 @@ async function main() {
         console.log('\n3. The forwarder\'s page, by the emailed link');
         const opened = await link('GET', R1.token);
         check('GET: the request, open, nothing answered', opened.status === 200 && opened.data?.state === 'open' && opened.data.options.length === 0 && opened.data.containerSize === '40HQ', opened);
-        check('the page is given the delivery options as written, and the stock movements (the column grant)',
+        check('the page is given the delivery options as written, and the stock movements as unpriced rows with no "to" (the table grant)',
             opened.data?.services?.join('|') === `Door to door|${DELIVERY}` && opened.data?.stockMovements?.length === 2
-            && opened.data.stockMovements[0].from === `Acme Medical ${TAG}` && opened.data.stockMovements[1].weightKg === 610.5, opened.data?.stockMovements ?? opened);
+            && opened.data.stockMovements[0].from === `Acme Medical ${TAG}` && opened.data.stockMovements[1].weightKg === 610.5
+            && opened.data.stockMovements.every(m => m.price === null && !('to' in m)), opened.data?.stockMovements ?? opened);
+        const firstMove = opened.data?.stockMovements?.[0];
+        const priced = await link('PUT', R1.token, { prices: [{ id: firstMove?.id, rowVersion: firstMove?.rowVersion, price: '120.5', currency: 'USD' }], name: 'Amy' }, 'stock-movements');
+        check('PUT stock-movements: one movement priced on its own; the request itself is untouched',
+            priced.status === 200 && priced.data?.stockMovements?.[0]?.price === '120.50' && priced.data.stockMovements[1].price === null
+            && priced.data.rowVersion === opened.data?.rowVersion && priced.data.state === 'open', priced);
+        const stalePrice = await link('PUT', R1.token, { prices: [{ id: firstMove?.id, rowVersion: firstMove?.rowVersion, price: '99', currency: 'USD' }] }, 'stock-movements');
+        check('a stale price is 409 with the current view', stalePrice.status === 409 && stalePrice.details?.stockMovements?.[0]?.price === '120.50', stalePrice);
         check('an unknown token is 404', (await link('GET', 'f'.repeat(48))).status === 404);
         const answered = await link('PUT', R1.token, { rowVersion: opened.data?.rowVersion, declined: false, name: 'Amy', options: [option(), option({ sailingDate: F.addDays(today, 35), loadingDate: F.addDays(today, 31), price: '1790.50', containerSize: '40GP' })] });
         check('PUT: two options saved', answered.status === 200 && answered.data?.state === 'answered' && answered.data.options.length === 2 && answered.data.options[1].price === '1790.50' && answered.data.options[1].containerSize === '40GP', answered);
@@ -234,7 +247,10 @@ async function main() {
         console.log('\n4. ShipLine reads the board; staff enter an emailed answer');
         let board = await api('GET', '/api/v1/freight-quotes');
         const b1 = () => board.body.requests.find(r => r.id === R1.id); const b2 = () => board.body.requests.find(r => r.id === R2.id);
-        check('the board carries the stock movements and the option\'s delivery option', b1()?.stockMovements?.length === 2 && b1().stockMovements[1].cbm === 3.25 && b1().options[0].service === DELIVERY, b1()?.stockMovements);
+        check('the board carries the stock movements with the forwarder\'s price, and the option\'s delivery option',
+            b1()?.stockMovements?.length === 2 && b1().stockMovements[1].cbm === 3.25 && b1().stockMovements[0].price === 120.5
+            && b1().stockMovements[0].priceSource === 'link' && b1().stockMovements[1].price === null && b2()?.stockMovements?.length === 2
+            && b1().options[0].service === DELIVERY, b1()?.stockMovements);
         check('the board shows the answer', board.status === 200 && b1()?.state === 'answered' && b1().options.length === 2 && b1().answerSource === 'link' && b1().answeredBy === 'Amy', b1());
         const summary = await api('GET', '/api/v1/freight-quotes/summary');
         check('the badge counts the send', summary.status === 200 && summary.body.answered >= 1, summary);
@@ -263,6 +279,32 @@ async function main() {
         check('the other forwarder\'s link is closed as filled', b2()?.state === 'revoked' && b2().revokeReason === 'filled', b2());
         const filled = await link('GET', R2.token);
         check('and its page says so', filled.status === 200 && filled.data?.state === 'revoked' && filled.data.revokeReason === 'filled' && filled.data.options.length === 0, filled);
+
+        // ── 5b. a stock movement added after the booking ─────────────────────
+        console.log('\n5b. Add a stock movement to the booked request');
+        const mailsBefore = frontCalls.length;
+        const addition = { addKey: crypto.randomUUID(), stockMovements: [{ from: `Late Factory ${TAG}`, cbm: 2, weightKg: 300 }] };
+        const addedMove = await api('POST', `/api/v1/freight-quotes/${R1.id}/stock-movements`, addition);
+        board = addedMove;
+        const late = () => b1()?.stockMovements?.find(m => m.from === `Late Factory ${TAG}`);
+        check('it is added under the confirmed booking, and the forwarder is emailed the link once',
+            addedMove.status === 200 && addedMove.body?.added === 1 && b1()?.state === 'booked' && Boolean(late()) && late().price === null
+            && frontCalls.length === mailsBefore + 1 && frontCalls[mailsBefore].body.includes(`/freight/${R1.token}`)
+            && frontCalls[mailsBefore].body.includes(`Late Factory ${TAG}`), addedMove.body?.error ?? addedMove.status);
+        const addedAgain = await api('POST', `/api/v1/freight-quotes/${R1.id}/stock-movements`, addition);
+        check('the same addition again adds and emails nothing', addedAgain.status === 200 && addedAgain.body?.alreadyAdded === true && frontCalls.length === mailsBefore + 1
+            && addedAgain.body.requests.find(r => r.id === R1.id).stockMovements.length === 3, addedAgain.body?.error ?? addedAgain.status);
+        check('a closed link takes no stock movement', (await api('POST', `/api/v1/freight-quotes/${R2.id}/stock-movements`, { stockMovements: addition.stockMovements })).body?.code === 'REVOKED');
+        const bookedPage = await link('GET', R1.token);
+        const lateOnPage = bookedPage.data?.stockMovements?.find(m => m.from === `Late Factory ${TAG}`);
+        check('the forwarder\'s page lists it under the booking', bookedPage.data?.state === 'booked' && Boolean(lateOnPage), bookedPage.data?.stockMovements ?? bookedPage);
+        const latePriced = await link('PUT', R1.token, { prices: [{ id: lateOnPage?.id, rowVersion: lateOnPage?.rowVersion, price: '45', currency: 'CNY' }] }, 'stock-movements');
+        check('and prices it there, booked or not', latePriced.status === 200 && latePriced.data?.stockMovements?.find(m => m.id === lateOnPage?.id)?.price === '45.00', latePriced);
+        const second2 = b1()?.stockMovements?.find(m => m.from === 'Best Gloves');
+        const typedPrice = await api('PATCH', `/api/v1/freight-stock-movements/${second2?.id}`, { price: '80', currency: 'USD', note: 'by phone' });
+        board = typedPrice;
+        check('staff type in a price given by phone', typedPrice.status === 200 && b1()?.stockMovements?.find(m => m.id === second2?.id)?.priceSource === 'staff'
+            && late()?.price === 45 && late().currency === 'CNY', b1()?.stockMovements ?? typedPrice);
 
         // ── 6. signed in ─────────────────────────────────────────────────────
         console.log('\n6. A contact signs in to the portal');
@@ -300,6 +342,28 @@ async function main() {
             check('the booking records it, unchanged since sent', Boolean(booking()?.contentsSentAt) && booking().contentsChanged === false, booking());
             const twice = await api('POST', `/api/v1/freight-bookings/${bookingId}/contents-email`, { rowVersion: staleVersion, attachDocuments: false });
             check('the same call again is refused, not sent twice', twice.status === 409 && twice.body?.code === 'STALE' && frontCalls.length === before + 1, twice);
+
+            // The forwarder's signed-in page (as jportal_app): when the contents
+            // were sent and which documents went with them. This email attached
+            // none, so an existing forwarder quote stands in for one.
+            const seen = await signedIn(claims, 'GET', '/api/supplier/freight-quotes/{id}', R1.id);
+            check('signed in, the page says when the contents were sent, with no documents (the column grant)',
+                seen.status === 200 && Boolean(seen.data?.booking?.contentsSentAt) && Array.isArray(seen.data.booking.documents) && seen.data.booking.documents.length === 0, seen.data?.booking ?? seen);
+            const [quote] = await q(
+                `SELECT id FROM draft_container_documents
+                  WHERE type = 'forwarder-quote' AND deleted_at IS NULL AND public_url LIKE 'https://shipping-purchase-orders-%/draft-containers/%'
+                  ORDER BY id DESC LIMIT 1`);
+            if (!quote) {
+                console.log('  SKIPPED  no forwarder quote document on TEST to list');
+            } else {
+                await q('UPDATE freight_bookings SET contents_document_ids = ? WHERE id = ?', [JSON.stringify([quote.id]), bookingId]);
+                const listed = await signedIn(claims, 'GET', '/api/supplier/freight-quotes/{id}', R1.id);
+                check('signed in, the page lists the documents the booking names, with their addresses',
+                    listed.status === 200 && listed.data?.booking?.documents?.length === 1 && listed.data.booking.documents[0].id === quote.id
+                    && String(listed.data.booking.documents[0].pdfUrl).startsWith('https://'), listed.data?.booking ?? listed);
+            }
+            const byLink = await link('GET', R1.token);
+            check('the emailed link\'s page lists none', byLink.status === 200 && byLink.data?.booking?.contentsSentAt === null && byLink.data.booking.documents.length === 0, byLink.data?.booking ?? byLink);
         }
 
         // ── 8. receipts ──────────────────────────────────────────────────────
@@ -307,13 +371,20 @@ async function main() {
         const conn = await getPool().getConnection();
         let sync;
         try { sync = await syncPortalReceipts(conn, { maxAgeMs: 0 }); } finally { conn.release(); }
-        check('the receipts sync ran both freight steps', sync && !sync.failed.includes('freight_quote_answered') && !sync.failed.includes('freight_booking_answered'), sync);
+        check('the receipts sync ran the three freight steps', sync && !sync.failed.includes('freight_quote_answered') && !sync.failed.includes('freight_booking_answered')
+            && !sync.failed.includes('freight_movements_priced'), sync);
         const receipts = await q(
             `SELECT email_type, send_id, confirm_via, confirmed_at FROM email_receipts
               WHERE (send_table = 'freight_quote_requests' AND send_id IN (?)) OR (send_table = 'freight_bookings' AND send_id = ?)`,
             [[R1.id, R2.id], bookingId]);
         const receipt = (type, id) => receipts.find(r => r.email_type === type && Number(r.send_id) === id);
         check('the answered request and the answered booking are confirmed', Boolean(receipt('freight_quote_request', R1.id)?.confirmed_at) && Boolean(receipt('freight_booking_request', bookingId)?.confirmed_at), receipts);
+        check('the stock movement price request is confirmed: every movement has a price', Boolean(receipt('freight_movement_request', R1.id)?.confirmed_at), receipts);
+        const lateId = board.body?.requests?.find(r => r.id === R1.id)?.stockMovements?.find(m => m.from === `Late Factory ${TAG}`)?.id;
+        const removedMove = await api('DELETE', `/api/v1/freight-stock-movements/${lateId}`);
+        board = removedMove;
+        check('a stock movement is removed, and leaves the forwarder\'s page', removedMove.status === 200 && b1()?.stockMovements?.length === 2
+            && (await link('GET', R1.token)).data?.stockMovements?.length === 2, removedMove.body?.error ?? b1()?.stockMovements);
 
         // ── 9. cancel, and remove ────────────────────────────────────────────
         console.log('\n9. Cancel the booking; remove a forwarder');
@@ -353,6 +424,11 @@ async function cleanup() {
             await q(`DELETE FROM audit_log WHERE entity_type = 'freight_quote_request' AND entity_id IN (?)`, [requests]);
             await q(`DELETE FROM ${JP}.audit_logs WHERE entity_type = 'freight_quote_request' AND entity_id IN (?)`, [requests]);
             await q('DELETE FROM freight_quote_options WHERE request_id IN (?)', [requests]);
+            const movements = (await q('SELECT id FROM freight_stock_movements WHERE request_id IN (?)', [requests])).map(m => Number(m.id));
+            if (movements.length) {
+                await q(`DELETE FROM audit_log WHERE entity_type = 'freight_stock_movement' AND entity_id IN (?)`, [movements]);
+                await q('DELETE FROM freight_stock_movements WHERE id IN (?)', [movements]);
+            }
         }
         if (bookings.length) {
             await q(`DELETE FROM email_receipts WHERE send_table = 'freight_bookings' AND send_id IN (?)`, [bookings]);

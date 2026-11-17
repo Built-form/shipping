@@ -14,6 +14,12 @@
 // the same page with a booking reference (or staff mark it). A draft container
 // is attached to the booking and its contents, by supplier, are emailed.
 //
+// A request may carry stock movements (collections from a factory, with CBM
+// and weight): rows of their own (freight_stock_movements, 2026-11-17_20),
+// each priced by the forwarder on its own line, apart from the sailing. Staff
+// can add one at any time while the link is not closed, after a quote and
+// after a booking too, and the forwarder is emailed to price it.
+//
 // The pure rules are in src/lib/freight-quotes.js. Registered from orders.js;
 // authed through the greedy /api/v1/{proxy+} route. Reads are open to every
 // staff user; writes need an editor role, as the QC routes do.
@@ -27,6 +33,7 @@ const poPortalEmail = require('../lib/po-portal-email');
 const { escapeHtml, wrapEmail } = require('../lib/email-layout');
 const {
     FREIGHT_QUOTE_REQUEST_TEMPLATE_KEY, FREIGHT_BOOKING_REQUEST_TEMPLATE_KEY, FREIGHT_BOOKING_CONTENTS_TEMPLATE_KEY,
+    FREIGHT_MOVEMENT_REQUEST_TEMPLATE_KEY,
 } = require('../lib/email-template-defaults');
 const { sendFrontMessage: defaultSend } = require('./front-send');
 const { preapprovePortalAddresses: defaultPreapprove } = require('./portal-access');
@@ -60,7 +67,7 @@ const LIVE = F.LIVE_BOOKING_STATUSES;
 const isLive = b => Boolean(b) && LIVE.includes(b.status);
 
 const REQUEST_COLUMNS = `r.id, r.token, r.batch_id, r.forwarder_id, r.forwarder_name, r.window_start_date,
-        r.window_end_date, r.origin, r.destination, r.container_size, r.services, r.stock_movements, r.staff_note, r.sent_to,
+        r.window_end_date, r.origin, r.destination, r.container_size, r.services, r.staff_note, r.sent_to,
         r.subject, r.created_by_email, r.created_at, r.sent_at, r.expires_at, r.revoked_at, r.revoke_reason,
         r.answer_count, r.answered_at, r.answered_by_name, r.answered_by_email, r.answer_source, r.answer_note,
         r.declined, r.row_version, (r.expires_at <= UTC_TIMESTAMP()) AS expired`;
@@ -86,6 +93,26 @@ function optionJson(o) {
     };
 }
 
+// A stock movement as the board carries it. `price` null = not priced yet.
+function movementJson(m) {
+    return {
+        id: Number(m.id),
+        requestId: Number(m.request_id),
+        from: m.factory,
+        cbm: Number(m.cbm),
+        weightKg: Number(m.weight_kg),
+        addedAt: iso(m.created_at),
+        addedByEmail: m.created_by_email || null,
+        price: m.price === null || m.price === undefined ? null : Number(m.price),
+        currency: m.currency || null,
+        priceNote: m.price_note || null,
+        pricedAt: iso(m.priced_at),
+        pricedBy: m.priced_by_email || m.priced_by_name || null,
+        priceSource: m.price_source || null,
+        rowVersion: Number(m.row_version),
+    };
+}
+
 // The request's own facts, as the emails and the validators read them.
 function requestFactsOf(row) {
     return {
@@ -96,7 +123,6 @@ function requestFactsOf(row) {
         containerSize: row.container_size,
         // The delivery options asked about, as text (an old request holds the four codes).
         services: F.servicesOf(row.services),
-        stockMovements: F.movementsOf(row.stock_movements),
         note: row.staff_note || null,
     };
 }
@@ -502,7 +528,7 @@ function registerFreightQuoteRoutes(app, deps) {
         };
     }
 
-    function requestJson(row, { options, liveBooking, portalBase }) {
+    function requestJson(row, { options, movements, liveBooking, portalBase }) {
         const state = F.requestState(row, Boolean(liveBooking));
         const facts = requestFactsOf(row);
         return {
@@ -513,6 +539,8 @@ function registerFreightQuoteRoutes(app, deps) {
             state,
             revokeReason: row.revoke_reason || null,
             ...facts,
+            // In the order added, each with the forwarder's price once given.
+            stockMovements: movements.map(movementJson),
             sentTo: F.jsonArray(row.sent_to).map(String),
             subject: row.subject || null,
             createdAt: iso(row.created_at),
@@ -534,8 +562,24 @@ function registerFreightQuoteRoutes(app, deps) {
         };
     }
 
-    // Requests (newest first) with their current options and every booking.
-    // `where` filters freight_quote_requests r.
+    // The stock movements of some requests that staff have not removed, oldest
+    // first. A server where 2026-11-17_20 has not run has none.
+    async function loadMovements(conn, requestIds) {
+        if (!requestIds.length) return [];
+        try {
+            const [rows] = await conn.query(
+                'SELECT * FROM freight_stock_movements WHERE request_id IN (?) AND deleted_at IS NULL ORDER BY request_id ASC, id ASC',
+                [requestIds]
+            );
+            return rows;
+        } catch (e) {
+            if (e.errno !== TABLE_MISSING) throw e;
+            return [];
+        }
+    }
+
+    // Requests (newest first) with their current options, their stock
+    // movements and every booking. `where` filters freight_quote_requests r.
     async function readBoard(conn, where, params, { withDrift = true } = {}) {
         const portalBase = poPortalEmail.portalBaseOf();
         const [rows] = await conn.query(
@@ -560,6 +604,7 @@ function registerFreightQuoteRoutes(app, deps) {
               ORDER BY o.request_id ASC, o.line_no ASC, o.id ASC`,
             bookedIds.length ? [ids, bookedIds] : [ids]
         );
+        const movements = await loadMovements(conn, ids);
         const shipmentIds = [...new Set(bookings.map(b => b.shipment_id).filter(v => v != null).map(Number))];
         const [shipments] = shipmentIds.length
             ? await conn.query('SELECT id, name, reference, stage FROM shipments WHERE id IN (?) AND deleted_at IS NULL', [shipmentIds])
@@ -594,6 +639,7 @@ function registerFreightQuoteRoutes(app, deps) {
             enabled: portalBase !== '',
             requests: rows.map(r => requestJson(r, {
                 options: options.filter(o => Number(o.request_id) === Number(r.id) && Number(o.is_current) === 1),
+                movements: movements.filter(m => Number(m.request_id) === Number(r.id)),
                 liveBooking: liveByRequest.get(Number(r.id)) || null,
                 portalBase,
             })),
@@ -677,9 +723,10 @@ function registerFreightQuoteRoutes(app, deps) {
     // Body { forwarderIds, batchId?, windowStart, windowEnd, origin?, destination?,
     //        containerSize?, services, stockMovements?, note?, expiryDays?,
     //        subject?, body? }. `services` are the delivery options asked about,
-    //        as text; `stockMovements` [{ from, to, cbm, weightKg }]; `subject`
-    //        and `body` the email as staff edited it in the dialog ({tokens}
-    //        still filled in per forwarder), the template's when left out.
+    //        as text; `stockMovements` [{ from, cbm, weightKg }], each priced by
+    //        the forwarder on its own line; `subject` and `body` the email as
+    //        staff edited it in the dialog ({tokens} still filled in per
+    //        forwarder), the template's when left out.
     // One request row, one link and one email per forwarder, all sharing
     // `batchId` (the send dialog makes it once). SAFE TO RETRY with the same
     // batchId: a forwarder that already has a row for it is reported as it
@@ -748,17 +795,19 @@ function registerFreightQuoteRoutes(app, deps) {
                     const [ins] = await conn.query(
                         `INSERT INTO freight_quote_requests
                             (token, batch_id, forwarder_id, forwarder_name, window_start_date, window_end_date, origin,
-                             destination, container_size, services, stock_movements, staff_note, sent_to, subject,
+                             destination, container_size, services, staff_note, sent_to, subject,
                              created_by_email, expires_at)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP() + INTERVAL ? DAY)`,
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP() + INTERVAL ? DAY)`,
                         [
                             token, batchId, fw.id, fw.name, want.windowStart, want.windowEnd, want.origin,
-                            want.destination, want.containerSize, JSON.stringify(want.services),
-                            want.stockMovements.length ? JSON.stringify(want.stockMovements) : null, want.note,
+                            want.destination, want.containerSize, JSON.stringify(want.services), want.note,
                             JSON.stringify(addresses), finalSubject, req.userEmail || null, want.expiryDays,
                         ]
                     );
                     requestId = Number(ins.insertId);
+                    // Each forwarder prices the movements itself, so each request
+                    // has its own rows. The send's batch id is their add key.
+                    await insertMovements(conn, requestId, batchId, want.stockMovements, req.userEmail);
                 } catch (e) {
                     // The same send, running twice at once: the other call has this forwarder.
                     if (e.errno !== DUPLICATE) throw e;
@@ -826,6 +875,19 @@ function registerFreightQuoteRoutes(app, deps) {
         });
         res.json(out);
     }));
+
+    // Stock movement rows for one request, unpriced. `addKey` names the call
+    // that adds them: with the line number it is unique per request, so the
+    // same call made twice can never add twice.
+    async function insertMovements(conn, requestId, addKey, movements, userEmail) {
+        if (!movements.length) return;
+        await conn.query(
+            `INSERT INTO freight_stock_movements
+                (request_id, add_key, line_no, factory, cbm, weight_kg, created_by_email)
+             VALUES ${movements.map(() => '(?, ?, ?, ?, ?, ?, ?)').join(', ')}`,
+            movements.flatMap((m, i) => [requestId, addKey, i + 1, m.from, m.cbm, m.weightKg, userEmail || null])
+        );
+    }
 
     async function lockRequest(conn, id) {
         const [[row]] = await conn.query(
@@ -1143,7 +1205,7 @@ function registerFreightQuoteRoutes(app, deps) {
                     if (wanted !== current) {
                         const ship = wanted === null ? null : await attachableShipment(conn, wanted, id);
                         // Another container: what was sent about the old one says nothing about this one.
-                        sets.push('shipment_id = ?', 'draft_container_name = ?', 'contents_sent_at = NULL', 'contents_sent_to = NULL', 'contents_json = NULL');
+                        sets.push('shipment_id = ?', 'draft_container_name = ?', 'contents_sent_at = NULL', 'contents_sent_to = NULL', 'contents_json = NULL', 'contents_document_ids = NULL');
                         params.push(wanted, ship ? (ship.name || ship.reference || null) : null);
                         before.shipmentId = current;
                         after.shipmentId = wanted;
@@ -1265,7 +1327,9 @@ function registerFreightQuoteRoutes(app, deps) {
     // generated forwarder quote, the combined PDF and CSV plus one pair per
     // supplier, attached. The lines listed are kept on the booking
     // (contents_json), so a later change to the container shows as
-    // "changed since sent". `rowVersion` is the booking's as last read: the
+    // "changed since sent", and so are the ids of the documents attached
+    // (contents_document_ids): the supplier portal lists those on the
+    // forwarder's page. `rowVersion` is the booking's as last read: the
     // call claims it before sending, so a retry of a call that did send is
     // refused (409 STALE) instead of sending twice. → the board.
     app.post('/api/v1/freight-bookings/:id(\\d+)/contents-email', route('POST /freight-bookings/:id/contents-email', async (req, res) => {
@@ -1332,12 +1396,17 @@ function registerFreightQuoteRoutes(app, deps) {
             const sent = await sendFrontMessage({ to: addresses, subject: finalSubject, html, attachments });
             if (!sent.ok) throw frontFailure(sent);
 
+            // contents_document_ids: the documents attached, in the order attached
+            // (the combined one first). The supplier portal lists them on the
+            // forwarder's page. NULL when the email went without documents.
+            const documentIds = docs.map(d => Number(d.id));
             await conn.query(
                 `UPDATE freight_bookings
                     SET contents_sent_at = UTC_TIMESTAMP(), contents_sent_to = ?, contents_json = ?,
+                        contents_document_ids = ?,
                         row_version = row_version + 1
                   WHERE id = ?`,
-                [JSON.stringify(addresses), JSON.stringify(F.contentsSnapshot(lines)), id]
+                [JSON.stringify(addresses), JSON.stringify(F.contentsSnapshot(lines)), documentIds.length ? JSON.stringify(documentIds) : null, id]
             );
             // Each attached PDF shows this email in its own sends history, as a
             // forwarder quote emailed from the draft does. `delivery` (2026-11-13_10):
@@ -1364,6 +1433,185 @@ function registerFreightQuoteRoutes(app, deps) {
                     frontMessageUid: sent.frontMessageUid, frontConversationId: sent.frontConversationId,
                 },
                 userEmail: req.userEmail,
+            });
+            return defaultBoard(conn);
+        });
+        res.json(board);
+    }));
+
+    // ── stock movements ─────────────────────────────────────────────────────
+
+    // ── POST /api/v1/freight-quotes/:id/stock-movements ─────────────────────
+    // Body { stockMovements: [{ from, cbm, weightKg }], addKey?, notify?, to?,
+    //        subject?, body? }. Adds stock movements to a request that is
+    // already out, whatever it has reached: waiting, quoted, booking requested
+    // or confirmed, or expired (never a closed link). Unless `notify` is
+    // false, the forwarder is emailed the new movements and the link to the
+    // same page, where each is priced on its own. The link is kept open at
+    // least another 30 days, so an expired one works again.
+    // The request's row_version is NOT bumped: nothing the forwarder may be
+    // typing (its options) is affected, so its open form must not be refused.
+    // SAFE TO RETRY with the same `addKey` (the dialog makes it once): a call
+    // whose rows are already there adds and emails nothing (`alreadyAdded`).
+    // A Front failure takes the rows back out, so nothing unasked-for is left
+    // on the forwarder's page and the same call can simply be made again.
+    // → { ok, added, alreadyAdded, …board }
+    app.post('/api/v1/freight-quotes/:id(\\d+)/stock-movements', route('POST /freight-quotes/:id/stock-movements', async (req, res) => {
+        refuseReadOnly(req);
+        const id = Number(req.params.id);
+        const v = F.validateMovementAdd(req.body);
+        if (v.code) throw invalid(v);
+        const { notify, to, subject, body } = req.body || {};
+        const wantEmail = notify !== false;
+        const portalBase = poPortalEmail.portalBaseOf();
+        if (wantEmail && !portalBase) {
+            throw new Fail(409, 'PORTAL_URL_UNSET', 'The supplier portal address (SUPPLIER_PORTAL_URL) is not configured, so the link cannot be sent.');
+        }
+        const addKey = v.value.addKey || crypto.randomUUID();
+        const added = v.value.stockMovements;
+
+        const out = await withConnection(async (conn) => {
+            const made = await inTransaction(conn, async () => {
+                const request = await lockRequest(conn, id);
+                if (request.revoked_at) throw new Fail(409, 'REVOKED', 'This request was closed, so nothing can be added to it.');
+                const [[counts]] = await conn.query(
+                    `SELECT COALESCE(SUM(add_key = ?), 0) AS same_call, COALESCE(SUM(deleted_at IS NULL), 0) AS live
+                       FROM freight_stock_movements WHERE request_id = ?`,
+                    [addKey, id]
+                );
+                if (Number(counts.same_call) > 0) return null;
+                if (Number(counts.live) + added.length > F.MAX_MOVEMENTS) {
+                    throw new Fail(409, 'TOO_MANY', `A request carries at most ${F.MAX_MOVEMENTS} stock movements; this one has ${Number(counts.live)}.`);
+                }
+                const addresses = wantEmail ? await recipientsFor(conn, to, Number(request.forwarder_id)) : [];
+                await insertMovements(conn, id, addKey, added, req.userEmail);
+                await conn.query(
+                    `UPDATE freight_quote_requests
+                        SET expires_at = GREATEST(expires_at, UTC_TIMESTAMP() + INTERVAL ? DAY)
+                      WHERE id = ?`,
+                    [BOOKING_EXTENDS_DAYS, id]
+                );
+                if (!wantEmail) return { request, addresses, finalSubject: null, html: null };
+
+                const facts = requestFactsOf(request);
+                const tpl = await getEmailTemplate(conn, FREIGHT_MOVEMENT_REQUEST_TEMPLATE_KEY);
+                const vars = {
+                    forwarder: request.forwarder_name || '', count: String(added.length),
+                    windowStart: facts.windowStart, windowEnd: facts.windowEnd, origin: facts.origin,
+                    destination: facts.destination, containerSize: facts.containerSize,
+                };
+                const finalSubject = ((typeof subject === 'string' && subject.trim())
+                    ? renderTemplate(subject.trim(), vars)
+                    : (renderTemplate(tpl.subject, vars) || 'Stock movement price request'))
+                    .replace(/[\r\n]+/g, ' ').slice(0, 500);
+                const escaped = Object.fromEntries(Object.entries(vars).map(([k, val]) => [k, escapeHtml(val)]));
+                const inner = renderTemplate((typeof body === 'string' && body.trim()) ? body : tpl.bodyHtml, escaped);
+                // The link lasts at least as long as it did, and at least 30 days from now.
+                const floor = F.addDays(new Date().toISOString().slice(0, 10), BOOKING_EXTENDS_DAYS);
+                const was = iso(request.expires_at);
+                const expiresOn = was && was.slice(0, 10) > floor ? was.slice(0, 10) : floor;
+                const html = wrapEmail({
+                    title: finalSubject,
+                    bodyHtml: inner + F.movementBlockHtml({ movements: added, url: F.freightUrl(portalBase, request.token), expiresOn }),
+                });
+                return { request, addresses, finalSubject, html };
+            });
+            if (!made) return { ok: true, added: 0, alreadyAdded: true, ...(await defaultBoard(conn)) };
+
+            let sent = null;
+            if (wantEmail) {
+                sent = await sendFrontMessage({ to: made.addresses, subject: made.finalSubject, html: made.html });
+                if (!sent.ok) {
+                    await conn.query('DELETE FROM freight_stock_movements WHERE request_id = ? AND add_key = ?', [id, addKey]);
+                    throw frontFailure(sent);
+                }
+                await logSentEmail(conn, {
+                    emailType: 'freight_movement_request', sentTo: made.addresses, subject: made.finalSubject,
+                    confirmVia: 'portal', sendTable: 'freight_quote_requests', sendId: id,
+                });
+            }
+            await recordAudit(conn, {
+                entityType: 'freight_quote_request', entityId: id, action: 'movements_added',
+                before: null,
+                after: {
+                    forwarder: made.request.forwarder_name || null, stockMovements: added,
+                    to: made.addresses, subject: made.finalSubject,
+                    frontMessageUid: sent ? sent.frontMessageUid : null, frontConversationId: sent ? sent.frontConversationId : null,
+                },
+                userEmail: req.userEmail,
+            });
+            return { ok: true, added: added.length, alreadyAdded: false, ...(await defaultBoard(conn)) };
+        });
+        res.json(out);
+    }));
+
+    async function lockMovement(conn, id) {
+        const [[row]] = await conn.query('SELECT * FROM freight_stock_movements WHERE id = ? FOR UPDATE', [id]);
+        if (!row || row.deleted_at) throw new Fail(404, 'NOT_FOUND', `Stock movement ${id} not found.`);
+        return row;
+    }
+
+    // ── PATCH /api/v1/freight-stock-movements/:id ───────────────────────────
+    // Body { price, currency, note? }: staff type in the price a forwarder
+    // gave by email or phone (price_source = 'staff'), or correct one.
+    // { price: null } takes a price back off. Allowed whatever the request has
+    // reached, a closed link included: the price is a record of what was said.
+    // → the board.
+    app.patch('/api/v1/freight-stock-movements/:id(\\d+)', route('PATCH /freight-stock-movements/:id', async (req, res) => {
+        refuseReadOnly(req);
+        const id = Number(req.params.id);
+        const v = F.validateMovementPrice(req.body);
+        if (v.code) throw invalid(v);
+        const board = await withConnection(async (conn) => {
+            await inTransaction(conn, async () => {
+                const m = await lockMovement(conn, id);
+                const priced = v.value.price !== null;
+                await conn.query(
+                    `UPDATE freight_stock_movements
+                        SET price = ?, currency = ?, price_note = ?, priced_at = ${priced ? 'UTC_TIMESTAMP()' : 'NULL'},
+                            priced_by_name = NULL, priced_by_email = ?, price_source = ?, price_ip = NULL,
+                            row_version = row_version + 1
+                      WHERE id = ?`,
+                    [v.value.price, v.value.currency, v.value.note, priced ? (req.userEmail || null) : null, priced ? 'staff' : null, id]
+                );
+                await recordAudit(conn, {
+                    entityType: 'freight_stock_movement', entityId: id, action: priced ? 'price_entered' : 'price_cleared',
+                    before: { price: m.price === null ? null : Number(m.price), currency: m.currency || null, source: m.price_source || null },
+                    after: { requestId: Number(m.request_id), factory: m.factory, price: v.value.price, currency: v.value.currency, note: v.value.note },
+                    userEmail: req.userEmail,
+                });
+            });
+            return defaultBoard(conn);
+        });
+        res.json(board);
+    }));
+
+    // ── DELETE /api/v1/freight-stock-movements/:id ──────────────────────────
+    // Staff remove a movement that is no longer wanted. Soft: the row and any
+    // price on it stay in the table, and it leaves the forwarder's page.
+    // Removing one twice is a no-op. → the board.
+    app.delete('/api/v1/freight-stock-movements/:id(\\d+)', route('DELETE /freight-stock-movements/:id', async (req, res) => {
+        refuseReadOnly(req);
+        const id = Number(req.params.id);
+        const board = await withConnection(async (conn) => {
+            await inTransaction(conn, async () => {
+                const [[m]] = await conn.query('SELECT * FROM freight_stock_movements WHERE id = ? FOR UPDATE', [id]);
+                if (!m) throw new Fail(404, 'NOT_FOUND', `Stock movement ${id} not found.`);
+                if (m.deleted_at) return;
+                await conn.query(
+                    `UPDATE freight_stock_movements
+                        SET deleted_at = UTC_TIMESTAMP(), deleted_by_email = ?, row_version = row_version + 1
+                      WHERE id = ?`,
+                    [req.userEmail || null, id]
+                );
+                await recordAudit(conn, {
+                    entityType: 'freight_stock_movement', entityId: id, action: 'removed',
+                    before: {
+                        requestId: Number(m.request_id), factory: m.factory, cbm: Number(m.cbm), weightKg: Number(m.weight_kg),
+                        price: m.price === null ? null : Number(m.price), currency: m.currency || null,
+                    },
+                    after: null, userEmail: req.userEmail,
+                });
             });
             return defaultBoard(conn);
         });

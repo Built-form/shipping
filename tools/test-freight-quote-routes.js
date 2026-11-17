@@ -21,7 +21,7 @@ const BATCH = 'a1b2c3d4-0000-4000-8000-000000000001';
 const NOW = () => new Date('2026-11-16T10:00:00Z');
 const future = days => new Date(NOW().getTime() + days * 86400000);
 
-function harness({ userType = 'standard', frontOk = () => true } = {}) {
+function harness({ userType = 'standard', frontOk = () => true, documentSet = null } = {}) {
     const db = {
         forwarders: [
             { id: 1, name: 'DCG', notes: null, deleted_at: null },
@@ -31,10 +31,12 @@ function harness({ userType = 'standard', frontOk = () => true } = {}) {
             { id: 1, forwarder_id: 1, name: 'Amy', email: 'amy@dcg.com', deleted_at: null },
             { id: 2, forwarder_id: 2, name: null, email: 'ops@savino.com', deleted_at: null },
         ],
-        requests: [], options: [], bookings: [],
+        requests: [], options: [], bookings: [], movements: [], movementSeq: 0,
         deliveryOptions: [{ id: 1, label: 'Door to door', deleted_at: null }, { id: 2, label: 'Door to port', deleted_at: null }],
         shipments: [{ id: 50, name: 'Draft 12', reference: null, stage: 'DRAFT', deleted_at: null, merged_into_id: null }],
         audits: [], receipts: [], sent: [], preapproved: [],
+        // draft_container_documents rows and their sends (a contents email with documents).
+        documents: [], documentSends: [],
     };
     const live = b => b.status === 'requested' || b.status === 'confirmed';
     const requestRow = r => ({ ...r, expired: r.expires_at <= NOW() ? 1 : 0 });
@@ -78,11 +80,12 @@ function harness({ userType = 'standard', frontOk = () => true } = {}) {
             }
             if (s.startsWith('INSERT INTO freight_quote_requests')) {
                 const [token, batch_id, forwarder_id, forwarder_name, window_start_date, window_end_date, origin, destination,
-                    container_size, services, stock_movements, staff_note, sent_to, subject, created_by_email, days] = params;
+                    container_size, services, staff_note, sent_to, subject, created_by_email, days] = params;
+                assert.doesNotMatch(s, /stock_movements/); // the old JSON column is no longer written
                 const id = db.requests.length + 1;
                 db.requests.push({
                     id, token, batch_id, forwarder_id, forwarder_name, window_start_date, window_end_date, origin, destination,
-                    container_size, services, stock_movements, staff_note, sent_to, subject, created_by_email, created_at: NOW(), sent_at: null,
+                    container_size, services, staff_note, sent_to, subject, created_by_email, created_at: NOW(), sent_at: null,
                     expires_at: future(days), revoked_at: null, revoke_reason: null, answer_count: 0, answered_at: null,
                     answered_by_name: null, answered_by_email: null, answer_source: null, answer_note: null, declined: 0, row_version: 1,
                 });
@@ -135,6 +138,55 @@ function harness({ userType = 'standard', frontOk = () => true } = {}) {
                 rows.forEach(r => Object.assign(r, { revoked_at: null, revoke_reason: null, row_version: r.row_version + 1 }));
                 return ok(rows.length);
             }
+            // stock movements
+            if (s.startsWith('INSERT INTO freight_stock_movements')) {
+                for (let i = 0; i < params.length; i += 7) {
+                    const [request_id, add_key, line_no, factory, cbm, weight_kg, created_by_email] = params.slice(i, i + 7);
+                    if (db.movements.some(m => m.request_id === request_id && m.add_key === add_key && m.line_no === line_no)) {
+                        throw Object.assign(new Error('dup'), { errno: 1062 });
+                    }
+                    db.movements.push({
+                        id: ++db.movementSeq, request_id, add_key, line_no, factory, cbm, weight_kg, created_by_email, created_at: NOW(),
+                        deleted_at: null, price: null, currency: null, price_note: null, priced_at: null, priced_by_name: null,
+                        priced_by_email: null, price_source: null, row_version: 1,
+                    });
+                }
+                return ok(params.length / 7);
+            }
+            if (s.startsWith('SELECT * FROM freight_stock_movements WHERE request_id IN (?) AND deleted_at IS NULL ORDER BY request_id ASC, id ASC')) {
+                return [db.movements.filter(m => params[0].includes(m.request_id) && !m.deleted_at)];
+            }
+            if (s.startsWith('SELECT COALESCE(SUM(add_key = ?), 0) AS same_call, COALESCE(SUM(deleted_at IS NULL), 0) AS live FROM freight_stock_movements WHERE request_id = ?')) {
+                const rows = db.movements.filter(m => m.request_id === params[1]);
+                return [[{ same_call: rows.filter(m => m.add_key === params[0]).length, live: rows.filter(m => !m.deleted_at).length }]];
+            }
+            if (s.startsWith('DELETE FROM freight_stock_movements WHERE request_id = ? AND add_key = ?')) {
+                const before = db.movements.length;
+                db.movements = db.movements.filter(m => !(m.request_id === params[0] && m.add_key === params[1]));
+                return ok(before - db.movements.length);
+            }
+            if (s.startsWith('SELECT * FROM freight_stock_movements WHERE id = ? FOR UPDATE')) {
+                return [db.movements.filter(m => m.id === params[0])];
+            }
+            if (s.startsWith('UPDATE freight_stock_movements SET price = ?, currency = ?, price_note = ?, priced_at =')) {
+                const [price, currency, price_note, priced_by_email, price_source, id] = params;
+                const m = db.movements.find(x => x.id === id);
+                Object.assign(m, {
+                    price, currency, price_note, priced_at: /priced_at = UTC_TIMESTAMP\(\)/.test(s) ? NOW() : null, priced_by_name: null,
+                    priced_by_email, price_source, row_version: m.row_version + 1,
+                });
+                return ok(1);
+            }
+            if (s.startsWith('UPDATE freight_stock_movements SET deleted_at = UTC_TIMESTAMP(), deleted_by_email = ?, row_version = row_version + 1 WHERE id = ?')) {
+                const m = db.movements.find(x => x.id === params[1]);
+                Object.assign(m, { deleted_at: NOW(), deleted_by_email: params[0], row_version: m.row_version + 1 });
+                return ok(1);
+            }
+            if (s.startsWith('UPDATE freight_quote_requests SET expires_at = GREATEST(expires_at, UTC_TIMESTAMP() + INTERVAL ? DAY) WHERE id = ?')) {
+                const r = db.requests.find(x => x.id === params[1]);
+                if (r.expires_at < future(params[0])) r.expires_at = future(params[0]);
+                return ok(1);
+            }
             // options
             if (s.startsWith('INSERT INTO freight_quote_options')) {
                 for (let i = 0; i < params.length; i += 15) {
@@ -178,7 +230,7 @@ function harness({ userType = 'standard', frontOk = () => true } = {}) {
                     id, request_id, option_id, status: 'requested', requested_by_email, requested_at: NOW(), request_note, sent_to,
                     subject, shipment_id, draft_container_name, booking_ref: null, response_note: null, responded_at: null,
                     responded_by_name: null, responded_by_email: null, response_source: null, cancelled_at: null, cancel_reason: null,
-                    contents_sent_at: null, contents_sent_to: null, contents_json: null, row_version: 1,
+                    contents_sent_at: null, contents_sent_to: null, contents_json: null, contents_document_ids: null, row_version: 1,
                 });
                 return [{ insertId: id }];
             }
@@ -194,14 +246,33 @@ function harness({ userType = 'standard', frontOk = () => true } = {}) {
                 return ok(1);
             }
             if (s.startsWith('UPDATE freight_bookings SET contents_sent_at = UTC_TIMESTAMP()')) {
-                const b = db.bookings.find(x => x.id === params[2]);
-                Object.assign(b, { contents_sent_at: NOW(), contents_sent_to: params[0], contents_json: params[1], row_version: b.row_version + 1 });
+                assert.ok(s.endsWith('contents_json = ?, contents_document_ids = ?, row_version = row_version + 1 WHERE id = ?'), s);
+                const b = db.bookings.find(x => x.id === params[3]);
+                Object.assign(b, {
+                    contents_sent_at: NOW(), contents_sent_to: params[0], contents_json: params[1], contents_document_ids: params[2],
+                    row_version: b.row_version + 1,
+                });
                 return ok(1);
+            }
+            // the documents of a contents email
+            if (s.startsWith('UPDATE draft_container_documents SET shipment_id = ? WHERE id IN (?)')) {
+                for (const d of db.documents) if (params[1].includes(d.id)) d.shipment_id = params[0];
+                return ok(params[1].length);
+            }
+            if (s.startsWith("SELECT id, s3_key, csv_s3_key, supplier FROM draft_container_documents WHERE batch_id = ? AND type = 'forwarder-quote'")) {
+                return [db.documents.filter(d => d.batch_id === params[0])];
+            }
+            if (s.startsWith('INSERT INTO draft_container_document_sends')) {
+                db.documentSends.push({ documentId: params[0], subject: params[2] });
+                return [{ insertId: db.documentSends.length }];
             }
             if (s.startsWith('UPDATE freight_bookings SET ') && s.endsWith('row_version = row_version + 1 WHERE id = ?')) { // PATCH
                 const b = db.bookings.find(x => x.id === params[params.length - 1]);
                 const p = [...params];
-                if (s.includes('shipment_id = ?')) Object.assign(b, { shipment_id: p.shift(), draft_container_name: p.shift(), contents_json: null, contents_sent_at: null });
+                if (s.includes('shipment_id = ?')) {
+                    assert.match(s, /contents_document_ids = NULL/);
+                    Object.assign(b, { shipment_id: p.shift(), draft_container_name: p.shift(), contents_json: null, contents_sent_at: null, contents_document_ids: null });
+                }
                 if (s.includes("status = 'confirmed'")) Object.assign(b, { status: 'confirmed', booking_ref: p.shift(), response_note: p.shift(), responded_by_email: p.shift(), response_source: 'staff', responded_at: NOW() });
                 if (s.includes("status = 'cancelled'")) Object.assign(b, { status: 'cancelled', cancel_reason: 'staff', cancelled_by_email: p.shift(), cancelled_at: NOW() });
                 b.row_version += 1;
@@ -232,8 +303,15 @@ function harness({ userType = 'standard', frontOk = () => true } = {}) {
         getEmailTemplate: async (_c, key) => ({ subject: `${key} {containerSize}{sailingDate}`, bodyHtml: '<p>Body for {forwarder}</p>' }),
         renderTemplate: (str, vars) => String(str).replace(/\{(\w+)\}/g, (m, k) => (vars[k] != null ? String(vars[k]) : '')),
         loadForwarderQuoteForPdf: async () => ({ lines, originPorts: ['Ningbo'] }),
-        generateDraftDocumentSet: async () => { throw new Error('not expected: attachDocuments is false in these tests'); },
-        s3: null,
+        // `documentSet` (a test that attaches documents): the rows one generate run files.
+        generateDraftDocumentSet: async () => {
+            if (!documentSet) throw new Error('not expected: attachDocuments is false in this test');
+            db.documents.push(...documentSet.map(d => ({ ...d, batch_id: 'batch-1', shipment_id: null })));
+            const [main, ...rest] = documentSet;
+            return { batchId: 'batch-1', main: { documentId: main.id }, supplierDocuments: rest.map(d => ({ documentId: d.id })) };
+        },
+        s3: documentSet ? { send: async (cmd) => ({ Body: { transformToByteArray: async () => Buffer.from(cmd.input.Key) } }) } : null,
+        poBucket: () => (documentSet ? 'bucket' : null),
         sendFrontMessage: async (msg) => {
             db.sent.push(msg);
             return frontOk(msg) ? { ok: true, frontMessageUid: `m${db.sent.length}`, frontConversationId: 'c1' } : { ok: false, reason: 'front_error', status: 500 };
@@ -302,9 +380,10 @@ test('send: delivery options as free text, stock movements, and the email as sta
     const out = await h.call('POST', '/api/v1/freight-quotes', {
         ...SEND, forwarderIds: [1],
         services: ['Door to port', 'Deliver to Unit 5, tail-lift', 'door to port'],
+        // No "to" any more; one sent by an older client is ignored.
         stockMovements: [
             { from: 'Acme Medical, Ningbo', to: 'Ningbo port', cbm: '12.5', weightKg: 2400 },
-            { from: 'Best Gloves <Shanghai>', to: 'Ningbo consolidation', cbm: 3.25, weightKg: '610.5' },
+            { from: 'Best Gloves <Shanghai>', cbm: 3.25, weightKg: '610.5' },
         ],
         subject: 'Quote please, {forwarder}: {containerSize}',
         body: '<p>Dear {forwarder}, our own words. Options: {services}.</p>',
@@ -313,10 +392,13 @@ test('send: delivery options as free text, stock movements, and the email as sta
     const request = out.body.requests[0];
     // The same option twice (in any case) counts once; the text is kept as typed.
     assert.deepEqual(request.services, ['Door to port', 'Deliver to Unit 5, tail-lift']);
-    assert.deepEqual(request.stockMovements, [
-        { from: 'Acme Medical, Ningbo', to: 'Ningbo port', cbm: 12.5, weightKg: 2400 },
-        { from: 'Best Gloves <Shanghai>', to: 'Ningbo consolidation', cbm: 3.25, weightKg: 610.5 },
+    // Rows of their own, unpriced, each to be priced on its own line.
+    assert.deepEqual(request.stockMovements.map(m => [m.id, m.from, m.cbm, m.weightKg, m.price, m.currency, m.rowVersion]), [
+        [1, 'Acme Medical, Ningbo', 12.5, 2400, null, null, 1],
+        [2, 'Best Gloves <Shanghai>', 3.25, 610.5, null, null, 1],
     ]);
+    assert.ok(!('to' in request.stockMovements[0]));
+    assert.equal(h.db.movements[0].add_key, BATCH);
     const mail = h.db.sent[0];
     assert.equal(mail.subject, 'Quote please, DCG: 40HQ');
     assert.match(mail.html, /Dear DCG, our own words\. Options: Door to port, Deliver to Unit 5, tail-lift\./);
@@ -328,6 +410,8 @@ test('send: delivery options as free text, stock movements, and the email as sta
     assert.match(mail.html, /Best Gloves &lt;Shanghai&gt;/);
     assert.match(mail.html, /15\.75/); // total CBM
     assert.match(mail.html, /3010\.5/); // total kg
+    assert.match(mail.html, /each priced separately/);
+    assert.doesNotMatch(mail.html, /Ningbo port|To port or consolidation/);
 
     // An option must name one of the delivery options asked about, exactly.
     const option = { ...OPTION, service: 'Deliver to Unit 5, tail-lift' };
@@ -335,10 +419,100 @@ test('send: delivery options as free text, stock movements, and the email as sta
     assert.equal((await h.call('POST', '/api/v1/freight-quotes/1/options', { options: [{ ...OPTION, service: 'door_to_door' }] })).body.field, 'options[0].service');
 
     const bad = body => h.call('POST', '/api/v1/freight-quotes', { ...SEND, batchId: undefined, forwarderIds: [2], ...body }).then(r => r.body.field);
-    assert.equal(await bad({ stockMovements: [{ from: '', to: 'Port', cbm: 1, weightKg: 1 }] }), 'stockMovements[0].from');
-    assert.equal(await bad({ stockMovements: [{ from: 'A', to: 'Port', cbm: 0, weightKg: 1 }] }), 'stockMovements[0].cbm');
-    assert.equal(await bad({ stockMovements: [{ from: 'A', to: 'Port', cbm: 1, weightKg: 'heavy' }] }), 'stockMovements[0].weightKg');
+    assert.equal(await bad({ stockMovements: [{ from: '', cbm: 1, weightKg: 1 }] }), 'stockMovements[0].from');
+    assert.equal(await bad({ stockMovements: [{ from: 'A', cbm: 0, weightKg: 1 }] }), 'stockMovements[0].cbm');
+    assert.equal(await bad({ stockMovements: [{ from: 'A', cbm: 1, weightKg: 'heavy' }] }), 'stockMovements[0].weightKg');
     assert.equal(await bad({ services: ['x'.repeat(101)] }), 'services');
+});
+
+const ADD_KEY = 'b2c3d4e5-0000-4000-8000-000000000002';
+
+test('stock movements: added after the booking, the forwarder is emailed once; a retry adds nothing', async () => {
+    const h = harness();
+    await answered(h);
+    const optionId = h.db.options.find(o => o.request_id === 1).id;
+    assert.equal((await h.call('POST', `/api/v1/freight-quotes/options/${optionId}/book`, {})).status, 200);
+    const versionBefore = h.db.requests[0].row_version;
+    const mails = h.db.sent.length;
+
+    const body = { addKey: ADD_KEY, stockMovements: [{ from: 'Late Factory', cbm: 2, weightKg: 300 }], subject: 'Price please, {forwarder} ({count})' };
+    const out = await h.call('POST', '/api/v1/freight-quotes/1/stock-movements', body);
+    assert.equal(out.status, 200);
+    assert.deepEqual([out.body.added, out.body.alreadyAdded], [1, false]);
+    const request = out.body.requests.find(r => r.id === 1);
+    assert.equal(request.state, 'booked');
+    assert.deepEqual(request.stockMovements.map(m => [m.from, m.price]), [['Late Factory', null]]);
+    // The other forwarder of the send was not asked.
+    assert.deepEqual(out.body.requests.find(r => r.id === 2).stockMovements, []);
+    // One email, to the forwarder's contact, with the movement and the link to the same page.
+    assert.equal(h.db.sent.length, mails + 1);
+    const mail = h.db.sent[mails];
+    assert.deepEqual(mail.to, ['amy@dcg.com']);
+    assert.equal(mail.subject, 'Price please, DCG (1)');
+    assert.match(mail.html, /Late Factory/);
+    assert.match(mail.html, new RegExp(`https://portal\\.example/freight/${h.db.requests[0].token}`));
+    assert.match(mail.html, /Price the stock movements/);
+    // The forwarder's open form is not disturbed: the request's version stays.
+    assert.equal(h.db.requests[0].row_version, versionBefore);
+    assert.equal(h.db.audits.at(-1).action, 'movements_added');
+    assert.doesNotMatch(JSON.stringify(h.db.audits), /[a-f0-9]{48}/);
+
+    const again = await h.call('POST', '/api/v1/freight-quotes/1/stock-movements', body);
+    assert.deepEqual([again.status, again.body.added, again.body.alreadyAdded], [200, 0, true]);
+    assert.equal(h.db.sent.length, mails + 1);
+    assert.equal(h.db.movements.length, 1);
+
+    // Without an email when staff say so; never on a closed link; never past the limit.
+    const quiet = await h.call('POST', '/api/v1/freight-quotes/2/stock-movements', { notify: false, stockMovements: [{ from: 'Quiet', cbm: 1, weightKg: 1 }] });
+    assert.equal(quiet.status, 200);
+    assert.equal(h.db.sent.length, mails + 1);
+    assert.equal((await h.call('POST', '/api/v1/freight-quotes/1/stock-movements', { stockMovements: [] })).body.field, 'stockMovements');
+    const many = Array.from({ length: 30 }, (_, i) => ({ from: `F${i}`, cbm: 1, weightKg: 1 }));
+    assert.equal((await h.call('POST', '/api/v1/freight-quotes/1/stock-movements', { stockMovements: many })).body.code, 'TOO_MANY');
+    await h.call('POST', '/api/v1/freight-quotes/2/revoke');
+    assert.equal((await h.call('POST', '/api/v1/freight-quotes/2/stock-movements', { stockMovements: [{ from: 'A', cbm: 1, weightKg: 1 }] })).body.code, 'REVOKED');
+});
+
+test('stock movements: a Front failure leaves nothing behind, and the same call can go again', async () => {
+    let fail = false;
+    const h = harness({ frontOk: () => !fail });
+    await answered(h);
+    fail = true;
+    const body = { addKey: ADD_KEY, stockMovements: [{ from: 'Late Factory', cbm: 2, weightKg: 300 }] };
+    const out = await h.call('POST', '/api/v1/freight-quotes/1/stock-movements', body);
+    assert.equal(out.status, 502);
+    assert.equal(h.db.movements.length, 0);
+    fail = false;
+    const again = await h.call('POST', '/api/v1/freight-quotes/1/stock-movements', body);
+    assert.deepEqual([again.status, again.body.added], [200, 1]);
+});
+
+test('stock movements: staff type in a price, take it back off, and remove a movement', async () => {
+    const h = harness();
+    await h.call('POST', '/api/v1/freight-quotes', {
+        ...SEND, forwarderIds: [1],
+        stockMovements: [{ from: 'Acme', cbm: 12.5, weightKg: 2400 }, { from: 'Best', cbm: 3, weightKg: 600 }],
+    });
+    const priced = await h.call('PATCH', '/api/v1/freight-stock-movements/1', { price: '120.5', currency: 'USD', note: 'by phone' });
+    assert.equal(priced.status, 200);
+    const [first, second] = priced.body.requests[0].stockMovements;
+    assert.deepEqual([first.price, first.currency, first.priceNote, first.priceSource, first.pricedBy, first.rowVersion], [120.5, 'USD', 'by phone', 'staff', 'staff@example.com', 2]);
+    assert.equal(second.price, null);
+
+    assert.equal((await h.call('PATCH', '/api/v1/freight-stock-movements/1', { price: '0', currency: 'USD' })).body.field, 'price');
+    assert.equal((await h.call('PATCH', '/api/v1/freight-stock-movements/1', { price: '10', currency: 'XXX' })).body.field, 'currency');
+    assert.equal((await h.call('PATCH', '/api/v1/freight-stock-movements/99', { price: '10', currency: 'USD' })).status, 404);
+
+    const cleared = await h.call('PATCH', '/api/v1/freight-stock-movements/1', { price: null });
+    assert.deepEqual([cleared.body.requests[0].stockMovements[0].price, cleared.body.requests[0].stockMovements[0].pricedAt], [null, null]);
+
+    const removed = await h.call('DELETE', '/api/v1/freight-stock-movements/2');
+    assert.deepEqual(removed.body.requests[0].stockMovements.map(m => m.from), ['Acme']);
+    assert.equal((await h.call('DELETE', '/api/v1/freight-stock-movements/2')).status, 200); // twice is a no-op
+    assert.equal((await h.call('PATCH', '/api/v1/freight-stock-movements/2', { price: '10', currency: 'USD' })).status, 404);
+
+    const reader = harness({ userType: 'readonly' });
+    assert.equal((await reader.call('POST', '/api/v1/freight-quotes/1/stock-movements', { stockMovements: [{ from: 'A', cbm: 1, weightKg: 1 }] })).status, 403);
 });
 
 test('delivery options: list, add, reword, remove; no duplicates; read-only refused', async () => {
@@ -502,4 +676,35 @@ test('contents: preview by supplier, the email, the snapshot, and the claim that
     assert.equal(retry.body.code, 'STALE');
     assert.equal(h.db.sent.length, mails);
     assert.equal((await h.call('POST', '/api/v1/freight-bookings/1/contents-email', {})).body.field, 'rowVersion');
+    // Sent without documents: the booking names none.
+    assert.equal(h.db.bookings[0].contents_document_ids, null);
+});
+
+test('contents: the documents attached are kept on the booking, replaced by a resend, cleared with the container', async () => {
+    const h = harness({
+        documentSet: [
+            { id: 698, supplier: null, s3_key: 'draft-containers/a/forwarder-quote-Draft_12-v1.pdf', csv_s3_key: 'draft-containers/a/forwarder-quote-Draft_12-v1.csv' },
+            { id: 699, supplier: 'Acme', s3_key: 'draft-containers/b/forwarder-quote-Acme-Draft_12-v1.pdf', csv_s3_key: null },
+        ],
+    });
+    h.db.shipments.push({ id: 51, name: 'Draft 13', reference: null, stage: 'DRAFT', deleted_at: null, merged_into_id: null });
+    await answered(h);
+    await h.call('POST', '/api/v1/freight-quotes/options/1/book', {});
+    const attached = await h.call('PATCH', '/api/v1/freight-bookings/1', { shipmentId: 50 });
+
+    const sent = await h.call('POST', '/api/v1/freight-bookings/1/contents-email', { rowVersion: attached.body.bookings[0].rowVersion });
+    assert.equal(sent.status, 200);
+    const mail = h.db.sent[h.db.sent.length - 1];
+    assert.deepEqual(mail.attachments.map(a => a.filename), [
+        'forwarder-quote-Draft_12-v1.pdf', 'forwarder-quote-Draft_12-v1.csv', 'forwarder-quote-Acme-Draft_12-v1.pdf',
+    ]);
+    // The ids, the combined document first: what the portal lists for the forwarder.
+    assert.equal(h.db.bookings[0].contents_document_ids, '[698,699]');
+    assert.deepEqual(h.db.documentSends.map(x => x.documentId), [698, 699]);
+    assert.deepEqual(h.db.documents.map(d => d.shipment_id), [50, 50]);
+
+    // Another container: what was sent about the old one is forgotten.
+    await h.call('PATCH', '/api/v1/freight-bookings/1', { shipmentId: 51 });
+    assert.equal(h.db.bookings[0].contents_document_ids, null);
+    assert.equal(h.db.bookings[0].contents_sent_at, null);
 });

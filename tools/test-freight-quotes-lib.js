@@ -31,8 +31,11 @@ test('token and link', () => {
     assert.equal(F.freightUrl('https://p.example', t), `https://p.example/freight/${t}`);
 });
 
-test('the three templates are known to the in-code fallback', () => {
-    const keys = [FREIGHT_QUOTE_REQUEST_TEMPLATE_KEY, FREIGHT_BOOKING_REQUEST_TEMPLATE_KEY, FREIGHT_BOOKING_CONTENTS_TEMPLATE_KEY];
+test('the four templates are known to the in-code fallback', () => {
+    const keys = [
+        FREIGHT_QUOTE_REQUEST_TEMPLATE_KEY, FREIGHT_BOOKING_REQUEST_TEMPLATE_KEY, FREIGHT_BOOKING_CONTENTS_TEMPLATE_KEY,
+        'freight_movement_request',
+    ];
     assert.deepEqual(FREIGHT_TEMPLATES.map(t => t.key), keys);
     for (const key of keys) {
         const tpl = DEFAULT_EMAIL_TEMPLATES.find(x => x.key === key);
@@ -123,23 +126,23 @@ test('delivery options are free text; the four old services keep their translati
     assert.equal(F.validateOptions([{ ...OPTION, service: 7 }], request).field, 'options[0].service');
 });
 
-test('stock movements: a factory, a port or consolidation point, CBM and weight', () => {
+test('stock movements: a factory, CBM and weight; no "to"', () => {
     const ok = F.validateMovements([
+        // A "to" from an older client is ignored, not refused.
         { from: ' Acme Medical ', to: 'Ningbo port', cbm: '12.5', weightKg: 2400 },
-        { from: 'Best Gloves', to: 'Ningbo consolidation', cbm: 3.255, weightKg: '610.55' },
+        { from: 'Best Gloves', cbm: 3.255, weightKg: '610.55' },
     ]);
     assert.deepEqual(ok.value, [
-        { from: 'Acme Medical', to: 'Ningbo port', cbm: 12.5, weightKg: 2400 },
-        { from: 'Best Gloves', to: 'Ningbo consolidation', cbm: 3.255, weightKg: 610.55 },
+        { from: 'Acme Medical', cbm: 12.5, weightKg: 2400 },
+        { from: 'Best Gloves', cbm: 3.255, weightKg: 610.55 },
     ]);
     assert.deepEqual(F.movementTotals(ok.value), { count: 2, cbm: 15.755, weightKg: 3010.55 });
     assert.deepEqual(F.validateMovements(undefined).value, []);
     assert.deepEqual(F.validateMovements([]).value, []);
 
-    const good = { from: 'A', to: 'B', cbm: 1, weightKg: 1 };
+    const good = { from: 'A', cbm: 1, weightKg: 1 };
     const field = patch => F.validateMovements([good, { ...good, ...patch }]).field;
     assert.equal(field({ from: ' ' }), 'stockMovements[1].from');
-    assert.equal(field({ to: undefined }), 'stockMovements[1].to');
     assert.equal(field({ cbm: 0 }), 'stockMovements[1].cbm');
     assert.equal(field({ cbm: '1.2345' }), 'stockMovements[1].cbm');
     assert.equal(field({ cbm: -2 }), 'stockMovements[1].cbm');
@@ -149,20 +152,55 @@ test('stock movements: a factory, a port or consolidation point, CBM and weight'
     assert.equal(F.validateMovements(Array.from({ length: 31 }, () => good)).field, 'stockMovements');
     assert.equal(F.validateMovements([null]).field, 'stockMovements[0]');
 
-    // As stored and read back; rubbish in the column reads as nothing.
-    assert.deepEqual(F.movementsOf(JSON.stringify(ok.value)), ok.value);
-    assert.deepEqual(F.movementsOf(null), []);
-    assert.deepEqual(F.movementsOf('{"not":"a list"}'), []);
-
     assert.equal(F.movementsHtml([]), '');
-    const one = F.movementsHtml([{ from: 'Acme <Ningbo>', to: 'Port', cbm: 12.5, weightKg: 2400 }]);
+    const one = F.movementsHtml([{ from: 'Acme <Ningbo>', cbm: 12.5, weightKg: 2400 }]);
     assert.match(one, /Acme &lt;Ningbo&gt;/);
     assert.match(one, />12\.5</);
+    assert.match(one, /each priced separately/);
     assert.doesNotMatch(one, /Total/);                           // one row needs no total
+    assert.doesNotMatch(one, /port or consolidation/i);          // no "to" column
     const two = F.movementsHtml(ok.value);
     assert.match(two, /Total \/ 合计/);
     assert.match(two, />15\.755</);
     assert.match(two, />3010\.55</);
+});
+
+test('stock movements: added later, priced one by one, totals by currency', () => {
+    const key = 'B2C3D4E5-0000-4000-8000-000000000002';
+    const add = F.validateMovementAdd({ addKey: key, stockMovements: [{ from: 'Late', cbm: 2, weightKg: 300 }] });
+    assert.deepEqual(add.value, { addKey: key.toLowerCase(), stockMovements: [{ from: 'Late', cbm: 2, weightKg: 300 }] });
+    assert.equal(F.validateMovementAdd({ stockMovements: [{ from: 'Late', cbm: 2, weightKg: 300 }] }).value.addKey, null);
+    assert.equal(F.validateMovementAdd({ stockMovements: [] }).field, 'stockMovements');
+    assert.equal(F.validateMovementAdd({ addKey: 'nope', stockMovements: [{ from: 'Late', cbm: 2, weightKg: 300 }] }).field, 'addKey');
+    assert.equal(F.validateMovementAdd(null).field, 'body');
+    assert.equal(F.validateMovementAdd({ stockMovements: [{ from: 'Late', cbm: 0, weightKg: 300 }] }).field, 'stockMovements[0].cbm');
+
+    assert.deepEqual(F.validateMovementPrice({ price: '120.5', currency: 'USD', note: ' incl. tolls ' }).value, { price: '120.50', currency: 'USD', note: 'incl. tolls' });
+    assert.deepEqual(F.validateMovementPrice({ price: 80, currency: 'CNY' }).value, { price: '80.00', currency: 'CNY', note: null });
+    // No price takes one back off, whatever else is sent.
+    assert.deepEqual(F.validateMovementPrice({ price: null, currency: 'USD', note: 'x' }).value, { price: null, currency: null, note: null });
+    assert.deepEqual(F.validateMovementPrice({ price: '' }).value, { price: null, currency: null, note: null });
+    assert.equal(F.validateMovementPrice({ price: '0', currency: 'USD' }).field, 'price');
+    assert.equal(F.validateMovementPrice({ price: '1.234', currency: 'USD' }).field, 'price');
+    assert.equal(F.validateMovementPrice({ price: 'free', currency: 'USD' }).field, 'price');
+    assert.equal(F.validateMovementPrice({ price: '10', currency: 'JPY' }).field, 'currency');
+    assert.equal(F.validateMovementPrice({ price: '10', currency: 'USD', note: 'x'.repeat(501) }).field, 'note');
+    assert.equal(F.validateMovementPrice([]).field, 'body');
+
+    // Never added across currencies; cents are summed whole.
+    assert.deepEqual(F.movementPriceTotals([
+        { price: 0.1, currency: 'CNY' }, { price: 120.5, currency: 'USD' }, { price: null, currency: null },
+        { price: 0.2, currency: 'CNY' }, { price: 30, currency: 'USD' },
+    ]), { priced: 4, unpriced: 1, totals: [{ currency: 'USD', amount: 150.5 }, { currency: 'CNY', amount: 0.3 }] });
+    assert.deepEqual(F.movementPriceTotals([]), { priced: 0, unpriced: 0, totals: [] });
+
+    const block = F.movementBlockHtml({
+        movements: [{ from: 'Late <Factory>', cbm: 2, weightKg: 300 }], url: 'https://p.example/freight/abc', expiresOn: '2026-12-17',
+    });
+    assert.match(block, /Late &lt;Factory&gt;/);
+    assert.match(block, /href="https:\/\/p\.example\/freight\/abc"/);
+    assert.match(block, /Price the stock movements/);
+    assert.match(block, /2026-12-17/);
 });
 
 test('requestState: revoked > expired > booked > answered > open', () => {
@@ -237,11 +275,12 @@ test('money and the emails\' fixed blocks', () => {
     const quote = F.quoteBlockHtml({
         request: {
             ...REQUEST, origin: 'Ningbo <factory>', destination: 'UK', note: 'Two pallets\nextra',
-            stockMovements: [{ from: 'Acme Medical', to: 'Ningbo port', cbm: 12.5, weightKg: 2400 }],
+            stockMovements: [{ from: 'Acme Medical', cbm: 12.5, weightKg: 2400 }],
         },
         url: 'https://p.example/freight/abc', expiresOn: '2026-12-16', registerUrl: 'https://p.example/register',
     });
-    assert.match(quote, /Stock movements to include/);
+    assert.match(quote, /Stock movements, each priced separately/);
+    assert.match(quote, /separate from the price of the sailing/);
     assert.match(quote, /Acme Medical/);
     assert.ok(quote.indexOf('Acme Medical') < quote.indexOf('Enter your quote'));   // above the button
     assert.match(quote, /href="https:\/\/p\.example\/freight\/abc"/);
