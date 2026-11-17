@@ -506,7 +506,7 @@ async function resolveNoticeDelivery(conn, payment, env = process.env) {
         if (!isSourceMissing(e)) throw e;
         portalAvailable = false;
     }
-    const out = N.deliveryFor({ portalBase, switchOn: N.portalSwitchOn(env), portalAvailable, supplierMatched: suppliers.length > 0 });
+    const out = N.deliveryFor({ portalBase, portalAvailable, supplierMatched: suppliers.length > 0 });
     const portal = out.delivery === 'portal';
     return {
         ...out,

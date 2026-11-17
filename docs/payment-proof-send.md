@@ -35,12 +35,11 @@ Where the portal cannot show the payment, **it cannot be sent**: the preview is 
 |---|---|---|---|
 | `no_supplier` | no live supplier is named **exactly** as the transfer's `supplier_name` | `409 SUPPLIER_NOT_ON_PORTAL` | make the payment's supplier name and the supplier record match (`allowedNext: ['edit_payment']`) |
 | `portal_url_unset` | `SUPPLIER_PORTAL_URL` is not configured | `409 PORTAL_NOT_LIVE` | nothing |
-| `portal_switch_off` | `PAYMENT_PROOF_PORTAL` is not `on` for this stage | `409 PORTAL_NOT_LIVE` | nothing |
-| `portal_unavailable` | the portal's `payment_views` table is not on this server | `409 PORTAL_NOT_LIVE` | nothing |
+| `portal_unavailable` | the portal's `payment_views` table is not on this server: the portal is not deployed on this stage yet | `409 PORTAL_NOT_LIVE` | nothing |
 
 What is wrong with the payment itself (no proof, a forwarder's payment, …) is said before any of these: that is what the sender can act on, and a forwarder's payment is never told to "match the supplier record".
 
-`PAYMENT_PROOF_PORTAL` is off by default so that shipping can be deployed before the portal's page exists. **While it is off nothing can be sent from ShipLine** (the dialog says the portal's Payments page is not switched on). Turn it on once the portal is live on that stage; turn it off to stop sends.
+**There is no switch** (the user, 2026-11-17: an earlier `PAYMENT_PROOF_PORTAL` was removed). Payments can be sent on a stage as soon as the portal is deployed there: its `payment_views` table is the sign. Until then ShipLine's dialog says the supplier portal is not available here, and nothing can be sent. A `PAYMENT_PROOF_PORTAL` left in a stage's secret is not read.
 
 Sends from before 2026-11-17 that went out attached stay in `supplier_payment_sends` with `delivery 'attached'` and are shown as they went; their receipts keep their confirm button. Nothing writes `'attached'` any more.
 
@@ -223,9 +222,9 @@ The proof link is the file's public, unguessable S3 address, as a PO PDF's is. H
 
 ## Rollout (test, then prod; all user-triggered)
 
-1. **Shipping**: `bash deploy.sh <stage>`. With `PAYMENT_PROOF_PORTAL` unset **nothing can be sent yet**: ShipLine's dialog says the portal's Payments page is not switched on. ShipLine can ship; its Send button only works after step 3.
+1. **Shipping**: `bash deploy.sh <stage>`. **Nothing can be sent yet**: ShipLine's dialog says the supplier portal is not available here. ShipLine can ship; its Send button works after step 2.
 2. **Portal**: its deploy creates `payment_views`, applies its grants file (the same grants as `_22`) and brings the Payments page.
-3. Set `PAYMENT_PROOF_PORTAL=on` in the stage's secret and deploy shipping again: payments can now be sent. Turning it off stops sends; there is no attached way to fall back to.
+   From then on payments can be sent, as links to the portal: no other step, no switch.
 
 ## Measured on TEST (2026-11-16, read-only)
 

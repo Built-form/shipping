@@ -136,7 +136,6 @@ provider:
     # "on" once the portal's Payments page is live on this stage: a payment sent
     # to a supplier then goes out as a link to it. Anything else (the default):
     # the proof is attached to the email instead. docs/payment-proof-send.md.
-    PAYMENT_PROOF_PORTAL: ${self:custom.secrets.PAYMENT_PROOF_PORTAL, 'off'}
     PI_NOTIFY_REDIRECT_TO: ${self:custom.secrets.PI_NOTIFY_REDIRECT_TO, ''}
     # Email receipt confirmation: optional static page (e.g. an S3-hosted
     # confirmation page) that the "Confirm receipt" click 302-redirects to after

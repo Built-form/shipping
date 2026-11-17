@@ -377,18 +377,17 @@ test('ready-date links: one per order of the deposit, where the portal can open 
 
 // ── Delivery ──────────────────────────────────────────────────────────────
 
-test('delivery: a portal link with the address, the switch, the portal\'s table and an exact supplier; otherwise nothing goes', () => {
-    const ok = { portalBase: 'https://portal.example', switchOn: true, portalAvailable: true, supplierMatched: true };
+test('delivery: a portal link with the address, the portal\'s table and an exact supplier; otherwise nothing goes. There is no switch', () => {
+    const ok = { portalBase: 'https://portal.example', portalAvailable: true, supplierMatched: true };
     assert.deepEqual(N.deliveryFor(ok), { delivery: 'portal', reason: null });
     // Never 'attached': a payment that cannot go as a link does not go.
     assert.deepEqual(N.deliveryFor({ ...ok, portalBase: '' }), { delivery: null, reason: 'portal_url_unset' });
-    assert.deepEqual(N.deliveryFor({ ...ok, switchOn: false }), { delivery: null, reason: 'portal_switch_off' });
     assert.deepEqual(N.deliveryFor({ ...ok, portalAvailable: false }), { delivery: null, reason: 'portal_unavailable' });
     assert.deepEqual(N.deliveryFor({ ...ok, supplierMatched: false }), { delivery: null, reason: 'no_supplier' });
     assert.equal(N.DELIVERY, 'portal');
-    // The switch is the word "on", however it is typed; anything else is off.
-    for (const v of ['on', 'ON', ' On ']) assert.equal(N.portalSwitchOn({ PAYMENT_PROOF_PORTAL: v }), true, String(v));
-    for (const v of [undefined, '', 'off', 'true', '1', 'yes']) assert.equal(N.portalSwitchOn({ PAYMENT_PROOF_PORTAL: v }), false, String(v));
+    // No PAYMENT_PROOF_PORTAL switch (the user, 2026-11-17): whatever is passed for one is not read.
+    assert.deepEqual(N.deliveryFor({ ...ok, switchOn: false }), { delivery: 'portal', reason: null });
+    assert.equal(N.portalSwitchOn, undefined);
 });
 
 test('a payment the portal cannot show is refused, with what is in the way and what to do about it', () => {
@@ -401,7 +400,6 @@ test('a payment the portal cannot show is refused, with what is in the way and w
     // The portal is not live on this server: nothing the sender can do.
     const said = {
         portal_url_unset: 'the supplier portal address is not configured',
-        portal_switch_off: 'the portal\'s Payments page is not switched on here',
         portal_unavailable: 'the supplier portal is not available here',
     };
     for (const [reason, words] of Object.entries(said)) {

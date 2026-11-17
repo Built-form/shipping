@@ -38,8 +38,8 @@ const sourceOf = (lines = [depositLine()], over = {}) => ({
 const PORTAL_DELIVERY = { delivery: 'portal', reason: null, portalBase: PORTAL, portalUrl: `${PORTAL}/payments?payment=45`, registerUrl: `${PORTAL}/register`, suppliers: [{ id: 900001, name: SUPPLIER }] };
 // What cannot be sent (nothing goes out attached instead): nobody of that name on the portal...
 const NO_SUPPLIER_DELIVERY = { delivery: null, reason: 'no_supplier', portalBase: PORTAL, portalUrl: null, registerUrl: null, suppliers: [] };
-// ...or the portal's Payments page not switched on for the stage, though the supplier is on the portal.
-const SWITCH_OFF_DELIVERY = { delivery: null, reason: 'portal_switch_off', portalBase: PORTAL, portalUrl: null, registerUrl: null, suppliers: [{ id: 900001, name: SUPPLIER }] };
+// ...or the portal's tables are not on this stage yet (it is not deployed here), though the supplier is on the portal.
+const NOT_DEPLOYED_DELIVERY = { delivery: null, reason: 'portal_unavailable', portalBase: PORTAL, portalUrl: null, registerUrl: null, suppliers: [{ id: 900001, name: SUPPLIER }] };
 
 // The store in memory. Its transitions are the ones the real store's guarded
 // UPDATEs make (checked against the SQL below).
@@ -157,9 +157,8 @@ test('a balance email has no ready dates; a transfer with both parts sends each 
 test('nothing is ever attached: a payment the portal cannot show is refused before anything is written, with what is in the way', async () => {
     const cases = [
         [NO_SUPPLIER_DELIVERY, 'SUPPLIER_NOT_ON_PORTAL', 'no_supplier', ['edit_payment']],
-        [SWITCH_OFF_DELIVERY, 'PORTAL_NOT_LIVE', 'portal_switch_off', []],
-        [{ ...SWITCH_OFF_DELIVERY, reason: 'portal_unavailable' }, 'PORTAL_NOT_LIVE', 'portal_unavailable', []],
-        [{ ...SWITCH_OFF_DELIVERY, reason: 'portal_url_unset', portalBase: null }, 'PORTAL_NOT_LIVE', 'portal_url_unset', []],
+        [NOT_DEPLOYED_DELIVERY, 'PORTAL_NOT_LIVE', 'portal_unavailable', []],
+        [{ ...NOT_DEPLOYED_DELIVERY, reason: 'portal_url_unset', portalBase: null }, 'PORTAL_NOT_LIVE', 'portal_url_unset', []],
     ];
     for (const [delivery, code, reason, next] of cases) {
         const store = memoryStore({ delivery });
@@ -550,10 +549,10 @@ test('the preview: figures, each notice with its wording to start from, its stat
     assert.deepEqual([a.sendable, a.blocked.status, a.blocked.code, a.blocked.reason, a.blocked.allowedNext], [false, 409, 'SUPPLIER_NOT_ON_PORTAL', 'no_supplier', ['edit_payment']]);
     assert.deepEqual(a.notices.map(n => [n.templateKey, n.portalUrl, n.readyDates]), [['payment_proof_deposit_portal', null, []], ['payment_proof_balance_portal', null, []]]);
     assert.notEqual(a.previewToken, p.previewToken);
-    // The Payments page not switched on for this stage: nothing can be sent from here yet, whoever the supplier is.
-    const off = await S.previewOf(source, SWITCH_OFF_DELIVERY, [], NOW);
-    assert.deepEqual(off.delivery, { delivery: null, reason: 'portal_switch_off', portalSupplier: true });
-    assert.deepEqual([off.sendable, off.blocked.code, off.blocked.reason, off.blocked.allowedNext], [false, 'PORTAL_NOT_LIVE', 'portal_switch_off', []]);
+    // The portal not deployed on this stage: nothing can be sent from here yet, whoever the supplier is.
+    const off = await S.previewOf(source, NOT_DEPLOYED_DELIVERY, [], NOW);
+    assert.deepEqual(off.delivery, { delivery: null, reason: 'portal_unavailable', portalSupplier: true });
+    assert.deepEqual([off.sendable, off.blocked.code, off.blocked.reason, off.blocked.allowedNext], [false, 'PORTAL_NOT_LIVE', 'portal_unavailable', []]);
     assert.deepEqual(off.notices.map(n => n.templateKey), ['payment_proof_deposit_portal', 'payment_proof_balance_portal']);
 });
 
@@ -561,7 +560,7 @@ test('the preview of a transfer that cannot be sent says why: what is wrong with
     const none = await S.previewOf(sourceOf([depositLine()], { documents: [] }), PORTAL_DELIVERY, [], NOW);
     assert.deepEqual([none.sendable, none.blocked.code, none.blocked.allowedNext], [false, 'NO_PROOF', ['attach_proof']]);
     // Both wrong: the payment's own fault is the one the sender can act on now.
-    const both = await S.previewOf(sourceOf([depositLine()], { documents: [] }), SWITCH_OFF_DELIVERY, [], NOW);
+    const both = await S.previewOf(sourceOf([depositLine()], { documents: [] }), NOT_DEPLOYED_DELIVERY, [], NOW);
     assert.equal(both.blocked.code, 'NO_PROOF');
     // A forwarder's payment is never told to "match the supplier record": it is not a supplier's at all.
     const forwarder = sourceOf([{ id: 3, kind: 'extra', targetId: 5, amount: 900, paidWith: null, target: target({ ridesWith: 'shipment', extraKind: 'freight', extraSupplier: 'DCG' }) }]);
@@ -602,7 +601,7 @@ const storeOn = (conn, over = {}) => S.createStore({
     getEmailTemplate: async () => ({ subject: 's', bodyHtml: 'b' }),
     recordAudit: async (c, a) => { conn.log.push({ sql: 'AUDIT', params: a }); },
     preapprove: async () => ({ status: 'ok', suppliers: [], poSupplierMatched: true, users: [] }),
-    env: { SUPPLIER_PORTAL_URL: PORTAL, PAYMENT_PROOF_PORTAL: 'on' },
+    env: { SUPPLIER_PORTAL_URL: PORTAL },
     ...over,
 });
 const sqlOf = conn => conn.log.map(x => x.sql);
@@ -838,7 +837,7 @@ test('the loader reads only what a notice needs, and still answers a server from
 });
 
 test('delivery from the database: the supplier matched exactly, the portal\'s own table as the sign it is there', async () => {
-    const env = { SUPPLIER_PORTAL_URL: `${PORTAL}/`, PAYMENT_PROOF_PORTAL: 'on' };
+    const env = { SUPPLIER_PORTAL_URL: `${PORTAL}/` };
     const pay = { id: 45, supplierName: SUPPLIER };
     const withSupplier = () => scripted([[/FROM suppliers s WHERE/, [[{ id: 900001, name: SUPPLIER }, { id: 900002, name: SUPPLIER }]]]]);
     const conn = withSupplier();
@@ -850,14 +849,15 @@ test('delivery from the database: the supplier matched exactly, the portal\'s ow
     assert.match(conn.log[0].sql, /FROM suppliers s WHERE s\.deleted_at IS NULL AND CONVERT\(s\.name USING utf8mb4\) COLLATE utf8mb4_0900_bin = CONVERT\(\? USING utf8mb4\) COLLATE utf8mb4_0900_bin ORDER BY s\.id$/);
     assert.deepEqual(conn.log[0].params, [SUPPLIER]);
     assert.equal(conn.log[1].sql, 'SELECT 1 AS ok FROM `jportal`.payment_views LIMIT 1');
-    // No supplier of that name, the switch off, no portal table, no address: it cannot go, each with its reason and no link.
+    // No supplier of that name, no portal table, no address: it cannot go, each with its reason and no link.
+    // An old PAYMENT_PROOF_PORTAL left in a stage's secret is not read: there is no switch.
     const reasons = [];
     reasons.push((await S.resolveNoticeDelivery(scripted(), pay, env)).reason);
-    reasons.push((await S.resolveNoticeDelivery(withSupplier(), pay, { ...env, PAYMENT_PROOF_PORTAL: 'off' })).reason);
     reasons.push((await S.resolveNoticeDelivery(scripted([[/FROM suppliers s WHERE/, [[{ id: 1, name: SUPPLIER }]]], [/payment_views/, Object.assign(new Error('no table'), { errno: 1146 })]]), pay, env)).reason);
-    reasons.push((await S.resolveNoticeDelivery(withSupplier(), pay, { PAYMENT_PROOF_PORTAL: 'on' })).reason);
-    assert.deepEqual(reasons, ['no_supplier', 'portal_switch_off', 'portal_unavailable', 'portal_url_unset']);
-    const off = await S.resolveNoticeDelivery(withSupplier(), pay, { ...env, PAYMENT_PROOF_PORTAL: 'off' });
+    reasons.push((await S.resolveNoticeDelivery(withSupplier(), pay, {})).reason);
+    assert.deepEqual(reasons, ['no_supplier', 'portal_unavailable', 'portal_url_unset']);
+    assert.equal((await S.resolveNoticeDelivery(withSupplier(), pay, { ...env, PAYMENT_PROOF_PORTAL: 'off' })).delivery, 'portal');
+    const off = await S.resolveNoticeDelivery(scripted([[/FROM suppliers s WHERE/, [[{ id: 900001, name: SUPPLIER }, { id: 900002, name: SUPPLIER }]]], [/payment_views/, Object.assign(new Error('no table'), { errno: 1146 })]]), pay, env);
     assert.deepEqual([off.delivery, off.portalUrl, off.registerUrl, off.suppliers.length], [null, null, null, 2]);
     // It still says where the portal is and who is on it.
     assert.equal(off.portalBase, PORTAL);

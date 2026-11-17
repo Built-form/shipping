@@ -269,23 +269,22 @@ const readyDatesUrl = (base, purchaseOrderId) => `${base}/orders/${encodeURIComp
 
 // ── Delivery ──────────────────────────────────────────────────────────────
 
-// PAYMENT_PROOF_PORTAL=on: the portal's Payments page is live on this stage.
-// Off by default, so shipping can ship before the portal does. While it is
-// off nothing can be sent from here: there is no other way a payment goes out.
-const portalSwitchOn = (env = process.env) => String((env && env.PAYMENT_PROOF_PORTAL) || '').trim().toLowerCase() === 'on';
+// There is no switch (the user, 2026-11-17, "dont want the switch"): a payment
+// can be sent wherever the portal can show it, which is once the portal is
+// deployed on that stage (its payment_views table is there). Until then nothing
+// can be sent from here: there is no other way a payment goes out.
 
 /**
  * Whether a notice can go out, which is as a link to the portal or not at all:
  * { delivery: 'portal', reason: null }, or { delivery: null, reason } with why not:
  *   portal_url_unset    SUPPLIER_PORTAL_URL is not configured on this server
- *   portal_switch_off   the Payments page is not switched on for this stage
- *   portal_unavailable  the portal's database (its payment_views table) is not here
+ *   portal_unavailable  the portal's database (its payment_views table) is not
+ *                       here: the portal is not deployed on this stage yet
  *   no_supplier         no live supplier has the transfer's exact supplier name
  */
-function deliveryFor({ portalBase, switchOn, portalAvailable, supplierMatched }) {
+function deliveryFor({ portalBase, portalAvailable, supplierMatched }) {
     const cannot = reason => ({ delivery: null, reason });
     if (!portalBase) return cannot('portal_url_unset');
-    if (!switchOn) return cannot('portal_switch_off');
     if (!portalAvailable) return cannot('portal_unavailable');
     if (!supplierMatched) return cannot('no_supplier');
     return { delivery: DELIVERY, reason: null };
@@ -293,7 +292,6 @@ function deliveryFor({ portalBase, switchOn, portalAvailable, supplierMatched })
 
 const REASON_TEXT = {
     portal_url_unset: 'the supplier portal address is not configured',
-    portal_switch_off: 'the portal\'s Payments page is not switched on here',
     portal_unavailable: 'the supplier portal is not available here',
 };
 
@@ -486,7 +484,7 @@ module.exports = {
     DEADLINE_SECONDS,
     toCents, noticeKindOfLine, noticeKindsOf, buildNotices, tokensFor,
     paymentPortalUrl, readyDatesUrl, readyDatesFor, telexContainersOf,
-    portalSwitchOn, deliveryFor, portalRefusal, deliveryConflict,
+    deliveryFor, portalRefusal, deliveryConflict,
     previewToken, requestHash, mayCallFront,
     effectiveStatus, noticeStates,
     portalBlockHtml, preapprovalNote,
