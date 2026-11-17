@@ -37,7 +37,7 @@ const {
 } = require('../lib/email-template-defaults');
 const { sendFrontMessage: defaultSend } = require('./front-send');
 const { preapprovePortalAddresses: defaultPreapprove } = require('./portal-access');
-const { logSentEmail } = require('../lib/email-receipt');
+const { logSentEmail, recordReminderSend } = require('../lib/email-receipt');
 const { londonToday: defaultLondonToday } = require('./daily-alerts');
 const defaultLog = require('../lib/logger');
 
@@ -70,7 +70,7 @@ const REQUEST_COLUMNS = `r.id, r.token, r.batch_id, r.forwarder_id, r.forwarder_
         r.window_end_date, r.origin, r.destination, r.container_size, r.services, r.staff_note, r.sent_to,
         r.subject, r.created_by_email, r.created_at, r.sent_at, r.expires_at, r.revoked_at, r.revoke_reason,
         r.answer_count, r.answered_at, r.answered_by_name, r.answered_by_email, r.answer_source, r.answer_note,
-        r.declined, r.row_version, (r.expires_at <= UTC_TIMESTAMP()) AS expired`;
+        r.declined, r.row_version, r.reminded_at, r.reminder_count, (r.expires_at <= UTC_TIMESTAMP()) AS expired`;
 
 function optionJson(o) {
     return {
@@ -290,18 +290,25 @@ function registerFreightQuoteRoutes(app, deps) {
     // ── DELETE /api/v1/forwarders/:id ───────────────────────────────────────
     // Soft. Its contacts go with it (no portal access through them any more) and
     // its open links are closed as `forwarder_removed`. Refused while one of its
-    // bookings is live: cancel that first. → { ok, revoked }
+    // bookings is in progress: cancel that first. A finished booking (confirmed,
+    // arrived more than a fortnight ago) does not stop it. → { ok, revoked }
     app.delete('/api/v1/forwarders/:id(\\d+)', route('DELETE /forwarders/:id', async (req, res) => {
         refuseReadOnly(req);
         const id = Number(req.params.id);
         const out = await withConnection(conn => inTransaction(conn, async () => {
             const before = await loadForwarder(conn, id);
+            // A booking still asked for, or confirmed and not yet finished (its
+            // sailing arrived more than a fortnight ago: F.bookingFinished).
             const [[live]] = await conn.query(
                 `SELECT COUNT(*) AS n
                    FROM freight_bookings b
                    JOIN freight_quote_requests r ON r.id = b.request_id
-                  WHERE r.forwarder_id = ? AND b.status IN (?)`,
-                [id, LIVE]
+                   LEFT JOIN freight_quote_options o ON o.id = b.option_id
+                  WHERE r.forwarder_id = ?
+                    AND (b.status = 'requested'
+                         OR (b.status = 'confirmed'
+                             AND (o.id IS NULL OR DATE_ADD(o.sailing_date, INTERVAL (o.transit_days + ?) DAY) >= ?)))`,
+                [id, F.FINISHED_AFTER_DAYS, londonToday()]
             );
             if (Number(live.n) > 0) {
                 throw new Fail(409, 'HAS_BOOKING', `${before.name} has a booking in progress. Cancel it before removing the forwarder.`);
@@ -497,12 +504,14 @@ function registerFreightQuoteRoutes(app, deps) {
         return { ship, source, lines };
     }
 
-    function bookingJson(b, { option, request, shipment, drift }) {
+    function bookingJson(b, { option, request, shipment, drift, finished }) {
         return {
             id: Number(b.id),
             requestId: Number(b.request_id),
             optionId: Number(b.option_id),
             status: b.status,
+            // Confirmed, and due to arrive more than a fortnight ago: history.
+            finished: Boolean(finished),
             forwarderId: request ? Number(request.forwarder_id) : null,
             forwarderName: request ? request.forwarder_name || null : null,
             option: option ? optionJson(option) : null,
@@ -528,8 +537,8 @@ function registerFreightQuoteRoutes(app, deps) {
         };
     }
 
-    function requestJson(row, { options, movements, liveBooking, portalBase }) {
-        const state = F.requestState(row, Boolean(liveBooking));
+    function requestJson(row, { options, movements, liveBooking, bookingFinished = false, lastBooking = null, portalBase }) {
+        const state = F.requestState(row, Boolean(liveBooking), bookingFinished);
         const facts = requestFactsOf(row);
         return {
             id: Number(row.id),
@@ -538,6 +547,12 @@ function registerFreightQuoteRoutes(app, deps) {
             forwarderName: row.forwarder_name || null,
             state,
             revokeReason: row.revoke_reason || null,
+            // A booking on it is requested or confirmed (finished or not): no
+            // other option of it can be booked, whatever `state` says.
+            hasLiveBooking: Boolean(liveBooking),
+            // The newest booking's status: `declined` tells a request the
+            // forwarder turned down apart from one never booked.
+            lastBookingStatus: lastBooking ? lastBooking.status : null,
             ...facts,
             // In the order added, each with the forwarder's price once given.
             stockMovements: movements.map(movementJson),
@@ -547,6 +562,9 @@ function registerFreightQuoteRoutes(app, deps) {
             // null = Front never confirmed the email (the call was cut short).
             sentAt: iso(row.sent_at),
             sentByEmail: row.created_by_email || null,
+            // Reminders sent by staff (POST …/remind): the last one, and how many.
+            remindedAt: iso(row.reminded_at),
+            reminderCount: Number(row.reminder_count) || 0,
             expiresAt: iso(row.expires_at),
             revokedAt: iso(row.revoked_at),
             answerCount: Number(row.answer_count),
@@ -614,11 +632,18 @@ function registerFreightQuoteRoutes(app, deps) {
         const optionById = new Map(options.map(o => [Number(o.id), o]));
         const shipmentById = new Map(shipments.map(s => [Number(s.id), s]));
         const liveByRequest = new Map(bookings.filter(isLive).map(b => [Number(b.request_id), b]));
+        // The rows come oldest first, so the last one set is the newest.
+        const lastByRequest = new Map(bookings.map(b => [Number(b.request_id), b]));
+        const today = londonToday();
+        const finishedIds = new Set(bookings
+            .filter(b => F.bookingFinished(b, optionById.get(Number(b.option_id)), today))
+            .map(b => Number(b.id)));
 
         const bookingsOut = [];
         for (const b of bookings) {
             let drift = null;
-            if (withDrift && isLive(b) && b.contents_json && b.shipment_id != null) {
+            // A finished booking's container has long arrived: nothing to compare.
+            if (withDrift && isLive(b) && !finishedIds.has(Number(b.id)) && b.contents_json && b.shipment_id != null) {
                 try {
                     const { lines } = await loadContainerLines(conn, Number(b.shipment_id));
                     drift = F.contentsDrift(b.contents_json, lines);
@@ -633,16 +658,22 @@ function registerFreightQuoteRoutes(app, deps) {
                 request: rowById.get(Number(b.request_id)) || null,
                 shipment: b.shipment_id != null ? shipmentById.get(Number(b.shipment_id)) || null : null,
                 drift,
+                finished: finishedIds.has(Number(b.id)),
             }));
         }
         return {
             enabled: portalBase !== '',
-            requests: rows.map(r => requestJson(r, {
-                options: options.filter(o => Number(o.request_id) === Number(r.id) && Number(o.is_current) === 1),
-                movements: movements.filter(m => Number(m.request_id) === Number(r.id)),
-                liveBooking: liveByRequest.get(Number(r.id)) || null,
-                portalBase,
-            })),
+            requests: rows.map((r) => {
+                const liveBooking = liveByRequest.get(Number(r.id)) || null;
+                return requestJson(r, {
+                    options: options.filter(o => Number(o.request_id) === Number(r.id) && Number(o.is_current) === 1),
+                    movements: movements.filter(m => Number(m.request_id) === Number(r.id)),
+                    liveBooking,
+                    bookingFinished: Boolean(liveBooking) && finishedIds.has(Number(liveBooking.id)),
+                    lastBooking: lastByRequest.get(Number(r.id)) || null,
+                    portalBase,
+                });
+            }),
             // Newest first, as the requests are.
             bookings: bookingsOut.reverse(),
         };
@@ -690,14 +721,30 @@ function registerFreightQuoteRoutes(app, deps) {
     }));
 
     // ── GET /api/v1/freight-quotes/summary ──────────────────────────────────
-    // { answered }: sends with a quote in and nothing booked yet (the FREIGHT
-    // tab's badge). A send counts once however many forwarders answered; a
-    // forwarder that cannot quote, a closed or expired link and a removed
-    // forwarder do not count.
+    // { answered, contentsDue, total }: what waits on staff (the FREIGHT tab's
+    // badge shows `total`).
+    //   answered     sends with a quote in and nothing booked yet. A send counts
+    //                once however many forwarders answered; a forwarder that
+    //                cannot quote, a closed or expired link and a removed
+    //                forwarder do not count. A booking the forwarder declined
+    //                puts its send back here.
+    //   contentsDue  bookings the forwarder confirmed whose contents have not
+    //                been emailed yet (a finished booking does not count).
+    // Bookings whose contents changed since they were sent are not counted
+    // here: that needs every container's lines read, which the board does.
     app.get('/api/v1/freight-quotes/summary', route('GET /freight-quotes/summary', async (req, res) => {
-        const answered = await withConnection(async (conn) => {
+        const counts = await withConnection(async (conn) => {
             try {
                 await syncFilled(conn);
+                const [[due]] = await conn.query(
+                    `SELECT COUNT(*) AS n
+                       FROM freight_bookings b
+                       JOIN freight_quote_requests r ON r.id = b.request_id
+                       JOIN freight_quote_options o ON o.id = b.option_id
+                      WHERE b.status = 'confirmed' AND b.contents_sent_at IS NULL AND r.revoked_at IS NULL
+                        AND DATE_ADD(o.sailing_date, INTERVAL (o.transit_days + ?) DAY) >= ?`,
+                    [F.FINISHED_AFTER_DAYS, londonToday()]
+                );
                 const [[row]] = await conn.query(
                     `SELECT COUNT(DISTINCT r.batch_id) AS n
                        FROM freight_quote_requests r
@@ -710,13 +757,13 @@ function registerFreightQuoteRoutes(app, deps) {
                                          WHERE br.batch_id = r.batch_id AND b.status IN (?))`,
                     [LIVE]
                 );
-                return Number(row.n) || 0;
+                return { answered: Number(row.n) || 0, contentsDue: Number(due.n) || 0 };
             } catch (e) {
                 if (e.errno !== TABLE_MISSING) throw e;
-                return 0;
+                return { answered: 0, contentsDue: 0 };
             }
         });
-        res.json({ answered });
+        res.json({ ...counts, total: counts.answered + counts.contentsDue });
     }));
 
     // ── POST /api/v1/freight-quotes ─────────────────────────────────────────
@@ -731,7 +778,11 @@ function registerFreightQuoteRoutes(app, deps) {
     // `batchId` (the send dialog makes it once). SAFE TO RETRY with the same
     // batchId: a forwarder that already has a row for it is reported as it
     // stands and never emailed again. A Front failure revokes that forwarder's
-    // request, so no dead link is left open; the others still go.
+    // request (`send_failed`), so no dead link is left open; the others still
+    // go. That row reached nobody, so the same batchId sent again TRIES IT
+    // AGAIN, as the dialog now has it, instead of reporting the failure for
+    // ever. A batchId that already exists may also carry a forwarder not asked
+    // before: ShipLine's "Ask another forwarder" adds one to a send that way.
     // → { batchId, results: [{ forwarderId, forwarderName, outcome, requestId?, error? }], …board }
     //   outcome: sent | already_sent | send_unconfirmed | failed | no_contacts
     app.post('/api/v1/freight-quotes', route('POST /freight-quotes', async (req, res) => {
@@ -758,10 +809,12 @@ function registerFreightQuoteRoutes(app, deps) {
             for (const fw of forwarders) {
                 const base = { forwarderId: fw.id, forwarderName: fw.name };
                 const [[existing]] = await conn.query(
-                    'SELECT id, sent_at, revoked_at FROM freight_quote_requests WHERE batch_id = ? AND forwarder_id = ?',
+                    'SELECT id, token, sent_at, revoked_at, revoke_reason FROM freight_quote_requests WHERE batch_id = ? AND forwarder_id = ?',
                     [batchId, fw.id]
                 );
-                if (existing) {
+                // Front refused the first attempt, so nobody was emailed: go again.
+                const retrying = Boolean(existing) && existing.revoke_reason === 'send_failed';
+                if (existing && !retrying) {
                     results.push({
                         ...base, requestId: Number(existing.id),
                         outcome: existing.revoked_at ? 'failed' : (existing.sent_at ? 'already_sent' : 'send_unconfirmed'),
@@ -789,30 +842,53 @@ function registerFreightQuoteRoutes(app, deps) {
                     : (renderTemplate(tpl.subject, vars) || `Freight quote request – ${want.windowStart} to ${want.windowEnd}`))
                     .replace(/[\r\n]+/g, ' ').slice(0, 500);
 
-                const token = F.newToken();
+                const token = retrying ? existing.token : F.newToken();
                 let requestId;
-                try {
-                    const [ins] = await conn.query(
-                        `INSERT INTO freight_quote_requests
-                            (token, batch_id, forwarder_id, forwarder_name, window_start_date, window_end_date, origin,
-                             destination, container_size, services, staff_note, sent_to, subject,
-                             created_by_email, expires_at)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP() + INTERVAL ? DAY)`,
+                if (retrying) {
+                    // The same row, as the dialog has it now, open again. Guarded
+                    // on the reason, so two retries at once cannot both send.
+                    requestId = Number(existing.id);
+                    const [reopened] = await conn.query(
+                        `UPDATE freight_quote_requests
+                            SET forwarder_name = ?, window_start_date = ?, window_end_date = ?, origin = ?, destination = ?,
+                                container_size = ?, services = ?, staff_note = ?, sent_to = ?, subject = ?,
+                                created_by_email = ?, sent_at = NULL, revoked_at = NULL, revoke_reason = NULL,
+                                expires_at = UTC_TIMESTAMP() + INTERVAL ? DAY, row_version = row_version + 1
+                          WHERE id = ? AND revoke_reason = 'send_failed'`,
                         [
-                            token, batchId, fw.id, fw.name, want.windowStart, want.windowEnd, want.origin,
-                            want.destination, want.containerSize, JSON.stringify(want.services), want.note,
-                            JSON.stringify(addresses), finalSubject, req.userEmail || null, want.expiryDays,
+                            fw.name, want.windowStart, want.windowEnd, want.origin, want.destination,
+                            want.containerSize, JSON.stringify(want.services), want.note, JSON.stringify(addresses),
+                            finalSubject, req.userEmail || null, want.expiryDays, requestId,
                         ]
                     );
-                    requestId = Number(ins.insertId);
-                    // Each forwarder prices the movements itself, so each request
-                    // has its own rows. The send's batch id is their add key.
+                    if (reopened.affectedRows !== 1) { results.push({ ...base, requestId, outcome: 'send_unconfirmed' }); continue; }
+                    // The movements of the attempt that failed give way to the ones listed now.
+                    await conn.query('DELETE FROM freight_stock_movements WHERE request_id = ? AND add_key = ?', [requestId, batchId]);
                     await insertMovements(conn, requestId, batchId, want.stockMovements, req.userEmail);
-                } catch (e) {
-                    // The same send, running twice at once: the other call has this forwarder.
-                    if (e.errno !== DUPLICATE) throw e;
-                    results.push({ ...base, outcome: 'send_unconfirmed' });
-                    continue;
+                } else {
+                    try {
+                        const [ins] = await conn.query(
+                            `INSERT INTO freight_quote_requests
+                                (token, batch_id, forwarder_id, forwarder_name, window_start_date, window_end_date, origin,
+                                 destination, container_size, services, staff_note, sent_to, subject,
+                                 created_by_email, expires_at)
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP() + INTERVAL ? DAY)`,
+                            [
+                                token, batchId, fw.id, fw.name, want.windowStart, want.windowEnd, want.origin,
+                                want.destination, want.containerSize, JSON.stringify(want.services), want.note,
+                                JSON.stringify(addresses), finalSubject, req.userEmail || null, want.expiryDays,
+                            ]
+                        );
+                        requestId = Number(ins.insertId);
+                        // Each forwarder prices the movements itself, so each request
+                        // has its own rows. The send's batch id is their add key.
+                        await insertMovements(conn, requestId, batchId, want.stockMovements, req.userEmail);
+                    } catch (e) {
+                        // The same send, running twice at once: the other call has this forwarder.
+                        if (e.errno !== DUPLICATE) throw e;
+                        results.push({ ...base, outcome: 'send_unconfirmed' });
+                        continue;
+                    }
                 }
 
                 const escaped = Object.fromEntries(Object.entries(vars).map(([k, val]) => [k, escapeHtml(val)]));
@@ -906,17 +982,27 @@ function registerFreightQuoteRoutes(app, deps) {
         return row || null;
     }
 
+    // Whether a live booking is finished (F.bookingFinished), read with its option.
+    async function isFinished(conn, booking) {
+        if (booking.status !== 'confirmed') return false;
+        const [[option]] = await conn.query('SELECT * FROM freight_quote_options WHERE id = ?', [booking.option_id]);
+        return F.bookingFinished(booking, option || null, londonToday());
+    }
+
     // ── POST /api/v1/freight-quotes/:id/revoke ──────────────────────────────
     // Closes a link. The options already given stay readable in ShipLine.
-    // Refused while a booking on it is live (the forwarder still needs the page
-    // to confirm): cancel the booking first. Revoking twice is a no-op. → the board.
+    // Refused while a booking on it is in progress (the forwarder still needs
+    // the page to confirm): cancel the booking first. A finished booking does
+    // not stop it. Revoking twice is a no-op. → the board.
     app.post('/api/v1/freight-quotes/:id(\\d+)/revoke', route('POST /freight-quotes/:id/revoke', async (req, res) => {
         refuseReadOnly(req);
         const id = Number(req.params.id);
         const board = await withConnection(async (conn) => {
             await inTransaction(conn, async () => {
                 const row = await lockRequest(conn, id);
-                if (await liveBookingOf(conn, id)) {
+                // A finished booking (arrived more than a fortnight ago) needs the page no longer.
+                const held = await liveBookingOf(conn, id);
+                if (held && !(await isFinished(conn, held))) {
                     throw new Fail(409, 'HAS_BOOKING', 'This request has a booking in progress. Cancel the booking before closing the link.');
                 }
                 if (row.revoked_at) return;
@@ -934,6 +1020,136 @@ function registerFreightQuoteRoutes(app, deps) {
             return defaultBoard(conn);
         });
         res.json(board);
+    }));
+
+    // ── POST /api/v1/freight-quotes/:id/remind ──────────────────────────────
+    // Body { reminderCount, to?, subject?, body? }. Emails the forwarder the
+    // SAME link again, by hand (nothing here is automatic). What it asks for is
+    // what is still waiting:
+    //   kind 'quote'      no answer yet: the quote request's template and block;
+    //   kind 'movements'  answered, but stock movements have no price: the price
+    //                     request's template, with the movements still unpriced.
+    // 409 NOTHING_WAITING when neither is true; 409 REVOKED on a closed link.
+    // An expired link is opened again: the link is kept open at least another
+    // REMINDER_EXTENDS_DAYS. A request whose first email Front never confirmed
+    // (`sent_at` NULL) counts as sent once a reminder has gone.
+    // `reminderCount` is the request's as last read: the call claims it before
+    // sending, so a retry of a call that did send is refused (409 STALE)
+    // instead of sending twice. A Front failure gives the claim back.
+    // The request's row_version is NOT bumped: the forwarder's open form must
+    // not be refused because of a reminder.
+    // On the Email Receipts page the reminder is listed under the email it
+    // repeats (email_receipt_reminders); with no such row, as an email of its own.
+    // → { ok, kind, …board }
+    app.post('/api/v1/freight-quotes/:id(\\d+)/remind', route('POST /freight-quotes/:id/remind', async (req, res) => {
+        refuseReadOnly(req);
+        const id = Number(req.params.id);
+        const { reminderCount, to, subject, body } = req.body || {};
+        if (!Number.isSafeInteger(reminderCount) || reminderCount < 0) {
+            throw new Fail(400, 'BAD_FIELD', 'reminderCount must be the request\'s reminderCount.', { field: 'reminderCount' });
+        }
+        const portalBase = poPortalEmail.portalBaseOf();
+        if (!portalBase) {
+            throw new Fail(409, 'PORTAL_URL_UNSET', 'The supplier portal address (SUPPLIER_PORTAL_URL) is not configured, so the link cannot be sent.');
+        }
+
+        const out = await withConnection(async (conn) => {
+            const made = await inTransaction(conn, async () => {
+                const request = await lockRequest(conn, id);
+                if (request.revoked_at) throw new Fail(409, 'REVOKED', 'This request was closed, so there is no link to remind the forwarder of.');
+                const movements = (await loadMovements(conn, [id]))
+                    .map(m => ({ from: m.factory, cbm: Number(m.cbm), weightKg: Number(m.weight_kg), priced: m.price !== null && m.price !== undefined }));
+                const unpriced = movements.filter(m => !m.priced);
+                const kind = !request.answered_at ? 'quote' : (unpriced.length ? 'movements' : null);
+                if (!kind) {
+                    throw new Fail(409, 'NOTHING_WAITING', 'This forwarder has answered and priced everything asked, so there is nothing to remind them of.');
+                }
+                if ((Number(request.reminder_count) || 0) !== reminderCount) {
+                    throw new Fail(409, 'STALE', 'A reminder has gone since this was shown. Reload and check before sending another.');
+                }
+                const addresses = await recipientsFor(conn, to, Number(request.forwarder_id));
+                // The claim: under the row lock, so only one call per count gets past here.
+                await conn.query(
+                    `UPDATE freight_quote_requests
+                        SET reminder_count = reminder_count + 1,
+                            expires_at = GREATEST(expires_at, UTC_TIMESTAMP() + INTERVAL ? DAY)
+                      WHERE id = ?`,
+                    [F.REMINDER_EXTENDS_DAYS, id]
+                );
+
+                const facts = requestFactsOf(request);
+                const tpl = await getEmailTemplate(conn, kind === 'quote' ? FREIGHT_QUOTE_REQUEST_TEMPLATE_KEY : FREIGHT_MOVEMENT_REQUEST_TEMPLATE_KEY);
+                const vars = {
+                    forwarder: request.forwarder_name || '', windowStart: facts.windowStart, windowEnd: facts.windowEnd,
+                    origin: facts.origin, destination: facts.destination, containerSize: facts.containerSize,
+                    services: facts.services.map(F.serviceName).join(', '), count: String(unpriced.length),
+                };
+                const fallback = kind === 'quote'
+                    ? `Freight quote request – ${facts.windowStart} to ${facts.windowEnd}`
+                    : 'Stock movement price request';
+                const finalSubject = ((typeof subject === 'string' && subject.trim())
+                    ? renderTemplate(subject.trim(), vars)
+                    : `Reminder: ${renderTemplate(tpl.subject, vars) || fallback}`)
+                    .replace(/[\r\n]+/g, ' ').slice(0, 500);
+                const escaped = Object.fromEntries(Object.entries(vars).map(([k, val]) => [k, escapeHtml(val)]));
+                const inner = renderTemplate((typeof body === 'string' && body.trim()) ? body : tpl.bodyHtml, escaped);
+                // The link lasts at least as long as it did, and at least the reminder's days from now.
+                const floor = F.addDays(new Date().toISOString().slice(0, 10), F.REMINDER_EXTENDS_DAYS);
+                const was = iso(request.expires_at);
+                const expiresOn = was && was.slice(0, 10) > floor ? was.slice(0, 10) : floor;
+                const url = F.freightUrl(portalBase, request.token);
+                const block = kind === 'quote'
+                    ? F.quoteBlockHtml({ request: { ...facts, stockMovements: movements }, url, expiresOn, registerUrl: poPortalEmail.registerUrl(portalBase) })
+                    : F.movementBlockHtml({ movements: unpriced, url, expiresOn });
+                return { kind, request, addresses, finalSubject, html: wrapEmail({ title: finalSubject, bodyHtml: inner + block }) };
+            });
+
+            const sent = await sendFrontMessage({ to: made.addresses, subject: made.finalSubject, html: made.html });
+            if (!sent.ok) {
+                await conn.query('UPDATE freight_quote_requests SET reminder_count = reminder_count - 1 WHERE id = ? AND reminder_count > 0', [id]);
+                throw frontFailure(sent);
+            }
+            await conn.query(
+                'UPDATE freight_quote_requests SET reminded_at = UTC_TIMESTAMP(), sent_at = COALESCE(sent_at, UTC_TIMESTAMP()) WHERE id = ?',
+                [id]
+            );
+            // Under the email it repeats on the Email Receipts page; the email is
+            // sent, so a failure here is logged and never fails the call.
+            const emailType = made.kind === 'quote' ? 'freight_quote_request' : 'freight_movement_request';
+            try {
+                const [[receipt]] = await conn.query(
+                    `SELECT id, reminder_count FROM email_receipts
+                      WHERE send_table = 'freight_quote_requests' AND send_id = ? AND email_type = ?
+                      ORDER BY id DESC LIMIT 1`,
+                    [id, emailType]
+                );
+                if (receipt) {
+                    await recordReminderSend(conn, receipt.id, {
+                        reminderNumber: Number(receipt.reminder_count || 0) + 1, sentTo: made.addresses, subject: made.finalSubject,
+                        frontMessageUid: sent.frontMessageUid, frontConversationId: sent.frontConversationId, sentByEmail: req.userEmail || null,
+                    });
+                } else {
+                    await logSentEmail(conn, {
+                        emailType, sentTo: made.addresses, subject: made.finalSubject,
+                        confirmVia: 'portal', sendTable: 'freight_quote_requests', sendId: id,
+                    });
+                }
+            } catch (e) {
+                log.warn('[freight-quotes] a reminder was not recorded on the Email Receipts page', { requestId: id, error: e.message });
+            }
+            await recordAudit(conn, {
+                entityType: 'freight_quote_request', entityId: id, action: 'reminded',
+                before: null,
+                after: {
+                    kind: made.kind, forwarder: made.request.forwarder_name || null, to: made.addresses, subject: made.finalSubject,
+                    reminderNumber: reminderCount + 1,
+                    frontMessageUid: sent.frontMessageUid, frontConversationId: sent.frontConversationId,
+                },
+                userEmail: req.userEmail,
+            });
+            return { ok: true, kind: made.kind, ...(await defaultBoard(conn)) };
+        });
+        res.json(out);
     }));
 
     async function insertOptions(conn, requestId, answerNo, options) {

@@ -34,12 +34,17 @@ function harness({ userType = 'standard', frontOk = () => true, documentSet = nu
         requests: [], options: [], bookings: [], movements: [], movementSeq: 0,
         deliveryOptions: [{ id: 1, label: 'Door to door', deleted_at: null }, { id: 2, label: 'Door to port', deleted_at: null }],
         shipments: [{ id: 50, name: 'Draft 12', reference: null, stage: 'DRAFT', deleted_at: null, merged_into_id: null }],
-        audits: [], receipts: [], sent: [], preapproved: [],
+        audits: [], receipts: [], receiptReminders: [], sent: [], preapproved: [],
         // draft_container_documents rows and their sends (a contents email with documents).
         documents: [], documentSends: [],
     };
     const live = b => b.status === 'requested' || b.status === 'confirmed';
     const requestRow = r => ({ ...r, expired: r.expires_at <= NOW() ? 1 : 0 });
+    // DATE_ADD(o.sailing_date, INTERVAL (o.transit_days + days) DAY), as 'YYYY-MM-DD'.
+    const arrivesPlus = (b, days) => {
+        const o = db.options.find(x => x.id === b.option_id);
+        return new Date(Date.parse(`${o.sailing_date}T00:00:00Z`) + (Number(o.transit_days) + days) * 86400000).toISOString().slice(0, 10);
+    };
     const ok = n => [{ affectedRows: n }];
 
     const conn = {
@@ -75,8 +80,84 @@ function harness({ userType = 'standard', frontOk = () => true, documentSet = nu
                 return ok(1);
             }
             // requests
-            if (s.startsWith('SELECT id, sent_at, revoked_at FROM freight_quote_requests WHERE batch_id = ? AND forwarder_id = ?')) {
+            if (s.startsWith('SELECT id, token, sent_at, revoked_at, revoke_reason FROM freight_quote_requests WHERE batch_id = ? AND forwarder_id = ?')) {
                 return [db.requests.filter(r => r.batch_id === params[0] && r.forwarder_id === params[1])];
+            }
+            // a send Front refused, tried again on the same row
+            if (s.startsWith('UPDATE freight_quote_requests SET forwarder_name = ?')) {
+                assert.ok(s.endsWith("WHERE id = ? AND revoke_reason = 'send_failed'"), s);
+                const [forwarder_name, window_start_date, window_end_date, origin, destination, container_size, services,
+                    staff_note, sent_to, subject, created_by_email, days, id] = params;
+                const r = db.requests.find(x => x.id === id && x.revoke_reason === 'send_failed');
+                if (!r) return ok(0);
+                Object.assign(r, {
+                    forwarder_name, window_start_date, window_end_date, origin, destination, container_size, services, staff_note,
+                    sent_to, subject, created_by_email, sent_at: null, revoked_at: null, revoke_reason: null,
+                    expires_at: future(days), row_version: r.row_version + 1,
+                });
+                return ok(1);
+            }
+            // reminders
+            if (s.startsWith('UPDATE freight_quote_requests SET reminder_count = reminder_count + 1, expires_at = GREATEST(expires_at, UTC_TIMESTAMP() + INTERVAL ? DAY) WHERE id = ?')) {
+                const r = db.requests.find(x => x.id === params[1]);
+                r.reminder_count += 1;
+                if (r.expires_at < future(params[0])) r.expires_at = future(params[0]);
+                return ok(1);
+            }
+            if (s.startsWith('UPDATE freight_quote_requests SET reminder_count = reminder_count - 1 WHERE id = ? AND reminder_count > 0')) {
+                db.requests.find(x => x.id === params[0]).reminder_count -= 1;
+                return ok(1);
+            }
+            if (s.startsWith('UPDATE freight_quote_requests SET reminded_at = UTC_TIMESTAMP(), sent_at = COALESCE(sent_at, UTC_TIMESTAMP()) WHERE id = ?')) {
+                const r = db.requests.find(x => x.id === params[0]);
+                Object.assign(r, { reminded_at: NOW(), sent_at: r.sent_at || NOW() });
+                return ok(1);
+            }
+            if (s.startsWith("SELECT id, reminder_count FROM email_receipts WHERE send_table = 'freight_quote_requests' AND send_id = ? AND email_type = ? ORDER BY id DESC LIMIT 1")) {
+                const rows = db.receipts.map((p, i) => ({ id: i + 1, email_type: p[1], send_table: p[2], send_id: p[3] }))
+                    .filter(x => x.send_table === 'freight_quote_requests' && x.send_id === params[0] && x.email_type === params[1])
+                    .map(x => ({ id: x.id, reminder_count: db.receiptReminders.filter(m => m.receiptId === x.id).length }));
+                return [rows.slice(-1)];
+            }
+            if (s.startsWith('INSERT INTO email_receipt_reminders')) {
+                db.receiptReminders.push({ receiptId: params[0], number: params[1], subject: params[3], by: params[6] });
+                return [{ insertId: db.receiptReminders.length }];
+            }
+            if (s.startsWith('UPDATE email_receipts SET reminder_count = reminder_count + 1')) return ok(1);
+            // removing a forwarder
+            if (s.startsWith('SELECT COUNT(*) AS n FROM freight_bookings b JOIN freight_quote_requests r ON r.id = b.request_id LEFT JOIN freight_quote_options o ON o.id = b.option_id WHERE r.forwarder_id = ?')) {
+                const [forwarderId, days, today] = params;
+                return [[{ n: db.bookings.filter((b) => {
+                    if (db.requests.find(r => r.id === b.request_id).forwarder_id !== forwarderId) return false;
+                    if (b.status === 'requested') return true;
+                    return b.status === 'confirmed' && arrivesPlus(b, days) >= today;
+                }).length }]];
+            }
+            if (s.startsWith('UPDATE forwarders SET deleted_at = UTC_TIMESTAMP() WHERE id = ?')) {
+                db.forwarders.find(f => f.id === params[0]).deleted_at = NOW();
+                return ok(1);
+            }
+            if (s.startsWith('UPDATE forwarder_contacts SET deleted_at = UTC_TIMESTAMP() WHERE forwarder_id = ? AND deleted_at IS NULL')) {
+                db.contacts.filter(c => c.forwarder_id === params[0]).forEach((c) => { c.deleted_at = NOW(); });
+                return ok(1);
+            }
+            if (s.startsWith("UPDATE freight_quote_requests SET revoked_at = UTC_TIMESTAMP(), revoke_reason = 'forwarder_removed'")) {
+                const rows = db.requests.filter(r => r.forwarder_id === params[0] && !r.revoked_at);
+                rows.forEach(r => Object.assign(r, { revoked_at: NOW(), revoke_reason: 'forwarder_removed', row_version: r.row_version + 1 }));
+                return ok(rows.length);
+            }
+            // the badge
+            if (s.startsWith("SELECT COUNT(*) AS n FROM freight_bookings b JOIN freight_quote_requests r ON r.id = b.request_id JOIN freight_quote_options o ON o.id = b.option_id WHERE b.status = 'confirmed' AND b.contents_sent_at IS NULL AND r.revoked_at IS NULL")) {
+                const [days, today] = params;
+                return [[{ n: db.bookings.filter(b => b.status === 'confirmed' && !b.contents_sent_at
+                    && !db.requests.find(r => r.id === b.request_id).revoked_at && arrivesPlus(b, days) >= today).length }]];
+            }
+            if (s.startsWith('SELECT COUNT(DISTINCT r.batch_id) AS n FROM freight_quote_requests r JOIN forwarders f')) {
+                const batches = new Set(db.requests.filter(r => !r.revoked_at && r.expires_at > NOW() && r.answered_at && !r.declined
+                    && !db.forwarders.find(f => f.id === r.forwarder_id).deleted_at
+                    && !db.bookings.some(b => live(b) && db.requests.find(x => x.id === b.request_id).batch_id === r.batch_id))
+                    .map(r => r.batch_id));
+                return [[{ n: batches.size }]];
             }
             if (s.startsWith('INSERT INTO freight_quote_requests')) {
                 const [token, batch_id, forwarder_id, forwarder_name, window_start_date, window_end_date, origin, destination,
@@ -88,6 +169,7 @@ function harness({ userType = 'standard', frontOk = () => true, documentSet = nu
                     container_size, services, staff_note, sent_to, subject, created_by_email, created_at: NOW(), sent_at: null,
                     expires_at: future(days), revoked_at: null, revoke_reason: null, answer_count: 0, answered_at: null,
                     answered_by_name: null, answered_by_email: null, answer_source: null, answer_note: null, declined: 0, row_version: 1,
+                    reminded_at: null, reminder_count: 0,
                 });
                 return [{ insertId: id }];
             }
@@ -707,4 +789,212 @@ test('contents: the documents attached are kept on the booking, replaced by a re
     await h.call('PATCH', '/api/v1/freight-bookings/1', { shipmentId: 51 });
     assert.equal(h.db.bookings[0].contents_document_ids, null);
     assert.equal(h.db.bookings[0].contents_sent_at, null);
+});
+
+// ── a booking and the link's expiry; finished bookings ─────────────────────
+
+// Booking 1 confirmed, and its sailing due to have arrived on 2026-10-01: more
+// than a fortnight before the harness's today (2026-11-16).
+function arrivedLongAgo(h) {
+    Object.assign(h.db.bookings[0], { status: 'confirmed', booking_ref: 'BK-1', response_source: 'link' });
+    Object.assign(h.db.options.find(o => o.id === 1), { sailing_date: '2026-09-01', transit_days: 30 });
+}
+
+test('state: a booking that stands outranks the link\'s expiry; a finished one no longer holds it open', async () => {
+    const h = harness();
+    await answered(h);
+    await h.call('POST', '/api/v1/freight-quotes/options/1/book', {});
+    h.db.requests[0].expires_at = future(-1); // the link's own days have run out
+    const read = async () => {
+        const board = (await h.call('GET', '/api/v1/freight-quotes')).body;
+        return { request: board.requests.find(r => r.id === 1), booking: board.bookings.find(b => b.id === 1) };
+    };
+    let now = await read();
+    assert.equal(now.request.state, 'booked');
+    assert.equal(now.request.hasLiveBooking, true);
+    assert.match(now.request.url, /\/freight\//);
+    assert.equal(now.booking.finished, false);
+
+    arrivedLongAgo(h);
+    now = await read();
+    assert.equal(now.booking.finished, true);
+    assert.equal(now.request.state, 'expired');
+    // Still no second booking on it, whatever the state says.
+    assert.equal(now.request.hasLiveBooking, true);
+    assert.equal(now.request.url, null);
+
+    // Finished, but the link has days left (a movement was added late): still the booking's page.
+    h.db.requests[0].expires_at = future(5);
+    assert.equal((await read()).request.state, 'booked');
+});
+
+test('a finished booking is not compared with its container, and stops neither closing the link nor removing the forwarder', async () => {
+    const h = harness();
+    await answered(h);
+    await h.call('POST', '/api/v1/freight-quotes/options/1/book', { shipmentId: 50 });
+    const confirmed = await h.call('PATCH', '/api/v1/freight-bookings/1', { status: 'confirmed', bookingRef: 'BK-1' });
+    const sent = await h.call('POST', '/api/v1/freight-bookings/1/contents-email', { rowVersion: confirmed.body.bookings[0].rowVersion, attachDocuments: false });
+    assert.equal(sent.body.bookings[0].contentsChanged, false);
+    assert.equal((await h.call('DELETE', '/api/v1/forwarders/1')).body.code, 'HAS_BOOKING');
+    assert.equal((await h.call('POST', '/api/v1/freight-quotes/1/revoke')).body.code, 'HAS_BOOKING');
+
+    arrivedLongAgo(h);
+    const board = (await h.call('GET', '/api/v1/freight-quotes')).body;
+    assert.equal(board.bookings[0].finished, true);
+    assert.equal(board.bookings[0].contentsChanged, null);
+    const closed = await h.call('POST', '/api/v1/freight-quotes/1/revoke');
+    assert.equal(closed.status, 200);
+    assert.equal(closed.body.requests.find(r => r.id === 1).state, 'revoked');
+    const removed = await h.call('DELETE', '/api/v1/forwarders/1');
+    assert.equal(removed.status, 200);
+    assert.notEqual(h.db.forwarders[0].deleted_at, null);
+
+    // A booking still asked for does stop it.
+    const g = harness();
+    await answered(g);
+    await g.call('POST', '/api/v1/freight-quotes/options/1/book', {});
+    assert.equal((await g.call('DELETE', '/api/v1/forwarders/1')).body.code, 'HAS_BOOKING');
+    assert.equal((await g.call('DELETE', '/api/v1/forwarders/2')).status, 200);
+    assert.equal(g.db.requests[1].revoke_reason, 'forwarder_removed');
+});
+
+// ── a refused send tried again; a forwarder added to a send ────────────────
+
+test('send: a forwarder Front refused is tried again under the same batchId, as the dialog now has it', async () => {
+    let fail = true;
+    const h = harness({ frontOk: () => !fail });
+    const body = { ...SEND, forwarderIds: [1], stockMovements: [{ from: 'Acme', cbm: 1, weightKg: 100 }] };
+    const first = await h.call('POST', '/api/v1/freight-quotes', body);
+    assert.deepEqual(first.body.results.map(r => r.outcome), ['failed']);
+    assert.equal(first.body.requests[0].state, 'revoked');
+    const { token } = h.db.requests[0];
+
+    fail = false;
+    const again = await h.call('POST', '/api/v1/freight-quotes', { ...body, windowEnd: '2026-12-20', stockMovements: [{ from: 'Best', cbm: 2, weightKg: 200 }] });
+    assert.deepEqual(again.body.results.map(r => [r.requestId, r.outcome]), [[1, 'sent']]);
+    // The same row and the same link, open again, with what the dialog said the second time.
+    assert.equal(h.db.requests.length, 1);
+    const row = h.db.requests[0];
+    assert.deepEqual([row.token, row.revoked_at, row.revoke_reason, row.window_end_date], [token, null, null, '2026-12-20']);
+    assert.ok(row.sent_at);
+    assert.equal(again.body.requests[0].state, 'open');
+    assert.deepEqual(again.body.requests[0].stockMovements.map(m => m.from), ['Best']);
+    const mail = h.db.sent[h.db.sent.length - 1];
+    assert.match(mail.html, new RegExp(`/freight/${token}`));
+    assert.match(mail.html, /Best/);
+    assert.doesNotMatch(mail.html, /Acme/);
+
+    // And now that it has gone, the same batchId emails nobody.
+    const mails = h.db.sent.length;
+    assert.deepEqual((await h.call('POST', '/api/v1/freight-quotes', body)).body.results.map(r => r.outcome), ['already_sent']);
+    assert.equal(h.db.sent.length, mails);
+});
+
+test('ask another forwarder: one added to a send later shares its batch, and a confirmation closes it as filled', async () => {
+    const h = harness();
+    await h.call('POST', '/api/v1/freight-quotes', { ...SEND, forwarderIds: [1] });
+    const added = await h.call('POST', '/api/v1/freight-quotes', { ...SEND, forwarderIds: [2] });
+    assert.deepEqual(added.body.results.map(r => [r.forwarderId, r.outcome]), [[2, 'sent']]);
+    assert.equal(h.db.sent.length, 2);
+    assert.deepEqual(h.db.requests.map(r => r.batch_id), [BATCH, BATCH]);
+
+    await h.call('POST', '/api/v1/freight-quotes/1/options', { options: [OPTION] });
+    await h.call('POST', '/api/v1/freight-quotes/2/options', { options: [OPTION] });
+    // Two forwarders answered one send: one thing to decide.
+    assert.equal((await h.call('GET', '/api/v1/freight-quotes/summary')).body.answered, 1);
+    await h.call('POST', '/api/v1/freight-quotes/options/1/book', {});
+    const confirmed = await h.call('PATCH', '/api/v1/freight-bookings/1', { status: 'confirmed', bookingRef: 'BK-9' });
+    assert.equal(confirmed.body.requests.find(r => r.id === 2).revokeReason, 'filled');
+});
+
+// ── reminders ──────────────────────────────────────────────────────────────
+
+test('remind: the same link again for what still waits, claimed once; refused when nothing waits', async () => {
+    const h = harness();
+    await h.call('POST', '/api/v1/freight-quotes', { ...SEND, forwarderIds: [1], stockMovements: [{ from: 'Acme', cbm: 1, weightKg: 100 }] });
+    h.db.requests[0].expires_at = future(-1); // the link has run out
+    const version = h.db.requests[0].row_version;
+    const mails = h.db.sent.length;
+
+    const out = await h.call('POST', '/api/v1/freight-quotes/1/remind', { reminderCount: 0 });
+    assert.deepEqual([out.status, out.body.kind], [200, 'quote']);
+    const request = out.body.requests[0];
+    assert.equal(request.reminderCount, 1);
+    assert.ok(request.remindedAt);
+    assert.equal(request.state, 'open'); // open again
+    assert.equal(h.db.sent.length, mails + 1);
+    const mail = h.db.sent[mails];
+    assert.deepEqual(mail.to, ['amy@dcg.com']);
+    assert.match(mail.subject, /^Reminder: /);
+    assert.match(mail.html, new RegExp(`/freight/${h.db.requests[0].token}`));
+    assert.match(mail.html, /Enter your quote/);
+    assert.match(mail.html, /Acme/);
+    // Listed under the email it repeats, not as an email of its own.
+    assert.equal(h.db.receipts.length, 1);
+    assert.deepEqual(h.db.receiptReminders.map(r => [r.receiptId, r.number, r.by]), [[1, 1, 'staff@example.com']]);
+    // The forwarder's open form is not disturbed.
+    assert.equal(h.db.requests[0].row_version, version);
+    assert.equal(h.db.audits.at(-1).action, 'reminded');
+    assert.doesNotMatch(JSON.stringify(h.db.audits), /[a-f0-9]{48}/);
+
+    // The same call again (a retry of one that did send) is refused.
+    const retry = await h.call('POST', '/api/v1/freight-quotes/1/remind', { reminderCount: 0 });
+    assert.deepEqual([retry.status, retry.body.code], [409, 'STALE']);
+    assert.equal(h.db.sent.length, mails + 1);
+
+    // Quoted, one stock movement still without a price: that is what is asked for.
+    await h.call('POST', '/api/v1/freight-quotes/1/options', { options: [OPTION] });
+    const prices = await h.call('POST', '/api/v1/freight-quotes/1/remind', { reminderCount: 1, subject: 'Prices please, {forwarder} ({count})' });
+    assert.deepEqual([prices.status, prices.body.kind], [200, 'movements']);
+    const second = h.db.sent[h.db.sent.length - 1];
+    assert.equal(second.subject, 'Prices please, DCG (1)');
+    assert.match(second.html, /Price the stock movements/);
+    // No price request went before (the movement was on the first email), so it is listed on its own.
+    assert.equal(h.db.receipts.length, 2);
+
+    await h.call('PATCH', '/api/v1/freight-stock-movements/1', { price: '100', currency: 'USD' });
+    assert.equal((await h.call('POST', '/api/v1/freight-quotes/1/remind', { reminderCount: 2 })).body.code, 'NOTHING_WAITING');
+
+    assert.equal((await h.call('POST', '/api/v1/freight-quotes/1/remind', {})).body.field, 'reminderCount');
+    await h.call('POST', '/api/v1/freight-quotes/1/revoke');
+    assert.equal((await h.call('POST', '/api/v1/freight-quotes/1/remind', { reminderCount: 2 })).body.code, 'REVOKED');
+    assert.equal((await harness({ userType: 'accountant' }).call('POST', '/api/v1/freight-quotes/1/remind', { reminderCount: 0 })).body.code, 'READ_ONLY');
+});
+
+test('remind: a Front failure gives the claim back; a send Front never confirmed counts as sent once reminded', async () => {
+    let fail = false;
+    const h = harness({ frontOk: () => !fail });
+    await h.call('POST', '/api/v1/freight-quotes', { ...SEND, forwarderIds: [1] });
+    h.db.requests[0].sent_at = null; // the first call was cut short
+    fail = true;
+    const refused = await h.call('POST', '/api/v1/freight-quotes/1/remind', { reminderCount: 0 });
+    assert.equal(refused.status, 502);
+    assert.deepEqual([h.db.requests[0].reminder_count, h.db.requests[0].reminded_at], [0, null]);
+    fail = false;
+    const out = await h.call('POST', '/api/v1/freight-quotes/1/remind', { reminderCount: 0 });
+    assert.equal(out.status, 200);
+    assert.ok(out.body.requests[0].sentAt);
+});
+
+// ── the badge ──────────────────────────────────────────────────────────────
+
+test('summary: quotes to decide, and confirmed bookings whose contents have not gone', async () => {
+    const h = harness();
+    await answered(h);
+    const summary = async () => (await h.call('GET', '/api/v1/freight-quotes/summary')).body;
+    assert.deepEqual(await summary(), { answered: 1, contentsDue: 0, total: 1 });
+    await h.call('POST', '/api/v1/freight-quotes/options/1/book', { shipmentId: 50 });
+    assert.deepEqual(await summary(), { answered: 0, contentsDue: 0, total: 0 });
+    const confirmed = await h.call('PATCH', '/api/v1/freight-bookings/1', { status: 'confirmed', bookingRef: 'BK-1' });
+    assert.deepEqual(await summary(), { answered: 0, contentsDue: 1, total: 1 });
+    await h.call('POST', '/api/v1/freight-bookings/1/contents-email', { rowVersion: confirmed.body.bookings[0].rowVersion, attachDocuments: false });
+    assert.deepEqual(await summary(), { answered: 0, contentsDue: 0, total: 0 });
+
+    // A booking the forwarder declined puts its send back among the quotes to decide.
+    const d = harness();
+    await answered(d);
+    await d.call('POST', '/api/v1/freight-quotes/options/1/book', {});
+    Object.assign(d.db.bookings[0], { status: 'declined', response_source: 'link' });
+    assert.equal((await d.call('GET', '/api/v1/freight-quotes/summary')).body.answered, 1);
+    assert.equal((await d.call('GET', '/api/v1/freight-quotes')).body.requests.find(r => r.id === 1).lastBookingStatus, 'declined');
 });
