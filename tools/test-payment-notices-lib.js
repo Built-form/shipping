@@ -162,16 +162,6 @@ test('what a proof carries to the dialog: its id, name and address, nothing of t
     assert.deepEqual(p, { id: 77, filename: 'proof.pdf', url: proof().url });
 });
 
-test('attached delivery: at most five files, 15 MB together, PDF or image', () => {
-    const f = (over = {}) => proof(over);
-    assert.equal(N.attachRefusal([f(), f({ id: 2, contentType: 'image/png' }), f({ id: 3, contentType: 'image/jpeg' })]), null);
-    assert.equal(N.attachRefusal([1, 2, 3, 4, 5, 6].map(id => f({ id }))).code, 'PROOFS_NOT_ATTACHABLE');
-    assert.equal(N.attachRefusal([f({ fileSize: 8 * 1024 * 1024 }), f({ id: 2, fileSize: 7 * 1024 * 1024 + 1 })]).code, 'PROOFS_NOT_ATTACHABLE');
-    assert.equal(N.attachRefusal([f({ fileSize: 8 * 1024 * 1024 }), f({ id: 2, fileSize: 7 * 1024 * 1024 })]), null);
-    assert.equal(N.attachRefusal([f({ contentType: 'application/zip' })]).code, 'PROOFS_NOT_ATTACHABLE');
-    assert.equal(N.attachRefusal([f({ s3Key: null })]).code, 'PROOFS_NOT_ATTACHABLE');
-});
-
 // ── What a supplier is told about a line ──────────────────────────────────
 
 test('a line names its PO or container only when that reference is filed under exactly the transfer\'s supplier', () => {
@@ -315,56 +305,71 @@ test('the portal block: the button to the payment, registration, and on a deposi
     const bal = N.portalBlockHtml({ kind: 'balance', url: 'https://portal.example/payments?payment=45', registerUrl: 'https://portal.example/register', preapproved: false, readyDates: [{ poNumber: 'PO_001J', url: 'https://portal.example/orders/101' }] });
     assert.equal(bal.includes('/orders/101'), false);
     assert.ok(bal.includes('our team will approve your access'));
+    // And with no container to release, nothing more than the first box.
+    assert.equal(/telex|电放/i.test(bal), false);
+    // A deposit never asks for a telex release, whatever it is handed.
+    assert.equal(/telex|电放/i.test(N.portalBlockHtml({ kind: 'deposit', url: 'https://portal.example/payments?payment=45', registerUrl: 'https://portal.example/register', preapproved: true, telex: ['333'] })), false);
 });
 
-test('the attached block names the files, and with no order to send anyone to says nothing of the portal', () => {
-    const html = N.attachedBlockHtml({ filenames: ['proof.pdf', 'b<i>.pdf'] });
-    assert.ok(html.includes('proof.pdf'));
-    assert.ok(html.includes('b&lt;i&gt;.pdf'));
-    assert.ok(html.includes('attached'));
-    assert.ok(html.includes('附件'));
-    assert.equal(/portal|门户|register/i.test(html), false);
-    assert.equal(N.attachedBlockHtml({ filenames: ['proof.pdf'], readyDates: [], registerUrl: 'https://portal.example/register' }), N.attachedBlockHtml({ filenames: ['proof.pdf'] }));
+test('the portal block of a balance asks for the telex release of each container, uploaded on the payment\'s own row', () => {
+    const URL = 'https://portal.example/payments?payment=45';
+    const block = telex => N.portalBlockHtml({ kind: 'balance', url: URL, registerUrl: 'https://portal.example/register', preapproved: true, telex });
+    const two = block(['333', '334']);
+    assert.ok(two.startsWith(block([])), 'the first box is the same, then the ask');
+    assert.ok(two.includes('Please upload the <strong>telex release</strong> of each container this payment covers (containers 333, 334) on the portal, on this payment\'s own row.'));
+    assert.ok(two.includes('请在门户中该笔付款所在行，上传本次付款所涉各货柜（货柜 333、334）的<strong>电放提单</strong>。'));
+    assert.ok(two.includes('Upload the telex release / 上传电放提单'));
+    // The button leads to the payment itself: twice in all, with the first box's.
+    assert.equal(two.split(`href="${URL}"`).length - 1 >= 2, true);
+    assert.equal(block([]).split('Upload the telex release').length - 1, 0);
+    // One container is "container", not "containers".
+    assert.ok(block(['333']).includes('this payment covers (container 333) on the portal'));
+    // A container with no number: no list with a gap in it.
+    const gap = block(['333', null]);
+    assert.ok(gap.includes('of each container this payment covers on the portal, on this payment\'s own row.'));
+    assert.ok(gap.includes('上传本次付款所涉各货柜的<strong>电放提单</strong>。'));
+    // A number is text, never markup.
+    assert.ok(block(['3<b>3']).includes('3&lt;b&gt;3'));
+    assert.equal(block(['3<b>3']).includes('3<b>3'), false);
 });
 
-// The ready dates are entered on the portal, never asked for by reply (the
-// user, 2026-11-17, on the first deposit email that went out attached).
-test('the attached block of a deposit sends the supplier to each order on the portal for its ready dates', () => {
-    const html = N.attachedBlockHtml({
-        filenames: ['proof.pdf'], registerUrl: 'https://portal.example/register',
-        readyDates: [{ poNumber: 'PO_001J', url: 'https://portal.example/orders/101' }, { poNumber: 'PO_<b>2', url: 'https://portal.example/orders/102' }],
-    });
-    // Still the attached box first: the proof rides on this email.
-    assert.ok(html.startsWith(N.attachedBlockHtml({ filenames: ['proof.pdf'] })));
-    assert.ok(html.includes('href="https://portal.example/orders/101"'));
-    assert.ok(html.includes('href="https://portal.example/orders/102"'));
-    assert.ok(html.includes('Enter ready dates: PO_001J / 填写预计完成日期'));
-    assert.ok(html.includes('Please enter the <strong>estimated ready date</strong> of each item on the order\'s page of our supplier portal.'));
-    assert.ok(html.includes('请在供应商门户的订单页面填写各产品的<strong>预计完成日期</strong>。'));
-    // A PO number is text, never markup.
-    assert.ok(html.includes('PO_&lt;b&gt;2'));
-    assert.equal(html.includes('PO_<b>2'), false);
-    // This email approved nobody on the portal: an address new to it registers and waits.
-    assert.ok(html.includes('https://portal.example/register'));
-    assert.ok(html.includes('our team will approve your access'));
-    assert.equal(html.includes('There is no approval to wait for'), false);
-    // It never says the proof is on the portal, or that nothing is attached.
-    assert.equal(/No file is attached|payments\?payment=/.test(html), false);
+test('the containers a balance asks the telex release of: the ones the portal lists on the payment\'s row', () => {
+    const built = N.buildNotices(source([
+        line('po_deposit', 1000, po(1), { id: 1, targetId: 101 }),
+        line('balance', 2000, box('333'), { id: 2, targetId: 9 }),
+        // A top-up of the same container: once.
+        line('balance', 100, box('333', { topUp: true }), { id: 3, targetId: 12 }),
+        line('balance', 500, box('334'), { id: 4, targetId: 10 }),
+        // A top-up on its own asks as a balance does.
+        line('balance', 60, box('338', { topUp: true }), { id: 9, targetId: 13 }),
+        // Filed under another company: told as its amount alone, and not asked about.
+        line('balance', 300, box('335', { shipmentSupplier: 'Other Factory Ltd' }), { id: 5, targetId: 11 }),
+        // QC units, a charge on a container, and an invoice paid through containers: the portal offers no upload for these.
+        line('qc', 50, po(2, { jfCode: 'JF1_FQC' }), { id: 6, targetId: 30 }),
+        line('extra', 20, { ...box('336'), extraKind: 'freight', ridesWith: 'balance', extraSupplier: SUPPLIER }, { id: 7, targetId: 40 }),
+        line('pi', 700, po(3, { paymentType: 'balance' }), { id: 8, targetId: 50, paidWith: [{ shipmentReference: '337', amount: 700 }] }),
+    ]));
+    const [deposit, balance] = built.notices;
+    assert.deepEqual(N.telexContainersOf(balance), ['333', '334', '338']);
+    assert.deepEqual(N.telexContainersOf(deposit), []);
+    // The rule itself, whatever built the lines: a line the supplier is not told of asks for nothing.
+    assert.deepEqual(N.telexContainersOf({ kind: 'balance', lines: [{ type: 'balance', named: false, shipmentId: 5340, container: '340' }, { type: 'top_up', named: true, shipmentId: 5341, container: '341' }, { type: 'balance', named: true, shipmentId: null, container: '342' }] }), ['341']);
+    // A shipment with no number in its name is still asked for, without one.
+    const unnamed = N.buildNotices(source([line('balance', 10, box('Air freight', { shipmentId: 6001 }))])).notices[0];
+    assert.deepEqual(N.telexContainersOf(unnamed), [null]);
+    assert.deepEqual([N.telexContainersOf(null), N.telexContainersOf({ kind: 'balance' })], [[], []]);
 });
 
-test('ready-date links: wherever the portal can open the order, whichever way the proof goes', () => {
+test('ready-date links: one per order of the deposit, where the portal can open it for this supplier', () => {
     const BASE = 'https://portal.example';
     const notice = { kind: 'deposit', readyDatePos: [{ id: 101, poNumber: 'PO_001J' }, { id: 102, poNumber: 'PO_002J' }] };
     const links = [{ poNumber: 'PO_001J', url: `${BASE}/orders/101` }, { poNumber: 'PO_002J', url: `${BASE}/orders/102` }];
     const matched = [{ id: 900001, name: SUPPLIER }];
     assert.deepEqual(N.readyDatesFor(notice, { delivery: 'portal', reason: null, portalBase: BASE, suppliers: matched }), links);
-    // Attached only because the Payments page is not switched on, or its table is not there: the orders are on the portal all the same.
-    assert.deepEqual(N.readyDatesFor(notice, { delivery: 'attached', reason: 'portal_switch_off', portalBase: BASE, suppliers: matched }), links);
-    assert.deepEqual(N.readyDatesFor(notice, { delivery: 'attached', reason: 'portal_unavailable', portalBase: BASE, suppliers: matched }), links);
     // No supplier of exactly that name: nobody on the portal can open these orders.
-    assert.deepEqual(N.readyDatesFor(notice, { delivery: 'attached', reason: 'no_supplier', portalBase: BASE, suppliers: [] }), []);
+    assert.deepEqual(N.readyDatesFor(notice, { delivery: null, reason: 'no_supplier', portalBase: BASE, suppliers: [] }), []);
     // No portal address on this server: no link to make.
-    assert.deepEqual(N.readyDatesFor(notice, { delivery: 'attached', reason: 'portal_url_unset', portalBase: null, suppliers: matched }), []);
+    assert.deepEqual(N.readyDatesFor(notice, { delivery: null, reason: 'portal_url_unset', portalBase: null, suppliers: matched }), []);
     // A balance asks for no ready dates.
     assert.deepEqual(N.readyDatesFor({ kind: 'balance', readyDatePos: [] }, { delivery: 'portal', reason: null, portalBase: BASE, suppliers: matched }), []);
     assert.deepEqual(N.readyDatesFor({ kind: 'balance' }, { delivery: 'portal', reason: null, portalBase: BASE, suppliers: matched }), []);
@@ -372,25 +377,51 @@ test('ready-date links: wherever the portal can open the order, whichever way th
 
 // ── Delivery ──────────────────────────────────────────────────────────────
 
-test('delivery: a portal link only with the address, the switch, the portal\'s table and an exact supplier', () => {
+test('delivery: a portal link with the address, the switch, the portal\'s table and an exact supplier; otherwise nothing goes', () => {
     const ok = { portalBase: 'https://portal.example', switchOn: true, portalAvailable: true, supplierMatched: true };
     assert.deepEqual(N.deliveryFor(ok), { delivery: 'portal', reason: null });
-    assert.deepEqual(N.deliveryFor({ ...ok, portalBase: '' }), { delivery: 'attached', reason: 'portal_url_unset' });
-    assert.deepEqual(N.deliveryFor({ ...ok, switchOn: false }), { delivery: 'attached', reason: 'portal_switch_off' });
-    assert.deepEqual(N.deliveryFor({ ...ok, portalAvailable: false }), { delivery: 'attached', reason: 'portal_unavailable' });
-    assert.deepEqual(N.deliveryFor({ ...ok, supplierMatched: false }), { delivery: 'attached', reason: 'no_supplier' });
+    // Never 'attached': a payment that cannot go as a link does not go.
+    assert.deepEqual(N.deliveryFor({ ...ok, portalBase: '' }), { delivery: null, reason: 'portal_url_unset' });
+    assert.deepEqual(N.deliveryFor({ ...ok, switchOn: false }), { delivery: null, reason: 'portal_switch_off' });
+    assert.deepEqual(N.deliveryFor({ ...ok, portalAvailable: false }), { delivery: null, reason: 'portal_unavailable' });
+    assert.deepEqual(N.deliveryFor({ ...ok, supplierMatched: false }), { delivery: null, reason: 'no_supplier' });
+    assert.equal(N.DELIVERY, 'portal');
     // The switch is the word "on", however it is typed; anything else is off.
     for (const v of ['on', 'ON', ' On ']) assert.equal(N.portalSwitchOn({ PAYMENT_PROOF_PORTAL: v }), true, String(v));
     for (const v of [undefined, '', 'off', 'true', '1', 'yes']) assert.equal(N.portalSwitchOn({ PAYMENT_PROOF_PORTAL: v }), false, String(v));
 });
 
-test('what the dialog showed is checked again at send: delivery, then everything else', () => {
-    assert.equal(N.deliveryConflict('portal', { delivery: 'portal', reason: null }), null);
-    const c = N.deliveryConflict('portal', { delivery: 'attached', reason: 'no_supplier' });
-    assert.deepEqual([c.code, c.delivery, c.reason, c.allowedNext], ['DELIVERY_CHANGED', 'attached', 'no_supplier', ['attached']]);
-    assert.deepEqual(N.deliveryConflict('attached', { delivery: 'portal', reason: null }).allowedNext, ['portal']);
+test('a payment the portal cannot show is refused, with what is in the way and what to do about it', () => {
+    assert.equal(N.portalRefusal({ delivery: 'portal', reason: null }, SUPPLIER), null);
+    // The supplier's name matches no supplier record: the sender can fix that.
+    assert.deepEqual(N.portalRefusal({ delivery: null, reason: 'no_supplier' }, SUPPLIER), {
+        status: 409, code: 'SUPPLIER_NOT_ON_PORTAL', reason: 'no_supplier', allowedNext: ['edit_payment'],
+        error: 'No supplier record is named exactly "Acme Medical Co., Ltd", so the supplier portal has nobody to show this payment to. Make the payment\'s supplier name and the supplier record match exactly, then send. The proof is not sent attached instead.',
+    });
+    // The portal is not live on this server: nothing the sender can do.
+    const said = {
+        portal_url_unset: 'the supplier portal address is not configured',
+        portal_switch_off: 'the portal\'s Payments page is not switched on here',
+        portal_unavailable: 'the supplier portal is not available here',
+    };
+    for (const [reason, words] of Object.entries(said)) {
+        assert.deepEqual(N.portalRefusal({ delivery: null, reason }, SUPPLIER), {
+            status: 409, code: 'PORTAL_NOT_LIVE', reason, allowedNext: [],
+            error: `A payment is sent to a supplier as a link to the supplier portal only, never with the proof attached. That cannot be done on this server yet: ${words}. Nothing can be sent until it is.`,
+        }, reason);
+    }
+    // Nothing known of how it would go is not "it can go".
+    assert.equal(N.portalRefusal(null, SUPPLIER).code, 'PORTAL_NOT_LIVE');
+    assert.equal(N.portalRefusal({ delivery: 'attached', reason: null }, SUPPLIER).code, 'PORTAL_NOT_LIVE');
+});
+
+test('a send that still asks for "proof attached" is told it goes as a portal link now', () => {
+    assert.equal(N.deliveryConflict('portal'), null);
+    const c = N.deliveryConflict('attached');
+    assert.deepEqual([c.status, c.code, c.delivery, c.reason, c.allowedNext], [409, 'DELIVERY_CHANGED', 'portal', null, ['portal']]);
+    assert.equal(c.error, 'A proof of payment is no longer sent attached: this payment goes out as a link to the supplier portal. Check the wording and send again.');
     // No delivery at all is not "whatever": the dialog always says which it showed.
-    assert.equal(N.deliveryConflict(undefined, { delivery: 'portal', reason: null }).code, 'DELIVERY_CHANGED');
+    assert.equal(N.deliveryConflict(undefined).code, 'DELIVERY_CHANGED');
 });
 
 test('the preview token changes with anything the dialog showed, and with nothing else', () => {
@@ -417,21 +448,26 @@ test('the preview token changes with anything the dialog showed, and with nothin
         source(lines(), { documents: [proof(), proof({ id: 79, filename: 'second.pdf' })] }),
     ];
     for (const [i, s] of differs.entries()) assert.notEqual(token(s), base, `case ${i}`);
-    assert.notEqual(token(source(lines()), 'attached'), base);
+    // Whether it can go at all is part of what the dialog showed.
+    assert.notEqual(token(source(lines()), null), base);
 });
 
 // ── The stored wording ────────────────────────────────────────────────────
 
 const { DEFAULT_EMAIL_TEMPLATES, PAYMENT_PROOF_TEMPLATES } = require('../src/lib/email-template-defaults');
 
-test('four templates: deposit and balance, each as a portal link and with the proof attached', () => {
-    const keys = PAYMENT_PROOF_TEMPLATES.map(t => t.key);
-    assert.deepEqual(keys, ['payment_proof_deposit_portal', 'payment_proof_deposit_attached', 'payment_proof_balance_portal', 'payment_proof_balance_attached']);
-    assert.deepEqual(N.TEMPLATE_KEYS, {
-        deposit: { portal: 'payment_proof_deposit_portal', attached: 'payment_proof_deposit_attached' },
-        balance: { portal: 'payment_proof_balance_portal', attached: 'payment_proof_balance_attached' },
-    });
-    for (const t of PAYMENT_PROOF_TEMPLATES) {
+const SENT_TEMPLATES = ['payment_proof_deposit_portal', 'payment_proof_balance_portal'];
+const RETIRED_TEMPLATES = ['payment_proof_deposit_attached', 'payment_proof_balance_attached'];
+
+test('two templates are sent, a deposit\'s and a balance\'s; the two "proof attached" ones are kept only for the old migrations', () => {
+    assert.deepEqual(N.TEMPLATE_KEYS, { deposit: 'payment_proof_deposit_portal', balance: 'payment_proof_balance_portal' });
+    assert.deepEqual(Object.values(N.TEMPLATE_KEYS), SENT_TEMPLATES);
+    // Still in the list, for 2026-11-16_30 and 2026-11-17_10 to read; nothing names them to send.
+    assert.deepEqual(PAYMENT_PROOF_TEMPLATES.map(t => t.key), ['payment_proof_deposit_portal', 'payment_proof_deposit_attached', 'payment_proof_balance_portal', 'payment_proof_balance_attached']);
+    assert.equal(Object.values(N.TEMPLATE_KEYS).some(key => RETIRED_TEMPLATES.includes(key)), false);
+    const sent = PAYMENT_PROOF_TEMPLATES.filter(t => SENT_TEMPLATES.includes(t.key));
+    assert.deepEqual(sent.map(t => t.name), ['Deposit paid', 'Balance paid']);
+    for (const t of sent) {
         // The dialog offers a template by this category; a default the send can fall back to.
         assert.equal(t.category, 'Payment proof', t.key);
         assert.equal(N.TEMPLATE_CATEGORY, 'Payment proof');
@@ -448,42 +484,34 @@ test('four templates: deposit and balance, each as a portal link and with the pr
     }
 });
 
-test('the wording asks for what each payment is owed in return, and never contradicts how it goes out', () => {
-    const t = Object.fromEntries(PAYMENT_PROOF_TEMPLATES.map(x => [x.key, x.bodyHtml]));
-    // A deposit: the estimated ready dates. A balance: the telex release.
-    for (const key of ['payment_proof_deposit_portal', 'payment_proof_deposit_attached']) {
-        assert.match(t[key], /estimated ready date/i, key);
-        assert.ok(t[key].includes('预计完成日期'), key);
-        assert.equal(/telex/i.test(t[key]), false, key);
+test('the wording says what was paid and points below it: the blocks under it say the rest, once', () => {
+    const t = Object.fromEntries(PAYMENT_PROOF_TEMPLATES.map(x => [x.key, x]));
+    const said = kind => [
+        '<div style="font-family:Helvetica,Arial,sans-serif;font-size:14px;color:#222;line-height:1.5;">',
+        '<p>Hi,</p>',
+        `<p>We have sent a <strong>${kind.en}</strong> payment of <strong>{currency} {amount}</strong> on {paidOn}, for: {paidFor}.</p>`,
+        '<p>The proof of payment, and anything we need from you for it, is below.</p>',
+        '<p>您好，</p>',
+        `<p>我们已于 {paidOn} 支付<strong>${kind.zh}</strong> <strong>{currency} {amount}</strong>，对应：{paidFor}。</p>`,
+        '<p>付款凭证及需要您配合办理的事项，请见下方。</p>',
+        '<p>Kind regards<br>JFA Medical LTD</p>',
+        '</div>',
+    ].join('');
+    assert.equal(t.payment_proof_deposit_portal.bodyHtml, said({ en: 'deposit', zh: '定金' }));
+    assert.equal(t.payment_proof_balance_portal.bodyHtml, said({ en: 'balance', zh: '尾款' }));
+    assert.equal(t.payment_proof_deposit_portal.subject, 'Deposit paid – {currency} {amount} – {paidFor} / 定金已付');
+    assert.equal(t.payment_proof_balance_portal.subject, 'Balance paid – {currency} {amount} – {paidFor} / 尾款已付');
+    for (const key of SENT_TEMPLATES) {
+        const body = t[key].bodyHtml;
+        // Nothing the appended blocks say again: where the proof is, the ready dates, the telex release.
+        assert.equal(/portal|门户|ready date|预计完成|telex|电放/i.test(body), false, key);
+        // Nothing is attached, and nothing is asked for by reply (the user, 2026-11-17).
+        assert.equal(/attach|附件|reply to this email|回复本邮件|confirm you have received/i.test(body), false, key);
+        // What the template editor says of it: nothing attached, and what is appended.
+        assert.match(t[key].description, /^Emailed to a supplier when a (deposit|balance) .*Nothing is attached: a button to the payment on the supplier portal/, key);
     }
-    for (const key of ['payment_proof_balance_portal', 'payment_proof_balance_attached']) {
-        assert.match(t[key], /telex release/i, key);
-        assert.ok(t[key].includes('电放'), key);
-        assert.equal(/ready date/i.test(t[key]), false, key);
-    }
-    // A link says nothing is attached. An attached email never says so; a balance's sends
-    // nobody to the portal, a deposit's does, for the ready dates.
-    for (const key of ['payment_proof_deposit_portal', 'payment_proof_balance_portal']) {
-        assert.match(t[key], /not attached/i, key);
-        assert.match(t[key], /supplier portal/i, key);
-    }
-    for (const key of ['payment_proof_deposit_attached', 'payment_proof_balance_attached']) {
-        assert.match(t[key], /attached/i, key);
-        assert.equal(/not attached/i.test(t[key]), false, key);
-    }
-    assert.equal(/portal|门户/i.test(t.payment_proof_balance_attached), false);
-    // The ready dates are entered on the portal, whichever way the proof goes: never by a
-    // reply to the email (the user, 2026-11-17).
-    assert.ok(t.payment_proof_deposit_attached.includes('enter the estimated ready date of each item on our supplier portal'));
-    assert.ok(t.payment_proof_deposit_attached.includes('在我们的供应商门户填写各产品的预计完成日期'));
-    for (const key of ['payment_proof_deposit_portal', 'payment_proof_deposit_attached']) {
-        assert.equal(/reply to this email/i.test(t[key]), false, key);
-        assert.equal(t[key].includes('回复本邮件'), false, key);
-        assert.match(t[key], /portal/i, key);
-    }
-    // What the template editor says of it, too.
-    const about = PAYMENT_PROOF_TEMPLATES.find(x => x.key === 'payment_proof_deposit_attached').description;
-    assert.match(about, /button to each order's ready dates on the supplier portal/);
+    assert.match(t.payment_proof_deposit_portal.description, /a button to each order's ready dates are appended automatically/);
+    assert.match(t.payment_proof_balance_portal.description, /a button to upload their telex release are appended automatically/);
 });
 
 // ── The state of a notice ─────────────────────────────────────────────────
@@ -599,4 +627,59 @@ test('the reword leaves an edited template alone and says so; a missing or alrea
     assert.equal(edited.asked.filter(a => /^UPDATE/.test(a.sql)).length, 1, 'nothing is written a second time');
     assert.deepEqual(await runReword(templateConn(0, [{ body_html: now.bodyHtml }])), ['payment_proof_deposit_attached already holds the new wording']);
     assert.deepEqual(await runReword(templateConn(0, [])), ['payment_proof_deposit_attached not found; nothing to reword']);
+});
+
+// ── Portal only: the stored templates ─────────────────────────────────────
+
+const portalOnly = require('../src/db/migrate/2026-11-17_30_payment_proof_portal_only');
+
+// A connection that answers each UPDATE with the next of `affected`, and a SELECT with `rows`.
+function portalOnlyConn(affected, rows = []) {
+    const asked = [];
+    const left = [...affected];
+    return {
+        asked,
+        query: async (sql, params) => {
+            const text = String(sql).replace(/\s+/g, ' ').trim();
+            asked.push({ sql: text, params });
+            return /^UPDATE/.test(text) ? [{ affectedRows: left.shift() ?? 0 }] : [rows];
+        },
+    };
+}
+const runPortalOnly = async (conn) => { const said = []; await portalOnly.up(conn, { log: m => said.push(m) }); return said; };
+
+test('portal only: the two templates that stay are reworded where they still hold what was seeded, and the attached pair is retired', async () => {
+    const now = key => PAYMENT_PROOF_TEMPLATES.find(t => t.key === key);
+    // What it looks for is the wording 2026-11-16_30 seeded, which said the rest in the body.
+    assert.deepEqual(Object.keys(portalOnly.SEEDED), SENT_TEMPLATES);
+    assert.ok(portalOnly.SEEDED.payment_proof_deposit_portal.bodyHtml.includes('It is not attached to this email. Please confirm you have received the payment, and enter the estimated ready date of each item on the order\'s page of the portal.'));
+    assert.ok(portalOnly.SEEDED.payment_proof_balance_portal.bodyHtml.includes('Please arrange the telex release and send us the telex-released bill of lading.'));
+    assert.deepEqual(Object.values(portalOnly.SEEDED).map(t => t.name), ['Deposit paid (supplier portal)', 'Balance paid (supplier portal)']);
+    for (const key of SENT_TEMPLATES) assert.notEqual(portalOnly.SEEDED[key].bodyHtml, now(key).bodyHtml, key);
+    assert.deepEqual(portalOnly.RETIRED, RETIRED_TEMPLATES);
+
+    const conn = portalOnlyConn([1, 1, 2]);
+    assert.deepEqual(await runPortalOnly(conn), ['payment_proof_deposit_portal reworded', 'payment_proof_balance_portal reworded', '2 "proof attached" template(s) retired']);
+    const REWORD = 'UPDATE email_templates SET name = ?, description = ?, body_html = ? WHERE template_key = ? AND deleted_at IS NULL AND body_html = ?';
+    assert.deepEqual(conn.asked, [
+        ...SENT_TEMPLATES.map(key => ({ sql: REWORD, params: [now(key).name, now(key).description, now(key).bodyHtml, key, portalOnly.SEEDED[key].bodyHtml] })),
+        // Soft-deleted, as the template editor deletes one: the rows stay.
+        { sql: 'UPDATE email_templates SET deleted_at = NOW() WHERE template_key IN (?, ?) AND deleted_at IS NULL', params: RETIRED_TEMPLATES },
+    ]);
+});
+
+test('portal only: an edited template is left alone and named; a missing or already reworded one is said; retiring twice retires none', async () => {
+    const now = key => PAYMENT_PROOF_TEMPLATES.find(t => t.key === key);
+    const edited = portalOnlyConn([0, 0, 0], [{ body_html: '<p>Our own words</p>' }]);
+    assert.deepEqual(await runPortalOnly(edited), [
+        'payment_proof_deposit_portal has been edited since it was seeded and was left as it is: check it does not say the proof is attached',
+        'payment_proof_balance_portal has been edited since it was seeded and was left as it is: check it does not say the proof is attached',
+        '0 "proof attached" template(s) retired',
+    ]);
+    // Three writes asked for, none of them a second try at an edited template.
+    assert.equal(edited.asked.filter(a => /^UPDATE/.test(a.sql)).length, 3);
+    assert.deepEqual((await runPortalOnly(portalOnlyConn([0, 0, 0], []))).slice(0, 2), ['payment_proof_deposit_portal not found; nothing to reword', 'payment_proof_balance_portal not found; nothing to reword']);
+    // Each key is compared with its own new wording.
+    const already = { asked: [], query: async (sql, params) => { already.asked.push(params); return /^\s*UPDATE/.test(sql) ? [{ affectedRows: 0 }] : [[{ body_html: now(params[0]).bodyHtml }]]; } };
+    assert.deepEqual((await runPortalOnly(already)).slice(0, 2), ['payment_proof_deposit_portal already holds the new wording', 'payment_proof_balance_portal already holds the new wording']);
 });

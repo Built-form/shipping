@@ -16,8 +16,9 @@
 //   2. under the locks an edit of the payment takes, the rules are run and ONE
 //      row is written as 'sending', then committed. That commit is the moment
 //      the send exists: nothing is emailed that has no row;
-//   3. outside any transaction: pre-approval (portal) or the receipt and the
-//      proof files (attached). A failure here is a definite 'failed';
+//   3. outside any transaction: the recipients are pre-approved on the
+//      portal. A failure that leaves nobody to show it to is a definite
+//      'failed'; nothing is ever attached instead (the user, 2026-11-17);
 //   4. Front is called once, and only while the row's deadline leaves room;
 //   5. accepted -> 'sent' (one finaliser, also used when a person says "it
 //      went"); refused -> 'failed'; no answer -> 'unknown', which is never
@@ -75,8 +76,9 @@ function sendJson(row, now = new Date()) {
  */
 function previewOf(source, delivery, sends = [], now = new Date()) {
     const built = N.buildNotices(source);
-    const attached = delivery.delivery === 'attached';
-    const blocked = built.blocked || (attached ? N.attachRefusal(source.documents) : null);
+    // What is wrong with the payment itself first; then whether the portal can
+    // show it to anyone. It goes out as a portal link or not at all.
+    const blocked = built.blocked || N.portalRefusal(delivery, source.payment.supplierName);
     const states = N.noticeStates(built.notices.map(n => n.kind), sends, source.payment.supplierName, now);
     return {
         paymentId: source.payment.id,
@@ -94,13 +96,14 @@ function previewOf(source, delivery, sends = [], now = new Date()) {
             paidFor: n.paidFor,
             unnamed: n.unnamed,
             blocked: n.blocked,
-            templateKey: N.TEMPLATE_KEYS[n.kind][delivery.delivery],
+            templateKey: N.TEMPLATE_KEYS[n.kind],
             tokens: N.tokensFor(built, n),
-            // null when it goes out attached (resolveNoticeDelivery).
+            // null when it cannot be sent (resolveNoticeDelivery).
             portalUrl: delivery.portalUrl,
-            // A deposit's orders on the portal, for their ready dates: linked whichever way
-            // the proof goes, wherever the portal can open them for this supplier.
+            // What the email asks for, with a button to it: a deposit's orders on the
+            // portal, for their ready dates; a balance's containers, for their telex release.
             readyDates: N.readyDatesFor(n, delivery),
+            telex: N.telexContainersOf(n),
             state: states[i].state,
             lastSentAt: states[i].lastSentAt,
             sends: sends.filter(s => s.noticeKind === n.kind).map(s => sendJson(s, now)),
@@ -134,7 +137,7 @@ async function sendNotice(ctx, { paymentId, kind, actor, body }) {
     if (!N.maySend(actor && actor.userType)) return refused(N.refusal('CANNOT_SEND'));
     if (!N.NOTICE_KINDS.includes(kind)) return bad('The part of the payment to send must be "deposit" or "balance".');
     if (typeof b.sendKey !== 'string' || !SEND_KEY_RE.test(b.sendKey)) return bad('`sendKey` must be 8 to 64 letters, digits, - or _.');
-    if (!N.DELIVERIES.includes(b.delivery)) return bad('`delivery` must be "portal" or "attached": the way the dialog showed.');
+    if (!N.DELIVERIES.includes(b.delivery)) return bad('`delivery` must be "portal": the way the dialog showed.');
     if (typeof b.previewToken !== 'string' || !b.previewToken) return bad('`previewToken` is required: what the dialog showed.');
     const { addresses, invalid } = P.parseRecipients(b.to);
     if (invalid.length) return bad(`Not an email address: ${invalid.join(', ')}`);
@@ -153,7 +156,7 @@ async function sendNotice(ctx, { paymentId, kind, actor, body }) {
     // Wording left blank falls back to the stored template for this notice.
     const wording = { subject: oneLine(b.subject), body: String(b.body || '').trim() };
     if (!wording.subject || !wording.body) {
-        const tpl = await store.template(N.TEMPLATE_KEYS[kind][b.delivery]);
+        const tpl = await store.template(N.TEMPLATE_KEYS[kind]);
         if (!wording.subject) wording.subject = oneLine(tpl.subject);
         if (!wording.body) wording.body = tpl.bodyHtml || '';
     }
@@ -162,12 +165,10 @@ async function sendNotice(ctx, { paymentId, kind, actor, body }) {
     const decide = (source, delivery, sends) => {
         const built = N.buildNotices(source);
         if (built.blocked) return { refusal: built.blocked };
-        const conflict = N.deliveryConflict(b.delivery, delivery);
+        const cannot = N.portalRefusal(delivery, source.payment.supplierName);
+        if (cannot) return { refusal: cannot };
+        const conflict = N.deliveryConflict(b.delivery);
         if (conflict) return { refusal: conflict };
-        if (delivery.delivery === 'attached') {
-            const cannot = N.attachRefusal(source.documents);
-            if (cannot) return { refusal: cannot };
-        }
         const notice = built.notices.find(n => n.kind === kind);
         if (!notice) return { refusal: N.refusal('NO_SUCH_NOTICE') };
         if (notice.blocked) return { refusal: notice.blocked };
@@ -183,7 +184,7 @@ async function sendNotice(ctx, { paymentId, kind, actor, body }) {
     };
     const row = d => ({
         noticeKind: kind,
-        delivery: b.delivery,
+        delivery: N.DELIVERY,
         supplierName: d.built.supplierName,
         sendKey: b.sendKey,
         requestHash,
@@ -201,64 +202,46 @@ async function sendNotice(ctx, { paymentId, kind, actor, body }) {
         return replay(d, now());
     }
     const { send, source, delivery, notice, subject, bodyHtml } = reserved;
-    const portal = delivery.delivery === 'portal';
 
     // 3. Outside any transaction. Whatever fails from here until Front is
     //    called is a definite "nothing was sent".
-    let token = null;
     const giveUp = async (reason, answer) => {
         await store.fail(send.id, String(reason).slice(0, 500));
-        if (token) await store.discardReceipt(token);
         return answer;
     };
     let portalAccess = null;
     let html;
-    let attachments;
     try {
-        if (portal) {
-            try {
-                portalAccess = await store.preapprove({
-                    recipients: addresses,
-                    // The portal lists the payment to users linked to a supplier
-                    // of exactly this name, so that name is all they are given.
-                    poSupplier: source.payment.supplierName,
-                    actorEmail: actor.email,
-                    note: N.preapprovalNote({ paymentId, kind, actor: actor.email }),
-                });
-            } catch (e) {
-                log.error('[payment-notices] portal pre-approval failed', { paymentId, error: e.message, errno: e.errno });
-                portalAccess = { status: 'error', suppliers: [], poSupplierMatched: false, users: [] };
-            }
-            if (portalAccess.status === 'no_supplier' || portalAccess.status === 'unavailable') {
-                const reason = portalAccess.status === 'no_supplier' ? 'no_supplier' : 'portal_unavailable';
-                return giveUp(`delivery_changed: ${reason}`, refused(N.deliveryConflict('portal', { delivery: 'attached', reason })));
-            }
-            const preapproved = portalAccess.status === 'ok' && portalAccess.users.every(u => P.GRANTED_OUTCOMES.has(u.outcome));
-            const block = N.portalBlockHtml({
-                kind,
-                url: delivery.portalUrl,
-                registerUrl: delivery.registerUrl,
-                preapproved,
-                readyDates: N.readyDatesFor(notice, delivery),
+        try {
+            portalAccess = await store.preapprove({
+                recipients: addresses,
+                // The portal lists the payment to users linked to a supplier
+                // of exactly this name, so that name is all they are given.
+                poSupplier: source.payment.supplierName,
+                actorEmail: actor.email,
+                note: N.preapprovalNote({ paymentId, kind, actor: actor.email }),
             });
-            html = wrapEmail({ title: subject, bodyHtml: `${bodyHtml}${block}` });
-        } else {
-            // The confirm button needs the receipt's token, so the receipt
-            // comes before the email is built.
-            token = await store.createReceipt({ emailType: N.EMAIL_TYPE, sentTo: addresses, subject, confirmVia: 'email' });
-            await store.setReceiptToken(send.id, token);
-            attachments = [];
-            for (const doc of source.documents) attachments.push(await store.readProof(doc));
-            // The ready dates are entered on the portal, never asked for by reply: the
-            // way to each order goes out here too. Nobody is approved on the portal by
-            // an attached send; an address new to it registers and waits.
-            const inner = `${bodyHtml}${N.attachedBlockHtml({
-                filenames: attachments.map(a => a.filename),
-                readyDates: N.readyDatesFor(notice, delivery),
-                registerUrl: delivery.portalBase ? P.registerUrl(delivery.portalBase) : null,
-            })}`;
-            html = wrapEmail({ title: subject, bodyHtml: R.appendReceiptLink(inner, token, ctx.apiBaseUrl) });
+        } catch (e) {
+            log.error('[payment-notices] portal pre-approval failed', { paymentId, error: e.message, errno: e.errno });
+            portalAccess = { status: 'error', suppliers: [], poSupplierMatched: false, users: [] };
         }
+        // The portal has nobody to show it to after all (the supplier record or
+        // the portal went between the check and here): nothing is sent, and
+        // nothing is attached instead.
+        if (portalAccess.status === 'no_supplier' || portalAccess.status === 'unavailable') {
+            const reason = portalAccess.status === 'no_supplier' ? 'no_supplier' : 'portal_unavailable';
+            return giveUp(`no portal delivery: ${reason}`, refused(N.portalRefusal({ delivery: null, reason }, source.payment.supplierName)));
+        }
+        const preapproved = portalAccess.status === 'ok' && portalAccess.users.every(u => P.GRANTED_OUTCOMES.has(u.outcome));
+        const block = N.portalBlockHtml({
+            kind,
+            url: delivery.portalUrl,
+            registerUrl: delivery.registerUrl,
+            preapproved,
+            readyDates: N.readyDatesFor(notice, delivery),
+            telex: N.telexContainersOf(notice),
+        });
+        html = wrapEmail({ title: subject, bodyHtml: `${bodyHtml}${block}` });
     } catch (e) {
         log.error('[payment-notices] a send could not be prepared', { paymentId, sendId: send.id, error: e.message });
         return giveUp(`prepare: ${e.message}`, refused(N.refusal('SEND_FAILED', { send: sendJson({ ...send, status: 'failed' }, now()) })));
@@ -271,7 +254,7 @@ async function sendNotice(ctx, { paymentId, kind, actor, body }) {
     }
     let front;
     try {
-        front = await sendFront({ to: addresses, subject, html, ...(attachments ? { attachments } : {}) });
+        front = await sendFront({ to: addresses, subject, html });
     } catch (e) {
         front = { ok: false, reason: 'network_error', detail: e && e.message };
     }
@@ -299,13 +282,11 @@ async function sendNotice(ctx, { paymentId, kind, actor, body }) {
     if (!done.ok && !(done.send && done.send.status === 'sent')) {
         return refused(N.refusal('SEND_OUTCOME_UNKNOWN', { send: sendJson(done.send || send, now()) }));
     }
-    if (portal) {
-        await store.logReceipt({
-            emailType: N.EMAIL_TYPE, sentTo: addresses, subject, confirmVia: 'portal', actionUrl: delivery.portalUrl,
-            sendTable: N.SEND_TABLE, sendId: send.id,
-        });
-    }
-    return result(200, { send: sendJson(done.send, now()), delivery: delivery.delivery, portalAccess, replayed: false });
+    await store.logReceipt({
+        emailType: N.EMAIL_TYPE, sentTo: addresses, subject, confirmVia: 'portal', actionUrl: delivery.portalUrl,
+        sendTable: N.SEND_TABLE, sendId: send.id,
+    });
+    return result(200, { send: sendJson(done.send, now()), delivery: N.DELIVERY, portalAccess, replayed: false });
 }
 
 /**
@@ -555,11 +536,11 @@ async function loadSends(conn, paymentIds, env = process.env) {
 
 /**
  * The store sendNotice / resolveSend work against, on MySQL. deps:
- * { withConnection, lockSupplierPaymentTargets, readObject(s3Key) -> Buffer,
- *   getEmailTemplate, recordAudit, preapprove?, env? }.
+ * { withConnection, lockSupplierPaymentTargets, getEmailTemplate, recordAudit,
+ *   preapprove?, env? }.
  */
 function createStore(deps) {
-    const { withConnection, lockSupplierPaymentTargets, readObject, getEmailTemplate, recordAudit } = deps;
+    const { withConnection, lockSupplierPaymentTargets, getEmailTemplate, recordAudit } = deps;
     const env = deps.env || process.env;
     const preapprove = deps.preapprove || preapprovePortalUsers;
     const jp = () => jportalSchema(env);
@@ -580,21 +561,13 @@ function createStore(deps) {
         getSend: id => withConnection(conn => readSend(conn, 's.id = ?', [id])),
         template: key => withConnection(conn => getEmailTemplate(conn, key)),
         preapprove: args => withConnection(conn => preapprove(conn, args)),
-        createReceipt: fields => withConnection(conn => R.createEmailReceipt(conn, fields)),
-        setReceiptToken: (id, token) => withConnection(conn => conn.query(`UPDATE supplier_payment_sends SET receipt_token = ? WHERE id = ?`, [token, id])),
+        // For a send from before 2026-11-17 that went out with the proof attached and is
+        // being resolved "not sent": its receipt (with a confirm button) is taken back.
         discardReceipt: token => withConnection(conn => R.discardEmailReceipt(conn, token)),
         logReceipt: fields => withConnection(conn => R.logSentEmail(conn, fields)),
 
-        async readProof(doc) {
-            const bytes = await readObject(doc.s3Key);
-            return {
-                filename: String(doc.filename || `proof-${doc.id}.pdf`).replace(/[\r\n"\\/]+/g, ' ').slice(0, 200),
-                contentType: doc.contentType,
-                bytes,
-            };
-        },
-
-        // Who opened the payment on the portal (jportal.payment_views). A
+        // Who opened the payment's proof on the portal (jportal.payment_views:
+        // the portal records a view for the proof and for nothing else). A
         // server without the portal answers as nobody.
         views: paymentId => withConnection(async conn => {
             try {

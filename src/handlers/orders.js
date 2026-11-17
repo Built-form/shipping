@@ -12364,10 +12364,10 @@ app.delete('/api/v1/supplier-payments/:id(\\d+)', async (req, res) => {
 // ── A recorded payment sent to its supplier ──────────────────────────────
 // /api/v1/supplier-payments/:id/notices[/:kind/email] and
 // /api/v1/supplier-payment-sends/:sendId/resolve: the proof of a payment
-// emailed to the supplier as a link to the portal's Payments page, or attached
-// where the supplier is not on the portal. The send takes the same locks an
-// edit of the payment does (lockSupplierPaymentTargets above), which is why it
-// is handed over. docs/payment-proof-send.md.
+// emailed to the supplier as a link to the portal's Payments page, and only
+// that way: it is never attached (the user, 2026-11-17). The send takes the
+// same locks an edit of the payment does (lockSupplierPaymentTargets above),
+// which is why it is handed over. docs/payment-proof-send.md.
 registerPaymentNoticeRoutes(app, {
     withConnection,
     ready: async () => {
@@ -12376,8 +12376,6 @@ registerPaymentNoticeRoutes(app, {
         await emailTemplatesSchemaReady;
         await emailReceiptsSchemaReady;
     },
-    s3,
-    bucket: () => PO_BUCKET,
     lockSupplierPaymentTargets,
     getEmailTemplate,
     recordAudit,

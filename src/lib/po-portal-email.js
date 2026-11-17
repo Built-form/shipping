@@ -143,8 +143,7 @@ function signedPiPortalBlockHtml({ poNumber, filename, poUrl, registerUrl: regUr
 // (src/lib/request-to-send-portal.js) passes its own.
 // How to get an account, in English and Chinese: two small lines. Said one way
 // to an address this email approved (`preapproved`), another to one it did
-// not. Also used by an email that links to the portal without this frame (a
-// deposit whose proof is attached, src/lib/payment-notices.js).
+// not.
 function accountHtml({ regUrl, preapproved, seeEn = 'this order', seeZh = '此订单' }) {
     const reg = escapeHtml(regUrl);
     const regLink = `<a href="${reg}" style="color:#1f5fbf;word-break:break-all;">${reg}</a>`;
@@ -184,5 +183,4 @@ module.exports = {
     portalBlockHtml,
     signedPiPortalBlockHtml,
     blockHtml,
-    accountHtml,
 };

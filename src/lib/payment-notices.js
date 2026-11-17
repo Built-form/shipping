@@ -6,8 +6,9 @@
 //   deposit   asks for the estimated ready dates;
 //   balance   (balances, QC units, repackaged lines) asks for the telex release.
 // The email links to the supplier portal's Payments page, which reads the
-// payment live through shipping's portal_payment*_v views; where that cannot
-// work, the proof is attached instead (the fallback Request to send has).
+// payment live through shipping's portal_payment*_v views. ONLY that way: the
+// proof is never attached to the email (the user, 2026-11-17). Where a link
+// cannot work the payment cannot be sent, and the dialog says what to fix.
 //
 // Nothing here is a copy of the payment for later: the portal never reads what
 // an email said (user, 2026-11-16). What is built here is what the send dialog
@@ -25,11 +26,17 @@ const NOTICE_KINDS = ['deposit', 'balance'];
 const EMAIL_TYPE = 'payment_proof';
 const SEND_TABLE = 'supplier_payment_sends';
 const TEMPLATE_CATEGORY = 'Payment proof';
-// The stored wording per notice and per way it goes out.
+// The stored wording per notice. The keys still say "_portal": they date from
+// when a second pair, "_attached", existed (retired by 2026-11-17_20).
 const TEMPLATE_KEYS = {
-    deposit: { portal: 'payment_proof_deposit_portal', attached: 'payment_proof_deposit_attached' },
-    balance: { portal: 'payment_proof_balance_portal', attached: 'payment_proof_balance_attached' },
+    deposit: 'payment_proof_deposit_portal',
+    balance: 'payment_proof_balance_portal',
 };
+// The one way a payment goes out. A send row from before 2026-11-17 may still
+// say 'attached': history, read and shown, never written again.
+const DELIVERY = 'portal';
+// What a send request may name as its delivery. 'attached' is accepted only to
+// be answered (409 DELIVERY_CHANGED): a dialog opened before the change.
 const DELIVERIES = ['portal', 'attached'];
 const SEND_ROLES = ['admin', 'standard', 'accountant'];
 
@@ -41,10 +48,6 @@ const SEND_ROLES = ['admin', 'standard', 'accountant'];
 const DEADLINE_SECONDS = 60;
 const FRONT_CALL_SECONDS = 15;   // src/services/front-send.js SEND_TIMEOUT_MS
 const FRONT_MARGIN_SECONDS = 5;
-
-const MAX_ATTACHED_FILES = 5;
-const MAX_ATTACHED_BYTES = 15 * 1024 * 1024;
-const ATTACHABLE_TYPES = ['application/pdf', 'image/png', 'image/jpeg'];
 
 const toCents = v => Math.round(Number(v) * 100);
 const fromCents = c => c / 100;
@@ -92,7 +95,9 @@ const REFUSALS = {
     LINES_EXCEED_TRANSFER: [409, 'The lines of this payment add up to more than the amount sent. Edit the payment first, then send.', ['edit_payment']],
     NO_PROOF: [409, 'There is no proof of payment on this payment. Attach one, then send.', ['attach_proof']],
     PROOF_NOT_SENDABLE: [409, 'A file on this payment is not a proof of payment filed under this supplier. Refile or remove it, then send.', ['fix_proof']],
-    PROOFS_NOT_ATTACHABLE: [409, `The proofs cannot be attached to an email: at most ${MAX_ATTACHED_FILES} files, 15 MB together, PDF or image.`, ['fix_proof']],
+    // Their words are written per case by portalRefusal.
+    PORTAL_NOT_LIVE: [409, 'Payments are sent to suppliers through the supplier portal only, and it cannot show them one on this server yet.', []],
+    SUPPLIER_NOT_ON_PORTAL: [409, 'No supplier record has this payment\'s exact supplier name, so the supplier portal has nobody to show it to.', ['edit_payment']],
     NOTICE_NOT_POSITIVE: [409, 'This part of the payment comes to nothing once its credits are taken off: there is nothing to tell the supplier.', []],
     PAYMENT_CHANGED: [409, 'This payment was changed after the email was written. Check the figures and send again.', ['reload']],
     UNRESOLVED_SEND: [409, 'An earlier send of this email may or may not have gone out. Check Front, then say which.', ['resolve_sent', 'resolve_not_sent']],
@@ -238,15 +243,6 @@ function buildNotices(source) {
     return { sendable: !blocked, blocked, supplierName: pay.supplierName, transfer, proofs, notices };
 }
 
-/** null when the proofs can ride on an email as attachments, else the refusal. */
-function attachRefusal(documents) {
-    const docs = documents || [];
-    const total = docs.reduce((a, d) => a + (Number(d.fileSize) || 0), 0);
-    const ok = docs.length <= MAX_ATTACHED_FILES && total <= MAX_ATTACHED_BYTES
-        && docs.every(d => d.s3Key && ATTACHABLE_TYPES.includes(String(d.contentType || '').toLowerCase()));
-    return ok ? null : refusal('PROOFS_NOT_ATTACHABLE');
-}
-
 const money = cents => {
     const sign = cents < 0 ? '-' : '';
     const abs = Math.abs(cents);
@@ -274,39 +270,64 @@ const readyDatesUrl = (base, purchaseOrderId) => `${base}/orders/${encodeURIComp
 // ── Delivery ──────────────────────────────────────────────────────────────
 
 // PAYMENT_PROOF_PORTAL=on: the portal's Payments page is live on this stage.
-// Off by default, so shipping can ship before the portal does.
+// Off by default, so shipping can ship before the portal does. While it is
+// off nothing can be sent from here: there is no other way a payment goes out.
 const portalSwitchOn = (env = process.env) => String((env && env.PAYMENT_PROOF_PORTAL) || '').trim().toLowerCase() === 'on';
 
 /**
- * How a notice goes out, and why not as a link when it does not:
+ * Whether a notice can go out, which is as a link to the portal or not at all:
+ * { delivery: 'portal', reason: null }, or { delivery: null, reason } with why not:
  *   portal_url_unset    SUPPLIER_PORTAL_URL is not configured on this server
  *   portal_switch_off   the Payments page is not switched on for this stage
  *   portal_unavailable  the portal's database (its payment_views table) is not here
  *   no_supplier         no live supplier has the transfer's exact supplier name
  */
 function deliveryFor({ portalBase, switchOn, portalAvailable, supplierMatched }) {
-    const attached = reason => ({ delivery: 'attached', reason });
-    if (!portalBase) return attached('portal_url_unset');
-    if (!switchOn) return attached('portal_switch_off');
-    if (!portalAvailable) return attached('portal_unavailable');
-    if (!supplierMatched) return attached('no_supplier');
-    return { delivery: 'portal', reason: null };
+    const cannot = reason => ({ delivery: null, reason });
+    if (!portalBase) return cannot('portal_url_unset');
+    if (!switchOn) return cannot('portal_switch_off');
+    if (!portalAvailable) return cannot('portal_unavailable');
+    if (!supplierMatched) return cannot('no_supplier');
+    return { delivery: DELIVERY, reason: null };
 }
 
 const REASON_TEXT = {
     portal_url_unset: 'the supplier portal address is not configured',
     portal_switch_off: 'the portal\'s Payments page is not switched on here',
     portal_unavailable: 'the supplier portal is not available here',
-    no_supplier: 'no supplier on the portal has this exact name',
 };
 
-/** null when the email goes out the way the dialog showed; otherwise the 409 body. */
-function deliveryConflict(requested, actual) {
-    if (requested === actual.delivery) return null;
-    const error = actual.delivery === 'attached'
-        ? `This payment cannot go out as a portal link (${REASON_TEXT[actual.reason] || actual.reason}): the proof would be attached instead. Check the wording and send again.`
-        : 'This supplier is on the portal: the payment goes out as a link to the portal, with nothing attached. Check the wording and send again.';
-    return { status: 409, code: 'DELIVERY_CHANGED', error, delivery: actual.delivery, reason: actual.reason, allowedNext: [actual.delivery] };
+/**
+ * null when the payment can go out as a portal link; otherwise the 409 that
+ * stops it, said for the sender: what is in the way and, where they can, what
+ * to do about it. `delivery` is deliveryFor's answer. Nothing is sent attached
+ * instead (the user, 2026-11-17).
+ */
+function portalRefusal(delivery, supplierName) {
+    if (delivery && delivery.delivery === DELIVERY) return null;
+    const reason = (delivery && delivery.reason) || 'portal_unavailable';
+    if (reason === 'no_supplier') {
+        return refusal('SUPPLIER_NOT_ON_PORTAL', {
+            reason,
+            error: `No supplier record is named exactly "${supplierName ?? ''}", so the supplier portal has nobody to show this payment to. Make the payment's supplier name and the supplier record match exactly, then send. The proof is not sent attached instead.`,
+        });
+    }
+    return refusal('PORTAL_NOT_LIVE', {
+        reason,
+        error: `A payment is sent to a supplier as a link to the supplier portal only, never with the proof attached. That cannot be done on this server yet: ${REASON_TEXT[reason] || reason}. Nothing can be sent until it is.`,
+    });
+}
+
+/**
+ * null when the send asked for the way payments go out; otherwise the 409 for
+ * a dialog that still showed "proof attached" (opened before 2026-11-17).
+ */
+function deliveryConflict(requested) {
+    if (requested === DELIVERY) return null;
+    return {
+        status: 409, code: 'DELIVERY_CHANGED', delivery: DELIVERY, reason: null, allowedNext: [DELIVERY],
+        error: 'A proof of payment is no longer sent attached: this payment goes out as a link to the supplier portal. Check the wording and send again.',
+    };
 }
 
 // ── What the dialog showed, and what was asked ────────────────────────────
@@ -385,20 +406,33 @@ const lead = html => `<p style="margin:0 0 12px;font-family:${FONT};font-size:15
 const foot = html => `<p style="margin:0 0 10px;font-family:${FONT};font-size:12px;line-height:1.5;color:${MUTED};">${html}</p>`;
 
 /**
- * Under a portal email's wording: the button to the payment on the portal and
- * how to get an account (the PO emails' frame), and, on a deposit, the way to
- * each order's estimated ready dates. `readyDates`: [{ poNumber, url }], only
- * orders the recipient can open.
+ * Under the email's wording: the button to the payment on the portal and how
+ * to get an account (the PO emails' frame), and then what the payment asks
+ * for in return, with the way to it:
+ *   a deposit   each order's estimated ready dates (`readyDates`: [{ poNumber,
+ *               url }], only orders the recipient can open);
+ *   a balance   the telex release of each container it paid (`telex`:
+ *               telexContainersOf), uploaded on the payment's own row.
+ * A payment that asks for neither gets the first box alone.
  */
-function portalBlockHtml({ kind, url, registerUrl, preapproved, readyDates = [] }) {
+function portalBlockHtml({ kind, url, registerUrl, preapproved, readyDates = [], telex = [] }) {
     const block = P.blockHtml({
         leadHtml: 'The <strong>proof of payment</strong> is on the supplier portal, with what the payment covers. Sign in to open it.<br><strong>付款凭证</strong>及付款明细已发布在供应商门户，请登录查看。',
         url, regUrl: registerUrl, preapproved,
         footHtml: 'No file is attached to this email: the proof is kept on the portal. / 本邮件不附带文件：付款凭证保存在门户中。',
         seeEn: 'this payment', seeZh: '此付款',
     });
-    if (kind !== 'deposit' || !readyDates.length) return block;
-    return `${block}${BOX_OPEN}${lead('Please enter the <strong>estimated ready date</strong> of each item on the order\'s page.<br>请在订单页面填写各产品的<strong>预计完成日期</strong>。')}${orderButtons(readyDates)}${BOX_CLOSE}`;
+    if (kind === 'deposit' && readyDates.length) {
+        return `${block}${BOX_OPEN}${lead('Please enter the <strong>estimated ready date</strong> of each item on the order\'s page.<br>请在订单页面填写各产品的<strong>预计完成日期</strong>。')}${orderButtons(readyDates)}${BOX_CLOSE}`;
+    }
+    if (kind === 'balance' && telex.length) {
+        // Named only when every one has a number: a list with a gap in it helps nobody.
+        const numbers = telex.every(Boolean) ? telex.map(escapeHtml) : [];
+        const en = numbers.length ? ` (${numbers.length === 1 ? 'container' : 'containers'} ${numbers.join(', ')})` : '';
+        const zh = numbers.length ? `（货柜 ${numbers.join('、')}）` : '';
+        return `${block}${BOX_OPEN}${lead(`Please upload the <strong>telex release</strong> of each container this payment covers${en} on the portal, on this payment's own row.<br>请在门户中该笔付款所在行，上传本次付款所涉各货柜${zh}的<strong>电放提单</strong>。`)}${button(url, 'Upload the telex release / 上传电放提单')}${linkFallback(url)}${BOX_CLOSE}`;
+    }
+    return block;
 }
 
 // A button to each order's own page, where its lines' estimated ready dates
@@ -411,11 +445,11 @@ const orderButtons = readyDates => readyDates.map(r => [
 /**
  * Where a deposit's estimated ready dates are entered: each of its orders'
  * own page on the portal. The ready dates are ALWAYS asked for there, never by
- * a reply to the email (the user, 2026-11-17), so the links go out whichever
- * way the proof does, wherever the portal can open the order for this
- * supplier: it has an address here, and a supplier of exactly the transfer's
- * name is on it. `delivery` is resolveNoticeDelivery's answer. A balance has
- * none (`readyDatePos` is a deposit's).
+ * a reply to the email (the user, 2026-11-17). One link per order, where the
+ * portal can open the order for this supplier: it has an address here, and a
+ * supplier of exactly the transfer's name is on it. `delivery` is
+ * resolveNoticeDelivery's answer. A balance has none (`readyDatePos` is a
+ * deposit's).
  */
 function readyDatesFor(notice, delivery) {
     const orders = (notice && notice.readyDatePos) || [];
@@ -424,19 +458,23 @@ function readyDatesFor(notice, delivery) {
 }
 
 /**
- * Under an attached email's wording: that the proof rides on this email. And,
- * for a deposit whose orders the portal can open (`readyDates`, from
- * readyDatesFor), a second box with the way to each order's ready dates and
- * how to get an account. This email approves nobody on the portal, so the
- * account lines are the ones for an address that still has to be approved.
- * With no such order it says nothing of the portal.
+ * The containers a balance asks the telex release of, each once, by the number
+ * the supplier knows (null for one with none): the ones the portal lists on the
+ * payment's row with an upload button. The portal's own rule (jportal
+ * src/lib/telex.js): a balance or top-up line filed under exactly the
+ * payment's supplier, with its shipment. Not a PI paid through containers, not
+ * QC units, not a charge. A deposit has none.
  */
-function attachedBlockHtml({ filenames = [], readyDates = [], registerUrl = null }) {
-    const names = filenames.map(escapeHtml).join(', ');
-    const proof = `${BOX_OPEN}${lead(`The <strong>proof of payment</strong> is attached to this email${names ? `: ${names}` : ''}.<br><strong>付款凭证</strong>见本邮件附件。`)}${foot('Please keep it for your records. / 请留存备查。')}${BOX_CLOSE}`;
-    if (!readyDates.length) return proof;
-    const account = registerUrl ? P.accountHtml({ regUrl: registerUrl, preapproved: false }) : '';
-    return `${proof}${BOX_OPEN}${lead('Please enter the <strong>estimated ready date</strong> of each item on the order\'s page of our supplier portal.<br>请在供应商门户的订单页面填写各产品的<strong>预计完成日期</strong>。')}${orderButtons(readyDates)}${account}${BOX_CLOSE}`;
+function telexContainersOf(notice) {
+    if (!notice) return [];
+    const seen = new Set();
+    const out = [];
+    for (const l of notice.lines || []) {
+        if ((l.type !== 'balance' && l.type !== 'top_up') || !l.named || l.shipmentId == null || seen.has(l.shipmentId)) continue;
+        seen.add(l.shipmentId);
+        out.push(l.container || null);
+    }
+    return out;
 }
 
 /** The note pre-approval leaves on a portal user it creates or approves. */
@@ -444,13 +482,13 @@ const preapprovalNote = ({ paymentId, kind, actor }) =>
     `Pre-approved from ShipLine: proof of payment ${paymentId} (${kind}) emailed by ${actor || 'shipline'}`;
 
 module.exports = {
-    NOTICE_KINDS, EMAIL_TYPE, SEND_TABLE, TEMPLATE_CATEGORY, TEMPLATE_KEYS, DELIVERIES, SEND_ROLES,
-    DEADLINE_SECONDS, MAX_ATTACHED_FILES, MAX_ATTACHED_BYTES,
-    toCents, noticeKindOfLine, noticeKindsOf, buildNotices, attachRefusal, tokensFor,
-    paymentPortalUrl, readyDatesUrl, readyDatesFor,
-    portalSwitchOn, deliveryFor, deliveryConflict,
+    NOTICE_KINDS, EMAIL_TYPE, SEND_TABLE, TEMPLATE_CATEGORY, TEMPLATE_KEYS, DELIVERY, DELIVERIES, SEND_ROLES,
+    DEADLINE_SECONDS,
+    toCents, noticeKindOfLine, noticeKindsOf, buildNotices, tokensFor,
+    paymentPortalUrl, readyDatesUrl, readyDatesFor, telexContainersOf,
+    portalSwitchOn, deliveryFor, portalRefusal, deliveryConflict,
     previewToken, requestHash, mayCallFront,
     effectiveStatus, noticeStates,
-    portalBlockHtml, attachedBlockHtml, preapprovalNote,
+    portalBlockHtml, preapprovalNote,
     refusal, maySend,
 };

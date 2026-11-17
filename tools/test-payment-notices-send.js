@@ -36,9 +36,10 @@ const sourceOf = (lines = [depositLine()], over = {}) => ({
     lines, documents: over.documents ?? [proofDoc()],
 });
 const PORTAL_DELIVERY = { delivery: 'portal', reason: null, portalBase: PORTAL, portalUrl: `${PORTAL}/payments?payment=45`, registerUrl: `${PORTAL}/register`, suppliers: [{ id: 900001, name: SUPPLIER }] };
-const ATTACHED_DELIVERY = { delivery: 'attached', reason: 'no_supplier', portalBase: PORTAL, portalUrl: null, registerUrl: null, suppliers: [] };
-// Attached only because the portal's Payments page is not switched on for the stage: the supplier is on the portal.
-const SWITCH_OFF_DELIVERY = { delivery: 'attached', reason: 'portal_switch_off', portalBase: PORTAL, portalUrl: null, registerUrl: null, suppliers: [{ id: 900001, name: SUPPLIER }] };
+// What cannot be sent (nothing goes out attached instead): nobody of that name on the portal...
+const NO_SUPPLIER_DELIVERY = { delivery: null, reason: 'no_supplier', portalBase: PORTAL, portalUrl: null, registerUrl: null, suppliers: [] };
+// ...or the portal's Payments page not switched on for the stage, though the supplier is on the portal.
+const SWITCH_OFF_DELIVERY = { delivery: null, reason: 'portal_switch_off', portalBase: PORTAL, portalUrl: null, registerUrl: null, suppliers: [{ id: 900001, name: SUPPLIER }] };
 
 // The store in memory. Its transitions are the ones the real store's guarded
 // UPDATEs make (checked against the SQL below).
@@ -64,10 +65,9 @@ function memoryStore(over = {}) {
     };
     s.template = async key => { s.calls.push(`template:${key}`); return { subject: 'Stored subject {amount}', bodyHtml: '<p>stored {paidFor}</p>' }; };
     s.preapprove = async args => { s.calls.push('preapprove'); s.preapproveArgs = args; if (s.preapproveThrows) throw new Error('deadlock'); return s.portalAccess; };
-    s.createReceipt = async fields => { s.calls.push('createReceipt'); if (s.receiptThrows) throw new Error('no table'); s.receipts.push(fields); return 'tok-1'; };
-    s.setReceiptToken = async (id, token) => { byId(id).receiptToken = token; };
+    // No receipt is minted and no proof is read by a send: nothing is attached. Only a send from
+    // before 2026-11-17 can still hold a receipt to take back.
     s.discardReceipt = async token => { s.calls.push(`discard:${token}`); };
-    s.readProof = async doc => { s.calls.push(`read:${doc.id}`); if (s.unreadable) throw Object.assign(new Error('NoSuchKey'), { name: 'NoSuchKey' }); return { filename: doc.filename, contentType: doc.contentType, bytes: Buffer.from(`file-${doc.id}`) }; };
     s.fail = async (id, reason) => { s.calls.push('fail'); const r = byId(id); if (r.status === 'sending') { r.status = 'failed'; r.sendError = reason; return true; } return false; };
     s.unknown = async (id, reason) => { s.calls.push('unknown'); if (s.unknownThrows) throw new Error('db down'); const r = byId(id); if (r.status === 'sending') { r.status = 'unknown'; r.sendError = reason; return true; } return false; };
     s.finalise = async (id, { front = null, byExecutor = false, resolvedBy = null }) => {
@@ -95,7 +95,7 @@ function memoryStore(over = {}) {
 // What the dialog sends: built from a preview of the same store.
 async function requestFor(store, kind = 'deposit', over = {}) {
     const p = await S.previewOf(store.source, store.delivery, [], NOW);
-    return { sendKey: 'key-0001-aaaa', to: ['li@acme.example'], subject: 'Deposit paid – {currency} {amount}', body: '<p>We paid {amount} for {paidFor}.</p>', delivery: store.delivery.delivery, previewToken: p.previewToken, ...over };
+    return { sendKey: 'key-0001-aaaa', to: ['li@acme.example'], subject: 'Deposit paid – {currency} {amount}', body: '<p>We paid {amount} for {paidFor}.</p>', delivery: 'portal', previewToken: p.previewToken, ...over };
 }
 const frontOk = calls => async msg => { calls.push(msg); return { ok: true, frontMessageUid: 'msg-1', frontConversationId: 'cnv-1' }; };
 const ctx = (store, sendFront, over = {}) => ({ store, sendFront, now: () => NOW, apiBaseUrl: 'https://api.example', ...over });
@@ -145,73 +145,45 @@ test('a balance email has no ready dates; a transfer with both parts sends each 
     assert.equal(front[1].subject, 'Balance 2,000.00');
     assert.ok(front[1].html.includes('<p>333</p>'));
     assert.equal(front[1].html.includes('/orders/'), false);
+    // What each asks for is under its wording, with a button: the deposit the ready dates, the balance the telex release.
+    assert.ok(front[0].html.includes('Enter ready dates: PO_001J'));
+    assert.equal(/telex/i.test(front[0].html), false);
+    assert.ok(front[1].html.includes('Please upload the <strong>telex release</strong> of each container this payment covers (container 333) on the portal'));
+    assert.ok(front[1].html.includes('Upload the telex release / 上传电放提单'));
+    assert.equal(/ready date/i.test(front[1].html), false);
+    assert.deepEqual(front.map(m => m.attachments), [undefined, undefined]);
 });
 
-test('an attached send: the receipt is minted before the email is built, the proofs are read, and ride on the email', async () => {
-    const store = memoryStore({ delivery: ATTACHED_DELIVERY });
-    const front = [];
-    const r = await send(store, frontOk(front), await requestFor(store));
-    assert.equal(r.status, 200);
-    const order = store.calls.filter(c => c === 'createReceipt' || c.startsWith('read:') || c === 'finalise');
-    assert.deepEqual(order, ['createReceipt', 'read:77', 'finalise']);
-    // Nobody is pre-approved for a portal the supplier is not on.
-    assert.equal(store.calls.includes('preapprove'), false);
-    assert.deepEqual(front[0].attachments.map(a => [a.filename, a.contentType, a.bytes.toString()]), [['proof.pdf', 'application/pdf', 'file-77']]);
-    // The confirm button carries the receipt's token; nothing sends anyone to the portal.
-    assert.ok(front[0].html.includes('https://api.example/api/v1/confirm-receipt/tok-1'));
-    assert.equal(/payments\?payment=|\/register/.test(front[0].html), false);
-    assert.ok(front[0].html.includes('proof.pdf'));
-    assert.deepEqual(store.receipts.map(x => [x.emailType, x.confirmVia]), [['payment_proof', 'email']]);
-    assert.equal(store.rows[0].receiptToken, 'tok-1');
-    assert.equal(store.rows[0].delivery, 'attached');
-    // No second receipt: the one minted is the email's.
-    assert.equal(store.calls.includes('logReceipt'), false);
+test('nothing is ever attached: a payment the portal cannot show is refused before anything is written, with what is in the way', async () => {
+    const cases = [
+        [NO_SUPPLIER_DELIVERY, 'SUPPLIER_NOT_ON_PORTAL', 'no_supplier', ['edit_payment']],
+        [SWITCH_OFF_DELIVERY, 'PORTAL_NOT_LIVE', 'portal_switch_off', []],
+        [{ ...SWITCH_OFF_DELIVERY, reason: 'portal_unavailable' }, 'PORTAL_NOT_LIVE', 'portal_unavailable', []],
+        [{ ...SWITCH_OFF_DELIVERY, reason: 'portal_url_unset', portalBase: null }, 'PORTAL_NOT_LIVE', 'portal_url_unset', []],
+    ];
+    for (const [delivery, code, reason, next] of cases) {
+        const store = memoryStore({ delivery });
+        const front = [];
+        const r = await send(store, frontOk(front), await requestFor(store));
+        assert.deepEqual([r.status, r.body.code, r.body.reason, r.body.allowedNext], [409, code, reason, next], reason);
+        assert.match(r.body.error, reason === 'no_supplier' ? /^No supplier record is named exactly "Acme Medical Co\., Ltd"/ : /^A payment is sent to a supplier as a link to the supplier portal only, never with the proof attached\./, reason);
+        assert.equal(front.length, 0, reason);
+        assert.equal(store.rows.length, 0, reason);
+        // Nobody is approved on the portal for an email that does not go.
+        assert.equal(store.calls.includes('preapprove'), false, reason);
+    }
 });
 
-// The ready dates are entered on the portal, never asked for by reply (the
-// user, 2026-11-17): the way there goes out with an attached proof too.
-test('an attached deposit still sends the supplier to the portal for the ready dates, and approves nobody', async () => {
-    const store = memoryStore({ delivery: SWITCH_OFF_DELIVERY });
-    const front = [];
-    const r = await send(store, frontOk(front), await requestFor(store));
-    assert.equal(r.status, 200);
-    const html = front[0].html;
-    assert.ok(html.includes(`href="${PORTAL}/orders/101"`));
-    assert.ok(html.includes('Enter ready dates: PO_001J'));
-    assert.ok(html.includes('of each item on the order\'s page of our supplier portal'));
-    // Nobody was approved by this email: an address new to the portal registers and waits.
-    assert.equal(store.calls.includes('preapprove'), false);
-    assert.ok(html.includes(`${PORTAL}/register`));
-    assert.ok(html.includes('our team will approve your access'));
-    assert.equal(html.includes('There is no approval to wait for'), false);
-    // The proof is on the email, not on the portal: nothing links to the payment there.
-    assert.equal(/payments\?payment=/.test(html), false);
-    assert.ok(html.includes('The <strong>proof of payment</strong> is attached to this email: proof.pdf'));
-    assert.deepEqual(front[0].attachments.map(a => a.filename), ['proof.pdf']);
-    assert.ok(html.includes('https://api.example/api/v1/confirm-receipt/tok-1'));
-    // The ready dates come before the confirm button, under the wording.
-    assert.ok(html.indexOf(`${PORTAL}/orders/101`) < html.indexOf('confirm-receipt/tok-1'));
-});
-
-test('an attached balance, and a deposit nobody on the portal can open the orders of, say nothing of the portal', async () => {
-    const balance = memoryStore({ delivery: SWITCH_OFF_DELIVERY, source: sourceOf([depositLine(), balanceLine()]) });
-    const front = [];
-    assert.equal((await send(balance, frontOk(front), await requestFor(balance, 'balance'), 'balance')).status, 200);
-    assert.equal(balance.rows[0].noticeKind, 'balance');
-    assert.equal(/\/orders\/|\/register|portal\.example/.test(front[0].html), false);
-    // No supplier of exactly that name: no order to send them to.
-    const unmatched = memoryStore({ delivery: ATTACHED_DELIVERY });
-    assert.equal((await send(unmatched, frontOk(front), await requestFor(unmatched))).status, 200);
-    assert.equal(/\/orders\/|\/register|portal\.example/.test(front[1].html), false);
-});
-
-test('a blank subject or body falls back to the stored template for that notice and delivery', async () => {
+test('a blank subject or body falls back to the stored template for that notice', async () => {
     const store = memoryStore();
     const front = [];
     await send(store, frontOk(front), await requestFor(store, 'deposit', { subject: '  ', body: '' }));
     assert.ok(store.calls.includes('template:payment_proof_deposit_portal'));
     assert.equal(front[0].subject, 'Stored subject 1,000.00');
     assert.ok(front[0].html.includes('<p>stored PO_001J</p>'));
+    const mixed = memoryStore({ source: sourceOf([depositLine(), balanceLine()]) });
+    await send(mixed, frontOk([]), await requestFor(mixed, 'balance', { subject: '', body: '<p>x</p>' }), 'balance');
+    assert.deepEqual(mixed.calls.filter(c => c.startsWith('template:')), ['template:payment_proof_balance_portal']);
 });
 
 // ── It is refused before anything is written ──────────────────────────────
@@ -290,36 +262,48 @@ test('the payment was edited after the dialog opened: 409 PAYMENT_CHANGED, nothi
     assert.equal(store.rows.length, 0);
 });
 
-test('the way it goes out changed since the dialog opened: 409 DELIVERY_CHANGED, nothing sent', async () => {
+test('a dialog that still asks for "proof attached" is told it goes as a link now: 409 DELIVERY_CHANGED, nothing sent', async () => {
+    const store = memoryStore();
+    const front = [];
+    const r = await send(store, frontOk(front), await requestFor(store, 'deposit', { delivery: 'attached' }));
+    assert.deepEqual([r.status, r.body.code, r.body.delivery, r.body.reason, r.body.allowedNext], [409, 'DELIVERY_CHANGED', 'portal', null, ['portal']]);
+    assert.equal(front.length, 0);
+    assert.equal(store.rows.length, 0);
+    // Where the portal cannot show it either, that is what it is told: there is no attached way to fall back to.
+    const none = memoryStore({ delivery: NO_SUPPLIER_DELIVERY });
+    assert.equal((await send(none, frontOk(front), await requestFor(none, 'deposit', { delivery: 'attached' }))).body.code, 'SUPPLIER_NOT_ON_PORTAL');
+});
+
+test('the portal stopped being able to show it since the dialog opened: refused, nothing sent', async () => {
     const store = memoryStore();
     const body = await requestFor(store);
-    store.delivery = ATTACHED_DELIVERY;
-    const r = await send(store, frontOk([]), body);
-    assert.deepEqual([r.status, r.body.code, r.body.delivery, r.body.reason, r.body.allowedNext], [409, 'DELIVERY_CHANGED', 'attached', 'no_supplier', ['attached']]);
+    store.delivery = NO_SUPPLIER_DELIVERY;
+    const front = [];
+    const r = await send(store, frontOk(front), body);
+    assert.deepEqual([r.status, r.body.code, r.body.reason], [409, 'SUPPLIER_NOT_ON_PORTAL', 'no_supplier']);
+    assert.equal(front.length, 0);
     assert.equal(store.rows.length, 0);
 });
 
-test('attached, but the proofs cannot ride on an email: refused before anything is written', async () => {
-    const big = [proofDoc({ fileSize: 9 * 1024 * 1024 }), proofDoc({ id: 78, filename: 'b.pdf', fileSize: 9 * 1024 * 1024 })];
-    const store = memoryStore({ delivery: ATTACHED_DELIVERY, source: sourceOf([depositLine()], { documents: big }) });
-    const r = await send(store, frontOk([]), await requestFor(store));
-    assert.deepEqual([r.status, r.body.code], [409, 'PROOFS_NOT_ATTACHABLE']);
-    assert.equal(store.rows.length, 0);
-    // The same proofs are fine as a link.
-    const portal = memoryStore({ source: sourceOf([depositLine()], { documents: big }) });
-    assert.equal((await send(portal, frontOk([]), await requestFor(portal))).status, 200);
+test('proofs of any size and number go as a link: none is read, none rides on the email', async () => {
+    const big = [1, 2, 3, 4, 5, 6, 7].map(id => proofDoc({ id, filename: `p${id}.zip`, contentType: 'application/zip', fileSize: 9 * 1024 * 1024 }));
+    const store = memoryStore({ source: sourceOf([depositLine()], { documents: big }) });
+    const front = [];
+    assert.equal((await send(store, frontOk(front), await requestFor(store))).status, 200);
+    assert.equal(front[0].attachments, undefined);
+    assert.deepEqual(Object.keys(front[0]).sort(), ['html', 'subject', 'to']);
 });
 
 // ── It fails after the row is written, before Front ───────────────────────
 
-test('pre-approval finds no such supplier or no portal: the send fails, 409 DELIVERY_CHANGED, Front is not called', async () => {
-    for (const [status, reason] of [['no_supplier', 'no_supplier'], ['unavailable', 'portal_unavailable']]) {
+test('pre-approval finds no such supplier or no portal after all: the send fails and says why, Front is not called, nothing is attached instead', async () => {
+    for (const [status, code, reason] of [['no_supplier', 'SUPPLIER_NOT_ON_PORTAL', 'no_supplier'], ['unavailable', 'PORTAL_NOT_LIVE', 'portal_unavailable']]) {
         const store = memoryStore({ portalAccess: { status, suppliers: [], poSupplierMatched: false, users: [] } });
         const front = [];
         const r = await send(store, frontOk(front), await requestFor(store));
-        assert.deepEqual([r.status, r.body.code, r.body.delivery, r.body.reason], [409, 'DELIVERY_CHANGED', 'attached', reason], status);
+        assert.deepEqual([r.status, r.body.code, r.body.reason], [409, code, reason], status);
         assert.equal(front.length, 0);
-        assert.deepEqual(store.rows.map(x => x.status), ['failed']);
+        assert.deepEqual(store.rows.map(x => [x.status, x.sendError]), [['failed', `no portal delivery: ${reason}`]]);
     }
 });
 
@@ -339,26 +323,6 @@ test('pre-approval failing for another reason does not stop the email: it goes w
     assert.deepEqual(b.body.portalAccess.users, [{ email: 'li@acme.example', outcome: 'blocked', suppliersAdded: 0 }]);
 });
 
-test('a proof that cannot be read stops an attached send: failed, the receipt taken back, Front not called', async () => {
-    const store = memoryStore({ delivery: ATTACHED_DELIVERY, unreadable: true });
-    const front = [];
-    const r = await send(store, frontOk(front), await requestFor(store));
-    assert.deepEqual([r.status, r.body.code], [502, 'SEND_FAILED']);
-    assert.equal(front.length, 0);
-    assert.deepEqual(store.rows.map(x => x.status), ['failed']);
-    assert.ok(store.calls.includes('discard:tok-1'));
-});
-
-test('no receipt can be minted for an attached send: failed before anything is read or sent', async () => {
-    const store = memoryStore({ delivery: ATTACHED_DELIVERY, receiptThrows: true });
-    const front = [];
-    const r = await send(store, frontOk(front), await requestFor(store));
-    assert.deepEqual([r.status, r.body.code], [502, 'SEND_FAILED']);
-    assert.equal(front.length, 0);
-    assert.equal(store.calls.some(c => c.startsWith('read:')), false);
-    assert.deepEqual(store.rows.map(x => x.status), ['failed']);
-});
-
 test('too little of the deadline left: Front is not called at all', async () => {
     const store = memoryStore();
     let t = NOW.getTime();
@@ -373,13 +337,13 @@ test('too little of the deadline left: Front is not called at all', async () => 
 
 // ── Front's answer ────────────────────────────────────────────────────────
 
-test('Front refuses: failed, 502, and the attached receipt is taken back', async () => {
-    const store = memoryStore({ delivery: ATTACHED_DELIVERY });
+test('Front refuses: failed, 502, and nothing more is done', async () => {
+    const store = memoryStore();
     const r = await send(store, async () => ({ ok: false, reason: 'front_error', status: 422, detail: 'bad' }), await requestFor(store));
     assert.deepEqual([r.status, r.body.code, r.body.frontStatus], [502, 'FRONT_REFUSED', 422]);
     assert.deepEqual(store.rows.map(x => [x.status, x.sendError]), [['failed', 'front_error: 422']]);
-    assert.ok(store.calls.includes('discard:tok-1'));
     assert.equal(store.calls.includes('finalise'), false);
+    assert.equal(store.calls.includes('logReceipt'), false);
     // Front not configured here is a definite "not sent" too.
     const nc = memoryStore();
     const n = await send(nc, async () => ({ ok: false, reason: 'front_not_configured' }), await requestFor(nc));
@@ -387,14 +351,14 @@ test('Front refuses: failed, 502, and the attached receipt is taken back', async
 });
 
 test('Front does not answer: the outcome is unknown, said plainly, and never tried again by itself', async () => {
-    const store = memoryStore({ delivery: ATTACHED_DELIVERY });
+    const store = memoryStore();
     let calls = 0;
     const r = await send(store, async () => { calls += 1; return { ok: false, reason: 'network_error', detail: 'aborted' }; }, await requestFor(store));
     assert.deepEqual([r.status, r.body.code, r.body.allowedNext], [502, 'SEND_OUTCOME_UNKNOWN', ['resolve_sent', 'resolve_not_sent']]);
     assert.equal(calls, 1);
     assert.deepEqual(store.rows.map(x => x.status), ['unknown']);
-    // It may have gone: its receipt is kept, for whoever says it did.
-    assert.equal(store.calls.some(c => c.startsWith('discard:')), false);
+    // It may have gone: its place on the Email Receipts page waits for whoever says it did.
+    assert.equal(store.calls.includes('logReceipt'), false);
     assert.equal(r.body.send.id, store.rows[0].id);
     // Front throwing is the same as Front not answering.
     const thrown = memoryStore();
@@ -502,14 +466,30 @@ test('an unknown send: "it went" finalises it as sent, with who said so; "it did
     assert.deepEqual([(await resolve(store, id, 'not_sent')).body.code], ['NOT_UNKNOWN']);
     assert.equal(store.rows[0].status, 'sent');
 
-    const other = memoryStore({ delivery: ATTACHED_DELIVERY });
+    const other = memoryStore();
     await send(other, async () => ({ ok: false, reason: 'network_error' }), await requestFor(other));
     const not = await resolve(other, other.rows[0].id, 'not_sent');
     assert.deepEqual([not.status, not.body.send.status, other.rows[0].sendError], [200, 'failed', 'resolved: not sent']);
-    // The receipt minted for an email that never went is taken back.
-    assert.ok(other.calls.includes('discard:tok-1'));
+    // Nothing was minted for it, so there is nothing to take back, and no receipt is logged for an email that did not go.
+    assert.equal(other.calls.some(c => c.startsWith('discard:')), false);
+    assert.equal(other.calls.includes('logReceipt'), false);
     // And now it can be sent again.
     assert.equal((await send(other, frontOk([]), await requestFor(other, 'deposit', { sendKey: 'fresh-send-key' }))).status, 200);
+});
+
+test('a send from before 2026-11-17 that went out with the proof attached can still be resolved: its receipt is taken back, or kept', async () => {
+    const old = over => ({ id: 90, paymentId: 45, noticeKind: 'deposit', delivery: 'attached', supplierName: SUPPLIER, sendKey: 'k-old-attached', requestHash: 'x', status: 'unknown', deadlineAt: '2026-11-16T11:00:00.000Z', sentTo: ['li@acme.example'], receiptToken: 'tok-old', ...over });
+    const store = memoryStore();
+    store.rows.push(old());
+    const not = await resolve(store, 90, 'not_sent');
+    assert.deepEqual([not.status, not.body.send.status, not.body.send.delivery], [200, 'failed', 'attached']);
+    assert.ok(store.calls.includes('discard:tok-old'));
+    // "It went": the receipt it was sent with stands; no portal receipt is logged for an attached email.
+    const went = memoryStore();
+    went.rows.push(old());
+    assert.equal((await resolve(went, 90, 'sent')).body.send.status, 'sent');
+    assert.equal(went.calls.includes('logReceipt'), false);
+    assert.equal(went.calls.some(c => c.startsWith('discard:')), false);
 });
 
 test('only an unknown send can be resolved: not one still going, one that went, or one that failed', async () => {
@@ -562,26 +542,32 @@ test('the preview: figures, each notice with its wording to start from, its stat
     assert.deepEqual(p.notices[1].readyDates, []);
     assert.deepEqual(p.notices[0].sends.map(s => [s.id, s.status, s.sentTo, s.sentByEmail]), [[5, 'sent', ['li@acme.example'], 'ops@jfa.example']]);
     assert.deepEqual(p.notices[1].sends, []);
-    // Attached: other wording, no link, and the reason said.
-    const a = await S.previewOf(source, ATTACHED_DELIVERY, [], NOW);
-    assert.deepEqual(a.delivery, { delivery: 'attached', reason: 'no_supplier', portalSupplier: false });
-    assert.deepEqual(a.notices.map(n => [n.templateKey, n.portalUrl, n.readyDates]), [['payment_proof_deposit_attached', null, []], ['payment_proof_balance_attached', null, []]]);
+    // What each part asks for, with a button in its email: a deposit's orders, a balance's containers.
+    assert.deepEqual(p.notices.map(n => n.telex), [[], ['333']]);
+    // Nobody of that name on the portal: it cannot be sent, and says what to fix. There is no attached way.
+    const a = await S.previewOf(source, NO_SUPPLIER_DELIVERY, [], NOW);
+    assert.deepEqual(a.delivery, { delivery: null, reason: 'no_supplier', portalSupplier: false });
+    assert.deepEqual([a.sendable, a.blocked.status, a.blocked.code, a.blocked.reason, a.blocked.allowedNext], [false, 409, 'SUPPLIER_NOT_ON_PORTAL', 'no_supplier', ['edit_payment']]);
+    assert.deepEqual(a.notices.map(n => [n.templateKey, n.portalUrl, n.readyDates]), [['payment_proof_deposit_portal', null, []], ['payment_proof_balance_portal', null, []]]);
     assert.notEqual(a.previewToken, p.previewToken);
-    // Attached while the supplier is on the portal: no link to the payment, but the deposit's orders are still linked for their ready dates.
+    // The Payments page not switched on for this stage: nothing can be sent from here yet, whoever the supplier is.
     const off = await S.previewOf(source, SWITCH_OFF_DELIVERY, [], NOW);
-    assert.deepEqual(off.delivery, { delivery: 'attached', reason: 'portal_switch_off', portalSupplier: true });
-    assert.deepEqual(off.notices.map(n => [n.templateKey, n.portalUrl, n.readyDates]), [
-        ['payment_proof_deposit_attached', null, [{ poNumber: 'PO_001J', url: `${PORTAL}/orders/101` }]],
-        ['payment_proof_balance_attached', null, []],
-    ]);
+    assert.deepEqual(off.delivery, { delivery: null, reason: 'portal_switch_off', portalSupplier: true });
+    assert.deepEqual([off.sendable, off.blocked.code, off.blocked.reason, off.blocked.allowedNext], [false, 'PORTAL_NOT_LIVE', 'portal_switch_off', []]);
+    assert.deepEqual(off.notices.map(n => n.templateKey), ['payment_proof_deposit_portal', 'payment_proof_balance_portal']);
 });
 
-test('the preview of a transfer that cannot be sent says why, and of an attached one whose proofs cannot be attached', async () => {
+test('the preview of a transfer that cannot be sent says why: what is wrong with the payment first, then with the portal', async () => {
     const none = await S.previewOf(sourceOf([depositLine()], { documents: [] }), PORTAL_DELIVERY, [], NOW);
     assert.deepEqual([none.sendable, none.blocked.code, none.blocked.allowedNext], [false, 'NO_PROOF', ['attach_proof']]);
-    const big = [proofDoc({ fileSize: 16 * 1024 * 1024 })];
-    const a = await S.previewOf(sourceOf([depositLine()], { documents: big }), ATTACHED_DELIVERY, [], NOW);
-    assert.deepEqual([a.sendable, a.blocked.code], [false, 'PROOFS_NOT_ATTACHABLE']);
+    // Both wrong: the payment's own fault is the one the sender can act on now.
+    const both = await S.previewOf(sourceOf([depositLine()], { documents: [] }), SWITCH_OFF_DELIVERY, [], NOW);
+    assert.equal(both.blocked.code, 'NO_PROOF');
+    // A forwarder's payment is never told to "match the supplier record": it is not a supplier's at all.
+    const forwarder = sourceOf([{ id: 3, kind: 'extra', targetId: 5, amount: 900, paidWith: null, target: target({ ridesWith: 'shipment', extraKind: 'freight', extraSupplier: 'DCG' }) }]);
+    assert.equal((await S.previewOf(forwarder, NO_SUPPLIER_DELIVERY, [], NOW)).blocked.code, 'NOT_A_SUPPLIER_PAYMENT');
+    // Proofs too large or too many to attach are no obstacle: nothing is attached.
+    const big = [proofDoc({ fileSize: 16 * 1024 * 1024 }), ...[2, 3, 4, 5, 6].map(id => proofDoc({ id }))];
     assert.equal((await S.previewOf(sourceOf([depositLine()], { documents: big }), PORTAL_DELIVERY, [], NOW)).sendable, true);
 });
 
@@ -613,7 +599,6 @@ function scripted(answers = []) {
 const storeOn = (conn, over = {}) => S.createStore({
     withConnection: fn => fn(conn),
     lockSupplierPaymentTargets: async (c, args) => { conn.log.push({ sql: 'LOCK', params: args }); return { paymentLive: over.paymentLive ?? true }; },
-    readObject: async () => Buffer.from('x'),
     getEmailTemplate: async () => ({ subject: 's', bodyHtml: 'b' }),
     recordAudit: async (c, a) => { conn.log.push({ sql: 'AUDIT', params: a }); },
     preapprove: async () => ({ status: 'ok', suppliers: [], poSupplierMatched: true, users: [] }),
@@ -865,7 +850,7 @@ test('delivery from the database: the supplier matched exactly, the portal\'s ow
     assert.match(conn.log[0].sql, /FROM suppliers s WHERE s\.deleted_at IS NULL AND CONVERT\(s\.name USING utf8mb4\) COLLATE utf8mb4_0900_bin = CONVERT\(\? USING utf8mb4\) COLLATE utf8mb4_0900_bin ORDER BY s\.id$/);
     assert.deepEqual(conn.log[0].params, [SUPPLIER]);
     assert.equal(conn.log[1].sql, 'SELECT 1 AS ok FROM `jportal`.payment_views LIMIT 1');
-    // No supplier of that name, the switch off, no portal table, no address: attached, each with its reason and no link.
+    // No supplier of that name, the switch off, no portal table, no address: it cannot go, each with its reason and no link.
     const reasons = [];
     reasons.push((await S.resolveNoticeDelivery(scripted(), pay, env)).reason);
     reasons.push((await S.resolveNoticeDelivery(withSupplier(), pay, { ...env, PAYMENT_PROOF_PORTAL: 'off' })).reason);
@@ -873,13 +858,12 @@ test('delivery from the database: the supplier matched exactly, the portal\'s ow
     reasons.push((await S.resolveNoticeDelivery(withSupplier(), pay, { PAYMENT_PROOF_PORTAL: 'on' })).reason);
     assert.deepEqual(reasons, ['no_supplier', 'portal_switch_off', 'portal_unavailable', 'portal_url_unset']);
     const off = await S.resolveNoticeDelivery(withSupplier(), pay, { ...env, PAYMENT_PROOF_PORTAL: 'off' });
-    assert.deepEqual([off.delivery, off.portalUrl, off.registerUrl, off.suppliers.length], ['attached', null, null, 2]);
-    // Attached or not, it still says where the portal is and who is on it: a deposit's
-    // ready dates are entered there whichever way the proof goes.
+    assert.deepEqual([off.delivery, off.portalUrl, off.registerUrl, off.suppliers.length], [null, null, null, 2]);
+    // It still says where the portal is and who is on it.
     assert.equal(off.portalBase, PORTAL);
     assert.deepEqual(N.readyDatesFor({ readyDatePos: [{ id: 101, poNumber: 'PO_001J' }] }, off), [{ poNumber: 'PO_001J', url: `${PORTAL}/orders/101` }]);
     const noTable = await S.resolveNoticeDelivery(scripted([[/FROM suppliers s WHERE/, [[{ id: 1, name: SUPPLIER }]]], [/payment_views/, Object.assign(new Error('no table'), { errno: 1146 })]]), pay, env);
-    assert.deepEqual([noTable.delivery, noTable.portalBase, noTable.suppliers], ['attached', PORTAL, [{ id: 1, name: SUPPLIER }]]);
+    assert.deepEqual([noTable.delivery, noTable.portalBase, noTable.suppliers], [null, PORTAL, [{ id: 1, name: SUPPLIER }]]);
     // Nobody of that name on the portal: no order of theirs can be opened there.
     assert.deepEqual(N.readyDatesFor({ readyDatePos: [{ id: 101, poNumber: 'PO_001J' }] }, await S.resolveNoticeDelivery(scripted(), pay, env)), []);
     // The portal's table failing for any other reason is a fault, not "no portal".

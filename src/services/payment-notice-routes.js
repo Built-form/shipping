@@ -2,7 +2,8 @@
 
 // "Send to supplier" on a recorded payment (docs/payment-proof-send.md):
 //   GET  /api/v1/supplier-payments/:id/notices
-//        what the send dialog shows: how the payment goes out and why, its
+//        what the send dialog shows: whether the payment can go out (as a
+//        link to the supplier portal, the only way) and why not, its
 //        proofs, and each part of it (deposit / balance) with the wording to
 //        start from, its state and its sends. Any signed-in user.
 //   POST /api/v1/supplier-payments/:id/notices/:kind/email
@@ -20,7 +21,6 @@
 //
 // Registered from orders.js; authed through the greedy /api/v1/{proxy+} route.
 
-const { GetObjectCommand } = require('@aws-sdk/client-s3');
 const N = require('../lib/payment-notices');
 const S = require('./payment-notices');
 const { sendFrontMessage } = require('./front-send');
@@ -33,17 +33,12 @@ const NOT_MIGRATED = {
 };
 
 function registerPaymentNoticeRoutes(app, deps) {
-    const { withConnection, ready, s3, bucket, lockSupplierPaymentTargets, getEmailTemplate, recordAudit, log } = deps;
+    const { withConnection, ready, lockSupplierPaymentTargets, getEmailTemplate, recordAudit, log } = deps;
     const sendFront = deps.sendFront || sendFrontMessage;
 
-    const store = S.createStore({
-        withConnection, lockSupplierPaymentTargets, getEmailTemplate, recordAudit,
-        // A proof's bytes, for an attached send: the same bucket the upload wrote to.
-        readObject: async key => {
-            const obj = await s3.send(new GetObjectCommand({ Bucket: bucket(), Key: key }));
-            return Buffer.from(await obj.Body.transformToByteArray());
-        },
-    });
+    // No file is read here: a payment goes out as a link to the portal, never with its
+    // proof attached (the user, 2026-11-17).
+    const store = S.createStore({ withConnection, lockSupplierPaymentTargets, getEmailTemplate, recordAudit });
 
     const handle = (site, fn) => async (req, res) => {
         try {

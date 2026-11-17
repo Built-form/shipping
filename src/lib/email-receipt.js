@@ -592,8 +592,9 @@ function portalSyncSteps(jp) {
              WHERE ${PENDING_PORTAL} AND r.send_table = '${JFPRO_AUDIT}' AND r.email_type = 'quote_request'
                AND q.answered_at IS NOT NULL`],
         // A payment sent as a portal link (docs/payment-proof-send.md): a
-        // supplier's user opened that payment on the portal after the email
-        // (the portal's own payment_views; opening a proof records one too).
+        // supplier's user opened that payment's proof on the portal after the
+        // email (the portal's own payment_views, written for a proof opened
+        // and for nothing else: arriving from the email's link is not one).
         ['payment_viewed', `
             UPDATE email_receipts r
               JOIN supplier_payment_sends s ON s.id = r.send_id

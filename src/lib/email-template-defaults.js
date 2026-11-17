@@ -395,13 +395,14 @@ DEFAULT_EMAIL_TEMPLATES.push(REQUEST_TO_SEND_UPDATE_PORTAL_TEMPLATE);
 
 // "Send to supplier" on a recorded payment (docs/payment-proof-send.md; seeded
 // by 2026-11-16_30_seed_payment_proof_templates.js). A transfer is told as a
-// deposit email and/or a balance email, and each goes out either as a link to
-// the supplier portal's Payments page or, where the supplier is not on the
-// portal, with the proof attached: four wordings, because what an email asks
-// for and whether it says "attached" depend on both. The sender appends a
-// fixed block under the body (the button to the portal and how to register;
-// or the names of the attached files; and on a deposit, either way, the way to
-// each order's ready dates on the portal). The figures are tokens the send fills in from the payment itself:
+// deposit email and/or a balance email, and each goes out as a link to the
+// supplier portal's Payments page, never with the proof attached (the user,
+// 2026-11-17): two wordings. The wording says what was paid and points below
+// it; the sender appends the rest under the body, so nothing is said twice:
+// the button to the payment on the portal and how to register, and then what
+// the payment asks for with the way to it (a deposit: each order's ready
+// dates; a balance: the telex release of each container, uploaded on the
+// payment's row). The figures are tokens the send fills in from the payment itself:
 // {amount} {currency} {paidOn} and {paidFor} (the PO numbers or container
 // numbers the supplier may be told, or a dash).
 const PAYMENT_PROOF_WRAP = body => [
@@ -429,18 +430,24 @@ const paymentProofBody = (kind, [en, zh]) => {
     const [hi, saidEn, nihao, saidZh] = PAYMENT_PROOF_SAID[kind];
     return PAYMENT_PROOF_WRAP([hi, saidEn, `<p>${en}</p>`, nihao, saidZh, `<p>${zh}</p>`]);
 };
+// The one sentence after what was paid, in English and Chinese: where the proof is and what
+// we ask for are said by the blocks the send appends, once, with their buttons.
+const PAYMENT_PROOF_SEE_BELOW = [
+    'The proof of payment, and anything we need from you for it, is below.',
+    '付款凭证及需要您配合办理的事项，请见下方。',
+];
 const PAYMENT_PROOF_TEMPLATES = [
     {
         key: 'payment_proof_deposit_portal',
-        name: 'Deposit paid (supplier portal)',
+        name: 'Deposit paid',
         category: 'Payment proof',
-        description: 'Emailed to a supplier when a deposit has been paid: no attachment, the proof of payment is on the supplier portal. A button to the portal, registration instructions and a button to each order\'s ready dates are appended automatically. Used when the supplier is on the portal. Tokens: {amount} {currency} {paidOn} {paidFor}.',
+        description: 'Emailed to a supplier when a deposit has been paid. Nothing is attached: a button to the payment on the supplier portal (where its proof is), registration instructions and a button to each order\'s ready dates are appended automatically. Tokens: {amount} {currency} {paidOn} {paidFor}.',
         subject: 'Deposit paid – {currency} {amount} – {paidFor} / 定金已付',
-        bodyHtml: paymentProofBody('deposit', [
-            'The proof of payment is on our supplier portal, with what the payment covers. It is not attached to this email. Please confirm you have received the payment, and enter the estimated ready date of each item on the order\'s page of the portal.',
-            '付款凭证及付款明细已发布在我们的供应商门户，本邮件不附带该文件。请确认收款，并在门户的订单页面填写各产品的预计完成日期。',
-        ]),
+        bodyHtml: paymentProofBody('deposit', PAYMENT_PROOF_SEE_BELOW),
     },
+    // RETIRED (2026-11-17_30_payment_proof_portal_only.js): a proof is no longer sent
+    // attached. Kept here, unchanged, only because the migrations that seeded and reworded
+    // it (2026-11-16_30, 2026-11-17_10) read it from this list. Nothing sends it.
     {
         key: 'payment_proof_deposit_attached',
         name: 'Deposit paid (proof attached)',
@@ -456,15 +463,13 @@ const PAYMENT_PROOF_TEMPLATES = [
     },
     {
         key: 'payment_proof_balance_portal',
-        name: 'Balance paid (supplier portal)',
+        name: 'Balance paid',
         category: 'Payment proof',
-        description: 'Emailed to a supplier when a balance (and any QC units paid with it) has been paid: no attachment, the proof of payment is on the supplier portal. A button to the portal and registration instructions are appended automatically. Used when the supplier is on the portal. Tokens: {amount} {currency} {paidOn} {paidFor}.',
+        description: 'Emailed to a supplier when a balance (and any QC units paid with it) has been paid. Nothing is attached: a button to the payment on the supplier portal (where its proof is), registration instructions and, where it paid for containers, a button to upload their telex release are appended automatically. Tokens: {amount} {currency} {paidOn} {paidFor}.',
         subject: 'Balance paid – {currency} {amount} – {paidFor} / 尾款已付',
-        bodyHtml: paymentProofBody('balance', [
-            'The proof of payment is on our supplier portal, with what the payment covers. It is not attached to this email. Please arrange the telex release and send us the telex-released bill of lading.',
-            '付款凭证及付款明细已发布在我们的供应商门户，本邮件不附带该文件。请安排电放，并将电放提单发给我们。',
-        ]),
+        bodyHtml: paymentProofBody('balance', PAYMENT_PROOF_SEE_BELOW),
     },
+    // RETIRED, as the deposit's above.
     {
         key: 'payment_proof_balance_attached',
         name: 'Balance paid (proof attached)',
