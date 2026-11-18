@@ -477,7 +477,39 @@ const FREIGHT_TEMPLATES = [
 // the seed has run.
 DEFAULT_EMAIL_TEMPLATES.push(...FREIGHT_TEMPLATES);
 
+// "We are waiting for ready dates" (src/services/ready-date-reminders.js,
+// docs/ready-date-reminders.md; seeded by
+// 2026-11-18_20_seed_ready_date_reminder_template.js). Sent by the system, not
+// from a send dialog: every working day, one email per supplier, while they
+// owe us a ready date. The sender appends a fixed block under this body, with
+// a section for each reason that applies: the items that need an ESTIMATED
+// ready date (final artwork confirmed over a week ago), and the items whose
+// estimated date has passed and need the ACTUAL one; each by purchase order,
+// then the button to the supplier portal. So the wording here names neither.
+// {supplier} {poNumbers} (comma separated) and {count} (the number of items)
+// are HTML-escaped by the sender.
+const READY_DATE_REMINDER_TEMPLATE_KEY = 'ready_date_reminder';
+const READY_DATE_REMINDER_TEMPLATE = {
+    key: READY_DATE_REMINDER_TEMPLATE_KEY,
+    name: 'Ready date reminder',
+    category: 'Supplier portal',
+    description: 'Sent automatically to a supplier every working day while a ready date is missing: the estimated ready date, from a week after the final artwork was confirmed (and once the deposit is paid or not required); and the actual ready date, once the estimated date has passed. One email per supplier covers all of their purchase orders. The items that need each date, by purchase order, and a button to the supplier portal are appended automatically. Tokens: {supplier} {poNumbers} {count}.',
+    subject: 'Ready dates needed – {poNumbers} / 请填写完成日期',
+    bodyHtml: [
+        '<div style="font-family:Helvetica,Arial,sans-serif;font-size:14px;color:#222;line-height:1.5;">',
+        '<p>Greetings,</p>',
+        '<p>We are waiting for <strong>ready dates</strong> for the items listed below. Please sign in to our supplier portal and enter them, so we can plan inspection and shipping.</p>',
+        '<p>您好，</p>',
+        '<p>我们正在等待以下产品的<strong>完成日期</strong>。请登录我们的供应商门户填写，以便我们安排验货和发运。</p>',
+        '<p>Thank you. / 谢谢。</p>',
+        '<p>Kind regards, / 此致敬礼<br>Operations Team.<br>JFA Medical Ltd.</p>',
+        '</div>',
+    ].join(''),
+};
+DEFAULT_EMAIL_TEMPLATES.push(READY_DATE_REMINDER_TEMPLATE);
+
 module.exports = {
+    READY_DATE_REMINDER_TEMPLATE_KEY, READY_DATE_REMINDER_TEMPLATE,
     FREIGHT_TEMPLATES, FREIGHT_QUOTE_REQUEST_TEMPLATE_KEY, FREIGHT_BOOKING_REQUEST_TEMPLATE_KEY,
     FREIGHT_BOOKING_CONTENTS_TEMPLATE_KEY, FREIGHT_MOVEMENT_REQUEST_TEMPLATE_KEY,
     DEFAULT_EMAIL_TEMPLATES, SUPPLIER_PI_TEMPLATE_KEYS, QC_VISIT_TEMPLATE_KEYS, PO_PORTAL_TEMPLATE_KEY,

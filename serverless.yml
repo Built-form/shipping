@@ -774,6 +774,25 @@ functions:
           rate: rate(6 hours)
           enabled: ${self:custom.schedulesEnabled.${sls:stage}, false}
 
+  # ── Ready-date reminders ──
+  # Emails a supplier a link to the supplier portal every working day while
+  # they owe us a ready date: the estimated date, from a week after staff
+  # confirm a PO line's final artwork and once the PO's deposit is paid or not
+  # required; the actual date, once the estimated one has passed. One email per
+  # supplier, covering all of their POs (docs/ready-date-reminders.md).
+  # Monday to Friday at 01:00 UTC (09:00 in China, the start of the supplier's
+  # day), never at a weekend; the code refuses a weekend too. A supplier is
+  # emailed at most once in 20 hours, so a manual invoke cannot double up.
+  # Needs SUPPLIER_PORTAL_URL for the link.
+  sendReadyDateReminders:
+    handler: src/handlers/send-ready-date-reminders.handler
+    timeout: 300
+    reservedConcurrency: 1
+    events:
+      - schedule:
+          rate: cron(0 1 ? * MON-FRI *)
+          enabled: ${self:custom.schedulesEnabled.${sls:stage}, false}
+
   # ── Nightly live→test S3 mirror ─────────────────────────────────────────────
   # Copies new/changed objects from the live PO-docs bucket into the test bucket
   # and deletes strays, so the S3 keys carried by the nightly DB replica resolve

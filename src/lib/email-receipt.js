@@ -18,7 +18,9 @@
 //   'none'    a notice; nothing is asked: a PI decision, a portal approval.
 // Only an 'email' row, or a 'portal' row with an action_url (the PO, the signed
 // PI, the Request to send), is chased with reminders
-// (src/services/receipt-reminders.js).
+// (src/services/receipt-reminders.js). The ready-date reminders
+// ('ready_date_reminder', a 'portal' row with no action_url) are repeated by
+// their own sweep, every working day (src/services/ready-date-reminders.js).
 //
 // The confirm button's link points at a PUBLIC, no-login endpoint (served by
 // the dedicated emailReceiptApi Lambda, src/handlers/email-receipt.js) keyed by
@@ -39,6 +41,7 @@
 const crypto = require('crypto');
 const log = require('./logger');
 const { jportalSchema, isSourceMissing } = require('./jportal');
+const { confirmReceiptsSql: confirmReadyDateReceiptsSql } = require('./ready-date-reminders');
 
 const CONFIRM_VIA = ['email', 'portal', 'none'];
 
@@ -605,6 +608,10 @@ function portalSyncSteps(jp) {
                             WHERE m.request_id = r.send_id AND m.deleted_at IS NULL AND m.priced_at >= r.created_at)
                AND NOT EXISTS (SELECT 1 FROM freight_stock_movements m
                                 WHERE m.request_id = r.send_id AND m.deleted_at IS NULL AND m.price IS NULL)`],
+        // The ready-date reminders of one supplier
+        // (docs/ready-date-reminders.md): none of the lines they asked about
+        // is waiting for a date any more. Also closes the chase.
+        ['ready_dates_added', confirmReadyDateReceiptsSql()],
     ];
 }
 
@@ -658,7 +665,7 @@ async function syncPortalReceipts(conn, { maxAgeMs = PORTAL_SYNC_MS } = {}) {
     } catch (e) {
         // JPORTAL_DB_SCHEMA is not a plain identifier: nothing can be read.
         log.warn('[email-receipt] portal sync skipped', { error: e.message });
-        return { failed: ['po_viewed', 'signed_pi_viewed', 'request_viewed', 'request_pl_uploaded', 'request_ci_uploaded', 'artwork_ticked', 'file_opened', 'qc_availability_answered', 'qc_schedule_opened', 'quote_answered', 'freight_quote_answered', 'freight_booking_answered', 'freight_movements_priced', ...failed] };
+        return { failed: ['po_viewed', 'signed_pi_viewed', 'request_viewed', 'request_pl_uploaded', 'request_ci_uploaded', 'artwork_ticked', 'file_opened', 'qc_availability_answered', 'qc_schedule_opened', 'quote_answered', 'freight_quote_answered', 'freight_booking_answered', 'freight_movements_priced', 'ready_dates_added', ...failed] };
     }
     for (const [name, sql] of steps) await run(name, () => conn.query(sql));
     return { failed };
