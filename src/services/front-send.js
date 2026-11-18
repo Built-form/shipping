@@ -2,16 +2,21 @@
 
 // Sends one HTML email through Front (/channels/{FRONT_CHANNEL_ID}/messages)
 // and NEVER throws: the caller records the outcome. Used by the
-// supplier-portal PI decision email (src/services/pi-submission-routes.js); the
-// older document-send handlers in orders.js and receipt-reminders.js build
-// their own multipart requests and are left as they are.
+// supplier-portal PI decision email (src/services/pi-submission-routes.js) and
+// the others that followed it; the older document-send handlers in orders.js
+// and receipt-reminders.js build their own multipart requests and are left as
+// they are.
 //
-// `attachments` is optional: [{ bytes, filename, contentType }] (the freight
+// `attachments` is optional: [{ bytes, filename, contentType }], files that ride
+// on the email (a payment's proof, src/services/payment-notices.js; the freight
 // contents email, src/services/freight-quote-routes.js). Without it the email
 // carries none, as before.
 //
 // → { ok: true, frontMessageUid, frontConversationId }
 //   { ok: false, reason: 'no_recipients' | 'front_not_configured' | 'front_error' | 'network_error', status?, detail? }
+// 'front_error' is Front ANSWERING with a refusal: nothing was sent.
+// 'network_error' is no answer at all (a timeout, a dropped connection): the
+// email may or may not have gone.
 
 const log = require('../lib/logger');
 

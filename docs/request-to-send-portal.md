@@ -150,13 +150,14 @@ An upload still waiting for staff is **not** shown on the request, by choice: ty
 - `2026-11-13_12_grant_request_progress_to_jportal.js`: the grants for "done": `draft_container_documents (shipment_id)`, `shipments (id, reference, stage)`, `orders (shipment_id)`, `packing_lists (container_kind, container_number, supplier_name, deleted_at)`, `shipment_payment_documents (shipment_id, supplier_name, doc_kind, deleted_at)`. A file of its own because test had already applied `_11` when they were added, and an applied migration is never run again. Without them the portal's page still lists every request, all as open.
 - `2026-11-13_30_request_to_send_update.sql` and `_31_grant_request_update_to_jportal.js`: `draft_container_document_sends.request_update` (JSON) and its grant. Without the column a send is recorded without it and nothing reads as an update on the portal.
 - `2026-11-13_40_seed_request_to_send_update_template.js`: the `request_to_send_update_portal` template.
+- `2026-11-16_10_grant_request_departure_to_jportal.js`: `shipments (etd, origin_port)` and `orders (supplier, port, estimated_departure_date)` for the portal's login. **The portal's page no longer shows the ETD and port the email gave**: it reads them live from the shipment (that supplier's orders first, then the shipment's row; portal README section 10, "The day and the port"). `request_etd` / `request_port` are still stored on the send and still returned to ShipLine as `sends[].etd` / `.port`: they are what the email said, and the portal falls back to them only on a server where these two grants are not applied yet.
 - The portal's `db/grants/jportal_app.sql` carries the same grants, and the portal's own deploy applies that file.
 - `2026-11-13_20_seed_request_to_send_portal_template.js`: the `request_to_send_portal` template, category `Supplier Quote`. The templates ops wrote for the attached email stay, and are what the dialog offers when a request goes out attached. **A sender who picks an "attached" template for a link says "attached" with nothing attached**: the dialog defaults to the right one and warns.
 
 ## Rollout (test, then prod)
 
 1. **Shipping**: `bash deploy.sh <stage>` (the three migrations, the routes). Nothing changes for senders yet: the old ShipLine sends no `delivery`.
-2. **Portal**: `bash deploy.sh <stage>` in `portal` (creates `supplier_quote_views`, its grants, the `/viewed` route, the Requests to send page). Its page reads `request_etd` / `request_port` / `csv_public_url`, so it must come **after** step 1 and after the grants are on the server.
+2. **Portal**: `bash deploy.sh <stage>` in `portal` (creates `supplier_quote_views`, its grants, the `/viewed` route, the Requests to send page). Its page reads `csv_public_url` and, since 2026-11-16, the shipment's own day and port, so it must come **after** step 1 and after the grants are on the server.
 3. **ShipLine**: deploy as usual. From here requests go out as links.
 
 On test, the database is rebuilt from prod every 3 days: the migrations and grants go with it until prod has them.

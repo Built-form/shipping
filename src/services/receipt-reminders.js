@@ -18,7 +18,7 @@
 //   • the manual "resend" button — POST /api/v1/email-receipts/:id/resend (orders.js).
 const log = require('../lib/logger');
 const {
-    appendReceiptLink, appendPortalLink, confirmViaOf, canRemind, syncPortalReceipts, CHASED_PORTAL_STEPS,
+    appendReceiptLink, appendPortalLink, confirmViaOf, canRemind, syncPortalReceipts, CHASED_PORTAL_STEPS, NEVER_SWEPT_TYPES,
     renderReminderEmailHtml, recordReminderSend, parseRecipients, queryWithRemindersStopped,
 } = require('../lib/email-receipt');
 
@@ -139,6 +139,7 @@ async function runReceiptReminders(pool, opts = {}) {
               WHERE confirmed_at IS NULL
                 AND ${chased}
                 AND sent_to IS NOT NULL
+                AND email_type NOT IN (${NEVER_SWEPT_TYPES.map(t => `'${t}'`).join(', ')})
                 AND reminder_count < ?
                 AND COALESCE(last_reminder_at, created_at) <= (NOW() - INTERVAL ${intervalHours} HOUR)
                 ${stopped ? `AND ${stopped} IS NULL` : ''}

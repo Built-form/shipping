@@ -146,6 +146,7 @@ test('portalSyncSteps: every step touches unconfirmed portal receipts only', () 
     const steps = R.portalSyncSteps('`jportal`');
     assert.deepEqual(steps.map(s => s[0]), [
         'po_viewed', 'signed_pi_viewed', 'request_viewed', 'request_pl_uploaded', 'request_ci_uploaded', 'artwork_ticked', 'file_opened', 'qc_availability_answered', 'qc_schedule_opened', 'quote_answered',
+        'payment_viewed',
         'freight_quote_answered', 'freight_booking_answered', 'freight_movements_priced', 'ready_dates_added',
     ]);
     for (const [name, sql] of steps) {
@@ -174,6 +175,53 @@ test('portalSyncSteps: every step touches unconfirmed portal receipts only', () 
         draft_container_document_sends: 'request_viewed',
     });
     for (const name of Object.values(R.CHASED_PORTAL_STEPS)) assert.ok(step[name], name);
+});
+
+// ── A payment sent to a supplier (docs/payment-proof-send.md) ────────────────
+
+test('a payment email sent as a portal link is confirmed when that payment is opened on the portal after it', () => {
+    const step = Object.fromEntries(R.portalSyncSteps('`jportal`')).payment_viewed;
+    const s = step.replace(/\s+/g, ' ').trim();
+    assert.match(s, /^UPDATE email_receipts r JOIN supplier_payment_sends s ON s\.id = r\.send_id SET r\.confirmed_at = /);
+    assert.match(s, /r\.send_table = 'supplier_payment_sends'/);
+    // The portal's own record of who opened which payment: that payment, after this email.
+    const view = '`jportal`.payment_views v WHERE v.supplier_payment_id = s.supplier_payment_id AND v.last_viewed_at >= r.created_at';
+    assert.equal(s.split(view).length - 1, 2, 'the time it is confirmed at, and whether it is');
+    assert.match(s, /SELECT MIN\(IF\(v\.first_viewed_at >= r\.created_at, v\.first_viewed_at, v\.last_viewed_at\)\)/);
+});
+
+test('payment emails are never swept: no automatic reminder, by either delivery', async () => {
+    assert.deepEqual(R.NEVER_SWEPT_TYPES, ['payment_proof']);
+    const conn = fakeConn(sql => (/COALESCE\(MAX\(send_id\)/.test(sql) ? [[{ last: 0 }]] : [[]]));
+    await runReceiptReminders({ getConnection: async () => conn }, { baseUrl: 'https://api.example.com' });
+    const pick = conn.queries.find(q => /^\s*SELECT id, token, email_type/.test(q.sql));
+    assert.match(pick.sql.replace(/\s+/g, ' '), /AND sent_to IS NOT NULL AND email_type NOT IN \('payment_proof'\) AND reminder_count < \?/);
+    // By its type, so a receipt minted before its send row exists is left alone too.
+    assert.doesNotMatch(pick.sql, /send_table NOT IN \('supplier_payment_sends'\)/);
+    // And it is not one of the chased portal kinds either.
+    assert.equal(Object.keys(R.CHASED_PORTAL_STEPS).includes('supplier_payment_sends'), false);
+    // A view that cannot be read is reported like any other step.
+    const blind = fakeConn((sql) => {
+        if (/payment_views/.test(sql)) throw Object.assign(new Error('no such table'), { errno: 1146 });
+        return /COALESCE\(MAX\(send_id\)/.test(sql) ? [[{ last: 0 }]] : [{ affectedRows: 0 }];
+    });
+    assert.ok((await R.syncPortalReceipts(blind, { maxAgeMs: 0 })).failed.includes('payment_viewed'));
+    // And when the portal's schema cannot be named at all, it is among the steps that did not run.
+    const saved = process.env.JPORTAL_DB_SCHEMA;
+    process.env.JPORTAL_DB_SCHEMA = 'not a schema';
+    try {
+        const none = fakeConn(sql => (/COALESCE\(MAX\(send_id\)/.test(sql) ? [[{ last: 0 }]] : [{ affectedRows: 0 }]));
+        assert.ok((await R.syncPortalReceipts(none, { maxAgeMs: 0 })).failed.includes('payment_viewed'));
+    } finally {
+        if (saved === undefined) delete process.env.JPORTAL_DB_SCHEMA; else process.env.JPORTAL_DB_SCHEMA = saved;
+    }
+});
+
+test('getReceiptForResend: also says which send the email belongs to, for a guard that needs it', async () => {
+    const conn = fakeConn(() => [[{ id: 5, send_table: 'supplier_payment_sends', send_id: 12 }]]);
+    const row = await R.getReceiptForResend(conn, 5);
+    assert.deepEqual([row.send_table, row.send_id], ['supplier_payment_sends', 12]);
+    assert.match(conn.queries[0].sql, /send_table, send_id/);
 });
 
 test('syncPortalReceipts: a missing schema or a failing step is reported, not thrown; and it is throttled', async () => {

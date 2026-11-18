@@ -393,6 +393,97 @@ const REQUEST_TO_SEND_UPDATE_PORTAL_TEMPLATE = {
 };
 DEFAULT_EMAIL_TEMPLATES.push(REQUEST_TO_SEND_UPDATE_PORTAL_TEMPLATE);
 
+// "Send to supplier" on a recorded payment (docs/payment-proof-send.md; seeded
+// by 2026-11-16_30_seed_payment_proof_templates.js). A transfer is told as a
+// deposit email and/or a balance email, and each goes out as a link to the
+// supplier portal's Payments page, never with the proof attached (the user,
+// 2026-11-17): two wordings. The wording says what was paid and points below
+// it; the sender appends the rest under the body, so nothing is said twice:
+// the button to the payment on the portal and how to register, and then what
+// the payment asks for with the way to it (a deposit: each order's ready
+// dates; a balance: the telex release of each container, uploaded on the
+// payment's row). The figures are tokens the send fills in from the payment itself:
+// {amount} {currency} {paidOn} and {paidFor} (the PO numbers or container
+// numbers the supplier may be told, or a dash).
+const PAYMENT_PROOF_WRAP = body => [
+    '<div style="font-family:Helvetica,Arial,sans-serif;font-size:14px;color:#222;line-height:1.5;">',
+    ...body,
+    '<p>Kind regards<br>JFA Medical LTD</p>',
+    '</div>',
+].join('');
+const PAYMENT_PROOF_SAID = {
+    deposit: [
+        '<p>Hi,</p>',
+        '<p>We have sent a <strong>deposit</strong> payment of <strong>{currency} {amount}</strong> on {paidOn}, for: {paidFor}.</p>',
+        '<p>您好，</p>',
+        '<p>我们已于 {paidOn} 支付<strong>定金</strong> <strong>{currency} {amount}</strong>，对应：{paidFor}。</p>',
+    ],
+    balance: [
+        '<p>Hi,</p>',
+        '<p>We have sent a <strong>balance</strong> payment of <strong>{currency} {amount}</strong> on {paidOn}, for: {paidFor}.</p>',
+        '<p>您好，</p>',
+        '<p>我们已于 {paidOn} 支付<strong>尾款</strong> <strong>{currency} {amount}</strong>，对应：{paidFor}。</p>',
+    ],
+};
+// [en, zh] inserted after the English and the Chinese line of PAYMENT_PROOF_SAID.
+const paymentProofBody = (kind, [en, zh]) => {
+    const [hi, saidEn, nihao, saidZh] = PAYMENT_PROOF_SAID[kind];
+    return PAYMENT_PROOF_WRAP([hi, saidEn, `<p>${en}</p>`, nihao, saidZh, `<p>${zh}</p>`]);
+};
+// The one sentence after what was paid, in English and Chinese: where the proof is and what
+// we ask for are said by the blocks the send appends, once, with their buttons.
+const PAYMENT_PROOF_SEE_BELOW = [
+    'The proof of payment, and anything we need from you for it, is below.',
+    '付款凭证及需要您配合办理的事项，请见下方。',
+];
+const PAYMENT_PROOF_TEMPLATES = [
+    {
+        key: 'payment_proof_deposit_portal',
+        name: 'Deposit paid',
+        category: 'Payment proof',
+        description: 'Emailed to a supplier when a deposit has been paid. Nothing is attached: a button to the payment on the supplier portal (where its proof is), registration instructions and a button to each order\'s ready dates are appended automatically. Tokens: {amount} {currency} {paidOn} {paidFor}.',
+        subject: 'Deposit paid – {currency} {amount} – {paidFor} / 定金已付',
+        bodyHtml: paymentProofBody('deposit', PAYMENT_PROOF_SEE_BELOW),
+    },
+    // RETIRED (2026-11-17_30_payment_proof_portal_only.js): a proof is no longer sent
+    // attached. Kept here, unchanged, only because the migrations that seeded and reworded
+    // it (2026-11-16_30, 2026-11-17_10) read it from this list. Nothing sends it.
+    {
+        key: 'payment_proof_deposit_attached',
+        name: 'Deposit paid (proof attached)',
+        category: 'Payment proof',
+        description: 'Emailed to a supplier when a deposit has been paid and the proof of payment goes out attached to the email (the portal cannot show them the payment). The names of the attached files, a button to each order\'s ready dates on the supplier portal (where the portal can open the order for them) and a "Confirm receipt" button are appended automatically. Tokens: {amount} {currency} {paidOn} {paidFor}.',
+        subject: 'Deposit paid – {currency} {amount} – {paidFor} / 定金已付',
+        bodyHtml: paymentProofBody('deposit', [
+            // The ready dates are entered on the portal, never asked for by reply (the
+            // user, 2026-11-17): the send appends a button to each order's page.
+            'The proof of payment is attached. Please confirm you have received the payment, and enter the estimated ready date of each item on our supplier portal.',
+            '付款凭证见附件。请确认收款，并在我们的供应商门户填写各产品的预计完成日期。',
+        ]),
+    },
+    {
+        key: 'payment_proof_balance_portal',
+        name: 'Balance paid',
+        category: 'Payment proof',
+        description: 'Emailed to a supplier when a balance (and any QC units paid with it) has been paid. Nothing is attached: a button to the payment on the supplier portal (where its proof is), registration instructions and, where it paid for containers, a button to upload their telex release are appended automatically. Tokens: {amount} {currency} {paidOn} {paidFor}.',
+        subject: 'Balance paid – {currency} {amount} – {paidFor} / 尾款已付',
+        bodyHtml: paymentProofBody('balance', PAYMENT_PROOF_SEE_BELOW),
+    },
+    // RETIRED, as the deposit's above.
+    {
+        key: 'payment_proof_balance_attached',
+        name: 'Balance paid (proof attached)',
+        category: 'Payment proof',
+        description: 'Emailed to a supplier when a balance (and any QC units paid with it) has been paid and the proof of payment goes out attached to the email (the supplier is not on the portal, or the portal is not available). The names of the attached files and a "Confirm receipt" button are appended automatically. Tokens: {amount} {currency} {paidOn} {paidFor}.',
+        subject: 'Balance paid – {currency} {amount} – {paidFor} / 尾款已付',
+        bodyHtml: paymentProofBody('balance', [
+            'The proof of payment is attached. Please arrange the telex release and send us the telex-released bill of lading.',
+            '付款凭证见附件。请安排电放，并将电放提单发给我们。',
+        ]),
+    },
+];
+DEFAULT_EMAIL_TEMPLATES.push(...PAYMENT_PROOF_TEMPLATES);
+
 // Freight quotes (src/services/freight-quote-routes.js, docs/freight-quotes.md;
 // seeded by 2026-11-16_20_seed_freight_templates.js), category 'Freight'. Sent
 // from ShipLine's FREIGHT page to a freight forwarder. Each is the INSIDE of
@@ -510,6 +601,7 @@ DEFAULT_EMAIL_TEMPLATES.push(READY_DATE_REMINDER_TEMPLATE);
 
 module.exports = {
     READY_DATE_REMINDER_TEMPLATE_KEY, READY_DATE_REMINDER_TEMPLATE,
+    PAYMENT_PROOF_TEMPLATES,
     FREIGHT_TEMPLATES, FREIGHT_QUOTE_REQUEST_TEMPLATE_KEY, FREIGHT_BOOKING_REQUEST_TEMPLATE_KEY,
     FREIGHT_BOOKING_CONTENTS_TEMPLATE_KEY, FREIGHT_MOVEMENT_REQUEST_TEMPLATE_KEY,
     DEFAULT_EMAIL_TEMPLATES, SUPPLIER_PI_TEMPLATE_KEYS, QC_VISIT_TEMPLATE_KEYS, PO_PORTAL_TEMPLATE_KEY,

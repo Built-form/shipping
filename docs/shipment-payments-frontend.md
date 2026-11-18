@@ -629,6 +629,16 @@ proof of payment (a remittance by kind or by what the reader found, or any
 upload with no shipment) — "proofs to apply" on the page. `shipmentId` keeps
 transfers with a line on one of that shipment's balances.
 
+Each transfer (here, and the one `POST` and `PUT` return) also carries
+`notices: [{ kind, state, lastSentAt, delivery }]`: whether its deposit part and
+its balance part have been **sent to the supplier**. `[]` when there is nothing
+to send; `null` on a server without the send log (hide the feature). Sending
+itself (`GET /supplier-payments/:id/notices`, `POST …/notices/:kind/email`,
+`POST /supplier-payment-sends/:sendId/resolve`) is in
+[payment-proof-send.md](payment-proof-send.md).
+
+The telex release a balance asks the supplier for is not on a transfer: it is the shipment's, listed by `GET /api/v1/telex-releases?shipmentId=` (`docs/telex-releases.md`).
+
 ### `GET /api/v1/supplier-payments/open-items?supplier=&currency=`
 
 What a transfer to this supplier could be applied to — open balances and open

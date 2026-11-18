@@ -133,6 +133,9 @@ provider:
     # docs/qc-availability.md). PI_NOTIFY_REDIRECT_TO (test only): send every
     # PI decision email there instead of to the supplier.
     SUPPLIER_PORTAL_URL: ${self:custom.secrets.SUPPLIER_PORTAL_URL, ''}
+    # "on" once the portal's Payments page is live on this stage: a payment sent
+    # to a supplier then goes out as a link to it. Anything else (the default):
+    # the proof is attached to the email instead. docs/payment-proof-send.md.
     PI_NOTIFY_REDIRECT_TO: ${self:custom.secrets.PI_NOTIFY_REDIRECT_TO, ''}
     # Email receipt confirmation: optional static page (e.g. an S3-hosted
     # confirmation page) that the "Confirm receipt" click 302-redirects to after
