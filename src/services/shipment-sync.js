@@ -36,6 +36,7 @@
 const log = require('../lib/logger');
 const { recordAudit } = require('../lib/audit');
 const S = require('../lib/shipments');
+const FL = require('../lib/forwarder-links');
 
 const BACKFILL_MARKER = 'shipments_backfill_v1';
 const KILL_SWITCH = 'shipments_shadow_off';
@@ -647,8 +648,9 @@ async function cancelShipment(conn, ship, { reason, userEmail = null, softDelete
 }
 
 // ── Merge ────────────────────────────────────────────────────────────────
+// forwarder: with forwarder_id, as a pair (FL.mergeForwarderPair), below.
 const MERGE_COALESCE = [
-    'name', 'tracking_ref', 'booking_ref', 'bl_number', 'forwarder', 'vessel_name', 'origin_port',
+    'name', 'tracking_ref', 'booking_ref', 'bl_number', 'vessel_name', 'origin_port',
     'etd', 'eta', 'ata', 'notes', 'source_draft_id', 'booked_at', 'departed_at', 'arrived_at', 'closed_at',
 ];
 
@@ -677,6 +679,13 @@ async function mergeShipments(conn, survivorId, loserId, { reference = null, use
     for (const col of MERGE_COALESCE) {
         if (survivor[col] == null && loser[col] != null) { sets.push(`${col} = ?`); vals.push(loser[col]); }
     }
+    // The forwarder pair (2026-11-20): the survivor's own whole, else the
+    // loser's whole — copied as stored, never re-resolved from the list.
+    const pair = FL.mergeForwarderPair(survivor, loser);
+    if ((pair.forwarder ?? null) !== (survivor.forwarder ?? null) || (pair.forwarder_id ?? null) !== (survivor.forwarder_id ?? null)) {
+        sets.push('forwarder = ?', 'forwarder_id = ?');
+        vals.push(pair.forwarder, pair.forwarder_id);
+    }
     if (!survivor.mode && loser.mode) {
         sets.push('mode = ?', 'mode_source = ?');
         vals.push(loser.mode, loser.mode_source || 'default');
@@ -704,6 +713,22 @@ async function mergeShipments(conn, survivorId, loserId, { reference = null, use
     await conn.query(`UPDATE draft_container_documents SET shipment_id = ? WHERE shipment_id = ?`, [survivor.id, loser.id]);
     await conn.query(`UPDATE quality_assurance_documents SET shipment_id = ? WHERE shipment_id = ?`, [survivor.id, loser.id]);
     await conn.query(`UPDATE draft_containers SET shipment_id = ? WHERE shipment_id = ?`, [survivor.id, loser.id]);
+    // Freight bookings (2026-11-20) follow their container. A live one only
+    // into a survivor that holds none (one live booking per container): this
+    // runs inside a draft's conversion, so it never refuses — a live booking
+    // left on the merged loser is reported by tools/verify-shipments.js.
+    const [bookedRows] = await conn.query(
+        `SELECT COUNT(*) AS n FROM freight_bookings WHERE shipment_id = ? AND status IN ('requested', 'confirmed')`, [survivor.id]
+    );
+    const survivorBooked = Array.isArray(bookedRows) && bookedRows[0] ? Number(bookedRows[0].n) : 0;
+    if (!(survivorBooked > 0)) {
+        await conn.query(
+            `UPDATE freight_bookings SET shipment_id = ? WHERE shipment_id = ? AND status IN ('requested', 'confirmed')`, [survivor.id, loser.id]
+        );
+    }
+    await conn.query(
+        `UPDATE freight_bookings SET shipment_id = ? WHERE shipment_id = ? AND status NOT IN ('requested', 'confirmed')`, [survivor.id, loser.id]
+    );
     if (S.isBookedStage(stage)) await rebuildBookedLines(conn, survivor.id);
 
     await shipmentAudit(conn, {
@@ -894,6 +919,10 @@ function validDate(v) {
 function shipmentSelect({ where = [], effectiveWhere = [], orderBy = 'COALESCE(z.booked_at, z.created_at) DESC, z.id DESC', limit = null, idFilter = null } = {}) {
     const memberScope = idFilter ? ` AND o.shipment_id IN (${idFilter})` : '';
     const lineScope = idFilter ? ` WHERE sl.shipment_id IN (${idFilter})` : '';
+    // The container's live freight booking (2026-11-20, src/lib/forwarder-links.js):
+    // at most one per container (uq_freight_bookings_live_shipment), so each
+    // MAX() reads that one row.
+    const bookingScope = idFilter ? ` AND fb.shipment_id IN (${idFilter})` : '';
     return `
         SELECT z.* FROM (
           SELECT y.*,
@@ -904,6 +933,7 @@ function shipmentSelect({ where = [], effectiveWhere = [], orderBy = 'COALESCE(z
                       ELSE y.stage END AS effective_stage
             FROM (
               SELECT s.*,
+                     bk.bk_count, bk.bk_id, bk.bk_status, bk.bk_ref, bk.bk_forwarder_id, bk.bk_forwarder_name,
                      COALESCE(m.member_count, 0) AS member_count,
                      m.member_eta, m.member_etd, m.member_vessel, m.member_ext, m.member_awb,
                      COALESCE(l.line_count, 0) AS line_count,
@@ -937,6 +967,15 @@ function shipmentSelect({ where = [], effectiveWhere = [], orderBy = 'COALESCE(z
                       JOIN orders lo ON lo.id = sl.order_id AND lo.deleted_at IS NULL${lineScope}
                      GROUP BY sl.shipment_id
                 ) l ON l.shipment_id = s.id
+                LEFT JOIN (
+                    SELECT fb.shipment_id, COUNT(*) AS bk_count,
+                           MAX(fb.id) AS bk_id, MAX(fb.status) AS bk_status, MAX(fb.booking_ref) AS bk_ref,
+                           MAX(fr.forwarder_id) AS bk_forwarder_id, MAX(fr.forwarder_name) AS bk_forwarder_name
+                      FROM freight_bookings fb
+                      JOIN freight_quote_requests fr ON fr.id = fb.request_id
+                     WHERE fb.status IN ('requested', 'confirmed') AND fb.shipment_id IS NOT NULL${bookingScope}
+                     GROUP BY fb.shipment_id
+                ) bk ON bk.shipment_id = s.id
                ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
             ) y
         ) z
@@ -1688,7 +1727,30 @@ async function verifyAll(conn, { fix = false, userEmail = null } = {}) {
 
     hard.documentsOnUnlinkedShipments = await documentLinkDrift(conn);
 
+    // Freight bookings (2026-11-20): a live booking's container decides which
+    // forwarder the container shows and what its forwarder payments may be
+    // priced from. One on a missing, deleted or merged shipment is drift (a
+    // merge whose survivor already had a booking leaves one there; so would a
+    // re-seed). One whose recorded container name matches nothing about the
+    // container it points at is for review (an id handed on after a re-seed).
+    const [bookingRows] = await conn.query(`
+        SELECT b.id, b.shipment_id, b.status, b.draft_container_name,
+               s.id AS sid, s.name, s.reference, s.deleted_at, s.merged_into_id
+          FROM freight_bookings b
+          LEFT JOIN shipments s ON s.id = b.shipment_id
+         WHERE b.status IN ('requested', 'confirmed') AND b.shipment_id IS NOT NULL`);
+    hard.liveFreightBookingOnInactiveShipment = bookingRows
+        .filter(r => r.sid == null || r.deleted_at || r.merged_into_id)
+        .map(r => ({ bookingId: r.id, shipmentId: r.shipment_id, status: r.status, mergedIntoId: r.merged_into_id || null, missing: r.sid == null }));
+
     // ── informational
+    info.freightBookingNameMismatch = bookingRows
+        .filter(r => r.sid != null && !r.deleted_at && !r.merged_into_id)
+        .filter(r => {
+            const hint = S.parseNameHint(r.draft_container_name);
+            return !FL.bookingNameMatches({ bookedName: r.draft_container_name, name: r.name, reference: r.reference, hintReference: hint ? hint.reference : null });
+        })
+        .map(r => ({ bookingId: r.id, shipmentId: r.shipment_id, bookedName: r.draft_container_name, name: r.name, reference: r.reference }));
     const [stageAhead] = await conn.query(`
         SELECT z.id, z.reference, z.stage, z.derived_stage
           FROM (${shipmentSelect({ where: [LIVE], orderBy: 'z.id' })}) z

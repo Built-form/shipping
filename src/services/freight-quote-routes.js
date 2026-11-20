@@ -1228,6 +1228,12 @@ function registerFreightQuoteRoutes(app, deps) {
         return ship;
     }
 
+    // One live booking per container is a unique key (2026-11-20,
+    // uq_freight_bookings_live_shipment): the check above runs under the
+    // booking's lock, not the container's, so two attaches at once meet here.
+    const isContainerTaken = e => /uq_freight_bookings_live_shipment/.test((e && e.message) || '');
+    const containerTaken = () => new Fail(409, 'CONTAINER_TAKEN', 'That container was attached to another booking a moment ago.');
+
     async function contactAddresses(conn, forwarderId) {
         const [rows] = await conn.query(
             'SELECT email FROM forwarder_contacts WHERE forwarder_id = ? AND deleted_at IS NULL ORDER BY id ASC',
@@ -1318,6 +1324,7 @@ function registerFreightQuoteRoutes(app, deps) {
                     bookingId = Number(ins.insertId);
                 } catch (e) {
                     if (e.errno !== DUPLICATE) throw e;
+                    if (isContainerTaken(e)) throw containerTaken();
                     throw new Fail(409, 'ALREADY_BOOKED', 'A booking is already in progress on this request.');
                 }
                 await conn.query(
@@ -1451,10 +1458,15 @@ function registerFreightQuoteRoutes(app, deps) {
                 }
 
                 if (!sets.length) return false;
-                await conn.query(
-                    `UPDATE freight_bookings SET ${sets.join(', ')}, row_version = row_version + 1 WHERE id = ?`,
-                    [...params, id]
-                );
+                try {
+                    await conn.query(
+                        `UPDATE freight_bookings SET ${sets.join(', ')}, row_version = row_version + 1 WHERE id = ?`,
+                        [...params, id]
+                    );
+                } catch (e) {
+                    if (e.errno === DUPLICATE && isContainerTaken(e)) throw containerTaken();
+                    throw e;
+                }
                 if (patch.status === 'cancelled') {
                     const request = await lockRequest(conn, Number(b.request_id));
                     await conn.query(
@@ -1800,6 +1812,65 @@ function registerFreightQuoteRoutes(app, deps) {
             return defaultBoard(conn);
         });
         res.json(board);
+    }));
+
+    // ── GET /api/v1/shipments/:id/forwarder-charges ─────────────────────────
+    // What the container's live freight booking prices (2026-11-20), for
+    // ShipLine's forwarder payment editor to offer: the booked option's
+    // all-in price and each stock movement's own price. A movement's price is
+    // never inside the option's, so the two add up. Each carries the live
+    // payment extra already priced from it (payment_extras.freight_booking_id /
+    // freight_movement_id). { booking: null, movements: [] } with none.
+    app.get('/api/v1/shipments/:id(\\d+)/forwarder-charges', route('GET /shipments/:id/forwarder-charges', async (req, res) => {
+        const shipmentId = Number(req.params.id);
+        const out = await withConnection(async (conn) => {
+            const [[b]] = await conn.query(
+                `SELECT b.id, b.status, b.booking_ref, b.request_id, b.option_id, r.forwarder_id, r.forwarder_name
+                   FROM freight_bookings b
+                   JOIN freight_quote_requests r ON r.id = b.request_id
+                  WHERE b.shipment_id = ? AND b.status IN (?)
+                  ORDER BY b.id DESC LIMIT 1`,
+                [shipmentId, LIVE]
+            );
+            if (!b) return { booking: null, movements: [] };
+            const [[o]] = await conn.query('SELECT * FROM freight_quote_options WHERE id = ?', [b.option_id]);
+            const [[f]] = b.forwarder_id != null
+                ? await conn.query('SELECT id, name, deleted_at FROM forwarders WHERE id = ?', [b.forwarder_id])
+                : [[null]];
+            const [moves] = await conn.query(
+                'SELECT id, factory, cbm, price, currency FROM freight_stock_movements WHERE request_id = ? AND deleted_at IS NULL ORDER BY id ASC',
+                [b.request_id]
+            );
+            const [held] = await conn.query(
+                `SELECT id, freight_booking_id, freight_movement_id, amount, currency FROM payment_extras
+                  WHERE deleted_at IS NULL AND (freight_booking_id = ? OR freight_movement_id IN (?))`,
+                [b.id, moves.length ? moves.map(m => m.id) : [0]]
+            );
+            const holder = (match) => {
+                const x = held.find(match);
+                return x ? { extraId: Number(x.id), extraAmount: Number(x.amount), extraCurrency: x.currency } : { extraId: null, extraAmount: null, extraCurrency: null };
+            };
+            const opt = o ? optionJson(o) : null;
+            return {
+                booking: {
+                    id: Number(b.id), status: b.status, bookingRef: b.booking_ref || null,
+                    forwarderId: b.forwarder_id != null ? Number(b.forwarder_id) : null,
+                    forwarderName: b.forwarder_name || null,
+                    forwarderLive: Boolean(f && !f.deleted_at),
+                    option: opt ? {
+                        price: opt.price, currency: opt.currency, service: opt.service, portFrom: opt.portFrom, portTo: opt.portTo,
+                        sailingDate: opt.sailingDate, arrivalDate: opt.arrivalDate, containerSize: opt.containerSize,
+                    } : null,
+                    ...holder(x => x.freight_booking_id != null && Number(x.freight_booking_id) === Number(b.id)),
+                },
+                movements: moves.map(m => ({
+                    id: Number(m.id), from: m.factory, cbm: Number(m.cbm),
+                    price: m.price == null ? null : Number(m.price), currency: m.currency || null,
+                    ...holder(x => x.freight_movement_id != null && Number(x.freight_movement_id) === Number(m.id)),
+                })),
+            };
+        });
+        res.json(out);
     }));
 
     // ── DELETE /api/v1/freight-stock-movements/:id ──────────────────────────

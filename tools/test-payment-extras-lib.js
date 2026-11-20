@@ -28,6 +28,7 @@ test('a charge riding with a PO deposit: cleaned up, amount to the cent', () => 
             supplierName: 'Suzhou Sunmed Co.,Ltd.', currency: 'USD', amount: 500, kind: 'mould', description: 'Mould for JF1375',
             ridesWith: 'deposit', purchaseOrderId: 395, shipmentId: null, shipmentReference: null, dueDate: null,
             sourceKind: null, sourceId: null, note: 'from the quote',
+            forwarderId: null, forwarderIdGiven: false, freightSource: null,
         },
     });
 });
@@ -135,7 +136,7 @@ test('labels and JSON', () => {
     }, { applied: 200 }), {
         id: 7, supplierName: 'Sunmed', supplierKey: 'sunmed', currency: 'USD', amount: 500, kind: 'mould', label: 'PO_00395J mould cost',
         description: null, ridesWith: 'deposit', purchaseOrderId: 395, poNumber: 'PO_00395J', shipmentId: null, shipmentReference: null,
-        dueDate: null, sourceKind: null, sourceId: null, status: 'open', paidOn: null, settledByPaymentId: null,
+        dueDate: null, sourceKind: null, sourceId: null, forwarderId: null, freightSource: null, status: 'open', paidOn: null, settledByPaymentId: null,
         applied: 200, remaining: 300, note: null, createdByEmail: 'ann@x.com', createdAt: '2026-09-29T09:15:00.000Z',
         updatedByEmail: null, updatedAt: '2026-09-29T09:15:00.000Z', settlements: [],
     });
@@ -155,6 +156,7 @@ test('a shipment cost: payee, container, no PO; freight/customs/duty/delivery ki
         supplierName: 'DCG Logistics', currency: 'GBP', amount: 1850, kind: 'freight', description: 'INV-5521',
         ridesWith: 'shipment', purchaseOrderId: null, shipmentId: 62, shipmentReference: '301', dueDate: '2026-10-10',
         sourceKind: null, sourceId: null, note: null,
+        forwarderId: null, forwarderIdGiven: false, freightSource: null,
     });
     for (const kind of ['customs', 'duty', 'delivery']) assert.equal(L.parseExtraBody({ supplierName: 'DCG', currency: 'GBP', amount: 10, kind, ridesWith: 'shipment', shipmentReference: '301' }).value.kind, kind);
     assert.ok(L.RIDES_WITH.includes('shipment')); // the full list is pinned by the credit-note test below
@@ -176,6 +178,7 @@ test('a supplier credit note: on account, negative, no PO, no container', () => 
         supplierName: 'Sunmed', currency: 'USD', amount: -4500, kind: 'credit_note', description: 'CN-2026-014',
         ridesWith: 'account', purchaseOrderId: null, shipmentId: null, shipmentReference: null, dueDate: null,
         sourceKind: null, sourceId: null, note: null,
+        forwarderId: null, forwarderIdGiven: false, freightSource: null,
     });
     assert.deepEqual(L.RIDES_WITH, ['deposit', 'balance', 'shipment', 'account']);
     assert.equal(L.lineLabel({ kind: 'credit_note', rides_with: 'account' }), 'Credit note');
@@ -204,4 +207,103 @@ test('credits in a transfer: against something paid, never more than it, and the
     assert.equal(L.checkCreditUse({ lines: lines(300, -300), amount: 50 }).code, 'CREDIT_ALONE');
     // No credits: nothing to say.
     assert.equal(L.checkCreditUse({ lines: lines(300, 200), amount: 500 }), null);
+});
+
+// Forwarder links (2026-11-20, docs/payment-extras-frontend.md): a forwarder
+// payment names the forwarder from ShipLine's Forwarders list by id; the name
+// stays as the recorded snapshot. A price from a freight booking or a stock
+// movement is its own source, in columns of its own (never source_kind).
+const fwd = (over = {}) => ({ supplierName: 'DCG', currency: 'GBP', amount: 1850, kind: 'freight', ridesWith: 'shipment', shipmentId: 62, shipmentReference: '301', ...over });
+const pick = (v, ...keys) => Object.fromEntries(keys.map(k => [k, v[k]]));
+
+test('forwarderId: a positive id, null (unlink) or left out — only on a forwarder payment', () => {
+    assert.deepEqual(pick(L.parseExtraBody(fwd({ forwarderId: 7 })).value, 'forwarderId', 'forwarderIdGiven'), { forwarderId: 7, forwarderIdGiven: true });
+    assert.deepEqual(pick(L.parseExtraBody(fwd({ forwarderId: '7' })).value, 'forwarderId', 'forwarderIdGiven'), { forwarderId: 7, forwarderIdGiven: true });
+    assert.deepEqual(pick(L.parseExtraBody(fwd({ forwarderId: null })).value, 'forwarderId', 'forwarderIdGiven'), { forwarderId: null, forwarderIdGiven: true });
+    assert.deepEqual(pick(L.parseExtraBody(fwd()).value, 'forwarderId', 'forwarderIdGiven'), { forwarderId: null, forwarderIdGiven: false });
+    for (const bad of [0, -1, 1.5, 'x', true]) {
+        assert.equal(L.parseExtraBody(fwd({ forwarderId: bad })).error, 'forwarderId must be a forwarder id, or null.', String(bad));
+    }
+    // Another kind of extra: a forwarder id makes no sense; null is harmless.
+    assert.equal(L.parseExtraBody(fwd({ ridesWith: 'balance', forwarderId: 7 })).error, 'Only a forwarder payment (ridesWith "shipment") names a forwarder.');
+    assert.equal(L.parseExtraBody(fwd({ ridesWith: 'balance', forwarderId: null })).value.forwarderIdGiven, false);
+});
+
+test('freightSource: a booking or a stock movement, only on a forwarder payment, never with an invoice source', () => {
+    assert.deepEqual(L.parseExtraBody(fwd({ freightSource: { kind: 'booking', id: 5 } })).value.freightSource, { kind: 'booking', id: 5 });
+    assert.deepEqual(L.parseExtraBody(fwd({ freightSource: { kind: 'movement', id: '9' } })).value.freightSource, { kind: 'movement', id: 9 });
+    assert.equal(L.parseExtraBody(fwd()).value.freightSource, null);
+    assert.equal(L.parseExtraBody(fwd({ freightSource: null })).value.freightSource, null);
+    const msg = 'freightSource must be { kind: "booking" | "movement", id }.';
+    for (const bad of [{ kind: 'quote', id: 5 }, { kind: 'booking' }, { kind: 'booking', id: 0 }, 'booking:5', 5]) {
+        assert.equal(L.parseExtraBody(fwd({ freightSource: bad })).error, msg, JSON.stringify(bad));
+    }
+    assert.equal(L.parseExtraBody(fwd({ freightSource: { kind: 'booking', id: 5 }, sourceKind: 'shipment_document', sourceId: 11 })).error,
+        'A price from a freight booking cannot also come from an invoice (sourceKind).');
+    assert.equal(L.parseExtraBody(fwd({ ridesWith: 'balance', freightSource: { kind: 'booking', id: 5 } })).error,
+        'Only a forwarder payment (ridesWith "shipment") can come from a freight booking.');
+});
+
+test('the payee link on create: by id, unlinked on purpose, or by name', () => {
+    const next = (o) => ({ forwarderIdGiven: false, forwarderId: null, supplierName: 'DCG', supplierKey: 'dcg', ...o });
+    assert.deepEqual(L.decidePayeeLink({ current: null, next: next({ forwarderIdGiven: true, forwarderId: 7 }) }), { action: 'byId', id: 7 });
+    assert.deepEqual(L.decidePayeeLink({ current: null, next: next({ forwarderIdGiven: true, forwarderId: null }) }), { action: 'unlink', name: 'DCG' });
+    assert.deepEqual(L.decidePayeeLink({ current: null, next: next() }), { action: 'byName', name: 'DCG' });
+});
+
+test('the payee link on edit: kept, re-resolved, unlinked or moved — never refreshed after a rename', () => {
+    const current = { forwarderId: 7, supplierName: 'DCG Logistics', supplierKey: 'dcg logistics' };
+    const next = (o) => ({ forwarderIdGiven: false, forwarderId: null, supplierName: 'DCG Logistics', supplierKey: 'dcg logistics', ...o });
+    // Old client, same name: the link and the recorded name stay.
+    assert.deepEqual(L.decidePayeeLink({ current, next: next() }), { action: 'keep' });
+    // Old client, another name: resolved by that name (or left unlinked).
+    assert.deepEqual(L.decidePayeeLink({ current, next: next({ supplierName: 'Savino', supplierKey: 'savino' }) }), { action: 'byName', name: 'Savino' });
+    // Unlinked on purpose.
+    assert.deepEqual(L.decidePayeeLink({ current, next: next({ forwarderIdGiven: true, forwarderId: null, supplierName: 'Somebody', supplierKey: 'somebody' }) }), { action: 'unlink', name: 'Somebody' });
+    // The same forwarder: the recorded name stays, even if the list now spells it otherwise or it was removed.
+    assert.deepEqual(L.decidePayeeLink({ current, next: next({ forwarderIdGiven: true, forwarderId: 7, supplierName: 'DCG Global', supplierKey: 'dcg global' }) }), { action: 'keep' });
+    // Another forwarder: its name from the list; it must be live.
+    assert.deepEqual(L.decidePayeeLink({ current, next: next({ forwarderIdGiven: true, forwarderId: 8 }) }), { action: 'byId', id: 8 });
+    // An extra with no link yet, same name: nothing to keep, resolve by name.
+    assert.deepEqual(L.decidePayeeLink({ current: { forwarderId: null, supplierName: 'DCG', supplierKey: 'dcg' }, next: next({ supplierName: 'DCG', supplierKey: 'dcg' }) }), { action: 'byName', name: 'DCG' });
+});
+
+test('editing with money applied: the forwarder cannot change, even to one spelled the same', () => {
+    const current = { amount: 500, currency: 'GBP', supplierKey: 'dcg', forwarderId: 7 };
+    const d = L.decideEdit({ current, next: { amount: 500, currency: 'GBP', supplierKey: 'dcg', forwarderId: 8 }, applied: 100 });
+    assert.deepEqual(d, { status: 409, code: 'EXTRA_HAS_PAYMENTS', error: 'Money has been applied to it — its forwarder cannot change.' });
+    assert.equal(L.decideEdit({ current, next: { amount: 500, currency: 'GBP', supplierKey: 'dcg', forwarderId: 7 }, applied: 100 }), null);
+    // Nothing applied: free to change.
+    assert.equal(L.decideEdit({ current, next: { amount: 500, currency: 'GBP', supplierKey: 'dcg', forwarderId: 8 }, applied: 0 }), null);
+    // Linking an unlinked one under the same name, or unlinking: the payee (its name) is unchanged, so allowed.
+    assert.equal(L.decideEdit({ current: { ...current, forwarderId: null }, next: { amount: 500, currency: 'GBP', supplierKey: 'dcg', forwarderId: 8 }, applied: 100 }), null);
+    assert.equal(L.decideEdit({ current, next: { amount: 500, currency: 'GBP', supplierKey: 'dcg', forwarderId: null }, applied: 100 }), null);
+});
+
+test('a price from a freight booking: its container, forwarder, kind of payment and source are fixed', () => {
+    const current = { freightBookingId: 5, freightMovementId: null, ridesWith: 'shipment', shipmentId: 62, shipmentReference: '301', forwarderId: 7, supplierKey: 'dcg' };
+    const next = (o) => ({ freightSource: null, ridesWith: 'shipment', shipmentId: 62, shipmentReference: '301', forwarderIdGiven: false, forwarderId: null, supplierKey: 'dcg', ...o });
+    const locked = (error) => ({ status: 422, code: 'SOURCE_LOCKED', error });
+    assert.equal(L.decideFreightLock({ current, next: next() }), null);
+    assert.equal(L.decideFreightLock({ current, next: next({ freightSource: { kind: 'booking', id: 5 } }) }), null);
+    assert.equal(L.decideFreightLock({ current, next: next({ forwarderIdGiven: true, forwarderId: 7 }) }), null);
+    assert.deepEqual(L.decideFreightLock({ current, next: next({ freightSource: { kind: 'movement', id: 5 } }) }), locked('It came from a freight booking — where it came from cannot change.'));
+    assert.deepEqual(L.decideFreightLock({ current, next: next({ shipmentId: 63 }) }), locked('It came from a freight booking — its container cannot change.'));
+    assert.deepEqual(L.decideFreightLock({ current, next: next({ shipmentReference: '302' }) }), locked('It came from a freight booking — its container cannot change.'));
+    assert.deepEqual(L.decideFreightLock({ current, next: next({ ridesWith: 'balance' }) }), locked('It came from a freight booking — it stays a forwarder payment.'));
+    assert.deepEqual(L.decideFreightLock({ current, next: next({ forwarderIdGiven: true, forwarderId: 8 }) }), locked('It came from a freight booking — its forwarder cannot change.'));
+    assert.deepEqual(L.decideFreightLock({ current, next: next({ forwarderIdGiven: true, forwarderId: null }) }), locked('It came from a freight booking — its forwarder cannot change.'));
+    assert.deepEqual(L.decideFreightLock({ current, next: next({ supplierKey: 'savino' }) }), locked('It came from a freight booking — its forwarder cannot change.'));
+    // A stock movement's price says so too.
+    assert.deepEqual(L.decideFreightLock({ current: { ...current, freightBookingId: null, freightMovementId: 12 }, next: next({ shipmentId: 63 }) }), locked('It came from a stock movement — its container cannot change.'));
+    // An extra not from a booking: no lock.
+    assert.equal(L.decideFreightLock({ current: { ...current, freightBookingId: null }, next: next({ shipmentId: 63 }) }), null);
+});
+
+test('JSON: the forwarder link and where a freight price came from', () => {
+    const base = { id: 9, amount: '1850', status: 'open', kind: 'freight', rides_with: 'shipment' };
+    const j = (o) => L.extraRowToJson({ ...base, ...o }, { applied: 0 });
+    assert.deepEqual(pick(j({ forwarder_id: 7, freight_booking_id: 5 }), 'forwarderId', 'freightSource'), { forwarderId: 7, freightSource: { kind: 'booking', id: 5 } });
+    assert.deepEqual(j({ freight_movement_id: 12 }).freightSource, { kind: 'movement', id: 12 });
+    assert.deepEqual(pick(j({}), 'forwarderId', 'freightSource'), { forwarderId: null, freightSource: null });
 });

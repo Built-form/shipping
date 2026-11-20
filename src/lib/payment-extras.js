@@ -34,6 +34,12 @@ const RIDES_WITH = ['deposit', 'balance', 'shipment', 'account'];
 const EDITOR_ROLES = ['admin', 'standard', 'accountant'];
 // Where a suggested extra was read from: a supplier's invoice on a container.
 const SOURCE_KINDS = ['shipment_document'];
+// Forwarder links (2026-11-20): a forwarder payment priced from the Freight
+// page — a booking's all-in price, or one stock movement's own price. Kept in
+// columns of their own (freight_booking_id / freight_movement_id), never in
+// source_kind / source_id: ShipLine's editor sends source_kind back on every
+// edit, and code from before this change would relabel it.
+const FREIGHT_SOURCE_KINDS = ['booking', 'movement'];
 // How both invoice readers (the PI check and the container-invoice reader)
 // return the charges on a document that are not goods — for the page to
 // suggest as extras. A discount or credit comes back negative.
@@ -60,6 +66,9 @@ const iso = v => (v == null ? null : v.toISOString ? v.toISOString() : String(v)
 const ymd = v => (v == null ? null : v instanceof Date ? v.toISOString().slice(0, 10) : String(v).slice(0, 10));
 const text = (v, max) => (typeof v === 'string' && v.trim() ? v.trim().slice(0, max) : null);
 const positiveId = v => (v == null || v === '' ? null : Number.isInteger(Number(v)) && Number(v) > 0 ? Number(v) : NaN);
+// A row id and nothing else: a number or digits (not true, not 1.5).
+const strictId = v => ((typeof v === 'number' || (typeof v === 'string' && /^\s*\d+\s*$/.test(v)))
+    && Number.isSafeInteger(Number(v)) && Number(v) > 0 ? Number(v) : NaN);
 
 // { value } or { error } — an extra as the page sends it (POST and PUT alike).
 function parseExtraBody(body) {
@@ -110,14 +119,87 @@ function parseExtraBody(body) {
     if (hasSource && (!SOURCE_KINDS.includes(String(b.sourceKind)) || sourceId == null || Number.isNaN(sourceId))) {
         return { error: `source must be sourceKind (${SOURCE_KINDS.join(', ')}) with sourceId, or neither.` };
     }
+    // The forwarder from the Forwarders list (2026-11-20): an id, null to
+    // unlink on purpose, or left out (an older client — the route keeps the link).
+    let forwarderIdGiven = false;
+    let forwarderId = null;
+    if (b.forwarderId !== undefined && b.forwarderId !== null) {
+        const n = strictId(b.forwarderId);
+        if (Number.isNaN(n)) return { error: 'forwarderId must be a forwarder id, or null.' };
+        if (ridesWith !== 'shipment') return { error: 'Only a forwarder payment (ridesWith "shipment") names a forwarder.' };
+        forwarderIdGiven = true;
+        forwarderId = n;
+    } else if (b.forwarderId === null && ridesWith === 'shipment') {
+        forwarderIdGiven = true;
+    }
+    let freightSource = null;
+    if (b.freightSource !== undefined && b.freightSource !== null) {
+        const fs = b.freightSource;
+        const id = fs && typeof fs === 'object' ? strictId(fs.id) : NaN;
+        if (!fs || typeof fs !== 'object' || !FREIGHT_SOURCE_KINDS.includes(fs.kind) || Number.isNaN(id)) {
+            return { error: 'freightSource must be { kind: "booking" | "movement", id }.' };
+        }
+        if (ridesWith !== 'shipment') return { error: 'Only a forwarder payment (ridesWith "shipment") can come from a freight booking.' };
+        if (hasSource) return { error: 'A price from a freight booking cannot also come from an invoice (sourceKind).' };
+        freightSource = { kind: fs.kind, id };
+    }
     return {
         value: {
             supplierName, currency, amount, kind, description: text(b.description, 255),
             ridesWith, purchaseOrderId, shipmentId, shipmentReference, dueDate,
             sourceKind: hasSource ? String(b.sourceKind) : null, sourceId: hasSource ? sourceId : null,
             note: text(b.note, 2000),
+            forwarderId, forwarderIdGiven, freightSource,
         },
     };
+}
+
+// Which forwarder a payment names, before the route looks anything up.
+// `current` is the stored extra (null on create): { forwarderId, supplierName,
+// supplierKey }; `next` the parsed body with its supplierKey. One of:
+//   { action: 'keep' }          the stored id and the stored name stay — never
+//                               refreshed from the list after a rename
+//   { action: 'byId', id }      that forwarder, by its name in the list (live)
+//   { action: 'unlink', name }  no forwarder, on purpose; the body's name
+//   { action: 'byName', name }  the body's name, linked when exactly one live
+//                               forwarder carries it (else no link)
+function decidePayeeLink({ current, next }) {
+    const stored = current && current.forwarderId != null ? Number(current.forwarderId) : null;
+    if (next.forwarderIdGiven) {
+        if (next.forwarderId == null) return { action: 'unlink', name: next.supplierName };
+        if (stored != null && stored === next.forwarderId) return { action: 'keep' };
+        return { action: 'byId', id: next.forwarderId };
+    }
+    if (stored != null && current.supplierKey === next.supplierKey) return { action: 'keep' };
+    return { action: 'byName', name: next.supplierName };
+}
+
+// A forwarder payment priced from a freight booking or a stock movement: what
+// it came from, its container, its forwarder and that it is a forwarder
+// payment stay as they were made (amount, currency, kind, description, dates
+// and note follow the forwarder's invoice and stay editable). `current`:
+// { freightBookingId, freightMovementId, ridesWith, shipmentId,
+// shipmentReference, forwarderId, supplierKey }; `next`: the parsed body with
+// its supplierKey. A container not named in the body (shipmentId null) is not
+// a change — the route writes the stored one. null, or a refusal.
+function decideFreightLock({ current, next }) {
+    const kind = current.freightBookingId != null ? 'booking' : current.freightMovementId != null ? 'movement' : null;
+    if (!kind) return null;
+    const id = Number(kind === 'booking' ? current.freightBookingId : current.freightMovementId);
+    const what = kind === 'booking' ? 'a freight booking' : 'a stock movement';
+    const locked = why => ({ status: 422, code: 'SOURCE_LOCKED', error: `It came from ${what} — ${why}` });
+    const ref = v => (v == null ? null : String(v).trim().toUpperCase() || null);
+    if (next.freightSource && (next.freightSource.kind !== kind || next.freightSource.id !== id)) return locked('where it came from cannot change.');
+    if (next.ridesWith !== current.ridesWith) return locked('it stays a forwarder payment.');
+    if ((next.shipmentId != null && next.shipmentId !== Number(current.shipmentId))
+        || (next.shipmentReference != null && ref(next.shipmentReference) !== ref(current.shipmentReference))) {
+        return locked('its container cannot change.');
+    }
+    if (next.forwarderIdGiven && (next.forwarderId ?? null) !== (current.forwarderId == null ? null : Number(current.forwarderId))) {
+        return locked('its forwarder cannot change.');
+    }
+    if (next.supplierKey !== current.supplierKey) return locked('its forwarder cannot change.');
+    return null;
 }
 
 // A transfer line applied to an extra: the same sign (a credit is used as a
@@ -169,6 +251,11 @@ function decideEdit({ current, next, applied }) {
     if (Math.abs(applied) <= EPS) return null;
     if (next.currency !== current.currency) return hasPayments('Money has been applied to it — its currency cannot change.');
     if (next.supplierKey !== current.supplierKey) return hasPayments('Money has been applied to it — its supplier cannot change.');
+    // Two forwarders can be spelled alike: moving the link between them is a
+    // change of payee too. Linking or unlinking under the same name is not.
+    if (current.forwarderId != null && next.forwarderId != null && Number(next.forwarderId) !== Number(current.forwarderId)) {
+        return hasPayments('Money has been applied to it — its forwarder cannot change.');
+    }
     if (Math.sign(next.amount) !== Math.sign(current.amount)) return hasPayments('Money has been applied to it — a charge cannot become a credit, or the other way round.');
     if (Math.abs(next.amount) < Math.abs(applied) - EPS) return hasPayments(`Money has been applied to it — it cannot go below the ${Math.abs(money(applied))} already applied.`);
     return null;
@@ -215,6 +302,9 @@ function extraRowToJson(r, { applied = 0, settlements = [] } = {}) {
         dueDate: ymd(r.due_date),
         sourceKind: r.source_kind || null,
         sourceId: r.source_id ?? null,
+        forwarderId: r.forwarder_id ?? null,
+        freightSource: r.freight_booking_id != null ? { kind: 'booking', id: Number(r.freight_booking_id) }
+            : r.freight_movement_id != null ? { kind: 'movement', id: Number(r.freight_movement_id) } : null,
         status: r.status,
         paidOn: ymd(r.paid_on),
         settledByPaymentId: r.settled_by_payment_id ?? null,
@@ -235,9 +325,12 @@ module.exports = {
     RIDES_WITH,
     EDITOR_ROLES,
     SOURCE_KINDS,
+    FREIGHT_SOURCE_KINDS,
     OTHER_CHARGES_SCHEMA,
     canEdit,
     parseExtraBody,
+    decidePayeeLink,
+    decideFreightLock,
     checkLine,
     checkCreditUse,
     settles,

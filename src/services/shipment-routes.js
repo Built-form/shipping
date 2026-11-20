@@ -15,6 +15,8 @@
 // '/' and spaces are looked up with ?name=, never in the path.
 
 const S = require('../lib/shipments');
+const FL = require('../lib/forwarder-links');
+const forwarderPairs = require('./forwarder-pairs');
 const sync = require('./shipment-sync');
 const { makeBookShipment } = require('./shipment-book');
 const { makeTransitionShipment } = require('./shipment-stage');
@@ -276,8 +278,11 @@ function registerShipmentRoutes(app, deps) {
                 }
             }
             const header = {};
+            // The forwarder is a pair (forwarder, forwarder_id), resolved in the transaction below.
+            const createForwarder = FL.decideShipmentForwarder({ stored: { id: null, name: null }, body: { forwarder: b.forwarder, forwarderId: b.forwarderId } });
+            if (createForwarder.error) return res.status(400).json({ error: createForwarder.error, code: 'BAD_FIELD' });
             for (const key of CREATE_HEADER) {
-                if (b[key] === undefined) continue;
+                if (b[key] === undefined || key === 'forwarder') continue;
                 const spec = HEADER_FIELDS[key] || WRITE_THROUGH[key];
                 const v = fieldValue(key, spec, b[key]);
                 if (v != null) header[spec.col] = v;
@@ -348,6 +353,11 @@ function registerShipmentRoutes(app, deps) {
                     synced = await sync.syncPlanned(conn, name, { origin: 'api', userEmail: req.userEmail, createIfMissing: true });
                 }
                 if (!synced || !synced.shipmentId || synced.stampedOnly) throw new Error('shipment not created');
+                const createPair = await forwarderPairs.pairFor(conn, createForwarder);
+                if (createPair && (createPair.name != null || createPair.id != null)) {
+                    header.forwarder = createPair.name;
+                    header.forwarder_id = createPair.id;
+                }
                 const headerCols = Object.keys(header);
                 await conn.query(
                     `UPDATE shipments
@@ -401,7 +411,7 @@ function registerShipmentRoutes(app, deps) {
         originPort: { col: 'origin_port', max: 255 },
         bookingRef: { col: 'booking_ref', max: 100 },
         blNumber: { col: 'bl_number', max: 100 },
-        forwarder: { col: 'forwarder', max: 255 },
+        // forwarder: with forwarderId, below (src/lib/forwarder-links.js).
         notes: { col: 'notes', max: 65535 },
         reviewNote: { col: 'review_note', max: 255 },
     };
@@ -490,6 +500,16 @@ function registerShipmentRoutes(app, deps) {
                 for (const [key, spec] of Object.entries(HEADER_FIELDS)) {
                     if (b[key] === undefined) continue;
                     change(key, spec.col, fieldValue(key, spec, b[key]));
+                }
+                // The container's own forwarder (2026-11-20): forwarder and
+                // forwarder_id are one value. A live freight booking still wins
+                // when read; this is what shows once it is gone.
+                const fwd = FL.decideShipmentForwarder({ stored: { id: ship.forwarder_id ?? null, name: ship.forwarder ?? null }, body: b });
+                if (fwd.error) throw new ShipmentError(400, 'BAD_FIELD', fwd.error, { field: b.forwarderId !== undefined ? 'forwarderId' : 'forwarder' });
+                const pair = await forwarderPairs.pairFor(conn, fwd);
+                if (pair && !(sameValue(ship.forwarder, pair.name) && sameValue(ship.forwarder_id, pair.id))) {
+                    change('forwarder', 'forwarder', pair.name);
+                    change('forwarderId', 'forwarder_id', pair.id);
                 }
                 for (const [key, spec] of Object.entries(WRITE_THROUGH)) {
                     if (b[key] === undefined) continue;

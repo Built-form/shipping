@@ -37,7 +37,13 @@ function harness({ userType = 'standard', frontOk = () => true, documentSet = nu
         audits: [], receipts: [], receiptReminders: [], sent: [], preapproved: [],
         // draft_container_documents rows and their sends (a contents email with documents).
         documents: [], documentSends: [],
+        // payment_extras rows priced from a booking or a movement (forwarder charges).
+        extras: [],
+        // A shipment id another booking takes at the last moment (the unique key refuses).
+        raceShipment: null,
     };
+    const containerDup = id => Object.assign(
+        new Error(`Duplicate entry '${id}' for key 'freight_bookings.uq_freight_bookings_live_shipment'`), { errno: 1062, code: 'ER_DUP_ENTRY' });
     const live = b => b.status === 'requested' || b.status === 'confirmed';
     const requestRow = r => ({ ...r, expired: r.expires_at <= NOW() ? 1 : 0 });
     // DATE_ADD(o.sailing_date, INTERVAL (o.transit_days + days) DAY), as 'YYYY-MM-DD'.
@@ -307,6 +313,8 @@ function harness({ userType = 'standard', frontOk = () => true, documentSet = nu
             if (s.startsWith('INSERT INTO freight_bookings')) {
                 const [request_id, option_id, requested_by_email, request_note, sent_to, subject, shipment_id, draft_container_name] = params;
                 if (db.bookings.some(b => b.request_id === request_id && live(b))) throw Object.assign(new Error('dup'), { errno: 1062 });
+                // Another booking took the container between the check and this insert.
+                if (shipment_id != null && db.raceShipment === shipment_id) throw containerDup(shipment_id);
                 const id = db.bookings.length + 1;
                 db.bookings.push({
                     id, request_id, option_id, status: 'requested', requested_by_email, requested_at: NOW(), request_note, sent_to,
@@ -353,6 +361,7 @@ function harness({ userType = 'standard', frontOk = () => true, documentSet = nu
                 const p = [...params];
                 if (s.includes('shipment_id = ?')) {
                     assert.match(s, /contents_document_ids = NULL/);
+                    if (p[0] != null && db.raceShipment === p[0]) throw containerDup(p[0]);
                     Object.assign(b, { shipment_id: p.shift(), draft_container_name: p.shift(), contents_json: null, contents_sent_at: null, contents_document_ids: null });
                 }
                 if (s.includes("status = 'confirmed'")) Object.assign(b, { status: 'confirmed', booking_ref: p.shift(), response_note: p.shift(), responded_by_email: p.shift(), response_source: 'staff', responded_at: NOW() });
@@ -368,6 +377,22 @@ function harness({ userType = 'standard', frontOk = () => true, documentSet = nu
                 return [db.shipments.filter(x => params[0].includes(x.id))];
             }
             if (s.startsWith('INSERT INTO email_receipts')) { db.receipts.push(params); return [{ insertId: db.receipts.length }]; }
+            // forwarder charges of a container (2026-11-20)
+            if (s.startsWith('SELECT b.id, b.status, b.booking_ref, b.request_id, b.option_id, r.forwarder_id, r.forwarder_name FROM freight_bookings b JOIN freight_quote_requests r ON r.id = b.request_id WHERE b.shipment_id = ? AND b.status IN (?) ORDER BY b.id DESC LIMIT 1')) {
+                const b = db.bookings.filter(x => x.shipment_id === params[0] && params[1].includes(x.status)).sort((x, y) => y.id - x.id)[0];
+                if (!b) return [[]];
+                const r = db.requests.find(x => x.id === b.request_id);
+                return [[{ id: b.id, status: b.status, booking_ref: b.booking_ref, request_id: b.request_id, option_id: b.option_id, forwarder_id: r.forwarder_id, forwarder_name: r.forwarder_name }]];
+            }
+            if (s.startsWith('SELECT id, name, deleted_at FROM forwarders WHERE id = ?')) {
+                return [db.forwarders.filter(f => f.id === params[0])];
+            }
+            if (s.startsWith('SELECT id, factory, cbm, price, currency FROM freight_stock_movements WHERE request_id = ? AND deleted_at IS NULL ORDER BY id ASC')) {
+                return [db.movements.filter(m => m.request_id === params[0] && !m.deleted_at).sort((a, b) => a.id - b.id)];
+            }
+            if (s.startsWith('SELECT id, freight_booking_id, freight_movement_id, amount, currency FROM payment_extras WHERE deleted_at IS NULL AND (freight_booking_id = ? OR freight_movement_id IN (?))')) {
+                return [db.extras.filter(x => !x.deleted_at && (x.freight_booking_id === params[0] || params[1].includes(x.freight_movement_id)))];
+            }
             throw new Error(`unexpected statement: ${s.slice(0, 140)}`);
         },
     };
@@ -997,4 +1022,55 @@ test('summary: quotes to decide, and confirmed bookings whose contents have not 
     Object.assign(d.db.bookings[0], { status: 'declined', response_source: 'link' });
     assert.equal((await d.call('GET', '/api/v1/freight-quotes/summary')).body.answered, 1);
     assert.equal((await d.call('GET', '/api/v1/freight-quotes')).body.requests.find(r => r.id === 1).lastBookingStatus, 'declined');
+});
+
+// Forwarder links (2026-11-20): one live booking per container is now a
+// unique key, so two attaches at the same moment end as one booking and one
+// CONTAINER_TAKEN; and a container's live booking prices its forwarder
+// payments (GET /shipments/:id/forwarder-charges).
+test('book and attach: a container another booking took at the last moment is CONTAINER_TAKEN', async () => {
+    const h = harness();
+    await answered(h);
+    h.db.raceShipment = 50;
+    const booked = await h.call('POST', '/api/v1/freight-quotes/options/1/book', { shipmentId: 50 });
+    assert.equal(booked.status, 409);
+    assert.equal(booked.body.code, 'CONTAINER_TAKEN');
+    h.db.raceShipment = null;
+    await h.call('POST', '/api/v1/freight-quotes/options/1/book', {});
+    h.db.raceShipment = 50;
+    const attached = await h.call('PATCH', '/api/v1/freight-bookings/1', { shipmentId: 50 });
+    assert.equal(attached.status, 409);
+    assert.equal(attached.body.code, 'CONTAINER_TAKEN');
+    assert.equal(h.db.bookings[0].shipment_id, null);
+});
+
+test('forwarder charges: the live booking on a container, its all-in price, and each stock movement priced on its own', async () => {
+    const h = harness();
+    await answered(h);
+    assert.deepEqual((await h.call('GET', '/api/v1/shipments/50/forwarder-charges')).body, { booking: null, movements: [] });
+    await h.call('POST', '/api/v1/freight-quotes/options/1/book', { shipmentId: 50 });
+    await h.call('POST', '/api/v1/freight-quotes/1/stock-movements', { notify: false, stockMovements: [{ from: 'Factory A', cbm: 2.5, weightKg: 300 }, { from: 'Factory B', cbm: 1, weightKg: 100 }] });
+    const [m1, m2] = h.db.movements.filter(m => m.request_id === 1);
+    await h.call('PATCH', `/api/v1/freight-stock-movements/${m1.id}`, { price: '120', currency: 'GBP' });
+    h.db.extras.push({ id: 900, freight_booking_id: 1, freight_movement_id: null, amount: '1850.00', currency: 'USD', deleted_at: null });
+    h.db.extras.push({ id: 901, freight_booking_id: null, freight_movement_id: m2.id, amount: '10.00', currency: 'GBP', deleted_at: new Date() });
+    const r = await h.call('GET', '/api/v1/shipments/50/forwarder-charges');
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.body, {
+        booking: {
+            id: 1, status: 'requested', bookingRef: null, forwarderId: 1, forwarderName: 'DCG', forwarderLive: true,
+            option: { price: 1850, currency: 'USD', service: 'door_to_port', portFrom: 'Ningbo', portTo: 'Felixstowe', sailingDate: '2026-12-10', arrivalDate: '2027-01-11', containerSize: '40HQ' },
+            extraId: 900, extraAmount: 1850, extraCurrency: 'USD',
+        },
+        movements: [
+            { id: m1.id, from: 'Factory A', cbm: 2.5, price: 120, currency: 'GBP', extraId: null, extraAmount: null, extraCurrency: null },
+            { id: m2.id, from: 'Factory B', cbm: 1, price: null, currency: null, extraId: null, extraAmount: null, extraCurrency: null },
+        ],
+    });
+    // The forwarder taken off the list: still shown (as the request recorded it), flagged.
+    h.db.forwarders[0].deleted_at = new Date();
+    assert.equal((await h.call('GET', '/api/v1/shipments/50/forwarder-charges')).body.booking.forwarderLive, false);
+    // Cancelled: nothing to price from any more.
+    await h.call('PATCH', '/api/v1/freight-bookings/1', { status: 'cancelled' });
+    assert.deepEqual((await h.call('GET', '/api/v1/shipments/50/forwarder-charges')).body, { booking: null, movements: [] });
 });

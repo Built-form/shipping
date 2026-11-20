@@ -15,6 +15,7 @@
 // Registered from orders.js; authed through the greedy /api/v1/{proxy+} route.
 
 const L = require('../lib/payment-extras');
+const FL = require('../lib/forwarder-links');
 const { supplierKey, resolveShipment } = require('./shipment-payments');
 
 const EXTRA_SELECT = `SELECT e.*, po.po_number
@@ -100,10 +101,108 @@ function registerPaymentExtraRoutes(app, {
         }
     };
 
-    const writeValues = (v, t) => [
-        v.supplierName, supplierKey(v.supplierName), v.currency, v.amount, v.kind, v.description, v.ridesWith,
-        v.purchaseOrderId, t.shipmentId, t.shipmentReference, v.dueDate, v.sourceKind, v.sourceId, v.note,
+    // `link`: { forwarderId, supplierName } — the payee as resolved below.
+    const writeValues = (v, t, link) => [
+        link.supplierName, supplierKey(link.supplierName), v.currency, v.amount, v.kind, v.description, v.ridesWith,
+        v.purchaseOrderId, t.shipmentId, t.shipmentReference, v.dueDate, v.sourceKind, v.sourceId, v.note, link.forwarderId,
     ];
+
+    // ── Forwarder links (2026-11-20, src/lib/payment-extras.js decidePayeeLink) ──
+    const LIVE_BOOKING = ['requested', 'confirmed'];
+    const badForwarder = id => ({ status: 400, code: 'BAD_FIELD', error: `Forwarder ${id} is not on the Forwarders list.`, payload: { field: 'forwarderId' } });
+    const forwarderById = async (conn, id) => {
+        const [rows] = await conn.query('SELECT id, name, deleted_at FROM forwarders WHERE id = ?', [id]);
+        return rows[0] || null;
+    };
+    // The payee a forwarder payment names: { forwarderId, supplierName } or { fail }.
+    // Only a forwarder payment carries a forwarder.
+    const resolveLink = async (conn, current, v) => {
+        if (v.ridesWith !== 'shipment') return { forwarderId: null, supplierName: v.supplierName };
+        const d = L.decidePayeeLink({
+            current: current ? { forwarderId: current.forwarder_id ?? null, supplierName: current.supplier_name, supplierKey: current.supplier_key } : null,
+            next: { ...v, supplierKey: supplierKey(v.supplierName) },
+        });
+        if (d.action === 'keep') return { forwarderId: Number(current.forwarder_id), supplierName: current.supplier_name };
+        if (d.action === 'unlink') return { forwarderId: null, supplierName: d.name };
+        if (d.action === 'byId') {
+            const f = await forwarderById(conn, d.id);
+            if (!f || f.deleted_at) return { fail: badForwarder(d.id) };
+            return { forwarderId: Number(f.id), supplierName: f.name };
+        }
+        // byName: linked when exactly one live forwarder carries that name; the name stays as sent.
+        const [list] = await conn.query('SELECT id, name, deleted_at FROM forwarders WHERE deleted_at IS NULL');
+        return { forwarderId: FL.pairFromText(d.name, list).id, supplierName: d.name };
+    };
+
+    // A forwarder payment priced from a freight booking or one stock movement
+    // (POST only): inside the caller's transaction. Discovers the ids without
+    // locks, then locks booking -> request -> movement (the order every freight
+    // route takes), and checks everything again under the locks.
+    // { bookingId, movementId, forwarderId, forwarderName } or { fail }.
+    const claimFreightSource = async (conn, v, t) => {
+        const { kind, id } = v.freightSource;
+        const stale = { fail: { status: 409, code: 'STALE', error: 'The booking changed while this was being added — read it again.' } };
+        let requestId;
+        let bookingId;
+        if (kind === 'booking') {
+            const [[b]] = await conn.query('SELECT id, request_id FROM freight_bookings WHERE id = ?', [id]);
+            if (!b) return { fail: { status: 404, code: 'NOT_FOUND', error: `Freight booking ${id} not found.` } };
+            bookingId = Number(b.id);
+            requestId = Number(b.request_id);
+        } else {
+            const [[m]] = await conn.query('SELECT id, request_id FROM freight_stock_movements WHERE id = ?', [id]);
+            if (!m) return { fail: { status: 404, code: 'NOT_FOUND', error: `Stock movement ${id} not found.` } };
+            requestId = Number(m.request_id);
+            const [[b]] = await conn.query(
+                'SELECT id FROM freight_bookings WHERE request_id = ? AND status IN (?) ORDER BY id DESC LIMIT 1', [requestId, LIVE_BOOKING]
+            );
+            if (!b) return { fail: { status: 409, code: 'NOT_LIVE', error: 'That stock movement has no live booking: price it once a booking is requested or confirmed.' } };
+            bookingId = Number(b.id);
+        }
+        const [[bk]] = await conn.query('SELECT id, request_id, status, shipment_id FROM freight_bookings WHERE id = ? FOR UPDATE', [bookingId]);
+        const [[rq]] = await conn.query('SELECT id, forwarder_id FROM freight_quote_requests WHERE id = ? FOR UPDATE', [requestId]);
+        let mv = null;
+        if (kind === 'movement') {
+            [[mv]] = await conn.query('SELECT id, request_id, deleted_at, price FROM freight_stock_movements WHERE id = ? FOR UPDATE', [id]);
+        }
+        if (!bk || !rq || Number(bk.request_id) !== requestId) return stale;
+        if (!LIVE_BOOKING.includes(bk.status)) {
+            return { fail: { status: 409, code: 'NOT_LIVE', error: `That booking is ${bk.status}: its price can no longer be added.` } };
+        }
+        if (kind === 'movement') {
+            if (!mv || Number(mv.request_id) !== requestId) return stale;
+            if (mv.deleted_at) return { fail: { status: 409, code: 'STALE', error: 'That stock movement was removed.' } };
+            if (mv.price == null) return { fail: { status: 409, code: 'UNPRICED', error: 'That stock movement has no price yet.' } };
+        }
+        if (t.shipmentId == null || bk.shipment_id == null || Number(bk.shipment_id) !== Number(t.shipmentId)) {
+            return { fail: { status: 422, code: 'SOURCE_MISMATCH', error: 'That booking is not on this container.' } };
+        }
+        const f = rq.forwarder_id != null ? await forwarderById(conn, rq.forwarder_id) : null;
+        if (!f || f.deleted_at) {
+            return { fail: { status: 409, code: 'FORWARDER_REMOVED', error: "The booking's forwarder was removed from the Forwarders list: restore it, or add the payment by hand." } };
+        }
+        return { bookingId: kind === 'booking' ? bookingId : null, movementId: kind === 'movement' ? Number(id) : null, forwarderId: Number(f.id), forwarderName: f.name };
+    };
+    const freightDuplicate = async (conn, e, v) => {
+        if (!(e && e.code === 'ER_DUP_ENTRY' && /uq_payment_extras_freight_source/.test(e.message || ''))) return null;
+        const key = `${v.freightSource.kind === 'booking' ? 'b' : 'm'}:${v.freightSource.id}`;
+        const [[row]] = await conn.query('SELECT id FROM payment_extras WHERE freight_source_key = ?', [key]);
+        const what = v.freightSource.kind === 'booking' ? 'this booking' : 'this stock movement';
+        return { status: 409, code: 'ALREADY_ADDED', error: `That price from ${what} has already been added.`, payload: { extraId: row ? row.id : null } };
+    };
+    // InnoDB picked this transaction to break a deadlock: once more, then give up.
+    const DEADLOCK = 1213;
+    const withDeadlockRetry = async (fn) => {
+        try { return await fn(); } catch (e) {
+            if (e && e.errno === DEADLOCK) {
+                try { return await fn(); } catch (e2) {
+                    if (e2 && e2.errno === DEADLOCK) return { fail: { status: 503, code: 'TRY_AGAIN', error: 'Busy — try again.' } };
+                    throw e2;
+                }
+            }
+            throw e;
+        }
+    };
 
     // GET /api/v1/payment-extras?supplier=&currency=&purchaseOrderId=&shipmentId=
     // Every live extra (open and paid) with what transfers have applied to it.
@@ -135,7 +234,7 @@ function registerPaymentExtraRoutes(app, {
             if (parsed.error) return refuse(res, { status: 400, code: 'BAD_FIELD', error: parsed.error });
             const v = parsed.value;
             await auditLogSchemaReady;
-            const out = await withConnection(async (conn) => {
+            const out = await withConnection(async (conn) => withDeadlockRetry(async () => {
                 const t = await resolveTarget(conn, v);
                 if (t.fail) return { fail: t.fail };
                 await conn.beginTransaction();
@@ -145,12 +244,33 @@ function registerPaymentExtraRoutes(app, {
                         await conn.rollback();
                         return { fail: { status: 409, code: 'ALREADY_ADDED', error: 'That charge from this invoice has already been added.', payload: { extraId: dup } } };
                     }
-                    const [ins] = await conn.query(
-                        `INSERT INTO payment_extras (supplier_name, supplier_key, currency, amount, kind, description, rides_with,
-                                                     purchase_order_id, shipment_id, shipment_reference, due_date, source_kind, source_id, note, created_by_email)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                        [...writeValues(v, t), req.userEmail || null]
-                    );
+                    let link;
+                    let freight = { bookingId: null, movementId: null };
+                    if (v.freightSource) {
+                        // Priced from the Freight page: the payee is the booking's forwarder.
+                        const f = await claimFreightSource(conn, v, t);
+                        if (f.fail) { await conn.rollback(); return { fail: f.fail }; }
+                        freight = f;
+                        link = { forwarderId: f.forwarderId, supplierName: f.forwarderName };
+                    } else {
+                        link = await resolveLink(conn, null, v);
+                        if (link.fail) { await conn.rollback(); return { fail: link.fail }; }
+                    }
+                    let ins;
+                    try {
+                        [ins] = await conn.query(
+                            `INSERT INTO payment_extras (supplier_name, supplier_key, currency, amount, kind, description, rides_with,
+                                                         purchase_order_id, shipment_id, shipment_reference, due_date, source_kind, source_id, note,
+                                                         forwarder_id, freight_booking_id, freight_movement_id, created_by_email)
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                            [...writeValues(v, t, link), freight.bookingId, freight.movementId, req.userEmail || null]
+                        );
+                    } catch (e) {
+                        // Two adds of one booking price at once: the unique key lets one in.
+                        const taken = v.freightSource ? await freightDuplicate(conn, e, v) : null;
+                        if (taken) { await conn.rollback(); return { fail: taken }; }
+                        throw e;
+                    }
                     const json = await jsonById(conn, ins.insertId);
                     await recordAudit(conn, { entityType: 'payment_extra', entityId: ins.insertId, action: 'create', before: null, after: json, userEmail: req.userEmail });
                     await conn.commit();
@@ -159,7 +279,7 @@ function registerPaymentExtraRoutes(app, {
                     await conn.rollback().catch(() => {});
                     throw e;
                 }
-            });
+            }));
             if (out.fail) return refuse(res, out.fail);
             res.status(201).json({ ...out.json, warnings: out.warnings });
         } catch (error) {
@@ -186,14 +306,43 @@ function registerPaymentExtraRoutes(app, {
                 try {
                     const current = await rowById(conn, id, { lock: true });
                     if (!current) { await conn.rollback(); return { fail: notFound(id) }; }
+                    // Priced from a freight booking or stock movement (2026-11-20): what
+                    // it came from, its container, its forwarder and its kind stay as
+                    // made. An older client sends back neither freightSource nor the
+                    // forwarder, and source_kind for nothing: both are written as stored.
+                    const fromFreight = current.freight_booking_id != null || current.freight_movement_id != null;
+                    if (!fromFreight && v.freightSource) {
+                        await conn.rollback();
+                        return { fail: { status: 422, code: 'SOURCE_LOCKED', error: 'Where a payment came from is set when it is added.' } };
+                    }
+                    let w = v;
+                    let target = t;
+                    let link;
+                    if (fromFreight) {
+                        const locked = L.decideFreightLock({
+                            current: {
+                                freightBookingId: current.freight_booking_id ?? null, freightMovementId: current.freight_movement_id ?? null,
+                                ridesWith: current.rides_with, shipmentId: current.shipment_id ?? null, shipmentReference: current.shipment_reference,
+                                forwarderId: current.forwarder_id ?? null, supplierKey: current.supplier_key,
+                            },
+                            next: { ...v, supplierKey: supplierKey(v.supplierName) },
+                        });
+                        if (locked) { await conn.rollback(); return { fail: locked }; }
+                        w = { ...v, ridesWith: current.rides_with, purchaseOrderId: null, sourceKind: null, sourceId: null };
+                        target = { ...t, shipmentId: current.shipment_id ?? null, shipmentReference: current.shipment_reference };
+                        link = { forwarderId: current.forwarder_id ?? null, supplierName: current.supplier_name };
+                    } else {
+                        link = await resolveLink(conn, current, v);
+                        if (link.fail) { await conn.rollback(); return { fail: link.fail }; }
+                    }
                     const applied = (await loadAppliedByTarget(conn, 'extra', [id])).get(id) || 0;
                     const refusal = L.decideEdit({
-                        current: { amount: Number(current.amount), currency: current.currency, supplierKey: current.supplier_key },
-                        next: { amount: v.amount, currency: v.currency, supplierKey: supplierKey(v.supplierName) },
+                        current: { amount: Number(current.amount), currency: current.currency, supplierKey: current.supplier_key, forwarderId: current.forwarder_id ?? null },
+                        next: { amount: w.amount, currency: w.currency, supplierKey: supplierKey(link.supplierName), forwarderId: link.forwarderId },
                         applied,
                     });
                     if (refusal) { await conn.rollback(); return { fail: refusal }; }
-                    const dup = await duplicateOf(conn, v, { excludeId: id });
+                    const dup = await duplicateOf(conn, w, { excludeId: id });
                     if (dup) {
                         await conn.rollback();
                         return { fail: { status: 409, code: 'ALREADY_ADDED', error: 'That charge from this invoice has already been added.', payload: { extraId: dup } } };
@@ -203,9 +352,9 @@ function registerPaymentExtraRoutes(app, {
                         `UPDATE payment_extras
                             SET supplier_name = ?, supplier_key = ?, currency = ?, amount = ?, kind = ?, description = ?, rides_with = ?,
                                 purchase_order_id = ?, shipment_id = ?, shipment_reference = ?, due_date = ?, source_kind = ?, source_id = ?, note = ?,
-                                updated_by_email = ?
+                                forwarder_id = ?, updated_by_email = ?
                           WHERE id = ?`,
-                        [...writeValues(v, t), req.userEmail || null, id]
+                        [...writeValues(w, target, link), req.userEmail || null, id]
                     );
                     await reconcile(conn, id, req.userEmail);
                     const json = await jsonById(conn, id);

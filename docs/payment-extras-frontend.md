@@ -101,6 +101,49 @@ was applied. Raising a settled extra above what was applied opens it again;
 bringing it back within what was applied settles it again (by the last
 transfer that paid it).
 
+## Forwarder links (2026-11-20)
+
+A forwarder payment (`ridesWith: "shipment"`) names its forwarder from the
+Freight page's Forwarders list, and may be priced from a freight booking.
+Rules: `decidePayeeLink` / `decideFreightLock` in `src/lib/payment-extras.js`.
+Schema: `src/db/migrate/2026-11-20_10_forwarder_links.js`.
+
+- **`forwarderId`** (body and JSON): the forwarder. Only on a forwarder payment
+  (`400` otherwise). **The payee name stays the recorded snapshot.** Sign-off
+  keys (container × payee), transfer matching and `EXTRA_PAYEE_MISMATCH` are
+  still by name, so the id adds the link without changing what a payment is.
+  - POST with an id: `supplierName` becomes that forwarder's name in the list
+    (the body's text is ignored); `400 BAD_FIELD field:"forwarderId"` for one
+    that is not live.
+  - POST or PUT with no `forwarderId` (an older client): linked when exactly
+    one live forwarder has that name, the name kept as sent. A PUT that leaves
+    the name as it was keeps the link and the stored name.
+  - PUT with the stored id keeps the stored name, **never refreshed** after the
+    forwarder is renamed or removed. Another id takes that forwarder's name;
+    with money applied, moving between two linked forwarders is `409
+    EXTRA_HAS_PAYMENTS` (linking or unlinking under the same name is not).
+  - `forwarderId: null` unlinks, on purpose.
+- **`freightSource: { kind: "booking" | "movement", id }`** (POST only; JSON on
+  every extra, or `null`): priced from a booking's all-in price or one stock
+  movement's own price. Kept in its own columns, never `sourceKind`. Never with
+  `sourceKind` / `sourceId` (`400`). The payee is the booking request's
+  forwarder, whatever the body says.
+  - The booking must be live (`requested` / `confirmed`) and on this container
+    (`shipmentId` required): `409 NOT_LIVE` · `422 SOURCE_MISMATCH`. A movement
+    must belong to that booking's request, not be removed, and have a price:
+    `409 STALE` · `409 UNPRICED`. The forwarder off the list: `409
+    FORWARDER_REMOVED`. A busy moment: `503 TRY_AGAIN`.
+  - **Once each:** a unique key holds one live extra per booking and per
+    movement, so a second add, or two at once, is `409 ALREADY_ADDED
+    { extraId }`. Deleting the extra frees it.
+  - **After adding:** its source, container, forwarder and `ridesWith` are
+    fixed (`422 SOURCE_LOCKED` on a PUT that changes one). Amount, currency,
+    kind, description, due date and note stay editable: they follow the
+    forwarder's invoice, also after the booking is cancelled. A PUT that sends
+    `sourceKind` for it (an older editor) is accepted and writes none.
+- `GET /api/v1/shipments/:id/forwarder-charges` lists what a container's live
+  booking can price (docs/freight-quotes.md).
+
 ## `DELETE /api/v1/payment-extras/:id`
 
 Soft. `409 EXTRA_HAS_PAYMENTS` while any live transfer applies money to it —

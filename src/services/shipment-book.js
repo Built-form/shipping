@@ -32,6 +32,8 @@
 // exactly as pack + close would leave it.
 
 const S = require('../lib/shipments');
+const FL = require('../lib/forwarder-links');
+const forwarderPairs = require('./forwarder-pairs');
 const sync = require('./shipment-sync');
 const { ShipmentError } = S;
 
@@ -290,9 +292,15 @@ function makeBookShipment(deps) {
             `stage = 'BOOKED'`, 'open_key = NULL', 'booked_at = COALESCE(booked_at, NOW())',
             'tracking_ref = COALESCE(?, tracking_ref)', 'vessel_name = ?',
             'eta = ?', 'etd = ?', 'origin_port = ?',
-            'booking_ref = COALESCE(?, booking_ref)', 'bl_number = COALESCE(?, bl_number)', 'forwarder = COALESCE(?, forwarder)',
+            'booking_ref = COALESCE(?, booking_ref)', 'bl_number = COALESCE(?, bl_number)',
         ];
-        const vals = [trackingRef, vesselName, eta, etd, originPort, bookingRef, blNumber, forwarder];
+        const vals = [trackingRef, vesselName, eta, etd, originPort, bookingRef, blNumber];
+        // The forwarder pair (2026-11-20, src/lib/forwarder-links.js): left as
+        // stored when the form sends none or the stored name, else resolved
+        // from the text — forwarder and forwarder_id together.
+        const forwarderPair = await forwarderPairs.pairFor(conn,
+            FL.decideBookForwarder({ stored: { id: ship.forwarder_id ?? null, name: ship.forwarder ?? null }, text: forwarder }));
+        if (forwarderPair) { sets.push('forwarder = ?', 'forwarder_id = ?'); vals.push(forwarderPair.name, forwarderPair.id); }
         if (modeFromBody) { sets.push('mode = ?', `mode_source = 'user'`); vals.push(mode); }
         await conn.query(`UPDATE shipments SET ${sets.join(', ')} WHERE id = ?`, [...vals, ship.id]);
         await sync.leaveBookedManifests(conn, packedRowIds, ship.id);

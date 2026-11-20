@@ -74,6 +74,29 @@ never in the path: look one up with `?name=`.
   "cancelledAt": null, "cancelledReason": null, "deletedAt": null }
 ```
 
+**The forwarder** (2026-11-20, `src/lib/forwarder-links.js`). `forwarder`,
+`forwarderId` and `forwarderSource` are what the container *shows*:
+
+- the forwarder of its live freight booking (`requested` or `confirmed`) when it
+  has one: `forwarderSource: "booking"`, and `booking: { id, status, bookingRef }`;
+- otherwise its own pair, `shipments.forwarder` (the name) and
+  `shipments.forwarder_id` (a row of the Freight page's Forwarders list, or
+  `null` for text typed before the list): `forwarderSource: "container"`, and
+  `booking: null`;
+- with neither: `forwarder: null`, `forwarderId: null`, `forwarderSource: null`.
+
+The booking is derived when the container is read, never written onto it,
+because the forwarder confirms on the supplier portal. While a booking holds the
+container its own pair is only the fallback: show the field read-only, "from
+booking #N". The stored pair is still writable, and reappears once the booking
+is cancelled. Every route that answers with a shipment re-reads it, so its
+response carries the same three fields.
+
+```json
+{ "forwarder": "DCG", "forwarderId": 7, "forwarderSource": "booking",
+  "booking": { "id": 41, "status": "confirmed", "bookingRef": "BK-1" } }
+```
+
 `reservedReference` / `reservedSeq`: the number an open (DRAFT / PLANNED)
 shipment's name holds (`… - 329` → `"329"`, on an AIR draft `"104. Air Freight"`),
 by the rule booking applies: a hint of the other sequence holds nothing. `null`
@@ -130,8 +153,25 @@ holds that number: `reservedBy`, `reservedByShipmentId`) · `422 LINES_REQUIRED`
 ### `PATCH /shipments/:id`
 
 Any of `name`, `mode`, `reference`, `trackingRef`, `vesselName`, `eta`, `etd`,
-`ata`, `originPort`, `bookingRef`, `blNumber`, `forwarder`, `notes`,
-`needsReview`, `reviewNote`.
+`ata`, `originPort`, `bookingRef`, `blNumber`, `forwarder`, `forwarderId`,
+`notes`, `needsReview`, `reviewNote`.
+
+- **`forwarderId` and `forwarder`** set the container's own pair. Both columns
+  are always written together:
+
+  | `forwarderId` | `forwarder` | result |
+  |---|---|---|
+  | left out | left out | unchanged |
+  | left out | text | linked when exactly one live forwarder has that name (and then written in the list's spelling); otherwise the text, unlinked. The stored name sent back, in any case, changes nothing |
+  | left out | `null` / `""` | both cleared |
+  | `n` | anything | that forwarder's id and its name in the list; the text is ignored. The stored id sent back changes nothing, even after a rename. `400 BAD_FIELD field:"forwarderId"` for an id that is not live on the list |
+  | `null` | text | the text, unlinked on purpose |
+  | `null` | left out / `null` / `""` | both cleared |
+
+  `POST /shipments` and the booking modal (`POST /shipments/:id/book`, text
+  only: left out or the stored name keeps the pair) follow the same rules. Send
+  `forwarderId` with the name as `forwarder`: a server from before this change
+  saves the text and ignores the id.
 
 - `name` on a DRAFT renames the legacy draft everywhere (allocations,
   documents, QA sheets) like `POST /draft-containers/rename`; on a PLANNED one it

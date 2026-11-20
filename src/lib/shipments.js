@@ -16,6 +16,7 @@
 // derive stages through this one module, so they can never disagree.
 
 const { STATUS_LEVEL, isFqcOrder } = require('./order-transitions');
+const FL = require('./forwarder-links');
 
 const MODES = ['SEA', 'AIR', 'ROAD'];
 const STAGES = ['PLANNED', 'DRAFT', 'BOOKED', 'IN_TRANSIT', 'ARRIVED', 'CLOSED', 'CANCELLED'];
@@ -301,7 +302,10 @@ function rowToShipment(row) {
         trackingRef: memberTracking || row.tracking_ref || null,
         bookingRef: row.booking_ref || null,
         blNumber: row.bl_number || null,
-        forwarder: row.forwarder || null,
+        // The live freight booking's forwarder, else the container's own
+        // (forwarder, forwarderId, forwarderSource and, read with the booking
+        // join, booking) — src/lib/forwarder-links.js.
+        ...FL.effectiveForwarder(row),
         vesselName: (booked && clean(row.member_vessel)) || row.vessel_name || null,
         originPort: row.origin_port || null,
         etd: (booked && dateOnly(row.member_etd)) || dateOnly(row.etd),

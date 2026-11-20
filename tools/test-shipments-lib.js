@@ -208,6 +208,28 @@ test('rowToShipment: an open shipment reports the number its name reserves; a bo
     assert.equal(booked.reference, '328');
 });
 
+test('rowToShipment: the forwarder — the live booking wins, else the container\'s own pair (2026-11-20)', () => {
+    const booked = S.rowToShipment({
+        id: 13, stage: 'BOOKED', reference: '331', forwarder: 'Typed Ltd', forwarder_id: 3,
+        bk_count: 1, bk_id: 41, bk_status: 'confirmed', bk_ref: 'BK-1', bk_forwarder_id: 7, bk_forwarder_name: 'DCG',
+    });
+    assert.deepEqual([booked.forwarder, booked.forwarderId, booked.forwarderSource, booked.booking],
+        ['DCG', 7, 'booking', { id: 41, status: 'confirmed', bookingRef: 'BK-1' }]);
+    const own = S.rowToShipment({ id: 14, stage: 'DRAFT', forwarder: 'DCG', forwarder_id: 7, bk_count: null });
+    assert.deepEqual([own.forwarder, own.forwarderId, own.forwarderSource, own.booking], ['DCG', 7, 'container', null]);
+    // A raw row (no booking join): its own pair, and no claim about a booking.
+    const raw = S.rowToShipment({ id: 15, stage: 'DRAFT', forwarder: 'Old Name' });
+    assert.deepEqual([raw.forwarder, raw.forwarderId, raw.forwarderSource, 'booking' in raw], ['Old Name', null, 'container', false]);
+});
+
+test('shipmentSelect joins each shipment\'s live freight booking and its forwarder, one row per shipment', () => {
+    const sql = sync.shipmentSelect({});
+    assert.match(sql, /LEFT JOIN \(\s*SELECT fb\.shipment_id, COUNT\(\*\) AS bk_count/);
+    assert.match(sql, /FROM freight_bookings fb\s+JOIN freight_quote_requests fr ON fr\.id = fb\.request_id/);
+    assert.match(sql, /WHERE fb\.status IN \('requested', 'confirmed'\) AND fb\.shipment_id IS NOT NULL/);
+    assert.match(sql, /GROUP BY fb\.shipment_id\s*\) bk ON bk\.shipment_id = s\.id/);
+});
+
 test('nextReference: a number reserved by an open shipment with no lines still counts', async () => {
     const conn = fakeConn((sql) => {
         if (sql.includes('FROM orders')) return [[{ ref: '327' }, { ref: '103. Air Freight' }]];
@@ -462,6 +484,54 @@ test('mergeShipments: the loser releases its keys before the survivor takes the 
     assert.ok(release >= 0 && take > release, 'release, then take');
     assert.ok(conn.calls[take].params.includes('330'));
     assert.deepEqual(has(conn.calls, 'UPDATE orders SET shipment_id = ?')[0].params, [5, 77]);
+});
+
+// Forwarder links (2026-11-20): the forwarder pair is kept whole, and a live
+// freight booking follows its container into the survivor — unless the
+// survivor holds one already (one live booking per container; then it stays
+// on the merged loser, which tools/verify-shipments.js reports).
+function mergeConn(rows, { survivorBooked = 0 } = {}) {
+    return fakeConn((sql, params) => {
+        if (sql.includes('FROM shipments WHERE id = ? FOR UPDATE')) return [[rows[params[0]]]];
+        if (sql.includes('FROM orders WHERE shipment_id = ? ORDER BY id FOR UPDATE')) return [[]];
+        if (sql.includes('FOR SHARE')) return [[]];
+        if (sql.includes('SELECT COUNT(*) AS n FROM freight_bookings WHERE shipment_id = ?')) return [[{ n: survivorBooked }]];
+        return [{ affectedRows: 1 }];
+    });
+}
+const survivorUpdate = (conn, id) => conn.calls.find(c => c.sql.startsWith('UPDATE shipments SET') && !c.sql.includes('merged_into_id') && c.params[c.params.length - 1] === id);
+
+test('mergeShipments: the forwarder pair is never mixed — the survivor keeps its own, or takes the other one whole', async () => {
+    const mixed = mergeConn({
+        5: { id: 5, stage: 'DRAFT', name: 'D', mode: 'SEA', forwarder: 'Alpha', forwarder_id: null },
+        9: { id: 9, stage: 'DRAFT', name: 'E', mode: 'SEA', forwarder: 'Beta', forwarder_id: 7 },
+    });
+    await sync.mergeShipments(mixed, 5, 9);
+    const u = survivorUpdate(mixed, 5);
+    assert.ok(!u || !/forwarder/.test(u.sql), 'the survivor keeps { Alpha, null }: nothing written to forwarder or forwarder_id');
+    const empty = mergeConn({
+        5: { id: 5, stage: 'DRAFT', name: 'D', mode: 'SEA', forwarder: null, forwarder_id: null },
+        9: { id: 9, stage: 'DRAFT', name: 'E', mode: 'SEA', forwarder: 'Beta', forwarder_id: 7 },
+    });
+    await sync.mergeShipments(empty, 5, 9);
+    const w = survivorUpdate(empty, 5);
+    assert.match(w.sql, /forwarder = \?, forwarder_id = \?/);
+    assert.deepEqual(w.params.slice(w.params.indexOf('Beta'), w.params.indexOf('Beta') + 2), ['Beta', 7]);
+});
+
+test('mergeShipments: a live freight booking follows its container into a survivor that has none', async () => {
+    const rows = {
+        5: { id: 5, stage: 'BOOKED', reference: '330', mode: 'SEA' },
+        9: { id: 9, stage: 'DRAFT', name: 'D', mode: 'SEA' },
+    };
+    const free = mergeConn(rows, { survivorBooked: 0 });
+    await sync.mergeShipments(free, 5, 9);
+    assert.deepEqual(has(free.calls, "UPDATE freight_bookings SET shipment_id = ? WHERE shipment_id = ? AND status IN ('requested', 'confirmed')").map(c => c.params), [[5, 9]]);
+    assert.deepEqual(has(free.calls, "UPDATE freight_bookings SET shipment_id = ? WHERE shipment_id = ? AND status NOT IN ('requested', 'confirmed')").map(c => c.params), [[5, 9]]);
+    const held = mergeConn(rows, { survivorBooked: 1 });
+    await sync.mergeShipments(held, 5, 9);
+    assert.equal(has(held.calls, "AND status IN ('requested', 'confirmed')").filter(c => c.sql.startsWith('UPDATE freight_bookings')).length, 0, 'the survivor already has one: the loser keeps its own');
+    assert.equal(has(held.calls, "AND status NOT IN ('requested', 'confirmed')").length, 1, 'history follows regardless');
 });
 
 test('findOrCreateByReference: race-safe upsert that returns the live holder, quarantining junk', async () => {

@@ -26,6 +26,7 @@ require('dotenv').config();
 const fs = require('fs');
 const { getPool, closePool } = require('../src/db');
 const sync = require('../src/services/shipment-sync');
+const { reseedGuard } = require('../src/lib/forwarder-links');
 
 function arg(name) {
     const i = process.argv.indexOf(name);
@@ -183,6 +184,23 @@ function printReport(r) {
         if (!t.length || !c.length) {
             console.error('The shipments schema is not applied here. Run `node tools/migrate.js --apply` for this database first (deploy.sh does it per stage).');
             process.exit(2);
+        }
+        // shipments.id is AUTO_INCREMENT: seeding an emptied table would hand
+        // old ids to other containers while freight bookings and payment
+        // extras still point at them (2026-11-20, src/lib/forwarder-links.js).
+        if (apply) {
+            const count = async (q) => { try { return Number((await conn.query(q))[0][0].n); } catch (e) { if (e.code === 'ER_NO_SUCH_TABLE') return 0; throw e; } };
+            const refusal = reseedGuard({
+                shipmentCount: await count('SELECT COUNT(*) AS n FROM shipments'),
+                dependants: {
+                    freight_bookings: await count('SELECT COUNT(*) AS n FROM freight_bookings WHERE shipment_id IS NOT NULL'),
+                    payment_extras: await count('SELECT COUNT(*) AS n FROM payment_extras WHERE shipment_id IS NOT NULL'),
+                },
+            });
+            if (refusal) {
+                console.error(`Refusing to seed: ${refusal}`);
+                process.exit(2);
+            }
         }
         const started = Date.now();
         const report = await sync.backfillAll(conn, {
