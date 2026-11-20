@@ -520,7 +520,8 @@ function registerFreightQuoteRoutes(app, deps) {
             requestNote: b.request_note || null,
             sentTo: F.jsonArray(b.sent_to).map(String),
             shipmentId: b.shipment_id != null ? Number(b.shipment_id) : null,
-            containerName: shipment ? (shipment.name || shipment.reference || null) : (b.draft_container_name || null),
+            // The number once the container is real: its draft name stays on the row.
+            containerName: shipment ? S.containerLabel(shipment) : (b.draft_container_name || null),
             containerStage: shipment ? shipment.stage : null,
             bookingRef: b.booking_ref || null,
             responseNote: b.response_note || null,
@@ -1224,7 +1225,7 @@ function registerFreightQuoteRoutes(app, deps) {
             'SELECT id FROM freight_bookings WHERE shipment_id = ? AND status IN (?) AND id <> ? LIMIT 1',
             [shipmentId, LIVE, exceptBookingId || 0]
         );
-        if (taken) throw new Fail(409, 'CONTAINER_TAKEN', `${ship.name || ship.reference} is already attached to another booking.`, { bookingId: Number(taken.id) });
+        if (taken) throw new Fail(409, 'CONTAINER_TAKEN', `${S.containerLabel(ship)} is already attached to another booking.`, { bookingId: Number(taken.id) });
         return ship;
     }
 

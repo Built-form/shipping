@@ -1044,6 +1044,27 @@ test('book and attach: a container another booking took at the last moment is CO
     assert.equal(h.db.bookings[0].shipment_id, null);
 });
 
+// A draft keeps its name on the record after it is made real (TEST shipment
+// 1214, 2026-11-20: BOOKED, reference 339, name still "DRAFT-SEA-… - 339 …").
+test('bookings: a container made real is named by its number, on the board and when it is taken', async () => {
+    const h = harness();
+    await answered(h);
+    const booked = await h.call('POST', '/api/v1/freight-quotes/options/1/book', { shipmentId: 50 });
+    assert.equal(booked.body.bookings[0].containerName, 'Draft 12');
+    assert.equal(booked.body.bookings[0].containerStage, 'DRAFT');
+
+    Object.assign(h.db.shipments[0], { name: 'DRAFT-SEA-261008-104309 - 339 Ningbo ETD 21 Oct', reference: '339', stage: 'BOOKED' });
+    const board = await h.call('GET', '/api/v1/freight-quotes');
+    assert.equal(board.body.bookings[0].shipmentId, 50);
+    assert.equal(board.body.bookings[0].containerName, '339');
+    assert.equal(board.body.bookings[0].containerStage, 'BOOKED');
+
+    const taken = await h.call('POST', '/api/v1/freight-quotes/options/2/book', { shipmentId: 50 });
+    assert.equal(taken.status, 409);
+    assert.equal(taken.body.code, 'CONTAINER_TAKEN');
+    assert.equal(taken.body.error, '339 is already attached to another booking.');
+});
+
 test('forwarder charges: the live booking on a container, its all-in price, and each stock movement priced on its own', async () => {
     const h = harness();
     await answered(h);

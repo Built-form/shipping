@@ -372,6 +372,17 @@ function documentSource(ship) {
         `Documents are generated for a DRAFT or a booked shipment (this one is ${ship.stage}).`, { stage: ship.stage });
 }
 
+// What staff call a container: its number once it is real, its name until
+// then. A draft's name stays on the row after it is booked ("DRAFT-SEA-… - 339"
+// on container 339), so the name alone would keep calling a real container a
+// draft. No reference yet (a closed draft from before references): the name.
+function containerLabel(ship) {
+    if (!ship) return null;
+    const reference = clean(ship.reference);
+    if (isBookedStage(ship.stage) && reference) return reference;
+    return clean(ship.name) || reference;
+}
+
 // Which history a quote document's events (generated, sent) belong to: the
 // draft's while its shipment is open or unknown, else the shipment's. Draft
 // history goes through draftAudit.ensureDraftRegistered, which reopens a closed
@@ -394,6 +405,11 @@ function shipmentSummary(s) {
         eta: s.eta,
         originPort: s.originPort,
         needsReview: s.needsReview,
+        // The container card names its forwarder: the live booking's, else the
+        // container's own (rowToShipment, src/lib/forwarder-links.js).
+        forwarder: s.forwarder ?? null,
+        forwarderId: s.forwarderId ?? null,
+        forwarderSource: s.forwarderSource ?? null,
     };
 }
 
@@ -432,6 +448,7 @@ module.exports = {
     auditSnapshot,
     ShipmentError,
     documentSource,
+    containerLabel,
     documentHistoryOwner,
     clean,
 };

@@ -574,6 +574,46 @@ test('documentSource: PLANNED and CANCELLED are refused, and a booked shipment n
         e => e instanceof S.ShipmentError && e.status === 422 && e.code === 'NO_REFERENCE');
 });
 
+test('shipmentSummary: the compact entry names the container\'s forwarder and where it comes from', () => {
+    const base = { id: 12, stage: 'BOOKED', mode: 'SEA', reference: '339', name: 'DRAFT-SEA-261008-104309 - 339' };
+    const of = row => {
+        const { forwarder, forwarderId, forwarderSource } = S.shipmentSummary(S.rowToShipment({ ...base, ...row }));
+        return { forwarder, forwarderId, forwarderSource };
+    };
+    // A live booking holds the container: the booking's forwarder, over the container's own.
+    assert.deepEqual(
+        of({ forwarder: 'Typed Co', forwarder_id: null, bk_count: 1, bk_id: 12, bk_status: 'confirmed', bk_ref: 'hello', bk_forwarder_id: 4, bk_forwarder_name: 'test2forwarder' }),
+        { forwarder: 'test2forwarder', forwarderId: 4, forwarderSource: 'booking' });
+    // No live booking: the pair set on the container.
+    assert.deepEqual(of({ forwarder: 'DCG', forwarder_id: 3, bk_count: 0, bk_id: null }),
+        { forwarder: 'DCG', forwarderId: 3, forwarderSource: 'container' });
+    // Nothing linked.
+    assert.deepEqual(of({ forwarder: null, forwarder_id: null, bk_count: 0, bk_id: null }),
+        { forwarder: null, forwarderId: null, forwarderSource: null });
+    // The booking itself stays out of the compact entry.
+    assert.equal('booking' in S.shipmentSummary(S.rowToShipment({ ...base, bk_count: 1, bk_id: 12, bk_status: 'confirmed', bk_forwarder_id: 4, bk_forwarder_name: 'x' })), false);
+});
+
+test('containerLabel: a real container is called by its number, a draft by its name', () => {
+    const DRAFT_NAME = 'DRAFT-SEA-261008-104309 - 339 Ningbo ETD 21 Oct';
+    // A draft's name stays on the record after it is booked: the number wins from then on.
+    for (const stage of ['BOOKED', 'IN_TRANSIT', 'ARRIVED', 'CLOSED']) {
+        assert.equal(S.containerLabel({ stage, name: DRAFT_NAME, reference: ' 339 ' }), '339', stage);
+    }
+    assert.equal(S.containerLabel({ stage: 'BOOKED', name: null, reference: '121. Air Freight' }), '121. Air Freight');
+    // Not real yet, or no longer: the name, as before.
+    for (const stage of ['DRAFT', 'PLANNED', 'CANCELLED']) {
+        assert.equal(S.containerLabel({ stage, name: DRAFT_NAME, reference: '339' }), DRAFT_NAME, stage);
+    }
+    // A closed draft from before references: the name is all there is.
+    assert.equal(S.containerLabel({ stage: 'CLOSED', name: 'DRAFT-SEA-260807-133925', reference: null }), 'DRAFT-SEA-260807-133925');
+    assert.equal(S.containerLabel({ stage: 'BOOKED', name: 'Draft 12', reference: '  ' }), 'Draft 12');
+    // No name: the number, whatever the stage. Nothing at all: null.
+    assert.equal(S.containerLabel({ stage: 'PLANNED', name: '  ', reference: '340' }), '340');
+    assert.equal(S.containerLabel({ stage: 'DRAFT', name: null, reference: null }), null);
+    assert.equal(S.containerLabel(null), null);
+});
+
 test('documentLinkDrift: a booked shipment\'s own document (no draft registry row) is linked, not drift', async () => {
     const conn = fakeConn(sql => {
         if (sql.startsWith('SELECT id, source_draft_id, merged_into_id, stage FROM shipments')) {

@@ -50,8 +50,14 @@ id, next to `purchaseOrders`:
   "shipments": { "42": { "id": 42, "reference": "310", "name": "DRAFT-SEA-260807-161657 - 310 ETD 18 Aug",
                          "mode": "SEA", "stage": "BOOKED", "trackingRef": "SEKU4613920",
                          "vesselName": null, "etd": null, "eta": "2026-10-02", "originPort": null,
-                         "needsReview": false } } }
+                         "needsReview": false,
+                         "forwarder": "DCG", "forwarderId": 3, "forwarderSource": "booking" } } }
 ```
+
+`forwarder`, `forwarderId` and `forwarderSource` (2026-11-20) are the same three a
+shipment read gives: the live freight booking's forwarder (`"booking"`), else the
+pair set on the container (`"container"`), else all `null`. ShipLine's container
+card shows the name.
 
 ## Endpoints
 
