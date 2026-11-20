@@ -75,7 +75,7 @@ Added in integer minor units. A notice's amount is the sum of its lines. What no
 
 | Code | When |
 |---|---|
-| `NOT_A_SUPPLIER_PAYMENT` | a forwarder's charge is on it |
+| `MIXED_PAYMENT` | a forwarder's charge and something else are on one transfer: it can be sent to neither (see "A forwarder's payment"). `NOT_A_SUPPLIER_PAYMENT` was this code's name until 2026-11-20, when a transfer that is a forwarder's alone became sendable to the forwarder |
 | `NO_LINES`, `LINE_TARGET_MISSING`, `LINES_EXCEED_TRANSFER` | nothing applied; something it was applied to has been deleted; lines above the transfer by more than 0.01 |
 | `NOTHING_SENT` | no money went (a credit covered it) |
 | `NO_PROOF` | no document on the transfer |
@@ -157,7 +157,9 @@ Refusals beyond the table above:
 
 ### On the transfers themselves
 
-`GET /api/v1/supplier-payments`, and the transfer returned by `POST` and `PUT`, carry `notices: [{ kind, state, lastSentAt, delivery }]`. `[]` when there is nothing to send (a forwarder's transfer); **`null` on a server without the send log**, which is how ShipLine knows to hide the feature.
+`GET /api/v1/supplier-payments`, and the transfer returned by `POST` and `PUT`, carry `notices: [{ kind, state, lastSentAt, delivery }]`. `[]` when there is no supplier part to send (a forwarder's transfer, or a mixed one); **`null` on a server without the send log**, which is how ShipLine knows to hide the feature.
+
+A transfer that is a forwarder's alone also carries `forwarderNotice` (the same shape, `kind: 'forwarder'`) and `acknowledgement` (see "A forwarder's payment"); both are `null` on every other transfer. Each line of kind `extra` carries `forwarderId`.
 
 ## The send, in order
 
@@ -219,6 +221,91 @@ The proof link is the file's public, unguessable S3 address, as a PO PDF's is. H
 - `2026-11-17_10_reword_payment_proof_deposit_attached.js`: the attached deposit wording, from "reply to this email" to "enter … on our supplier portal". Touches only a row still holding the seeded body. Superseded the same day: `_30` retires that template.
 - `2026-11-17_30_payment_proof_portal_only.js`: rewords and renames the two templates that stay (only where a row still holds the seeded body; an edited one is left and named in the log), and retires the two `_attached` ones (soft-deleted; their rows stay). The in-code list still holds the retired pair, unchanged, because `_30` of 2026-11-16 and `_10` read it.
 - `2026-11-16_10_grant_request_departure_to_jportal.js` belongs to the Requests to send page (`docs/request-to-send-portal.md`).
+
+## A forwarder's payment
+
+"Send to forwarder" (2026-11-20). A recorded payment to a **freight forwarder** is sent to that forwarder's contacts as a link to the portal's Freight payments page (`<portal>/freight-payments?payment=<id>`), where they see it, open its proof and may press Acknowledge. The same route, send log and machinery as a supplier's send (`sendKey`, `previewToken`, the one row written before Front is called, "check Front", resolve, receipt), with the part `forwarder`.
+
+### Whose payment it is
+
+By **forwarder id, never by a name**. `forwarderOfLines` (`src/lib/payment-notices.js`): every line of the transfer is a forwarder's charge (`payment_extras`, `rides_with = 'shipment'`) linked to the same row of the Forwarders list (`payment_extras.forwarder_id`). The transfer's own payee name decides nothing but which proof files count (a `remittance` filed under exactly that name, as for a supplier).
+
+| Code | When |
+|---|---|
+| `MIXED_PAYMENT` | a forwarder's charge shares the transfer with anything else (goods, a deposit, a credit on the account). Record the forwarder's charges as a payment of their own |
+| `FORWARDER_NOT_LINKED` | a charge's payee is typed text, not one of the Forwarders list. Pick the forwarder on the charge (or run `tools/backfill-forwarder-ids.js`) |
+| `FORWARDERS_DIFFER` | charges of two forwarders on one transfer |
+| `FORWARDER_REMOVED` | the forwarder is off the Forwarders list |
+| `FORWARDER_NO_CONTACT` | the forwarder has no contact: nobody could open it |
+| `PORTAL_NOT_LIVE` | the portal address is not configured, or the portal's `forwarder_payment_events` table is not on this server (its Freight payments page is not deployed there) |
+| `NOT_A_CONTACT` (400) | an address in `to` is not a live contact of that forwarder (`notContacts` names them), or none is |
+
+`NO_LINES`, `NOTHING_SENT`, `LINE_TARGET_MISSING`, `LINES_EXCEED_TRANSFER`, `NO_PROOF`, `PROOF_NOT_SENDABLE` and `NOTICE_NOT_POSITIVE` apply as for a supplier.
+
+### Who it goes to
+
+Only the forwarder's own **contacts** (`forwarder_contacts`): `to` must be a non-empty list of them, trimmed and lower-cased, each once. The portal shows the payment to whoever signs in with a contact's address, so any other address would get an email about a page they cannot open. Every address is pre-approved on the portal with **no supplier linked** (`preapprovePortalAddresses`, as a freight quote request does): a forwarder's contact sees that forwarder's quote requests and payments, and no supplier's orders.
+
+### What the forwarder is told
+
+Per charge: its container (the number only), its kind and its amount. **Never** the description or note typed on it, a PO, an invoice number, or a supplier (the user, 2026-11-20). The stored wording is `payment_proof_forwarder_portal` ("Forwarder paid", category `Payment proof`); `{paidFor}` is the container numbers. Under it the send appends the button to the payment and how to get an account. Nothing is asked for in return.
+
+### What comes back
+
+`GET …/notices` for a forwarder's transfer adds:
+
+- `audience: 'forwarder'` (`'supplier'` on every other);
+- `forwarder: { id, name, contacts: [{ name, email }] }`, or `null` while it is linked to none;
+- `opened: [{ email, name, firstAt, lastAt, count }]`: who of that forwarder opened a proof;
+- `acknowledgement: { byName, byEmail, at, current } | null`: who pressed Acknowledge. `current` is true when it was made of the payment **as it stands**; false when a figure, a container or a proof has changed since.
+
+`views` is always `[]` for it: `jportal.payment_views` is the supplier page's, and an opening there proves nothing about a forwarder.
+
+Both come from the portal's own `forwarder_payment_events`, and only for the forwarder the transfer is linked to **now**: what a forwarder it used to belong to did is never shown as this one's. "As it stands" is one definition, the `revision` column of `portal_forwarder_payments_v`: a hash, computed in the view, of everything the forwarder is shown.
+
+The email's receipt is confirmed (`forwarder_payment_seen`, `src/lib/email-receipt.js`) when that forwarder opened a proof or acknowledged **after the email**. It means they did something with it since; it does not say the payment is unchanged.
+
+### What the portal reads
+
+`2026-11-20_21_portal_forwarder_payment_views.sql`, three definer views, granted to the portal's login by `_22`:
+
+- `portal_forwarder_payments_v`: a live transfer whose every line is a live charge linked to one forwarder (an aggregate over **all** its lines: one line of any other kind, a deleted or missing charge, an unlinked one, or two forwarders keeps the whole transfer out), whose forwarder is on the list, and which a `sent` send of part `forwarder` carries **that same forwarder id** for. With `revision`.
+- `portal_forwarder_payment_lines_v`: `amount, extra_kind, shipment_reference`.
+- `portal_forwarder_payment_proofs_v`: the documents linked to that payment that are a `remittance` under exactly its name.
+
+The same migration re-creates the **supplier's** `portal_payments_v` with two more conditions: a send counts only when its part is `deposit` or `balance`, and the transfer holds no forwarder charge now. Without them a payment sent to a forwarder would be a row of the supplier's view for any supplier user whose supplier record has exactly the forwarder's name; and a payment sent to a supplier and later turned into a forwarder's would stay there.
+
+Live, like the supplier's page: an edit shows at once. A payment re-pointed at another forwarder leaves the first one's page and is not on the second's until it is sent to it; pointed back, it shows to the first again without a new send.
+
+### On ShipLine's list
+
+`forwarderNotice` and `acknowledgement` on the transfer (above). `notices` stays `[]` for a forwarder's transfer on purpose: a ShipLine from before this shows no button on one, so the send is offered only by a ShipLine that knows it goes to the forwarder's contacts.
+
+### Reminder
+
+A manual reminder of a forwarder's email (`reminderRefusal`) is refused with `PAYMENT_NOT_CURRENT` unless the forwarder view still lists the payment for the forwarder it went to and every address it went to is still a contact.
+
+### Schema
+
+- `2026-11-20_20_forwarder_payment_sends.js`: `supplier_payment_sends.forwarder_id`.
+- `2026-11-20_21_portal_forwarder_payment_views.sql`: the three views, and the supplier's first view tightened.
+- `2026-11-20_22_grant_portal_forwarder_payment_views_to_jportal.js`: `SELECT` on the three for the portal's login.
+- `2026-11-20_23_seed_forwarder_payment_template.js`: the wording.
+- The portal's own: `jportal.forwarder_payment_events` (its `2026-11-20_jportal_forwarder_payment_events.sql`), insert-only.
+
+Needs the forwarder links of `2026-11-20_10` and, for payments recorded before them, `tools/backfill-forwarder-ids.js`.
+
+### Tests
+
+`tools/test-forwarder-payment-notices-lib.js` and the forwarder cases of `tools/test-payment-notices-send.js` and `tools/test-email-receipt-lib.js` (all in `npm run test:unit`). Against a real database: `tools/test-portal-forwarder-views.js --confirm-host <TEST host>` (fixtures of its own, removed at the end): who each view lists, that a forwarder's payment is never a row of the supplier's view, what `revision` covers, and that the portal's one-statement write waits for an uncommitted edit and then writes nothing for the revision that went.
+
+### Rollout (all user-triggered)
+
+1. This repo: migrate and deploy. Nothing changes for staff.
+2. The portal: its migration (`forwarder_payment_events`), grants and deploy; then its `tools/smoke-forwarder-payments.js`.
+3. ShipLine, once step 2's smoke passes. Its button is what turns this on: there is no switch.
+
+To take the portal's page away again, roll **this repo** back first: the portal's table outlives a portal rollback, so the check above would not stop a send, and an open ShipLine tab can still send.
 
 ## Rollout (test, then prod; all user-triggered)
 

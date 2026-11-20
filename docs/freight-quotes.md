@@ -3,7 +3,7 @@
 Containers from China to the UK used to be arranged by email. Now:
 
 1. **Request.** Staff pick one or more freight forwarders, a date range and the delivery options to quote on ShipLine's FREIGHT page (header tab 09), list any stock movements (goods to be collected from a factory, with CBM and weight), read and edit the email, and send. Each forwarder gets its own email and its own link.
-2. **Answer.** The link opens a page on the supplier portal with **no sign-in**, where the forwarder lists its options: loading date, sailing date, transit time, port A, port B, service, container size, all-in price. A forwarder contact who signs in to the portal sees the same requests under **Freight quotes**.
+2. **Answer.** The link opens a page on the supplier portal with **no sign-in**, where the forwarder lists its options: loading date, sailing date, transit time, port A, port B, service, container size, all-in price. A forwarder contact who signs in to the portal sees the same requests under **Freight quotes**, and, once a payment to their forwarder has been sent from ShipLine, that payment and its proof under **Freight payments** (`docs/payment-proof-send.md`, "A forwarder's payment").
 3. **Compare and book.** The options show in ShipLine as a month calendar and as a list. Staff open one and press **Request booking**; the forwarder gets a second email and confirms on the same page with a booking reference (or declines). Staff can also mark a booking confirmed themselves.
 4. **Contents.** Staff attach a draft container to the booking and email the forwarder its contents **broken down by supplier**, with the forwarder quote PDFs and CSVs attached.
 

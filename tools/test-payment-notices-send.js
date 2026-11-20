@@ -222,7 +222,8 @@ test('each thing that stops a transfer is a 409 with what to do next, and nothin
         ['NO_PROOF', sourceOf([depositLine()], { documents: [] })],
         ['PROOF_NOT_SENDABLE', sourceOf([depositLine()], { documents: [proofDoc({ docKind: 'balance_invoice' })] })],
         ['PROOF_NOT_SENDABLE', sourceOf([depositLine()], { documents: [proofDoc({ supplierName: 'Another Factory Ltd' })] })],
-        ['NOT_A_SUPPLIER_PAYMENT', sourceOf([{ id: 3, kind: 'extra', targetId: 5, amount: 900, paidWith: null, target: target({ ridesWith: 'shipment', extraKind: 'freight', extraSupplier: 'DCG' }) }])],
+        // A forwarder's charge whose payee was typed, not picked from the Forwarders list: it has nobody to go to.
+        ['FORWARDER_NOT_LINKED', sourceOf([{ id: 3, kind: 'extra', targetId: 5, amount: 900, paidWith: null, target: target({ ridesWith: 'shipment', extraKind: 'freight', extraSupplier: 'DCG' }) }])],
         ['LINE_TARGET_MISSING', sourceOf([depositLine(), { id: 2, kind: 'balance', targetId: 9, amount: 5, paidWith: null, target: null }])],
         ['NOTHING_SENT', sourceOf([depositLine()], { payment: { amount: 0 } })],
         ['LINES_EXCEED_TRANSFER', sourceOf([depositLine()], { payment: { amount: 900 } })],
@@ -564,7 +565,7 @@ test('the preview of a transfer that cannot be sent says why: what is wrong with
     assert.equal(both.blocked.code, 'NO_PROOF');
     // A forwarder's payment is never told to "match the supplier record": it is not a supplier's at all.
     const forwarder = sourceOf([{ id: 3, kind: 'extra', targetId: 5, amount: 900, paidWith: null, target: target({ ridesWith: 'shipment', extraKind: 'freight', extraSupplier: 'DCG' }) }]);
-    assert.equal((await S.previewOf(forwarder, NO_SUPPLIER_DELIVERY, [], NOW)).blocked.code, 'NOT_A_SUPPLIER_PAYMENT');
+    assert.equal((await S.previewOf(forwarder, NO_SUPPLIER_DELIVERY, [], NOW)).blocked.code, 'FORWARDER_NOT_LINKED');
     // Proofs too large or too many to attach are no obstacle: nothing is attached.
     const big = [proofDoc({ fileSize: 16 * 1024 * 1024 }), ...[2, 3, 4, 5, 6].map(id => proofDoc({ id }))];
     assert.equal((await S.previewOf(sourceOf([depositLine()], { documents: big }), PORTAL_DELIVERY, [], NOW)).sendable, true);
@@ -817,7 +818,8 @@ test('the loader reads only what a notice needs, and still answers a server from
     assert.match(lines, /WHERE l\.payment_id = \? ORDER BY l\.id$/);
     assert.equal(/description|unit_price|bank|amount_due|due_terms|status/.test(lines), false);
     assert.equal(docs, 'SELECT id, doc_kind, supplier_name, filename, public_url, s3_key, content_type, file_size FROM shipment_payment_documents WHERE deleted_at IS NULL AND supplier_payment_id = ? ORDER BY id');
-    // paid_with_json not there yet (1054), then payment_extras not there (1146): asked again with less, twice.
+    // paid_with_json not there yet (1054: the newer forwarder_id is given up first, then it), then
+    // payment_extras not there (1146): asked again with less, three times.
     let asked = 0;
     const old = loaderConn([{ ...LINE_BASE, id: 1, target_kind: 'po_deposit', target_id: 101, amount: '5.00', po_id: 101, po_number: 'PO_001J', po_supplier: SUPPLIER }], [], [
         [/FROM supplier_payment_lines l/, (sql) => {
@@ -828,7 +830,7 @@ test('the loader reads only what a notice needs, and still answers a server from
         }],
     ]);
     const src = await S.loadNoticeSource(old, 45);
-    assert.equal(asked, 3);
+    assert.equal(asked, 4);
     assert.deepEqual([src.lines.length, src.lines[0].target.poNumber], [1, 'PO_001J']);
     // Any other fault is a fault, and is not asked again with less.
     const broken = loaderConn([], [], [[/FROM supplier_payment_lines l/, Object.assign(new Error('gone away'), { errno: 2006 })]]);
@@ -943,4 +945,319 @@ test('the store reads who opened a payment on the portal, and answers a server w
     assert.match(conn.log[0].sql, /FROM `jportal`\.payment_views v WHERE v\.supplier_payment_id = \? ORDER BY v\.first_viewed_at, v\.user_email$/);
     const none = scripted([[/payment_views/, Object.assign(new Error('no such table'), { errno: 1146 })]]);
     assert.deepEqual(await storeOn(none).views(45), []);
+});
+
+// ── A forwarder's payment (2026-11-20; "A forwarder's payment" in docs/payment-proof-send.md) ──
+
+const FWD = 'DCG Logistics';
+const FWD_URL = `${PORTAL}/freight-payments?payment=45`;
+const chargeLine = (over = {}) => ({
+    id: 3, kind: 'extra', targetId: 5, amount: 900, paidWith: null,
+    target: target({ ridesWith: 'shipment', extraKind: 'freight', extraSupplier: FWD, shipmentSupplier: FWD, shipmentId: 5339, shipmentReference: '339', forwarderId: 7, ...(over.target || {}) }),
+    ...(over.line || {}),
+});
+const fwdSource = (lines = [chargeLine()], over = {}) => sourceOf(lines, { payment: { supplierName: FWD, supplierKey: 'dcg logistics', ...(over.payment || {}) }, documents: over.documents ?? [proofDoc({ supplierName: FWD })] });
+const FWD_CONTACTS = [{ name: 'Ann Lee', email: 'ann@dcg.example' }, { name: null, email: 'ops@dcg.example' }];
+const FWD_DELIVERY = { delivery: 'portal', reason: null, portalBase: PORTAL, portalUrl: FWD_URL, registerUrl: `${PORTAL}/register`, suppliers: [], forwarder: { id: 7, name: FWD, removed: false }, contacts: FWD_CONTACTS };
+const fwdStore = (over = {}) => {
+    const s = memoryStore({ source: fwdSource(), delivery: FWD_DELIVERY, addressAccess: { status: 'ok', users: [{ email: 'ann@dcg.example', outcome: 'invited', suppliersAdded: 0 }] }, ...over });
+    s.preapproveAddresses = async args => { s.calls.push('preapproveAddresses'); s.preapproveAddressArgs = args; if (s.preapproveThrows) throw new Error('deadlock'); return s.addressAccess; };
+    return s;
+};
+const fwdRequest = (store, over = {}) => requestFor(store, 'forwarder', { to: ['ann@dcg.example'], subject: 'Paid {currency} {amount} for {paidFor}', body: '<p>We paid {amount}.</p>', ...over });
+
+test('a forwarder\'s payment goes to its contacts: written with the forwarder, addresses approved without any supplier, one link to its own page', async () => {
+    const store = fwdStore();
+    const front = [];
+    const r = await send(store, frontOk(front), await fwdRequest(store), 'forwarder');
+    assert.equal(r.status, 200);
+    assert.deepEqual(store.calls.filter(c => ['reserve', 'preapprove', 'preapproveAddresses', 'finalise', 'logReceipt'].includes(c)), ['reserve', 'preapproveAddresses', 'finalise', 'logReceipt']);
+    const [row] = store.rows;
+    assert.deepEqual([row.status, row.noticeKind, row.delivery, row.supplierName, row.forwarderId, row.sentTo], ['sent', 'forwarder', 'portal', FWD, 7, ['ann@dcg.example']]);
+    // No supplier is named to the portal: a forwarder's contact is given no supplier's orders.
+    assert.deepEqual(Object.keys(store.preapproveAddressArgs).sort(), ['actorEmail', 'emails', 'note']);
+    assert.deepEqual([store.preapproveAddressArgs.emails, store.preapproveAddressArgs.actorEmail], [['ann@dcg.example'], 'ops@jfa.example']);
+    assert.match(store.preapproveAddressArgs.note, /forwarder/i);
+    assert.equal(front.length, 1);
+    assert.deepEqual(front[0].to, ['ann@dcg.example']);
+    assert.equal(front[0].subject, 'Paid USD 900.00 for 339');
+    assert.ok(front[0].html.includes(FWD_URL));
+    assert.ok(front[0].html.includes('already approved'));
+    assert.doesNotMatch(front[0].html, /\/payments\?payment=|telex|ready date/i);
+    assert.equal(front[0].attachments, undefined);
+    assert.deepEqual(store.logged, [{ emailType: 'payment_proof', sentTo: ['ann@dcg.example'], subject: 'Paid USD 900.00 for 339', confirmVia: 'portal', actionUrl: FWD_URL, sendTable: 'supplier_payment_sends', sendId: 1 }]);
+    assert.deepEqual([r.body.send.kind, r.body.send.forwarderId, r.body.delivery], ['forwarder', 7, 'portal']);
+});
+
+test('a supplier\'s send still names no forwarder and approves through the supplier', async () => {
+    const store = memoryStore();
+    store.preapproveAddresses = async () => { store.calls.push('preapproveAddresses'); return { status: 'ok', users: [] }; };
+    const r = await send(store, frontOk([]), await requestFor(store));
+    assert.equal(r.status, 200);
+    assert.equal(store.rows[0].forwarderId, null);
+    assert.equal(store.calls.includes('preapproveAddresses'), false);
+    assert.equal(r.body.send.forwarderId, null);
+});
+
+test('an address that is not one of the forwarder\'s contacts stops the send: nothing written, nothing emailed', async () => {
+    for (const to of [['boss@other.example'], ['ann@dcg.example', 'boss@other.example']]) {
+        const store = fwdStore();
+        const front = [];
+        const r = await send(store, frontOk(front), await fwdRequest(store, { to }), 'forwarder');
+        assert.deepEqual([r.status, r.body.code, r.body.notContacts], [400, 'NOT_A_CONTACT', ['boss@other.example']], to.join());
+        assert.equal(store.rows.length, 0);
+        assert.equal(front.length, 0);
+        assert.equal(store.calls.includes('preapproveAddresses'), false);
+    }
+    // A contact, however it is typed.
+    const store = fwdStore();
+    assert.equal((await send(store, frontOk([]), await fwdRequest(store, { to: [' Ann@DCG.example '] }), 'forwarder')).status, 200);
+});
+
+test('the part asked for must be the transfer\'s own: a supplier part of a forwarder\'s, or the forwarder part of a supplier\'s, is a 404', async () => {
+    const f = fwdStore();
+    const r = await send(f, frontOk([]), await fwdRequest(f), 'deposit');
+    assert.deepEqual([r.status, r.body.code], [404, 'NO_SUCH_NOTICE']);
+    const s = memoryStore();
+    const r2 = await send(s, frontOk([]), await requestFor(s), 'forwarder');
+    assert.deepEqual([r2.status, r2.body.code], [404, 'NO_SUCH_NOTICE']);
+    assert.equal(f.rows.length + s.rows.length, 0);
+});
+
+test('what stops a forwarder\'s send: the payment first, then the forwarder and the portal, each said for a forwarder', async () => {
+    const cases = [
+        ['MIXED_PAYMENT', { source: fwdSource([chargeLine(), balanceLine({ target: target({ shipmentId: 5333, shipmentReference: '333', shipmentSupplier: FWD }) })]) }],
+        ['FORWARDER_NOT_LINKED', { source: fwdSource([chargeLine({ target: { forwarderId: null } })]) }],
+        ['FORWARDERS_DIFFER', { source: fwdSource([chargeLine(), chargeLine({ line: { id: 4, targetId: 6 }, target: { forwarderId: 8 } })]) }],
+        ['NO_PROOF', { source: fwdSource([chargeLine()], { documents: [] }) }],
+        ['FORWARDER_NO_CONTACT', { delivery: { ...FWD_DELIVERY, delivery: null, reason: 'no_contact', portalUrl: null, contacts: [] } }],
+        ['FORWARDER_REMOVED', { delivery: { ...FWD_DELIVERY, delivery: null, reason: 'forwarder_removed', portalUrl: null, forwarder: { id: 7, name: FWD, removed: true } } }],
+        ['PORTAL_NOT_LIVE', { delivery: { ...FWD_DELIVERY, delivery: null, reason: 'portal_unavailable', portalUrl: null } }],
+    ];
+    for (const [code, over] of cases) {
+        const store = fwdStore(over);
+        const front = [];
+        const p = await S.previewOf(store.source, store.delivery, [], NOW);
+        assert.deepEqual([p.sendable, p.blocked.code], [false, code], `preview ${code}`);
+        assert.doesNotMatch(p.blocked.error, /supplier record|to a supplier as/, code);
+        const r = await send(store, frontOk(front), await fwdRequest(store), 'forwarder');
+        assert.deepEqual([r.status, r.body.code], [409, code], code);
+        assert.equal(front.length, 0, code);
+        assert.equal(store.rows.length, 0, code);
+    }
+});
+
+test('the portal going away between the check and the send leaves a definite "not sent"', async () => {
+    const store = fwdStore({ addressAccess: { status: 'unavailable', users: [] } });
+    const front = [];
+    const r = await send(store, frontOk(front), await fwdRequest(store), 'forwarder');
+    assert.deepEqual([r.status, r.body.code, r.body.reason], [409, 'PORTAL_NOT_LIVE', 'portal_unavailable']);
+    assert.equal(front.length, 0);
+    assert.deepEqual(store.rows.map(x => x.status), ['failed']);
+    // A fault approving the addresses does not stop the email: they register and are approved by hand.
+    const faulty = fwdStore({ preapproveThrows: true });
+    const sent = [];
+    const ok = await send(faulty, frontOk(sent), await fwdRequest(faulty), 'forwarder');
+    assert.equal(ok.status, 200);
+    assert.equal(ok.body.portalAccess.status, 'error');
+    assert.ok(sent[0].html.includes('our team will approve your access'));
+});
+
+test('a payment re-pointed at another forwarder after the dialog opened is refused as changed', async () => {
+    const store = fwdStore();
+    const body = await fwdRequest(store);
+    store.source = fwdSource([chargeLine({ target: { forwarderId: 8 } })]);
+    const r = await send(store, frontOk([]), body, 'forwarder');
+    assert.deepEqual([r.status, r.body.code], [409, 'PAYMENT_CHANGED']);
+});
+
+test('the preview of a forwarder\'s payment: who it goes to, its one part, and its state by forwarder', async () => {
+    const sentRow = over => ({ id: 1, paymentId: 45, noticeKind: 'forwarder', delivery: 'portal', supplierName: FWD, forwarderId: 7, status: 'sent', sentTo: ['ann@dcg.example'], sentAt: '2026-11-16T11:00:00Z', deadlineAt: '2026-11-16T11:01:00Z', ...over });
+    const p = await S.previewOf(fwdSource(), FWD_DELIVERY, [sentRow()], NOW);
+    assert.deepEqual([p.audience, p.sendable, p.blocked, p.supplierName], ['forwarder', true, null, FWD]);
+    assert.deepEqual(p.forwarder, { id: 7, name: FWD, contacts: FWD_CONTACTS });
+    assert.equal(p.notices.length, 1);
+    const [n] = p.notices;
+    assert.deepEqual([n.kind, n.amount, n.paidFor, n.templateKey, n.portalUrl, n.readyDates, n.telex, n.state, n.lastSentAt],
+        ['forwarder', 900, ['339'], 'payment_proof_forwarder_portal', FWD_URL, [], [], 'sent', '2026-11-16T11:00:00Z']);
+    assert.deepEqual(n.lines.map(l => [l.container, l.extraKind, l.amount]), [['339', 'freight', 900]]);
+    assert.deepEqual(n.sends.map(s => [s.kind, s.forwarderId, s.status]), [['forwarder', 7, 'sent']]);
+    // Sent to the forwarder it used to belong to: not sent, as far as this one goes.
+    const moved = await S.previewOf(fwdSource([chargeLine({ target: { forwarderId: 8 } })]), { ...FWD_DELIVERY, forwarder: { id: 8, name: 'Arrow', removed: false } }, [sentRow()], NOW);
+    assert.deepEqual([moved.notices[0].state, moved.notices[0].lastSentAt], ['not_sent', null]);
+    // A supplier's preview says whose it is and carries no forwarder.
+    const s = await S.previewOf(sourceOf(), PORTAL_DELIVERY, [], NOW);
+    assert.deepEqual([s.audience, s.forwarder], ['supplier', null]);
+});
+
+// The store, on a scripted connection.
+const FWD_PAY_ROW = { id: 45, supplier_name: FWD, supplier_key: 'dcg logistics', amount: '900.00', currency: 'USD', paid_on: '2026-11-14' };
+const FWD_LINE_ROW = { ...LINE_BASE, id: 3, target_kind: 'extra', target_id: 5, amount: '900.00', ex_id: 5, extra_kind: 'freight', rides_with: 'shipment', extra_supplier: FWD, ex_shipment_id: 5339, shipment_id: 5339, shipment_reference: '339', ex_forwarder_id: 7 };
+const fwdConn = (over = []) => scripted([
+    ...over,
+    [/FROM supplier_payments WHERE id = \? AND deleted_at IS NULL/, [[FWD_PAY_ROW]]],
+    [/FROM supplier_payment_lines l/, [[FWD_LINE_ROW]]],
+    [/FROM shipment_payment_documents WHERE/, [[]]],
+    [/FROM forwarders f WHERE f\.id = \?/, [[{ id: 7, name: FWD, deleted_at: null }]]],
+    [/FROM forwarder_contacts c WHERE c\.forwarder_id = \?/, [[{ name: 'Ann Lee', email: 'ann@dcg.example' }]]],
+    [/forwarder_payment_events LIMIT 1/, [[]]],
+    [/FROM supplier_payment_sends s WHERE s\.supplier_payment_id IN/, [[]]],
+]);
+
+test('the loader reads each charge\'s forwarder; a server without the column still answers, and keeps the rest', async () => {
+    const conn = fwdConn();
+    const src = await S.loadNoticeSource(conn, 45);
+    assert.equal(src.lines[0].target.forwarderId, 7);
+    assert.match(sqlOf(conn).find(s => s.includes('FROM supplier_payment_lines l')), /ex\.forwarder_id AS ex_forwarder_id/);
+    let tries = 0;
+    const old = scripted([
+        [/FROM supplier_payments WHERE id = \? AND deleted_at IS NULL/, [[FWD_PAY_ROW]]],
+        [/FROM supplier_payment_lines l/, sql => { tries += 1; if (sql.includes('ex.forwarder_id')) throw Object.assign(new Error('Unknown column'), { errno: 1054 }); return [[{ ...FWD_LINE_ROW, ex_forwarder_id: undefined }]]; }],
+        [/FROM shipment_payment_documents WHERE/, [[]]],
+    ]);
+    const o = await S.loadNoticeSource(old, 45);
+    assert.equal(o.lines[0].target.forwarderId, null);
+    assert.equal(tries, 2);
+    // Only the forwarder column was given up: the per-container PI money is still read.
+    assert.ok(sqlOf(old).filter(s => s.includes('FROM supplier_payment_lines l'))[1].includes('l.paid_with_json'));
+});
+
+test('how a forwarder\'s payment goes out is read from the Forwarders list and the portal\'s own table, never from supplier records', async () => {
+    const conn = fwdConn();
+    const src = await S.loadNoticeSource(conn, 45);
+    const d = await S.resolveDelivery(conn, src, { SUPPLIER_PORTAL_URL: PORTAL });
+    assert.deepEqual(d, {
+        delivery: 'portal', reason: null, portalBase: PORTAL, portalUrl: FWD_URL, registerUrl: `${PORTAL}/register`, suppliers: [],
+        forwarder: { id: 7, name: FWD, removed: false }, contacts: [{ name: 'Ann Lee', email: 'ann@dcg.example' }],
+    });
+    assert.equal(sqlOf(conn).some(s => /FROM suppliers s/.test(s)), false);
+    assert.equal(sqlOf(conn).some(s => /payment_views/.test(s)), false);
+    assert.ok(sqlOf(conn).some(s => /FROM `jportal`\.forwarder_payment_events LIMIT 1/.test(s)));
+    assert.ok(sqlOf(conn).some(s => /FROM forwarder_contacts c WHERE c\.forwarder_id = \? AND c\.deleted_at IS NULL ORDER BY c\.id$/.test(s)));
+    const why = async over => (await S.resolveDelivery(fwdConn(over), src, { SUPPLIER_PORTAL_URL: PORTAL })).reason;
+    assert.equal(await why([[/FROM forwarders f WHERE/, [[{ id: 7, name: FWD, deleted_at: '2026-11-19 10:00:00' }]]]]), 'forwarder_removed');
+    // A forwarder off the list has nobody to send to: its contacts are not read, and none is offered.
+    const off = fwdConn([[/FROM forwarders f WHERE/, [[{ id: 7, name: FWD, deleted_at: '2026-11-19 10:00:00' }]]]]);
+    const gone = await S.resolveDelivery(off, src, { SUPPLIER_PORTAL_URL: PORTAL });
+    assert.deepEqual([gone.forwarder, gone.contacts, gone.portalUrl], [{ id: 7, name: FWD, removed: true }, [], null]);
+    assert.equal(sqlOf(off).some(s => /forwarder_contacts/.test(s)), false);
+    assert.equal(await why([[/FROM forwarders f WHERE/, [[]]]]), 'forwarder_removed');
+    assert.equal(await why([[/FROM forwarder_contacts c/, [[]]]]), 'no_contact');
+    assert.equal(await why([[/forwarder_payment_events/, Object.assign(new Error('no such table'), { errno: 1146 })]]), 'portal_unavailable');
+    assert.equal((await S.resolveDelivery(fwdConn(), src, {})).reason, 'portal_url_unset');
+    await assert.rejects(S.resolveDelivery(fwdConn([[/forwarder_payment_events/, Object.assign(new Error('gone away'), { errno: 2006 })]]), src, { SUPPLIER_PORTAL_URL: PORTAL }));
+    // A supplier's transfer is resolved as it always was.
+    const sup = loaderConn([{ ...LINE_BASE, id: 1, target_kind: 'po_deposit', target_id: 101, amount: '1000.00', po_id: 101, po_number: 'PO_001J', po_supplier: SUPPLIER }]);
+    await S.resolveDelivery(sup, await S.loadNoticeSource(sup, 45), { SUPPLIER_PORTAL_URL: PORTAL });
+    assert.ok(sqlOf(sup).some(s => /FROM suppliers s/.test(s)));
+    assert.equal(sqlOf(sup).some(s => /forwarder/.test(s) && !/FROM supplier_payment_lines/.test(s)), false);
+});
+
+test('the store writes a forwarder\'s send with its forwarder, and a supplier\'s exactly as before', async () => {
+    const rowOf = forwarderId => ({ noticeKind: forwarderId ? 'forwarder' : 'deposit', delivery: 'portal', supplierName: FWD, sendKey: 'k1-abcdefgh', requestHash: 'h', deadlineAt: '2026-11-16T12:01:00.000Z', sentTo: ['ann@dcg.example'], subject: 'S', sentByEmail: 'ops@jfa.example', forwarderId });
+    const insertOf = async forwarderId => {
+        const conn = fwdConn([[/^INSERT INTO supplier_payment_sends/, [{ insertId: 9 }]]]);
+        await storeOn(conn).reserve({ paymentId: 45, decide: () => ({ notice: {} }), row: () => rowOf(forwarderId) });
+        return conn.log.find(x => x.sql.startsWith('INSERT INTO supplier_payment_sends'));
+    };
+    const f = await insertOf(7);
+    assert.match(f.sql, /\(supplier_payment_id, notice_kind, delivery, supplier_name, send_key, request_hash, status, deadline_at, sent_to, subject, sent_by_email, forwarder_id\) VALUES \(\?, \?, \?, \?, \?, \?, 'sending', \?, \?, \?, \?, \?\)$/);
+    assert.deepEqual([f.params[1], f.params[f.params.length - 1]], ['forwarder', 7]);
+    const s = await insertOf(null);
+    assert.match(s.sql, /sent_by_email\) VALUES \(\?, \?, \?, \?, \?, \?, 'sending', \?, \?, \?, \?\)$/);
+    assert.equal(s.params.length, 10);
+});
+
+test('a send row says its forwarder and where its reminder leads', async () => {
+    const row = { id: 7, supplier_payment_id: 45, notice_kind: 'forwarder', delivery: 'portal', supplier_name: FWD, forwarder_id: 7, status: 'sent', sent_to: '["ann@dcg.example"]' };
+    const got = await storeOn(scripted([[/FROM supplier_payment_sends s WHERE s\.id = \?/, [[row]]]])).getSend(7);
+    assert.deepEqual([got.forwarderId, got.portalUrl], [7, FWD_URL]);
+    const sup = await storeOn(scripted([[/FROM supplier_payment_sends s WHERE s\.id = \?/, [[{ ...row, notice_kind: 'balance', forwarder_id: null }]]]])).getSend(7);
+    assert.deepEqual([sup.forwarderId, sup.portalUrl], [null, `${PORTAL}/payments?payment=45`]);
+});
+
+test('what the forwarder did with a payment is read from the portal\'s events and the view\'s own revision; a server without them says nothing', async () => {
+    const conn = scripted([
+        [/forwarder_payment_events e WHERE e\.supplier_payment_id IN \(\?\)/, [[
+            { supplier_payment_id: 45, forwarder_id: 7, event: 'opened', user_email: 'ann@dcg.example', user_name: 'Ann Lee', revision: 'r1', at_iso: '2026-11-16T12:10:00Z' },
+            { supplier_payment_id: 45, forwarder_id: 7, event: 'acknowledged', user_email: 'ann@dcg.example', user_name: 'Ann Lee', revision: 'r1', at_iso: '2026-11-16T12:11:00Z' },
+        ]]],
+        [/FROM portal_forwarder_payments_v p WHERE p\.payment_id IN \(\?\)/, [[{ payment_id: 45, forwarder_id: 7, revision: 'r1' }]]],
+    ]);
+    const got = await storeOn(conn).forwarderEvidence(45, 7);
+    assert.deepEqual(got, {
+        opened: [{ email: 'ann@dcg.example', name: 'Ann Lee', firstAt: '2026-11-16T12:10:00Z', lastAt: '2026-11-16T12:10:00Z', count: 1 }],
+        acknowledgement: { byName: 'Ann Lee', byEmail: 'ann@dcg.example', at: '2026-11-16T12:11:00Z', current: true },
+    });
+    assert.match(conn.log[0].sql, /FROM `jportal`\.forwarder_payment_events e WHERE e\.supplier_payment_id IN \(\?\) ORDER BY e\.id$/);
+    // The view lists the payment under another forwarder now: the revision is not this one's.
+    const moved = scripted([
+        [/forwarder_payment_events e/, [[{ supplier_payment_id: 45, forwarder_id: 7, event: 'acknowledged', user_email: 'ann@dcg.example', user_name: 'Ann Lee', revision: 'r1', at_iso: '2026-11-16T12:11:00Z' }]]],
+        [/FROM portal_forwarder_payments_v p/, [[{ payment_id: 45, forwarder_id: 8, revision: 'r1' }]]],
+    ]);
+    assert.equal((await storeOn(moved).forwarderEvidence(45, 7)).acknowledgement.current, false);
+    const missing = errno => scripted([[/forwarder_payment_events|portal_forwarder_payments_v/, Object.assign(new Error('missing'), { errno })]]);
+    assert.deepEqual(await storeOn(missing(1146)).forwarderEvidence(45, 7), { opened: [], acknowledgement: null });
+    await assert.rejects(storeOn(missing(2006)).forwarderEvidence(45, 7));
+    // Not linked to a forwarder: nothing is asked.
+    const none = scripted();
+    assert.deepEqual(await storeOn(none).forwarderEvidence(45, null), { opened: [], acknowledgement: null });
+    assert.equal(none.log.length, 0);
+});
+
+test('each listed forwarder transfer says the state of its send and its acknowledgement; the supplier parts stay none', async () => {
+    const sendRowOf = over => ({ id: 1, supplier_payment_id: 47, notice_kind: 'forwarder', delivery: 'portal', supplier_name: FWD, forwarder_id: 7, status: 'sent', sent_to: '[]', deadline_at_iso: '2026-11-16T11:01:00Z', sent_at_iso: '2026-11-16T11:00:00Z', ...over });
+    const payments = [
+        { id: 45, supplierName: SUPPLIER, lines: [{ kind: 'po_deposit', amount: 1 }] },
+        { id: 47, supplierName: FWD, lines: [{ kind: 'extra', ridesWith: 'shipment', forwarderId: 7, amount: 1 }] },
+        { id: 48, supplierName: FWD, lines: [{ kind: 'extra', ridesWith: 'shipment', forwarderId: null, amount: 1 }] },
+        { id: 49, supplierName: FWD, lines: [{ kind: 'extra', ridesWith: 'shipment', forwarderId: 7, amount: 1 }, { kind: 'balance', amount: 1 }] },
+    ];
+    const conn = scripted([
+        [/FROM supplier_payment_sends s WHERE s\.supplier_payment_id IN \(\?, \?\)/, [[sendRowOf({})]]],
+        [/forwarder_payment_events e WHERE e\.supplier_payment_id IN \(\?, \?\)/, [[{ supplier_payment_id: 47, forwarder_id: 7, event: 'acknowledged', user_email: 'ann@dcg.example', user_name: 'Ann Lee', revision: 'r0', at_iso: '2026-11-16T12:11:00Z' }]]],
+        [/FROM portal_forwarder_payments_v p WHERE p\.payment_id IN \(\?, \?\)/, [[{ payment_id: 47, forwarder_id: 7, revision: 'r1' }]]],
+    ]);
+    const out = await S.forwarderSummaries(conn, payments, {}, NOW);
+    assert.deepEqual([...out.keys()], [47, 48]);
+    assert.deepEqual(out.get(47), {
+        forwarderNotice: { kind: 'forwarder', state: 'sent', lastSentAt: '2026-11-16T11:00:00Z', delivery: 'portal' },
+        // Acknowledged at an earlier revision: said, and said to be out of date.
+        acknowledgement: { byName: 'Ann Lee', byEmail: 'ann@dcg.example', at: '2026-11-16T12:11:00Z', current: false },
+    });
+    assert.deepEqual(out.get(48), { forwarderNotice: { kind: 'forwarder', state: 'not_sent', lastSentAt: null, delivery: null }, acknowledgement: null });
+    // Only the forwarder transfers are asked about.
+    assert.deepEqual(conn.log[0].params, [47, 48]);
+    // No forwarder transfer on the page: the database is asked nothing.
+    const quiet = scripted();
+    assert.equal((await S.forwarderSummaries(quiet, payments.slice(0, 1), {}, NOW)).size, 0);
+    assert.equal(quiet.log.length, 0);
+    // The supplier parts of every one of them are as they were.
+    assert.deepEqual([...(await S.noticeSummaries(scripted(), payments, {}, NOW)).values()].map(v => v.map(n => n.kind)), [['deposit'], [], [], []]);
+    const none = scripted([[/supplier_payment_sends/, Object.assign(new Error('no such table'), { errno: 1146 })]]);
+    assert.equal(await S.forwarderSummaries(none, payments, {}, NOW), null);
+});
+
+test('a reminder of a forwarder\'s payment email is refused once the payment is no longer that forwarder\'s, or a recipient is no longer a contact', async () => {
+    const receipt = { id: 5, send_table: 'supplier_payment_sends', send_id: 12 };
+    const conn = ({ shown = true, contacts = ['ann@dcg.example', 'ops@dcg.example'], sentTo = '["ann@dcg.example"]' } = {}) => scripted([
+        [/FROM supplier_payment_sends s LEFT JOIN supplier_payments sp/, [[{ current: 1, notice_kind: 'forwarder', supplier_payment_id: 45, sent_to: sentTo }]]],
+        [/FROM supplier_payment_sends s JOIN portal_forwarder_payments_v p/, [shown ? [{ forwarder_id: 7 }] : []]],
+        [/FROM forwarder_contacts c WHERE c\.forwarder_id = \?/, [contacts.map(email => ({ name: null, email }))]],
+    ]);
+    assert.equal(await S.reminderRefusal(conn(), receipt), null);
+    const code = async over => { const r = await S.reminderRefusal(conn(over), receipt); return r && r.code; };
+    // Deleted, mixed, unlinked, moved to another forwarder, or the forwarder removed: the view no longer lists it for the send's forwarder.
+    assert.equal(await code({ shown: false }), 'PAYMENT_NOT_CURRENT');
+    assert.equal(await code({ contacts: ['ops@dcg.example'] }), 'PAYMENT_NOT_CURRENT');
+    assert.equal(await code({ contacts: [] }), 'PAYMENT_NOT_CURRENT');
+    assert.equal(await code({ sentTo: '["Ann@DCG.example"]' }), null);
+    const c = conn();
+    await S.reminderRefusal(c, receipt);
+    assert.match(c.log[1].sql, /FROM supplier_payment_sends s JOIN portal_forwarder_payments_v p ON p\.payment_id = s\.supplier_payment_id AND p\.forwarder_id = s\.forwarder_id WHERE s\.id = \?$/);
+    assert.deepEqual(c.log[1].params, [12]);
+    // A supplier's reminder asks only what it always asked.
+    const sup = scripted([[/FROM supplier_payment_sends s LEFT JOIN supplier_payments sp/, [[{ current: 1, notice_kind: 'deposit', supplier_payment_id: 45, sent_to: '[]' }]]]]);
+    assert.equal(await S.reminderRefusal(sup, receipt), null);
+    assert.equal(sup.log.length, 1);
 });

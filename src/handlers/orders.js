@@ -11093,6 +11093,9 @@ function supplierPaymentLineToJson(l, target) {
         // An extra only: what kind of charge, and which payment it rode with.
         extraKind: target?.extraKind ?? null,
         ridesWith: target?.ridesWith ?? null,
+        // A forwarder's charge only (ridesWith 'shipment'): the row of the
+        // Forwarders list its payee is linked to, or null while it is typed text.
+        forwarderId: target?.forwarderId ?? null,
         // A pi line only: the PI money per container, as ticked in Record
         // payment — [{ shipmentReference, amount }]; null when none was sent.
         paidWith: paidWithFromRow(l.paid_with_json),
@@ -11240,7 +11243,7 @@ async function loadSupplierPaymentTargets(conn, lines) {
                 supplier: r.supplier_name, supplierKey: r.supplier_key, settledBy: r.settled_by_payment_id ?? null, paidOn: r.paid_on || null,
                 label: extrasLib.lineLabel(r), purchaseOrderId: r.purchase_order_id ?? null, poNumber: r.po_number || null,
                 paymentType: null, shipmentId: r.shipment_id ?? null, shipmentReference: r.shipment_reference || null, invoiceNumber: null,
-                extraKind: r.kind, ridesWith: r.rides_with,
+                extraKind: r.kind, ridesWith: r.rides_with, forwarderId: r.forwarder_id ?? null,
             });
         }
     }
@@ -11356,6 +11359,24 @@ async function withPaymentNotices(conn, transfers) {
         log.warn('[supplier-payments] the send state of these payments could not be read', { error: e.message, errno: e.errno });
     }
     for (const t of transfers) t.notices = notices ? (notices.get(t.id) || []) : null;
+    // A forwarder's transfer ("A forwarder's payment" in docs/payment-proof-send.md):
+    // its one part's state in `forwarderNotice`, and what the forwarder
+    // acknowledged on the portal in `acknowledgement`. `notices` stays [] for
+    // one, so a ShipLine from before this shows no button on it. Both null on
+    // any other transfer, and where the send log could not be read.
+    let forwarders = null;
+    if (notices) {
+        try {
+            forwarders = await paymentNotices.forwarderSummaries(conn, transfers);
+        } catch (e) {
+            log.warn('[supplier-payments] the forwarder send state of these payments could not be read', { error: e.message, errno: e.errno });
+        }
+    }
+    for (const t of transfers) {
+        const f = forwarders ? forwarders.get(t.id) : null;
+        t.forwarderNotice = f ? f.forwarderNotice : null;
+        t.acknowledgement = f ? f.acknowledgement : null;
+    }
     return transfers;
 }
 

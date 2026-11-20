@@ -58,10 +58,19 @@ function registerPaymentNoticeRoutes(app, deps) {
         const loaded = await store.forPreview(id);
         if (!loaded) return { status: 404, body: { error: `Supplier payment ${id} not found.`, code: 'NOT_FOUND' } };
         if (!loaded.migrated) return NOT_MIGRATED;
+        const preview = S.previewOf(loaded.source, loaded.delivery, loaded.sends);
+        // A forwarder's payment: who opened its proof and who acknowledged it
+        // come from the portal's own forwarder events, for the forwarder it is
+        // linked to now. Never from payment_views: an opening by a supplier's
+        // user, from before the payment was a forwarder's, proves nothing here.
+        if (preview.audience === N.FORWARDER_KIND) {
+            const evidence = await store.forwarderEvidence(id, preview.forwarder ? preview.forwarder.id : null);
+            return { status: 200, body: { ...preview, views: [], ...evidence, canSend: N.maySend(req.userType) } };
+        }
         const views = await store.views(id);
         return {
             status: 200,
-            body: { ...S.previewOf(loaded.source, loaded.delivery, loaded.sends), views, canSend: N.maySend(req.userType) },
+            body: { ...preview, views, canSend: N.maySend(req.userType) },
         };
     }));
 

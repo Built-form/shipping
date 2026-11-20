@@ -504,6 +504,10 @@ function portalSyncSteps(jp) {
     const paymentView = `${jp}.payment_views v
                  WHERE v.supplier_payment_id = s.supplier_payment_id
                    AND v.last_viewed_at >= r.created_at`;
+    const forwarderEvent = `${jp}.forwarder_payment_events e
+                 WHERE e.supplier_payment_id = s.supplier_payment_id
+                   AND e.forwarder_id = s.forwarder_id
+                   AND e.created_at >= r.created_at`;
     return [
         // The PO email: a supplier's user opened that PDF on the portal.
         ['po_viewed', `
@@ -603,8 +607,21 @@ function portalSyncSteps(jp) {
               JOIN supplier_payment_sends s ON s.id = r.send_id
                SET r.confirmed_at = (SELECT MIN(IF(v.first_viewed_at >= r.created_at, v.first_viewed_at, v.last_viewed_at))
                                        FROM ${paymentView})
-             WHERE ${PENDING_PORTAL} AND r.send_table = 'supplier_payment_sends'
+             WHERE ${PENDING_PORTAL} AND r.send_table = 'supplier_payment_sends' AND s.notice_kind <> 'forwarder'
                AND EXISTS (SELECT 1 FROM ${paymentView})`],
+        // A payment sent to a FORWARDER ("A forwarder's payment" in
+        // docs/payment-proof-send.md): that forwarder opened its proof or
+        // pressed Acknowledge on the portal after the email (the portal's
+        // forwarder_payment_events). By forwarder id: what a forwarder the
+        // payment used to belong to did, or a supplier's user, confirms
+        // nothing. It says they did something with it since this email, not
+        // that the payment is unchanged since.
+        ['forwarder_payment_seen', `
+            UPDATE email_receipts r
+              JOIN supplier_payment_sends s ON s.id = r.send_id
+               SET r.confirmed_at = (SELECT MIN(e.created_at) FROM ${forwarderEvent})
+             WHERE ${PENDING_PORTAL} AND r.send_table = 'supplier_payment_sends' AND s.notice_kind = 'forwarder'
+               AND EXISTS (SELECT 1 FROM ${forwarderEvent})`],
         // The freight quote request: the forwarder (or staff for them) answered.
         ['freight_quote_answered', `
             UPDATE email_receipts r
@@ -689,7 +706,7 @@ async function syncPortalReceipts(conn, { maxAgeMs = PORTAL_SYNC_MS } = {}) {
     } catch (e) {
         // JPORTAL_DB_SCHEMA is not a plain identifier: nothing can be read.
         log.warn('[email-receipt] portal sync skipped', { error: e.message });
-        return { failed: ['po_viewed', 'signed_pi_viewed', 'request_viewed', 'request_pl_uploaded', 'request_ci_uploaded', 'artwork_ticked', 'file_opened', 'qc_availability_answered', 'qc_schedule_opened', 'quote_answered', 'payment_viewed', 'freight_quote_answered', 'freight_booking_answered', 'freight_movements_priced', 'ready_dates_added', ...failed] };
+        return { failed: ['po_viewed', 'signed_pi_viewed', 'request_viewed', 'request_pl_uploaded', 'request_ci_uploaded', 'artwork_ticked', 'file_opened', 'qc_availability_answered', 'qc_schedule_opened', 'quote_answered', 'payment_viewed', 'forwarder_payment_seen', 'freight_quote_answered', 'freight_booking_answered', 'freight_movements_priced', 'ready_dates_added', ...failed] };
     }
     for (const [name, sql] of steps) await run(name, () => conn.query(sql));
     return { failed };

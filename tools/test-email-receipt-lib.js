@@ -146,7 +146,7 @@ test('portalSyncSteps: every step touches unconfirmed portal receipts only', () 
     const steps = R.portalSyncSteps('`jportal`');
     assert.deepEqual(steps.map(s => s[0]), [
         'po_viewed', 'signed_pi_viewed', 'request_viewed', 'request_pl_uploaded', 'request_ci_uploaded', 'artwork_ticked', 'file_opened', 'qc_availability_answered', 'qc_schedule_opened', 'quote_answered',
-        'payment_viewed',
+        'payment_viewed', 'forwarder_payment_seen',
         'freight_quote_answered', 'freight_booking_answered', 'freight_movements_priced', 'ready_dates_added',
     ]);
     for (const [name, sql] of steps) {
@@ -188,6 +188,20 @@ test('a payment email sent as a portal link is confirmed when that payment is op
     const view = '`jportal`.payment_views v WHERE v.supplier_payment_id = s.supplier_payment_id AND v.last_viewed_at >= r.created_at';
     assert.equal(s.split(view).length - 1, 2, 'the time it is confirmed at, and whether it is');
     assert.match(s, /SELECT MIN\(IF\(v\.first_viewed_at >= r\.created_at, v\.first_viewed_at, v\.last_viewed_at\)\)/);
+});
+
+test('a forwarder\'s payment email is confirmed by what that forwarder did on the portal after it, never by a supplier\'s opening', () => {
+    const steps = Object.fromEntries(R.portalSyncSteps('`jportal`'));
+    // The supplier's step leaves a forwarder's email alone: payment_views says nothing about a forwarder.
+    assert.match(steps.payment_viewed.replace(/\s+/g, ' '), /r\.send_table = 'supplier_payment_sends' AND s\.notice_kind <> 'forwarder' AND EXISTS/);
+    const s = steps.forwarder_payment_seen.replace(/\s+/g, ' ').trim();
+    assert.match(s, /^UPDATE email_receipts r JOIN supplier_payment_sends s ON s\.id = r\.send_id SET r\.confirmed_at = \(SELECT MIN\(e\.created_at\) FROM /);
+    assert.match(s, /r\.send_table = 'supplier_payment_sends' AND s\.notice_kind = 'forwarder' AND EXISTS/);
+    // The portal's own events (a proof opened, or Acknowledge pressed): that payment, by the
+    // forwarder this email went to, after this email.
+    const event = '`jportal`.forwarder_payment_events e WHERE e.supplier_payment_id = s.supplier_payment_id AND e.forwarder_id = s.forwarder_id AND e.created_at >= r.created_at';
+    assert.equal(s.split(event).length - 1, 2, 'the time it is confirmed at, and whether it is');
+    assert.doesNotMatch(s, /payment_views/);
 });
 
 test('payment emails are never swept: no automatic reminder, by either delivery', async () => {

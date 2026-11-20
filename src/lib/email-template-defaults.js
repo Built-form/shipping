@@ -484,6 +484,31 @@ const PAYMENT_PROOF_TEMPLATES = [
 ];
 DEFAULT_EMAIL_TEMPLATES.push(...PAYMENT_PROOF_TEMPLATES);
 
+// "Send to forwarder" (2026-11-20; docs/payment-proof-send.md, "A forwarder's
+// payment"; seeded by 2026-11-20_23_seed_forwarder_payment_template.js): the
+// one wording of a payment made to a freight forwarder, sent to that
+// forwarder's contacts. The sender appends the button to the payment on the
+// portal and how to register; nothing is asked for in return. {paidFor} is the
+// container numbers. A constant of its own, NOT in PAYMENT_PROOF_TEMPLATES:
+// the migrations of 2026-11-16_30 and 2026-11-17_30 read that list as it was.
+const FORWARDER_PAYMENT_TEMPLATE_KEY = 'payment_proof_forwarder_portal';
+const FORWARDER_PAYMENT_TEMPLATE = {
+    key: FORWARDER_PAYMENT_TEMPLATE_KEY,
+    name: 'Forwarder paid',
+    category: 'Payment proof',
+    description: 'Emailed to a freight forwarder\'s contacts when a payment to the forwarder has been made. Nothing is sent with the email: a button to the payment on the portal (where its proof is) and registration instructions are appended automatically. Tokens: {amount} {currency} {paidOn} {paidFor}.',
+    subject: 'Payment sent – {currency} {amount} – {paidFor} / 款项已付',
+    bodyHtml: PAYMENT_PROOF_WRAP([
+        '<p>Hi,</p>',
+        '<p>We have sent a payment of <strong>{currency} {amount}</strong> on {paidOn}, for containers: {paidFor}.</p>',
+        '<p>The proof of payment is below.</p>',
+        '<p>您好，</p>',
+        '<p>我们已于 {paidOn} 支付 <strong>{currency} {amount}</strong>，对应货柜：{paidFor}。</p>',
+        '<p>付款凭证请见下方。</p>',
+    ]),
+};
+DEFAULT_EMAIL_TEMPLATES.push(FORWARDER_PAYMENT_TEMPLATE);
+
 // Freight quotes (src/services/freight-quote-routes.js, docs/freight-quotes.md;
 // seeded by 2026-11-16_20_seed_freight_templates.js), category 'Freight'. Sent
 // from ShipLine's FREIGHT page to a freight forwarder. Each is the INSIDE of
@@ -602,6 +627,7 @@ DEFAULT_EMAIL_TEMPLATES.push(READY_DATE_REMINDER_TEMPLATE);
 module.exports = {
     READY_DATE_REMINDER_TEMPLATE_KEY, READY_DATE_REMINDER_TEMPLATE,
     PAYMENT_PROOF_TEMPLATES,
+    FORWARDER_PAYMENT_TEMPLATE_KEY, FORWARDER_PAYMENT_TEMPLATE,
     FREIGHT_TEMPLATES, FREIGHT_QUOTE_REQUEST_TEMPLATE_KEY, FREIGHT_BOOKING_REQUEST_TEMPLATE_KEY,
     FREIGHT_BOOKING_CONTENTS_TEMPLATE_KEY, FREIGHT_MOVEMENT_REQUEST_TEMPLATE_KEY,
     DEFAULT_EMAIL_TEMPLATES, SUPPLIER_PI_TEMPLATE_KEYS, QC_VISIT_TEMPLATE_KEYS, PO_PORTAL_TEMPLATE_KEY,

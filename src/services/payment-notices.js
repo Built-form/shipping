@@ -30,7 +30,7 @@ const P = require('../lib/po-portal-email');
 const R = require('../lib/email-receipt');
 const { jportalSchema, isSourceMissing } = require('../lib/jportal');
 const { wrapEmail } = require('../lib/email-layout');
-const { preapprovePortalUsers } = require('./portal-access');
+const { preapprovePortalUsers, preapprovePortalAddresses } = require('./portal-access');
 
 const ER_DUP_ENTRY = 1062;
 const ER_NO_SUCH_TABLE = 1146;
@@ -57,6 +57,8 @@ function sendJson(row, now = new Date()) {
         delivery: row.delivery,
         status: N.effectiveStatus(row, now),
         supplierName: row.supplierName,
+        // A forwarder's send only: the forwarder it went to.
+        forwarderId: row.forwarderId ?? null,
         sentTo: row.sentTo || [],
         subject: row.subject || null,
         sentByEmail: row.sentByEmail || null,
@@ -76,13 +78,21 @@ function sendJson(row, now = new Date()) {
  */
 function previewOf(source, delivery, sends = [], now = new Date()) {
     const built = N.buildNotices(source);
+    const toForwarder = built.audience === N.FORWARDER_KIND;
     // What is wrong with the payment itself first; then whether the portal can
     // show it to anyone. It goes out as a portal link or not at all.
-    const blocked = built.blocked || N.portalRefusal(delivery, source.payment.supplierName);
-    const states = N.noticeStates(built.notices.map(n => n.kind), sends, source.payment.supplierName, now);
+    const blocked = built.blocked || cannotDeliver(built, delivery, source);
+    // A forwarder's one part is 'sent' when sent to the forwarder it is linked to now.
+    const states = toForwarder
+        ? built.notices.map(n => N.forwarderNoticeOf(ownerLines(source), sends, now) || { kind: n.kind, state: 'not_sent', lastSentAt: null })
+        : N.noticeStates(built.notices.map(n => n.kind), sends, source.payment.supplierName, now);
     return {
         paymentId: source.payment.id,
         supplierName: source.payment.supplierName,
+        // Who it is sent to: 'supplier', or 'forwarder' with the forwarder and
+        // the contacts it may go to (no others: see N.recipientsAreContacts).
+        audience: built.audience,
+        forwarder: toForwarder && delivery.forwarder ? { id: delivery.forwarder.id, name: delivery.forwarder.name, contacts: delivery.contacts || [] } : null,
         sendable: !blocked,
         blocked,
         transfer: built.transfer,
@@ -111,6 +121,16 @@ function previewOf(source, delivery, sends = [], now = new Date()) {
     };
 }
 
+// A transfer's lines as N.forwarderOfLines reads them, from the loader's.
+const ownerLines = source => (source.lines || []).filter(l => l.target)
+    .map(l => ({ kind: l.kind, ridesWith: l.target.ridesWith, forwarderId: l.target.forwarderId }));
+
+// Why the portal cannot show a payment to anyone, said for whoever it is
+// sent to: a supplier, or a forwarder. null when it can.
+const cannotDeliver = (built, delivery, source) => (built.audience === N.FORWARDER_KIND
+    ? N.forwarderRefusal(delivery, delivery && delivery.forwarder ? delivery.forwarder.name : source.payment.supplierName)
+    : N.portalRefusal(delivery, source.payment.supplierName));
+
 // What a recorded outcome answers a retried key with.
 function replay(row, now) {
     const send = sendJson(row, now);
@@ -135,7 +155,7 @@ async function sendNotice(ctx, { paymentId, kind, actor, body }) {
     const b = body || {};
 
     if (!N.maySend(actor && actor.userType)) return refused(N.refusal('CANNOT_SEND'));
-    if (!N.NOTICE_KINDS.includes(kind)) return bad('The part of the payment to send must be "deposit" or "balance".');
+    if (!N.SEND_KINDS.includes(kind)) return bad('The part of the payment to send must be "deposit", "balance" or "forwarder".');
     if (typeof b.sendKey !== 'string' || !SEND_KEY_RE.test(b.sendKey)) return bad('`sendKey` must be 8 to 64 letters, digits, - or _.');
     if (!N.DELIVERIES.includes(b.delivery)) return bad('`delivery` must be "portal": the way the dialog showed.');
     if (typeof b.previewToken !== 'string' || !b.previewToken) return bad('`previewToken` is required: what the dialog showed.');
@@ -165,7 +185,7 @@ async function sendNotice(ctx, { paymentId, kind, actor, body }) {
     const decide = (source, delivery, sends) => {
         const built = N.buildNotices(source);
         if (built.blocked) return { refusal: built.blocked };
-        const cannot = N.portalRefusal(delivery, source.payment.supplierName);
+        const cannot = cannotDeliver(built, delivery, source);
         if (cannot) return { refusal: cannot };
         const conflict = N.deliveryConflict(b.delivery);
         if (conflict) return { refusal: conflict };
@@ -173,6 +193,13 @@ async function sendNotice(ctx, { paymentId, kind, actor, body }) {
         if (!notice) return { refusal: N.refusal('NO_SUCH_NOTICE') };
         if (notice.blocked) return { refusal: notice.blocked };
         if (N.previewToken(built, delivery.delivery) !== b.previewToken) return { refusal: N.refusal('PAYMENT_CHANGED') };
+        // A forwarder's payment goes to that forwarder's contacts and nobody
+        // else, read under the same locks: whoever signs in with a contact's
+        // address is who the portal shows it to.
+        if (built.audience === N.FORWARDER_KIND) {
+            const who = N.recipientsAreContacts(addresses, delivery.contacts);
+            if (who.notContacts.length || !who.to.length) return { refusal: N.refusal('NOT_A_CONTACT', { notContacts: who.notContacts }) };
+        }
         const at = now();
         for (const s of sends.filter(x => x.noticeKind === kind)) {
             const status = N.effectiveStatus(s, at);
@@ -186,6 +213,8 @@ async function sendNotice(ctx, { paymentId, kind, actor, body }) {
         noticeKind: kind,
         delivery: N.DELIVERY,
         supplierName: d.built.supplierName,
+        // A forwarder's send: who it went to, by id. null for a supplier's.
+        forwarderId: d.built.audience === N.FORWARDER_KIND ? d.built.forwarderId : null,
         sendKey: b.sendKey,
         requestHash,
         deadlineAt: new Date(now().getTime() + N.DEADLINE_SECONDS * 1000).toISOString(),
@@ -209,18 +238,28 @@ async function sendNotice(ctx, { paymentId, kind, actor, body }) {
         await store.fail(send.id, String(reason).slice(0, 500));
         return answer;
     };
+    const toForwarder = kind === N.FORWARDER_KIND;
     let portalAccess = null;
     let html;
     try {
         try {
-            portalAccess = await store.preapprove({
-                recipients: addresses,
-                // The portal lists the payment to users linked to a supplier
-                // of exactly this name, so that name is all they are given.
-                poSupplier: source.payment.supplierName,
-                actorEmail: actor.email,
-                note: N.preapprovalNote({ paymentId, kind, actor: actor.email }),
-            });
+            portalAccess = toForwarder
+                // A forwarder's contacts are approved with NO supplier linked, as a
+                // freight quote request approves them: the portal knows them by
+                // their address on the Forwarders list, and they see no supplier's orders.
+                ? await store.preapproveAddresses({
+                    emails: addresses,
+                    actorEmail: actor.email,
+                    note: `Freight forwarder contact: ${delivery.forwarder ? delivery.forwarder.name : source.payment.supplierName} (proof of payment ${paymentId})`,
+                })
+                : await store.preapprove({
+                    recipients: addresses,
+                    // The portal lists the payment to users linked to a supplier
+                    // of exactly this name, so that name is all they are given.
+                    poSupplier: source.payment.supplierName,
+                    actorEmail: actor.email,
+                    note: N.preapprovalNote({ paymentId, kind, actor: actor.email }),
+                });
         } catch (e) {
             log.error('[payment-notices] portal pre-approval failed', { paymentId, error: e.message, errno: e.errno });
             portalAccess = { status: 'error', suppliers: [], poSupplierMatched: false, users: [] };
@@ -230,17 +269,19 @@ async function sendNotice(ctx, { paymentId, kind, actor, body }) {
         // nothing is attached instead.
         if (portalAccess.status === 'no_supplier' || portalAccess.status === 'unavailable') {
             const reason = portalAccess.status === 'no_supplier' ? 'no_supplier' : 'portal_unavailable';
-            return giveUp(`no portal delivery: ${reason}`, refused(N.portalRefusal({ delivery: null, reason }, source.payment.supplierName)));
+            return giveUp(`no portal delivery: ${reason}`, refused(cannotDeliver({ audience: toForwarder ? N.FORWARDER_KIND : 'supplier' }, { delivery: null, reason, forwarder: delivery.forwarder }, source)));
         }
-        const preapproved = portalAccess.status === 'ok' && portalAccess.users.every(u => P.GRANTED_OUTCOMES.has(u.outcome));
-        const block = N.portalBlockHtml({
-            kind,
-            url: delivery.portalUrl,
-            registerUrl: delivery.registerUrl,
-            preapproved,
-            readyDates: N.readyDatesFor(notice, delivery),
-            telex: N.telexContainersOf(notice),
-        });
+        const preapproved = portalAccess.status === 'ok' && (portalAccess.users || []).every(u => P.GRANTED_OUTCOMES.has(u.outcome));
+        const block = toForwarder
+            ? N.forwarderBlockHtml({ url: delivery.portalUrl, registerUrl: delivery.registerUrl, preapproved })
+            : N.portalBlockHtml({
+                kind,
+                url: delivery.portalUrl,
+                registerUrl: delivery.registerUrl,
+                preapproved,
+                readyDates: N.readyDatesFor(notice, delivery),
+                telex: N.telexContainersOf(notice),
+            });
         html = wrapEmail({ title: subject, bodyHtml: `${bodyHtml}${block}` });
     } catch (e) {
         log.error('[payment-notices] a send could not be prepared', { paymentId, sendId: send.id, error: e.message });
@@ -338,6 +379,8 @@ const sendRow = (r, env) => ({
     noticeKind: r.notice_kind,
     delivery: r.delivery,
     supplierName: r.supplier_name,
+    // undefined on a server from before 2026-11-20_20: no forwarder's send exists there.
+    forwarderId: r.forwarder_id != null ? Number(r.forwarder_id) : null,
     sendKey: r.send_key,
     requestHash: r.request_hash,
     status: r.status,
@@ -351,8 +394,11 @@ const sendRow = (r, env) => ({
     sentAt: r.sent_at_iso || null,
     resolvedAt: r.resolved_at_iso || null,
     resolvedByEmail: r.resolved_by_email || null,
-    // Where a portal send's reminder button leads: the payment's own page.
-    portalUrl: r.delivery === 'portal' && P.portalBaseOf(env) ? N.paymentPortalUrl(P.portalBaseOf(env), r.supplier_payment_id) : null,
+    // Where a portal send's reminder button leads: the payment's own page,
+    // which for a forwarder's is the Freight payments page.
+    portalUrl: r.delivery === 'portal' && P.portalBaseOf(env)
+        ? (r.notice_kind === N.FORWARDER_KIND ? N.forwarderPaymentPortalUrl : N.paymentPortalUrl)(P.portalBaseOf(env), r.supplier_payment_id)
+        : null,
 });
 
 // 'YYYY-MM-DD HH:MM:SS' (UTC) for a DATETIME column, from an ISO instant.
@@ -393,14 +439,17 @@ function targetOf(r) {
         extraKind: r.extra_kind || null,
         ridesWith: r.rides_with || null,
         extraSupplier: r.extra_supplier ?? null,
+        // A forwarder's charge: the row of the Forwarders list it is linked to.
+        forwarderId: r.ex_forwarder_id != null ? Number(r.ex_forwarder_id) : null,
     };
 }
 
 // The lines of one transfer with what each points at: the same joins as the
 // portal's own view of a line (2026-11-16_21 portal_payment_lines_v), so the
 // dialog and the portal cannot disagree about what a line is.
-const linesSql = ({ paidWith = true, extras = true } = {}) => `
+const linesSql = ({ paidWith = true, extras = true, forwarder = true } = {}) => `
     SELECT l.id, l.target_kind, l.target_id, l.amount, ${paidWith ? 'l.paid_with_json' : 'NULL AS paid_with_json'},
+           ${extras && forwarder ? 'ex.forwarder_id AS ex_forwarder_id' : 'NULL AS ex_forwarder_id'},
            pip.id AS pip_id, pip.payment_type,
            po.id AS po_id, po.po_number, po.supplier AS po_supplier,
            o.id AS order_id, o.jf_code,
@@ -447,16 +496,18 @@ async function loadNoticeSource(conn, paymentId) {
     );
     if (!pays.length) return null;
     const p = pays[0];
-    // A server from before paid_with_json (2026-10-19_10) or payment_extras
-    // (2026-09-29_10) still answers, with less.
-    const shape = { paidWith: true, extras: true };
+    // A server from before payment_extras.forwarder_id (2026-11-20_10),
+    // paid_with_json (2026-10-19_10) or payment_extras (2026-09-29_10) still
+    // answers, with less. The newest column is given up first.
+    const shape = { paidWith: true, extras: true, forwarder: true };
     let rows;
     for (;;) {
         try {
             [rows] = await conn.query(linesSql(shape), [paymentId]);
             break;
         } catch (e) {
-            if (e.errno === ER_BAD_FIELD && shape.paidWith) shape.paidWith = false;
+            if (e.errno === ER_BAD_FIELD && shape.forwarder) shape.forwarder = false;
+            else if (e.errno === ER_BAD_FIELD && shape.paidWith) shape.paidWith = false;
             else if (e.errno === ER_NO_SUCH_TABLE && shape.extras) shape.extras = false;
             else throw e;
         }
@@ -517,6 +568,98 @@ async function resolveNoticeDelivery(conn, payment, env = process.env) {
     };
 }
 
+/**
+ * Which way a FORWARDER's transfer goes out now: resolveNoticeDelivery's shape
+ * (`suppliers` always empty) with `forwarder` ({ id, name, removed } or null:
+ * not linked, or gone) and `contacts` (its live contacts: who it may be sent
+ * to and who the portal shows it to). Nothing is read of a supplier record: a
+ * forwarder is known by its row of the Forwarders list, never by a name. The
+ * portal is "there" when its forwarder_payment_events table is: the table its
+ * Freight payments page came with.
+ */
+async function resolveForwarderDelivery(conn, payment, forwarderId, env = process.env) {
+    const portalBase = P.portalBaseOf(env);
+    let forwarder = null;
+    let contacts = [];
+    if (forwarderId != null) {
+        try {
+            const [rows] = await conn.query('SELECT f.id, f.name, f.deleted_at FROM forwarders f WHERE f.id = ?', [forwarderId]);
+            if (rows.length) forwarder = { id: Number(rows[0].id), name: rows[0].name, removed: rows[0].deleted_at != null };
+            if (forwarder && !forwarder.removed) {
+                const [people] = await conn.query(
+                    'SELECT c.name, c.email FROM forwarder_contacts c WHERE c.forwarder_id = ? AND c.deleted_at IS NULL ORDER BY c.id',
+                    [forwarderId]
+                );
+                contacts = people.map(c => ({ name: c.name || null, email: c.email }));
+            }
+        } catch (e) {
+            // A server without the freight tables has no Forwarders list.
+            if (e.errno !== ER_NO_SUCH_TABLE) throw e;
+        }
+    }
+    let portalAvailable = true;
+    try {
+        await conn.query(`SELECT 1 AS ok FROM ${jportalSchema(env)}.forwarder_payment_events LIMIT 1`);
+    } catch (e) {
+        if (!isSourceMissing(e)) throw e;
+        portalAvailable = false;
+    }
+    const out = N.forwarderDelivery({ portalBase, portalAvailable, forwarder, contacts });
+    const portal = out.delivery === 'portal';
+    return {
+        ...out,
+        portalBase,
+        portalUrl: portal ? N.forwarderPaymentPortalUrl(portalBase, payment.id) : null,
+        registerUrl: portal ? P.registerUrl(portalBase) : null,
+        suppliers: [],
+        forwarder,
+        contacts,
+    };
+}
+
+/** How a transfer goes out now, for whoever it is sent to: `source` is the loader's answer. */
+async function resolveDelivery(conn, source, env = process.env) {
+    const owner = N.forwarderOfLines(ownerLines(source));
+    if (!owner) return resolveNoticeDelivery(conn, source.payment, env);
+    return resolveForwarderDelivery(conn, source.payment, owner.blocked ? null : owner.forwarderId, env);
+}
+
+// What the portal's forwarders did with these transfers, and each one's
+// present revision on the portal's own view (the one definition of "what the
+// forwarder is shown": 2026-11-20_21 portal_forwarder_payments_v). A server
+// without the portal's table or the view answers as nothing.
+async function readForwarderEvidence(conn, paymentIds, env = process.env) {
+    const marks = paymentIds.map(() => '?').join(', ');
+    const out = { events: new Map(), revisions: new Map() };
+    try {
+        const [rows] = await conn.query(
+            `SELECT e.supplier_payment_id, e.forwarder_id, e.event, e.user_email, e.user_name, e.revision,
+                    DATE_FORMAT(e.created_at, ${ISO}) AS at_iso
+               FROM ${jportalSchema(env)}.forwarder_payment_events e
+              WHERE e.supplier_payment_id IN (${marks})
+              ORDER BY e.id`,
+            paymentIds
+        );
+        for (const r of rows) {
+            const id = Number(r.supplier_payment_id);
+            if (!out.events.has(id)) out.events.set(id, []);
+            out.events.get(id).push({ forwarderId: Number(r.forwarder_id), event: r.event, userEmail: r.user_email, userName: r.user_name || null, revision: r.revision, at: r.at_iso });
+        }
+        const [views] = await conn.query(
+            `SELECT p.payment_id, p.forwarder_id, p.revision FROM portal_forwarder_payments_v p WHERE p.payment_id IN (${marks})`,
+            paymentIds
+        );
+        for (const v of views) out.revisions.set(`${Number(v.payment_id)}:${Number(v.forwarder_id)}`, v.revision);
+    } catch (e) {
+        if (!isSourceMissing(e)) throw e;
+        return { events: new Map(), revisions: new Map() };
+    }
+    return out;
+}
+const evidenceOf = (read, paymentId, forwarderId) => N.forwarderEvidence(read.events.get(paymentId) || [], {
+    forwarderId, revision: forwarderId == null ? null : (read.revisions.get(`${paymentId}:${forwarderId}`) || null),
+});
+
 /** The sends of these transfers, oldest first. null where the table is not migrated. */
 async function loadSends(conn, paymentIds, env = process.env) {
     if (!paymentIds.length) return [];
@@ -543,6 +686,7 @@ function createStore(deps) {
     const { withConnection, lockSupplierPaymentTargets, getEmailTemplate, recordAudit } = deps;
     const env = deps.env || process.env;
     const preapprove = deps.preapprove || preapprovePortalUsers;
+    const preapproveAddresses = deps.preapproveAddresses || preapprovePortalAddresses;
     const jp = () => jportalSchema(env);
 
     const readSend = async (conn, where, params) => {
@@ -561,6 +705,15 @@ function createStore(deps) {
         getSend: id => withConnection(conn => readSend(conn, 's.id = ?', [id])),
         template: key => withConnection(conn => getEmailTemplate(conn, key)),
         preapprove: args => withConnection(conn => preapprove(conn, args)),
+        // A forwarder's contacts: approved on the portal with no supplier linked.
+        preapproveAddresses: args => withConnection(conn => preapproveAddresses(conn, args)),
+
+        // What the forwarder a transfer is linked to did with it on the portal:
+        // { opened, acknowledgement } (N.forwarderEvidence). Nothing of a
+        // forwarder it used to belong to, and nothing at all when it is linked to none.
+        forwarderEvidence: (paymentId, forwarderId) => (forwarderId == null
+            ? Promise.resolve({ opened: [], acknowledgement: null })
+            : withConnection(async conn => evidenceOf(await readForwarderEvidence(conn, [paymentId], env), paymentId, forwarderId))),
         // For a send from before 2026-11-17 that went out with the proof attached and is
         // being resolved "not sent": its receipt (with a confirm button) is taken back.
         discardReceipt: token => withConnection(conn => R.discardEmailReceipt(conn, token)),
@@ -589,7 +742,7 @@ function createStore(deps) {
         forPreview: paymentId => withConnection(async conn => {
             const source = await loadNoticeSource(conn, paymentId);
             if (!source) return null;
-            const delivery = await resolveNoticeDelivery(conn, source.payment, env);
+            const delivery = await resolveDelivery(conn, source, env);
             const sends = await loadSends(conn, [paymentId], env);
             return { source, delivery, sends: sends || [], migrated: sends !== null };
         }),
@@ -621,18 +774,22 @@ function createStore(deps) {
                         planned = source;
                         continue;
                     }
-                    const delivery = await resolveNoticeDelivery(conn, source.payment, env);
+                    const delivery = await resolveDelivery(conn, source, env);
                     const sends = (await loadSends(conn, [paymentId], env)) || [];
                     const decision = decide(source, delivery, sends);
                     if (decision.refusal) { await conn.rollback(); return { refusal: decision.refusal }; }
                     const f = row(decision);
+                    // forwarder_id is named only on a forwarder's send, so a supplier's is
+                    // written as it always was, also on a server from before the column.
+                    const toForwarder = f.forwarderId != null;
                     let insertId;
                     try {
                         const [r] = await conn.query(
                             `INSERT INTO supplier_payment_sends
-                                    (supplier_payment_id, notice_kind, delivery, supplier_name, send_key, request_hash, status, deadline_at, sent_to, subject, sent_by_email)
-                             VALUES (?, ?, ?, ?, ?, ?, 'sending', ?, ?, ?, ?)`,
-                            [paymentId, f.noticeKind, f.delivery, f.supplierName, f.sendKey, f.requestHash, sqlUtc(f.deadlineAt), JSON.stringify(f.sentTo), f.subject, f.sentByEmail]
+                                    (supplier_payment_id, notice_kind, delivery, supplier_name, send_key, request_hash, status, deadline_at, sent_to, subject, sent_by_email${toForwarder ? ', forwarder_id' : ''})
+                             VALUES (?, ?, ?, ?, ?, ?, 'sending', ?, ?, ?, ?${toForwarder ? ', ?' : ''})`,
+                            [paymentId, f.noticeKind, f.delivery, f.supplierName, f.sendKey, f.requestHash, sqlUtc(f.deadlineAt), JSON.stringify(f.sentTo), f.subject, f.sentByEmail,
+                                ...(toForwarder ? [f.forwarderId] : [])]
                         );
                         insertId = r.insertId;
                     } catch (e) {
@@ -743,10 +900,41 @@ async function noticeSummaries(conn, payments, env = process.env, now = new Date
 }
 
 /**
+ * For each transfer on the list that is a forwarder's alone:
+ * Map(payment id -> { forwarderNotice, acknowledgement }), the state of its
+ * one part (N.forwarderNoticeOf) and what its forwarder acknowledged
+ * (N.forwarderEvidence). Transfers that are a supplier's or mixed have no
+ * entry. null where the send log is not migrated. Asks the database nothing
+ * when the page holds no forwarder's transfer. `payments` are the API's own
+ * transfer JSON, whose lines carry forwarderId.
+ */
+async function forwarderSummaries(conn, payments, env = process.env, now = new Date()) {
+    const owned = payments
+        .map(p => ({ p, owner: N.forwarderOfLines(p.lines) }))
+        .filter(x => x.owner && x.owner.blocked !== 'MIXED_PAYMENT');
+    const out = new Map();
+    if (!owned.length) return out;
+    const ids = owned.map(x => x.p.id);
+    const sends = await loadSends(conn, ids, env);
+    if (sends === null) return null;
+    const read = await readForwarderEvidence(conn, ids, env);
+    for (const { p, owner } of owned) {
+        out.set(p.id, {
+            forwarderNotice: N.forwarderNoticeOf(p.lines, sends.filter(s => s.paymentId === p.id), now),
+            acknowledgement: evidenceOf(read, p.id, owner.blocked ? null : owner.forwarderId).acknowledgement,
+        });
+    }
+    return out;
+}
+
+/**
  * Whether a manual reminder of a payment email must be refused: the payment
  * has been deleted, or is no longer the supplier's the email went to (the
  * reminder would point them at something they cannot open, or at someone
- * else's payment). null when it may go. `receipt` needs send_table / send_id.
+ * else's payment). For a forwarder's email: the portal no longer lists the
+ * payment for the forwarder it went to, or someone it went to is no longer
+ * one of that forwarder's contacts (they could not open it). null when it may
+ * go. `receipt` needs send_table / send_id.
  */
 async function reminderRefusal(conn, receipt) {
     if (!receipt || receipt.send_table !== N.SEND_TABLE || !receipt.send_id) return null;
@@ -754,7 +942,8 @@ async function reminderRefusal(conn, receipt) {
     try {
         [rows] = await conn.query(
             `SELECT (sp.id IS NOT NULL
-                     AND CONVERT(sp.supplier_name USING utf8mb4) ${BIN} = CONVERT(s.supplier_name USING utf8mb4) ${BIN}) AS current
+                     AND CONVERT(sp.supplier_name USING utf8mb4) ${BIN} = CONVERT(s.supplier_name USING utf8mb4) ${BIN}) AS current,
+                    s.notice_kind, s.supplier_payment_id, s.sent_to
                FROM supplier_payment_sends s
                LEFT JOIN supplier_payments sp ON sp.id = s.supplier_payment_id AND sp.deleted_at IS NULL
               WHERE s.id = ?`,
@@ -764,12 +953,28 @@ async function reminderRefusal(conn, receipt) {
         if (e.errno !== ER_NO_SUCH_TABLE) throw e;
         return null;
     }
-    if (!rows.length || Number(rows[0].current) !== 1) return N.refusal('PAYMENT_NOT_CURRENT');
-    return null;
+    if (!rows.length) return N.refusal('PAYMENT_NOT_CURRENT');
+    if (rows[0].notice_kind !== N.FORWARDER_KIND) return Number(rows[0].current) === 1 ? null : N.refusal('PAYMENT_NOT_CURRENT');
+    // A forwarder's: who it belongs to is the portal view's own test (a live
+    // transfer, every line that forwarder's charge, the forwarder on the list).
+    const [shown] = await conn.query(
+        `SELECT p.forwarder_id
+           FROM supplier_payment_sends s
+           JOIN portal_forwarder_payments_v p ON p.payment_id = s.supplier_payment_id AND p.forwarder_id = s.forwarder_id
+          WHERE s.id = ?`,
+        [receipt.send_id]
+    );
+    if (!shown.length) return N.refusal('PAYMENT_NOT_CURRENT');
+    const [people] = await conn.query(
+        'SELECT c.name, c.email FROM forwarder_contacts c WHERE c.forwarder_id = ? AND c.deleted_at IS NULL ORDER BY c.id',
+        [shown[0].forwarder_id]
+    );
+    const who = N.recipientsAreContacts(jsonList(rows[0].sent_to), people);
+    return who.notContacts.length || !who.to.length ? N.refusal('PAYMENT_NOT_CURRENT') : null;
 }
 
 module.exports = {
     sendNotice, resolveSend, previewOf, sendJson,
-    createStore, loadNoticeSource, resolveNoticeDelivery, loadSends,
-    noticeSummaries, reminderRefusal,
+    createStore, loadNoticeSource, resolveNoticeDelivery, resolveForwarderDelivery, resolveDelivery, loadSends,
+    noticeSummaries, forwarderSummaries, reminderRefusal,
 };

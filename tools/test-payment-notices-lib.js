@@ -125,7 +125,9 @@ test('nothing sent, a forwarder, a deleted target, no lines: the transfer cannot
     const code = (lines, over) => { const b = N.buildNotices(source(lines, over)); return [b.sendable, b.blocked && b.blocked.code]; };
     // Paid by credit: no money went, so there is no proof to send.
     assert.deepEqual(code([dep, line('extra', -1000, { ridesWith: 'account', extraSupplier: SUPPLIER }, { id: 2 })], { payment: { amount: 0 } }), [false, 'NOTHING_SENT']);
-    assert.deepEqual(code([line('extra', 900, { ridesWith: 'shipment', extraKind: 'freight', extraSupplier: 'DCG' })]), [false, 'NOT_A_SUPPLIER_PAYMENT']);
+    // A forwarder's charge whose payee was typed, not picked from the Forwarders list
+    // (2026-11-20: a forwarder's payment is sent to the forwarder; tools/test-forwarder-payment-notices-lib.js).
+    assert.deepEqual(code([line('extra', 900, { ridesWith: 'shipment', extraKind: 'freight', extraSupplier: 'DCG' })]), [false, 'FORWARDER_NOT_LINKED']);
     assert.deepEqual(code([dep, line('balance', 500, null, { id: 2, targetId: 9 })]), [false, 'LINE_TARGET_MISSING']);
     assert.deepEqual(code([], { payment: { amount: 100 } }), [false, 'NO_LINES']);
     assert.deepEqual(code([dep]), [true, null]);
@@ -458,8 +460,9 @@ const SENT_TEMPLATES = ['payment_proof_deposit_portal', 'payment_proof_balance_p
 const RETIRED_TEMPLATES = ['payment_proof_deposit_attached', 'payment_proof_balance_attached'];
 
 test('two templates are sent, a deposit\'s and a balance\'s; the two "proof attached" ones are kept only for the old migrations', () => {
-    assert.deepEqual(N.TEMPLATE_KEYS, { deposit: 'payment_proof_deposit_portal', balance: 'payment_proof_balance_portal' });
-    assert.deepEqual(Object.values(N.TEMPLATE_KEYS), SENT_TEMPLATES);
+    // To a supplier. The third is a forwarder's own (2026-11-20; tools/test-forwarder-payment-notices-lib.js).
+    assert.deepEqual(N.TEMPLATE_KEYS, { deposit: 'payment_proof_deposit_portal', balance: 'payment_proof_balance_portal', forwarder: 'payment_proof_forwarder_portal' });
+    assert.deepEqual(N.NOTICE_KINDS.map(k => N.TEMPLATE_KEYS[k]), SENT_TEMPLATES);
     // Still in the list, for 2026-11-16_30 and 2026-11-17_10 to read; nothing names them to send.
     assert.deepEqual(PAYMENT_PROOF_TEMPLATES.map(t => t.key), ['payment_proof_deposit_portal', 'payment_proof_deposit_attached', 'payment_proof_balance_portal', 'payment_proof_balance_attached']);
     assert.equal(Object.values(N.TEMPLATE_KEYS).some(key => RETIRED_TEMPLATES.includes(key)), false);
