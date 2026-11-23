@@ -147,7 +147,7 @@ test('portalSyncSteps: every step touches unconfirmed portal receipts only', () 
     assert.deepEqual(steps.map(s => s[0]), [
         'po_viewed', 'signed_pi_viewed', 'request_viewed', 'request_pl_uploaded', 'request_ci_uploaded', 'artwork_ticked', 'file_opened', 'qc_availability_answered', 'qc_schedule_opened', 'quote_answered',
         'payment_viewed', 'forwarder_payment_seen',
-        'freight_quote_answered', 'freight_booking_answered', 'freight_movements_priced', 'ready_dates_added',
+        'freight_quote_answered', 'freight_booking_answered', 'freight_movements_priced', 'forwarder_container_answered', 'ready_dates_added',
     ]);
     for (const [name, sql] of steps) {
         assert.match(sql, /^\s*UPDATE email_receipts r/, name);
@@ -175,6 +175,23 @@ test('portalSyncSteps: every step touches unconfirmed portal receipts only', () 
         draft_container_document_sends: 'request_viewed',
     });
     for (const name of Object.values(R.CHASED_PORTAL_STEPS)) assert.ok(step[name], name);
+});
+
+// ── The container email to a forwarder (docs/forwarder-containers.md) ────────
+
+test('the container email is confirmed when that forwarder sends something complete for that container after it', () => {
+    const s = Object.fromEntries(R.portalSyncSteps('`jportal`')).forwarder_container_answered.replace(/\s+/g, ' ').trim();
+    assert.match(s, /^UPDATE email_receipts r JOIN freight_container_notices n ON n\.id = r\.send_id SET r\.confirmed_at = /);
+    assert.match(s, /r\.send_table = 'freight_container_notices' AND n\.sent_at IS NOT NULL/);
+    // The same container AND the same forwarder, at or after the email actually went.
+    const details = '`jportal`.forwarder_container_details d WHERE d.shipment_id = n.shipment_id AND d.forwarder_id = n.forwarder_id AND d.created_at >= n.sent_at';
+    const uploads = '`jportal`.forwarder_uploads u WHERE u.shipment_id = n.shipment_id AND u.forwarder_id = n.forwarder_id AND u.sent_at IS NOT NULL AND u.sent_at >= n.sent_at';
+    assert.equal(s.split(details).length - 1, 3, 'when it is confirmed (twice: alone and against an upload), and whether it is');
+    assert.equal(s.split(uploads).length - 1, 3);
+    // An upload counts from the moment its file arrived, never from when its address was asked for.
+    assert.doesNotMatch(s, /u\.created_at/);
+    // Measured from when the email went, not from when its row was first written.
+    assert.doesNotMatch(s, /r\.created_at/);
 });
 
 // ── A payment sent to a supplier (docs/payment-proof-send.md) ────────────────

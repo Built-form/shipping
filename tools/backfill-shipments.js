@@ -195,6 +195,10 @@ function printReport(r) {
                 dependants: {
                     freight_bookings: await count('SELECT COUNT(*) AS n FROM freight_bookings WHERE shipment_id IS NOT NULL'),
                     payment_extras: await count('SELECT COUNT(*) AS n FROM payment_extras WHERE shipment_id IS NOT NULL'),
+                    // A forwarder's container page (docs/forwarder-containers.md): the
+                    // emails sent about a container and the files accepted for it.
+                    freight_container_notices: await count('SELECT COUNT(*) AS n FROM freight_container_notices'),
+                    shipment_forwarder_documents: await count('SELECT COUNT(*) AS n FROM shipment_forwarder_documents'),
                 },
             });
             if (refusal) {

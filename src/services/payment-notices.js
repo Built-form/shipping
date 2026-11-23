@@ -977,4 +977,6 @@ module.exports = {
     sendNotice, resolveSend, previewOf, sendJson,
     createStore, loadNoticeSource, resolveNoticeDelivery, resolveForwarderDelivery, resolveDelivery, loadSends,
     noticeSummaries, forwarderSummaries, reminderRefusal,
+    // For the container card's FORWARDER tab (src/services/forwarder-container-routes.js).
+    readForwarderEvidence,
 };

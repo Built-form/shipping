@@ -219,6 +219,14 @@ provider:
             - s3:GetObject
           Resource:
             - arn:aws:s3:::jportal-pi-uploads-${self:custom.envName}/files/sup/*
+        # A freight forwarder's uploads for a container, as the portal
+        # published them (files/fwd/, docs/forwarder-containers.md): read only,
+        # for the five-minute view link and the copy made when one is accepted.
+        - Effect: Allow
+          Action:
+            - s3:GetObject
+          Resource:
+            - arn:aws:s3:::jportal-pi-uploads-${self:custom.envName}/files/fwd/*
         - Effect: Allow
           Action:
             - s3:ListBucket

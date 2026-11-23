@@ -651,3 +651,10 @@ test('documentHistoryOwner: an open draft keeps its own history; booked and canc
         assert.equal(S.documentHistoryOwner(stage), 'shipment', stage);
     }
 });
+
+test('shipmentSummary: the compact entry carries the expected loading date, which only the shipment holds', () => {
+    const base = { id: 1, reference: '339', mode: 'SEA', stage: 'BOOKED', effective_stage: 'BOOKED', bk_count: 0 };
+    assert.equal(S.shipmentSummary(S.rowToShipment({ ...base, loading_date: '2026-12-15' })).loadingDate, '2026-12-15');
+    assert.equal(S.shipmentSummary(S.rowToShipment({ ...base, loading_date: null })).loadingDate, null);
+    assert.equal(S.shipmentSummary(S.rowToShipment(base)).loadingDate, null);
+});

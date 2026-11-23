@@ -411,6 +411,9 @@ function registerShipmentRoutes(app, deps) {
         originPort: { col: 'origin_port', max: 255 },
         bookingRef: { col: 'booking_ref', max: 100 },
         blNumber: { col: 'bl_number', max: 100 },
+        // The expected loading date (2026-11-23, docs/forwarder-containers.md): on
+        // the shipment only, as blNumber is; no order carries one.
+        loadingDate: { col: 'loading_date', type: 'date' },
         // forwarder: with forwarderId, below (src/lib/forwarder-links.js).
         notes: { col: 'notes', max: 65535 },
         reviewNote: { col: 'review_note', max: 255 },
@@ -435,212 +438,219 @@ function registerShipmentRoutes(app, deps) {
         return s == null ? null : s.slice(0, spec.max);
     }
 
+    // What PATCH /shipments/:id does, inside a transaction on `conn`: the header
+    // fields of `b`, written through to every member order of a booked shipment.
+    // A function of its own (2026-11-23) so that an accepted date from a
+    // forwarder (src/services/forwarder-container-routes.js) is written by the
+    // very same code, in its own transaction. → { id, warnings, recordsMoved? }
+    async function patchShipmentIn(conn, id, b, userEmail) {
+        const ship = await lockLive(conn, id);
+        const booked = S.isBookedStage(ship.stage);
+        const sets = [];
+        const vals = [];
+        const orderSets = {};
+        const warnings = [];
+        const before = {};
+        const after = {};
+        const change = (key, col, value) => {
+            before[key] = ship[col] instanceof Date ? ship[col].toISOString() : (ship[col] ?? null);
+            after[key] = value;
+            sets.push(`${col} = ?`);
+            vals.push(value);
+        };
+
+        if (b.name !== undefined) {
+            const newName = S.clean(b.name);
+            if (!newName) throw new ShipmentError(400, 'BAD_NAME', 'name cannot be empty.');
+            if (newName.length > 100) throw new ShipmentError(400, 'BAD_NAME', 'name must be 100 characters or fewer.');
+            if (newName !== ship.name) {
+                if (ship.stage === 'DRAFT') {
+                    const r = await draftAudit.renameDraft(conn, { from: ship.name, to: newName, userEmail: userEmail });
+                    if (r.conflict) throw new ShipmentError(409, 'NAME_IN_USE', `A draft named "${newName}" already exists.`);
+                    change('name', 'name', newName);
+                    sets.push('open_key = ?');
+                    vals.push(`D:${newName}`);
+                } else if (ship.stage === 'PLANNED') {
+                    if (newName.toLowerCase() !== String(ship.name).toLowerCase()) {
+                        const [[taken]] = await conn.query(
+                            `SELECT COUNT(*) AS n FROM planned_container_allocations WHERE planned_container_name = ?`, [newName]
+                        );
+                        if (Number(taken.n) > 0) throw new ShipmentError(409, 'NAME_IN_USE', `A planned container named "${newName}" already exists.`);
+                    }
+                    await conn.query(
+                        `UPDATE planned_container_allocations SET planned_container_name = ? WHERE planned_container_name = ?`,
+                        [newName, ship.name]
+                    );
+                    change('name', 'name', newName);
+                    sets.push('open_key = ?');
+                    vals.push(`P:${newName}`);
+                } else {
+                    // Booked: a label only. renameDraft here would reopen
+                    // the closed registry row and wipe what the draft became.
+                    change('name', 'name', newName);
+                }
+            }
+        }
+        if (b.mode !== undefined) {
+            const m = String(b.mode || '').trim().toUpperCase();
+            if (!S.isMode(m)) throw new ShipmentError(400, 'BAD_MODE', 'mode must be SEA, AIR or ROAD.');
+            if (m !== ship.mode || ship.mode_source !== 'user') {
+                change('mode', 'mode', m);
+                sets.push(`mode_source = 'user'`);
+            }
+        }
+        if (b.needsReview !== undefined) change('needsReview', 'needs_review', b.needsReview ? 1 : 0);
+        for (const [key, spec] of Object.entries(HEADER_FIELDS)) {
+            if (b[key] === undefined) continue;
+            change(key, spec.col, fieldValue(key, spec, b[key]));
+        }
+        // The container's own forwarder (2026-11-20): forwarder and
+        // forwarder_id are one value. A live freight booking still wins
+        // when read; this is what shows once it is gone.
+        const fwd = FL.decideShipmentForwarder({ stored: { id: ship.forwarder_id ?? null, name: ship.forwarder ?? null }, body: b });
+        if (fwd.error) throw new ShipmentError(400, 'BAD_FIELD', fwd.error, { field: b.forwarderId !== undefined ? 'forwarderId' : 'forwarder' });
+        const pair = await forwarderPairs.pairFor(conn, fwd);
+        if (pair && !(sameValue(ship.forwarder, pair.name) && sameValue(ship.forwarder_id, pair.id))) {
+            change('forwarder', 'forwarder', pair.name);
+            change('forwarderId', 'forwarder_id', pair.id);
+        }
+        for (const [key, spec] of Object.entries(WRITE_THROUGH)) {
+            if (b[key] === undefined) continue;
+            const v = fieldValue(key, spec, b[key]);
+            change(key, spec.col, v);
+            if (booked) orderSets[spec.orderCol] = v;
+        }
+
+        let newReference = null;
+        if (b.reference !== undefined) {
+            if (!booked) throw new ShipmentError(422, 'REFERENCE_AT_BOOKING', 'A reference is assigned when the shipment is booked.');
+            const parsed = S.parseReference(b.reference);
+            if (!parsed) throw new ShipmentError(400, 'BAD_REFERENCE', 'reference cannot be empty.');
+            if (parsed.reference !== ship.reference) {
+                const mode = after.mode || ship.mode;
+                if (parsed.mode && mode && parsed.mode !== mode) {
+                    throw new ShipmentError(422, 'REFERENCE_MODE_MISMATCH', `Reference "${parsed.reference}" belongs to the ${parsed.mode} sequence.`);
+                }
+                if (parsed.reference.length > rename.REFERENCE_MAX) {
+                    throw new ShipmentError(400, 'BAD_REFERENCE', `reference must be ${rename.REFERENCE_MAX} characters or fewer.`);
+                }
+                const holder = await sync.reservedHolder(conn, parsed.reference, { exceptShipmentId: ship.id });
+                if (holder) {
+                    throw new ShipmentError(409, 'REFERENCE_IN_USE', `Reference "${parsed.reference}" is held by the open draft "${holder.name}".`,
+                        { reference: parsed.reference, reservedBy: holder.name, reservedByShipmentId: holder.id });
+                }
+                if (!(await sync.referenceIsFree(conn, parsed.reference, { exceptShipmentId: ship.id }))) {
+                    throw new ShipmentError(409, 'REFERENCE_IN_USE', `Reference "${parsed.reference}" is already in use.`);
+                }
+                // Payment records and paperwork name the container as
+                // text. They move with it (below, after the orders),
+                // but never unseen, and never onto a number that
+                // already has records of its own: that would mix two
+                // containers' paperwork.
+                const theirs = await rename.recordsUnder(conn, parsed.reference);
+                if (rename.total(theirs) > 0) {
+                    throw new ShipmentError(409, 'REFERENCE_HAS_RECORDS',
+                        `"${parsed.reference}" already has payment records or paperwork of its own.`, { reference: parsed.reference, records: theirs });
+                }
+                const own = ship.reference ? await rename.recordsUnder(conn, ship.reference, { shipmentId: ship.id }) : null;
+                if (own && rename.total(own) > 0 && b.confirmRecords !== true) {
+                    throw new ShipmentError(409, 'RENAME_TOUCHES_RECORDS',
+                        `${rename.total(own)} record(s) kept under "${ship.reference}" move to "${parsed.reference}" with it. Confirm to rename.`,
+                        { from: ship.reference, reference: parsed.reference, records: own });
+                }
+                change('reference', 'reference', parsed.reference);
+                sets.push('reference_seq = ?');
+                vals.push(parsed.seq);
+                newReference = parsed.reference;
+                orderSets.container_number = newReference;
+            }
+        }
+
+        let trackingChange;
+        if (b.trackingRef !== undefined) {
+            const v = S.clean(b.trackingRef) ? S.clean(b.trackingRef).slice(0, 255) : null;
+            change('trackingRef', 'tracking_ref', v);
+            if (booked) trackingChange = { value: v };
+        }
+
+        if (!sets.length && !Object.keys(orderSets).length && trackingChange === undefined) {
+            return { id, warnings, unchanged: true };
+        }
+        if (sets.length) {
+            try {
+                await conn.query(`UPDATE shipments SET ${sets.join(', ')} WHERE id = ?`, [...vals, ship.id]);
+            } catch (e) {
+                if (e.code === 'ER_DUP_ENTRY') throw new ShipmentError(409, 'CONFLICT', 'The new name or reference is already in use.');
+                throw e;
+            }
+        }
+
+        // Write-through to the member orders, one audited UPDATE each.
+        if (booked && (Object.keys(orderSets).length || trackingChange !== undefined)) {
+            const [members] = await conn.query(
+                `SELECT * FROM orders WHERE shipment_id = ? AND deleted_at IS NULL ORDER BY id FOR UPDATE`, [ship.id]
+            );
+            const mode = after.mode || ship.mode;
+            for (const m of members) {
+                const oSets = { ...orderSets };
+                if (trackingChange !== undefined) {
+                    const prev = S.trackingRefFor(mode, [m]);
+                    if (trackingChange.value) {
+                        const col = S.carrierColumnFor(trackingChange.value);
+                        oSets[col] = trackingChange.value;
+                        if (prev.sourceColumn && prev.sourceColumn !== col) oSets[prev.sourceColumn] = null;
+                    } else if (prev.sourceColumn) {
+                        oSets[prev.sourceColumn] = null;
+                    }
+                }
+                const cols = Object.keys(oSets).filter(c => !sameValue(m[c], oSets[c]));
+                if (!cols.length) continue;
+                const [beforeRows] = await conn.query(`${ORDER_SELECT} AND orders.id = ?`, [m.id]);
+                await conn.query(
+                    `UPDATE orders SET ${cols.map(c => `${c} = ?`).join(', ')} WHERE id = ?`,
+                    [...cols.map(c => oSets[c]), m.id]
+                );
+                const [afterRows] = await conn.query(`${ORDER_SELECT} AND orders.id = ?`, [m.id]);
+                await recordAudit(conn, {
+                    entityType: 'order', entityId: m.id, action: 'update',
+                    before: S.auditSnapshot(rowToOrder(beforeRows[0])), after: S.auditSnapshot(rowToOrder(afterRows[0])),
+                    userEmail: userEmail,
+                });
+            }
+            if (orderSets.eta !== undefined || orderSets.vessel_name !== undefined || orderSets.arrived_date !== undefined) {
+                const ref = trackingChange ? trackingChange.value : (S.clean(ship.tracking_ref) || null);
+                if (ref && await hasShipsgoCache(conn, ref)) {
+                    if (orderSets.eta !== undefined || orderSets.vessel_name !== undefined) {
+                        warnings.push(`ShipsGo tracks ${ref}: its hourly sync overwrites eta and vessel on these orders.`);
+                    }
+                    if (orderSets.arrived_date != null) {
+                        warnings.push(`ShipsGo tracks ${ref}: once it reports an actual arrival, its hourly sync replaces this arrival date on these orders.`);
+                    }
+                }
+            }
+        }
+        // The records that name the old number as text follow the orders.
+        let recordsMoved = null;
+        if (newReference && ship.reference) {
+            const carried = await rename.carryRecords(conn, {
+                shipmentId: ship.id, from: ship.reference, to: newReference, userEmail: userEmail, recordAudit,
+            });
+            recordsMoved = carried.moved;
+            warnings.push(...carried.warnings);
+            if (Object.values(recordsMoved).some(n => n > 0)) after.recordsMoved = recordsMoved;
+        }
+        await recordAudit(conn, {
+            entityType: 'shipment', entityId: ship.id, action: 'update', before, after, userEmail: userEmail,
+        });
+        return { id, warnings, recordsMoved };
+    }
+
     app.patch('/api/v1/shipments/:id(\\d+)', async (req, res) => {
         try {
             await ready();
             const b = req.body || {};
             const id = idParam(req);
-            const result = await withConnection(conn => inTransaction(conn, async () => {
-                const ship = await lockLive(conn, id);
-                const booked = S.isBookedStage(ship.stage);
-                const sets = [];
-                const vals = [];
-                const orderSets = {};
-                const warnings = [];
-                const before = {};
-                const after = {};
-                const change = (key, col, value) => {
-                    before[key] = ship[col] instanceof Date ? ship[col].toISOString() : (ship[col] ?? null);
-                    after[key] = value;
-                    sets.push(`${col} = ?`);
-                    vals.push(value);
-                };
-
-                if (b.name !== undefined) {
-                    const newName = S.clean(b.name);
-                    if (!newName) throw new ShipmentError(400, 'BAD_NAME', 'name cannot be empty.');
-                    if (newName.length > 100) throw new ShipmentError(400, 'BAD_NAME', 'name must be 100 characters or fewer.');
-                    if (newName !== ship.name) {
-                        if (ship.stage === 'DRAFT') {
-                            const r = await draftAudit.renameDraft(conn, { from: ship.name, to: newName, userEmail: req.userEmail });
-                            if (r.conflict) throw new ShipmentError(409, 'NAME_IN_USE', `A draft named "${newName}" already exists.`);
-                            change('name', 'name', newName);
-                            sets.push('open_key = ?');
-                            vals.push(`D:${newName}`);
-                        } else if (ship.stage === 'PLANNED') {
-                            if (newName.toLowerCase() !== String(ship.name).toLowerCase()) {
-                                const [[taken]] = await conn.query(
-                                    `SELECT COUNT(*) AS n FROM planned_container_allocations WHERE planned_container_name = ?`, [newName]
-                                );
-                                if (Number(taken.n) > 0) throw new ShipmentError(409, 'NAME_IN_USE', `A planned container named "${newName}" already exists.`);
-                            }
-                            await conn.query(
-                                `UPDATE planned_container_allocations SET planned_container_name = ? WHERE planned_container_name = ?`,
-                                [newName, ship.name]
-                            );
-                            change('name', 'name', newName);
-                            sets.push('open_key = ?');
-                            vals.push(`P:${newName}`);
-                        } else {
-                            // Booked: a label only. renameDraft here would reopen
-                            // the closed registry row and wipe what the draft became.
-                            change('name', 'name', newName);
-                        }
-                    }
-                }
-                if (b.mode !== undefined) {
-                    const m = String(b.mode || '').trim().toUpperCase();
-                    if (!S.isMode(m)) throw new ShipmentError(400, 'BAD_MODE', 'mode must be SEA, AIR or ROAD.');
-                    if (m !== ship.mode || ship.mode_source !== 'user') {
-                        change('mode', 'mode', m);
-                        sets.push(`mode_source = 'user'`);
-                    }
-                }
-                if (b.needsReview !== undefined) change('needsReview', 'needs_review', b.needsReview ? 1 : 0);
-                for (const [key, spec] of Object.entries(HEADER_FIELDS)) {
-                    if (b[key] === undefined) continue;
-                    change(key, spec.col, fieldValue(key, spec, b[key]));
-                }
-                // The container's own forwarder (2026-11-20): forwarder and
-                // forwarder_id are one value. A live freight booking still wins
-                // when read; this is what shows once it is gone.
-                const fwd = FL.decideShipmentForwarder({ stored: { id: ship.forwarder_id ?? null, name: ship.forwarder ?? null }, body: b });
-                if (fwd.error) throw new ShipmentError(400, 'BAD_FIELD', fwd.error, { field: b.forwarderId !== undefined ? 'forwarderId' : 'forwarder' });
-                const pair = await forwarderPairs.pairFor(conn, fwd);
-                if (pair && !(sameValue(ship.forwarder, pair.name) && sameValue(ship.forwarder_id, pair.id))) {
-                    change('forwarder', 'forwarder', pair.name);
-                    change('forwarderId', 'forwarder_id', pair.id);
-                }
-                for (const [key, spec] of Object.entries(WRITE_THROUGH)) {
-                    if (b[key] === undefined) continue;
-                    const v = fieldValue(key, spec, b[key]);
-                    change(key, spec.col, v);
-                    if (booked) orderSets[spec.orderCol] = v;
-                }
-
-                let newReference = null;
-                if (b.reference !== undefined) {
-                    if (!booked) throw new ShipmentError(422, 'REFERENCE_AT_BOOKING', 'A reference is assigned when the shipment is booked.');
-                    const parsed = S.parseReference(b.reference);
-                    if (!parsed) throw new ShipmentError(400, 'BAD_REFERENCE', 'reference cannot be empty.');
-                    if (parsed.reference !== ship.reference) {
-                        const mode = after.mode || ship.mode;
-                        if (parsed.mode && mode && parsed.mode !== mode) {
-                            throw new ShipmentError(422, 'REFERENCE_MODE_MISMATCH', `Reference "${parsed.reference}" belongs to the ${parsed.mode} sequence.`);
-                        }
-                        if (parsed.reference.length > rename.REFERENCE_MAX) {
-                            throw new ShipmentError(400, 'BAD_REFERENCE', `reference must be ${rename.REFERENCE_MAX} characters or fewer.`);
-                        }
-                        const holder = await sync.reservedHolder(conn, parsed.reference, { exceptShipmentId: ship.id });
-                        if (holder) {
-                            throw new ShipmentError(409, 'REFERENCE_IN_USE', `Reference "${parsed.reference}" is held by the open draft "${holder.name}".`,
-                                { reference: parsed.reference, reservedBy: holder.name, reservedByShipmentId: holder.id });
-                        }
-                        if (!(await sync.referenceIsFree(conn, parsed.reference, { exceptShipmentId: ship.id }))) {
-                            throw new ShipmentError(409, 'REFERENCE_IN_USE', `Reference "${parsed.reference}" is already in use.`);
-                        }
-                        // Payment records and paperwork name the container as
-                        // text. They move with it (below, after the orders),
-                        // but never unseen, and never onto a number that
-                        // already has records of its own: that would mix two
-                        // containers' paperwork.
-                        const theirs = await rename.recordsUnder(conn, parsed.reference);
-                        if (rename.total(theirs) > 0) {
-                            throw new ShipmentError(409, 'REFERENCE_HAS_RECORDS',
-                                `"${parsed.reference}" already has payment records or paperwork of its own.`, { reference: parsed.reference, records: theirs });
-                        }
-                        const own = ship.reference ? await rename.recordsUnder(conn, ship.reference, { shipmentId: ship.id }) : null;
-                        if (own && rename.total(own) > 0 && b.confirmRecords !== true) {
-                            throw new ShipmentError(409, 'RENAME_TOUCHES_RECORDS',
-                                `${rename.total(own)} record(s) kept under "${ship.reference}" move to "${parsed.reference}" with it. Confirm to rename.`,
-                                { from: ship.reference, reference: parsed.reference, records: own });
-                        }
-                        change('reference', 'reference', parsed.reference);
-                        sets.push('reference_seq = ?');
-                        vals.push(parsed.seq);
-                        newReference = parsed.reference;
-                        orderSets.container_number = newReference;
-                    }
-                }
-
-                let trackingChange;
-                if (b.trackingRef !== undefined) {
-                    const v = S.clean(b.trackingRef) ? S.clean(b.trackingRef).slice(0, 255) : null;
-                    change('trackingRef', 'tracking_ref', v);
-                    if (booked) trackingChange = { value: v };
-                }
-
-                if (!sets.length && !Object.keys(orderSets).length && trackingChange === undefined) {
-                    return { id, warnings, unchanged: true };
-                }
-                if (sets.length) {
-                    try {
-                        await conn.query(`UPDATE shipments SET ${sets.join(', ')} WHERE id = ?`, [...vals, ship.id]);
-                    } catch (e) {
-                        if (e.code === 'ER_DUP_ENTRY') throw new ShipmentError(409, 'CONFLICT', 'The new name or reference is already in use.');
-                        throw e;
-                    }
-                }
-
-                // Write-through to the member orders, one audited UPDATE each.
-                if (booked && (Object.keys(orderSets).length || trackingChange !== undefined)) {
-                    const [members] = await conn.query(
-                        `SELECT * FROM orders WHERE shipment_id = ? AND deleted_at IS NULL ORDER BY id FOR UPDATE`, [ship.id]
-                    );
-                    const mode = after.mode || ship.mode;
-                    for (const m of members) {
-                        const oSets = { ...orderSets };
-                        if (trackingChange !== undefined) {
-                            const prev = S.trackingRefFor(mode, [m]);
-                            if (trackingChange.value) {
-                                const col = S.carrierColumnFor(trackingChange.value);
-                                oSets[col] = trackingChange.value;
-                                if (prev.sourceColumn && prev.sourceColumn !== col) oSets[prev.sourceColumn] = null;
-                            } else if (prev.sourceColumn) {
-                                oSets[prev.sourceColumn] = null;
-                            }
-                        }
-                        const cols = Object.keys(oSets).filter(c => !sameValue(m[c], oSets[c]));
-                        if (!cols.length) continue;
-                        const [beforeRows] = await conn.query(`${ORDER_SELECT} AND orders.id = ?`, [m.id]);
-                        await conn.query(
-                            `UPDATE orders SET ${cols.map(c => `${c} = ?`).join(', ')} WHERE id = ?`,
-                            [...cols.map(c => oSets[c]), m.id]
-                        );
-                        const [afterRows] = await conn.query(`${ORDER_SELECT} AND orders.id = ?`, [m.id]);
-                        await recordAudit(conn, {
-                            entityType: 'order', entityId: m.id, action: 'update',
-                            before: S.auditSnapshot(rowToOrder(beforeRows[0])), after: S.auditSnapshot(rowToOrder(afterRows[0])),
-                            userEmail: req.userEmail,
-                        });
-                    }
-                    if (orderSets.eta !== undefined || orderSets.vessel_name !== undefined || orderSets.arrived_date !== undefined) {
-                        const ref = trackingChange ? trackingChange.value : (S.clean(ship.tracking_ref) || null);
-                        if (ref && await hasShipsgoCache(conn, ref)) {
-                            if (orderSets.eta !== undefined || orderSets.vessel_name !== undefined) {
-                                warnings.push(`ShipsGo tracks ${ref}: its hourly sync overwrites eta and vessel on these orders.`);
-                            }
-                            if (orderSets.arrived_date != null) {
-                                warnings.push(`ShipsGo tracks ${ref}: once it reports an actual arrival, its hourly sync replaces this arrival date on these orders.`);
-                            }
-                        }
-                    }
-                }
-                // The records that name the old number as text follow the orders.
-                let recordsMoved = null;
-                if (newReference && ship.reference) {
-                    const carried = await rename.carryRecords(conn, {
-                        shipmentId: ship.id, from: ship.reference, to: newReference, userEmail: req.userEmail, recordAudit,
-                    });
-                    recordsMoved = carried.moved;
-                    warnings.push(...carried.warnings);
-                    if (Object.values(recordsMoved).some(n => n > 0)) after.recordsMoved = recordsMoved;
-                }
-                await recordAudit(conn, {
-                    entityType: 'shipment', entityId: ship.id, action: 'update', before, after, userEmail: req.userEmail,
-                });
-                return { id, warnings, recordsMoved };
-            }));
+            const result = await withConnection(conn => inTransaction(conn, () => patchShipmentIn(conn, id, b, req.userEmail)));
             const detail = await withConnection(conn => shipmentDetail(conn, result.id));
             res.json({
                 ...detail,
@@ -1103,6 +1113,8 @@ function registerShipmentRoutes(app, deps) {
             sendError(res, error, '[GET /shipments/:id/history]');
         }
     });
+
+    return { patchShipmentIn };
 }
 
 module.exports = { registerShipmentRoutes };

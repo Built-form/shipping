@@ -86,6 +86,9 @@ const paymentNotices = require('../services/payment-notices');
 const { registerPaymentNoticeRoutes } = require('../services/payment-notice-routes');
 // Telex releases: filed per supplier per shipment (docs/telex-releases.md).
 const { registerTelexReleaseRoutes } = require('../services/telex-release-routes');
+// A forwarder's container page on the portal (docs/forwarder-containers.md).
+const { registerForwarderContainerRoutes } = require('../services/forwarder-container-routes');
+const { registerForwarderUploadRoutes } = require('../services/forwarder-upload-routes');
 const { registerUiHintRoutes } = require('../services/ui-hint-routes');
 const extrasLib = require('../lib/payment-extras');
 const { correctBalance } = require('../lib/balance-correction');
@@ -10159,6 +10162,10 @@ function shipmentPaymentDocumentRowToJson(r) {
         extractedAt: r.extracted_at?.toISOString?.() ?? r.extracted_at ?? null,
         extracted: parseJsonColumn(r.extract_json),
         uploadedByEmail: r.uploaded_by_email || null,
+        // An invoice accepted from a forwarder's page on the supplier portal
+        // (docs/forwarder-containers.md): the upload it came from, and whose it is.
+        forwarderUploadId: r.forwarder_upload_id ?? null,
+        forwarderId: r.forwarder_id ?? null,
         createdAt: r.created_at?.toISOString?.() ?? r.created_at,
     };
 }
@@ -12424,7 +12431,9 @@ registerTelexReleaseRoutes(app, {
 // and s3, which only exist once the module has evaluated this far (registering
 // beside registerUserRoutes would hit their temporal dead zone). No other route
 // overlaps /api/v1/shipments, so the position is otherwise irrelevant.
-registerShipmentRoutes(app, {
+// It hands back the body of its PATCH, which accepting a forwarder's dates
+// (registerForwarderContainerRoutes, below) writes through.
+const shipmentRoutes = registerShipmentRoutes(app, {
     withConnection,
     ready: async () => {
         await shipmentsSchemaReady;
@@ -12698,6 +12707,50 @@ registerFreightQuoteRoutes(app, {
     generateDraftDocumentSet,
     s3,
     poBucket: () => PO_BUCKET,
+    log,
+});
+
+// A forwarder's container page on the supplier portal: what the container
+// card's FORWARDER tab reads (/api/v1/shipments/:id/forwarder-portal), the
+// email that sends a forwarder the link (/forwarder-notice), and accepting or
+// sending back the container number and dates a forwarder proposed
+// (/forwarder-details/:id/claim, finish, release, reject; /forwarder-submissions).
+// docs/forwarder-containers.md.
+registerForwarderContainerRoutes(app, {
+    withConnection,
+    ready: async () => {
+        await shipmentsSchemaReady;
+        await draftRegistryReady;
+        await auditLogSchemaReady;
+        await plannedContainerAllocationsSchemaReady;
+        await emailTemplatesSchemaReady;
+        await emailReceiptsSchemaReady;
+    },
+    recordAudit,
+    getEmailTemplate, renderTemplate,
+    // An accepted date is written by PATCH /shipments/:id's own code, inside
+    // the accept's transaction.
+    patchShipment: (conn, id, body, userEmail) => shipmentRoutes.patchShipmentIn(conn, id, body, userEmail),
+    log,
+});
+
+// The files a forwarder uploads on that page (its invoice, loading photos, bill of
+// lading): viewing one, accepting it (it is filed with the container: an invoice in
+// the invoice store and read as any other, a photo with the container's photos, a
+// bill of lading in shipment_forwarder_documents) or sending it back.
+registerForwarderUploadRoutes(app, {
+    withConnection,
+    ready: async () => {
+        await shipmentsSchemaReady;
+        await auditLogSchemaReady;
+        await shipmentPaymentsSchemaReady;
+    },
+    s3,
+    poBucket: PO_BUCKET,
+    publicS3Url,
+    recordAudit,
+    startExtraction: startShipmentPaymentExtraction,
+    documentJson: shipmentPaymentDocumentRowToJson,
     log,
 });
 

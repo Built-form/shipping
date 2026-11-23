@@ -308,6 +308,8 @@ function rowToShipment(row) {
         ...FL.effectiveForwarder(row),
         vesselName: (booked && clean(row.member_vessel)) || row.vessel_name || null,
         originPort: row.origin_port || null,
+        // The expected loading date (2026-11-23): on the shipment only, no order carries one.
+        loadingDate: dateOnly(row.loading_date),
         etd: (booked && dateOnly(row.member_etd)) || dateOnly(row.etd),
         eta: (booked && dateOnly(row.member_eta)) || dateOnly(row.eta),
         ata: dateOnly(row.ata),
@@ -404,6 +406,8 @@ function shipmentSummary(s) {
         etd: s.etd,
         eta: s.eta,
         originPort: s.originPort,
+        // The expected loading date (2026-11-23): the container card shows it under its departure date.
+        loadingDate: s.loadingDate ?? null,
         needsReview: s.needsReview,
         // The container card names its forwarder: the live booking's, else the
         // container's own (rowToShipment, src/lib/forwarder-links.js).

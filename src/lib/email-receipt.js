@@ -508,6 +508,17 @@ function portalSyncSteps(jp) {
                  WHERE e.supplier_payment_id = s.supplier_payment_id
                    AND e.forwarder_id = s.forwarder_id
                    AND e.created_at >= r.created_at`;
+    // The container email (docs/forwarder-containers.md): what THAT forwarder
+    // sent for THAT container on the portal at or after the email went
+    // (n.sent_at, not the row's own start: the row is written before Front is
+    // called). A number or dates as soon as they are sent; a file only once it
+    // has arrived (sent_at), never when its upload address was asked for.
+    const containerDetails = `${jp}.forwarder_container_details d
+                 WHERE d.shipment_id = n.shipment_id AND d.forwarder_id = n.forwarder_id
+                   AND d.created_at >= n.sent_at`;
+    const containerUpload = `${jp}.forwarder_uploads u
+                 WHERE u.shipment_id = n.shipment_id AND u.forwarder_id = n.forwarder_id
+                   AND u.sent_at IS NOT NULL AND u.sent_at >= n.sent_at`;
     return [
         // The PO email: a supplier's user opened that PDF on the portal.
         ['po_viewed', `
@@ -649,6 +660,18 @@ function portalSyncSteps(jp) {
                             WHERE m.request_id = r.send_id AND m.deleted_at IS NULL AND m.priced_at >= r.created_at)
                AND NOT EXISTS (SELECT 1 FROM freight_stock_movements m
                                 WHERE m.request_id = r.send_id AND m.deleted_at IS NULL AND m.price IS NULL)`],
+        // The container email: that forwarder sent the container's number or
+        // dates, or a file, on the portal after it. The earlier of the two.
+        ['forwarder_container_answered', `
+            UPDATE email_receipts r
+              JOIN freight_container_notices n ON n.id = r.send_id
+               SET r.confirmed_at = COALESCE(
+                       LEAST((SELECT MIN(d.created_at) FROM ${containerDetails}),
+                             (SELECT MIN(u.sent_at) FROM ${containerUpload})),
+                       (SELECT MIN(d.created_at) FROM ${containerDetails}),
+                       (SELECT MIN(u.sent_at) FROM ${containerUpload}))
+             WHERE ${PENDING_PORTAL} AND r.send_table = 'freight_container_notices' AND n.sent_at IS NOT NULL
+               AND (EXISTS (SELECT 1 FROM ${containerDetails}) OR EXISTS (SELECT 1 FROM ${containerUpload}))`],
         // The ready-date reminders of one supplier
         // (docs/ready-date-reminders.md): none of the lines they asked about
         // is waiting for a date any more. Also closes the chase.
@@ -706,7 +729,7 @@ async function syncPortalReceipts(conn, { maxAgeMs = PORTAL_SYNC_MS } = {}) {
     } catch (e) {
         // JPORTAL_DB_SCHEMA is not a plain identifier: nothing can be read.
         log.warn('[email-receipt] portal sync skipped', { error: e.message });
-        return { failed: ['po_viewed', 'signed_pi_viewed', 'request_viewed', 'request_pl_uploaded', 'request_ci_uploaded', 'artwork_ticked', 'file_opened', 'qc_availability_answered', 'qc_schedule_opened', 'quote_answered', 'payment_viewed', 'forwarder_payment_seen', 'freight_quote_answered', 'freight_booking_answered', 'freight_movements_priced', 'ready_dates_added', ...failed] };
+        return { failed: ['po_viewed', 'signed_pi_viewed', 'request_viewed', 'request_pl_uploaded', 'request_ci_uploaded', 'artwork_ticked', 'file_opened', 'qc_availability_answered', 'qc_schedule_opened', 'quote_answered', 'payment_viewed', 'forwarder_payment_seen', 'freight_quote_answered', 'freight_booking_answered', 'freight_movements_priced', 'forwarder_container_answered', 'ready_dates_added', ...failed] };
     }
     for (const [name, sql] of steps) await run(name, () => conn.query(sql));
     return { failed };

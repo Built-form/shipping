@@ -704,6 +704,45 @@ function bookingBlockHtml({ option, url, note }) {
     ].join('');
 }
 
+// What the container email can ask a forwarder for (containerAsks in
+// src/lib/forwarder-containers.js), as its block lists them.
+const CONTAINER_ASK_LABELS = Object.freeze({
+    ecn: 'Container number / 柜号',
+    loadingDate: 'Expected loading date / 预计装柜日期',
+    etd: 'Expected departure date / 预计开船日期',
+    invoice: 'Your invoice / 贵司发票',
+    photos: 'Photos of the loading / 装柜照片',
+    billOfLading: 'Bill of lading / 提单',
+});
+
+/**
+ * The fixed block under the container email's body
+ * (docs/forwarder-containers.md): the container, what we still need for it,
+ * the button to its page on the portal, and how to get in. That page needs a
+ * sign-in, unlike the quote and booking links.
+ */
+function containerBlockHtml({ containerName, bookingRef, asks, url, registerUrl }) {
+    const rows = [['Container / 集装箱', escapeHtml(containerName || '')]];
+    if (bookingRef) rows.push(['Booking ref / 订舱号', escapeHtml(bookingRef)]);
+    const wanted = (asks || []).filter(a => CONTAINER_ASK_LABELS[a]);
+    const reg = escapeHtml(registerUrl || '');
+    const regLink = reg ? `<a href="${reg}" style="color:#1f5fbf;word-break:break-all;">${reg}</a>` : '';
+    return [
+        boxOpen,
+        lead('<strong>What we need for this container</strong> / <strong>此集装箱所需资料</strong>'),
+        facts(rows),
+        wanted.length
+            ? `<ul style="margin:0 0 12px;padding:0 0 0 20px;font-family:${FONT};font-size:14px;line-height:1.7;color:${INK};">${wanted.map(a => `<li>${CONTAINER_ASK_LABELS[a]}</li>`).join('')}</ul>`
+            : '',
+        button(url, 'Open the container / 打开集装箱页面'),
+        linkFallback(url),
+        small('Open the page and sign in. Payments we have made for this container, with the proof, show on the same page.'),
+        small('请打开页面并登录。我方就此集装箱支付的款项及付款凭证也显示在同一页面。'),
+        regLink ? small(`No account yet? Register at ${regLink} with the email address this message was sent to. No approval is needed. / 尚无账号？请使用接收本邮件的邮箱地址在 ${regLink} 注册，无需审核。`) : '',
+        boxClose,
+    ].join('');
+}
+
 // ── a container's contents by supplier ──────────────────────────────────────
 
 const round = (n, places) => Number(Number(n || 0).toFixed(places));
@@ -838,5 +877,6 @@ module.exports = {
     bookingFinished, requestState, isEditable, validateOptions, validateStaffAnswer,
     validateBookingRef, optionalText,
     money, serviceLabel, requestFacts, movementsHtml, movementBlockHtml, quoteBlockHtml, optionFacts, bookingBlockHtml,
+    CONTAINER_ASK_LABELS, containerBlockHtml,
     groupContentsBySupplier, contentsHtml, contentsSnapshot, contentsDrift,
 };

@@ -1,6 +1,6 @@
 # Telex releases
 
-The telex-released bill of lading a supplier sends once a container's balance is paid. One per supplier per shipment, as a packing list or an invoice is. Until now they were kept in Notion.
+The telex-released bill of lading a supplier sends once a container's balance is paid. (A **forwarder's** own bill of lading file is something else, with its own table: `docs/forwarder-containers.md`.) One per supplier per shipment, as a packing list or an invoice is. Until now they were kept in Notion.
 
 Built 2026-11-16, the last part of "Send to supplier" (`docs/payment-proof-send.md`): the balance email asks for the telex release; this is where it comes back to.
 

@@ -593,6 +593,32 @@ const FREIGHT_TEMPLATES = [
 // the seed has run.
 DEFAULT_EMAIL_TEMPLATES.push(...FREIGHT_TEMPLATES);
 
+// The container email (src/services/forwarder-container-routes.js,
+// docs/forwarder-containers.md; seeded by
+// 2026-11-23_13_seed_forwarder_container_template.js), category 'Freight' so
+// ShipLine's Freight email dialog offers it. Sent by staff from a container's
+// FORWARDER tab once it is the forwarder's. The INSIDE of the card, as the
+// four above: the sender appends the container, what is still needed and the
+// "Open the container" button. Kept out of FREIGHT_TEMPLATES, which the two
+// earlier seed migrations loop over.
+const FREIGHT_CONTAINER_TEMPLATE_KEY = 'freight_container_details';
+const FREIGHT_CONTAINER_TEMPLATE = {
+    key: FREIGHT_CONTAINER_TEMPLATE_KEY,
+    name: 'Freight container details',
+    category: 'Freight',
+    description: 'Emailed to a freight forwarder about a container that is theirs, to ask for its container number, the expected loading and departure dates, their invoice, photos of the loading and the bill of lading. The container, what is still needed and an "Open the container" button are appended automatically: the button opens the container’s page on the supplier portal, which needs a sign-in. Tokens: {forwarder} {containerName} {bookingRef}.',
+    subject: 'Container {containerName} – details needed / 集装箱 {containerName} 资料',
+    bodyHtml: [
+        FREIGHT_GREETING,
+        '<p>Greetings,</p>',
+        '<p>Container <strong>{containerName}</strong> is with you. Please use the button below to give us its container number and the expected loading and departure dates, and to send us your invoice, photos of the loading and the bill of lading.</p>',
+        '<p>您好，</p>',
+        '<p>集装箱 <strong>{containerName}</strong> 由贵司承运。请点击下方按钮，填写柜号及预计装柜、开船日期，并上传贵司发票、装柜照片和提单。</p>',
+        FREIGHT_SIGNOFF,
+    ].join(''),
+};
+DEFAULT_EMAIL_TEMPLATES.push(FREIGHT_CONTAINER_TEMPLATE);
+
 // "We are waiting for ready dates" (src/services/ready-date-reminders.js,
 // docs/ready-date-reminders.md; seeded by
 // 2026-11-18_20_seed_ready_date_reminder_template.js). Sent by the system, not
@@ -630,6 +656,7 @@ module.exports = {
     FORWARDER_PAYMENT_TEMPLATE_KEY, FORWARDER_PAYMENT_TEMPLATE,
     FREIGHT_TEMPLATES, FREIGHT_QUOTE_REQUEST_TEMPLATE_KEY, FREIGHT_BOOKING_REQUEST_TEMPLATE_KEY,
     FREIGHT_BOOKING_CONTENTS_TEMPLATE_KEY, FREIGHT_MOVEMENT_REQUEST_TEMPLATE_KEY,
+    FREIGHT_CONTAINER_TEMPLATE_KEY, FREIGHT_CONTAINER_TEMPLATE,
     DEFAULT_EMAIL_TEMPLATES, SUPPLIER_PI_TEMPLATE_KEYS, QC_VISIT_TEMPLATE_KEYS, PO_PORTAL_TEMPLATE_KEY,
     SIGNED_PI_TEMPLATE_KEY,
     FILE_TRANSFER_TEMPLATE_KEY, FILE_TRANSFER_TEMPLATE,

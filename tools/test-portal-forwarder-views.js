@@ -106,7 +106,7 @@ const skip = name => { skipped++; console.log(`  SKIP  ${name}`); };
         check('it is NOT a row of the supplier\'s view, though its send carries the payment\'s own name', !(await inSup(p1.id)));
         const lines1 = await q('SELECT * FROM portal_forwarder_payment_lines_v WHERE payment_id = ? ORDER BY line_id', [p1.id]);
         check('its charges are listed, one each', lines1.length === 2);
-        check('a charge is told as amount, kind and container only', lines1.length > 0 && Object.keys(lines1[0]).sort().join() === 'amount,extra_kind,line_id,payment_id,shipment_reference', lines1[0] && Object.keys(lines1[0]).join());
+        check('a charge is told as amount, kind and container only', lines1.length > 0 && Object.keys(lines1[0]).sort().join() === 'amount,extra_kind,line_id,payment_id,shipment_id,shipment_reference', lines1[0] && Object.keys(lines1[0]).join());
         check('nothing typed on a charge is in any column', !JSON.stringify(lines1).includes('INTERNAL'));
         const proofs1 = await q('SELECT * FROM portal_forwarder_payment_proofs_v WHERE payment_id = ?', [p1.id]);
         check('its proof is listed', proofs1.length === 1 && proofs1[0].filename === 'proof.pdf');

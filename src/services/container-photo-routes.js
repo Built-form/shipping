@@ -58,6 +58,8 @@ function registerContainerPhotoRoutes(app, deps) {
             preset: r.preset || null,
             description: r.description || null,
             uploadedByEmail: r.uploaded_by_email || null,
+            // A photo accepted from a forwarder's page on the supplier portal (docs/forwarder-containers.md).
+            forwarderUploadId: r.forwarder_upload_id != null ? Number(r.forwarder_upload_id) : null,
             createdAt: iso(r.created_at),
             updatedAt: iso(r.updated_at),
             updatedByEmail: r.updated_by_email || null,

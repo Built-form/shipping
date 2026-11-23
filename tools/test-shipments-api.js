@@ -72,6 +72,13 @@ async function run() {
     check('legacy "renamed" event', (await draftEvents(renamed)).includes('renamed'));
     r = await api.patch(`/api/v1/shipments/${s.id}`, { mode: 'AIR', notes: null });
     check('PATCH mode / clear notes', r.status === 200 && r.data.mode === 'AIR' && r.data.notes === null, r.data);
+    // The expected loading date (2026-11-23): a header field on the shipment only.
+    r = await api.patch(`/api/v1/shipments/${s.id}`, { loadingDate: '2026-12-15' });
+    check('PATCH loadingDate: kept on the shipment', r.status === 200 && r.data.loadingDate === '2026-12-15', r.data);
+    r = await api.patch(`/api/v1/shipments/${s.id}`, { loadingDate: '15/12/2026' });
+    check('PATCH loadingDate that is not a date: 400 BAD_DATE, and the date held stays', r.status === 400 && r.data.code === 'BAD_DATE' && (await H.shipment(s.id)).loadingDate === '2026-12-15', r.data);
+    r = await api.patch(`/api/v1/shipments/${s.id}`, { loadingDate: null });
+    check('PATCH loadingDate null clears it', r.status === 200 && r.data.loadingDate === null, r.data);
     await api.patch(`/api/v1/shipments/${s.id}`, { mode: 'SEA' });
 
     section('5. Lines: PUT / DELETE /shipments/:id/lines/:orderId');
