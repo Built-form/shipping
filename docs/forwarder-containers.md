@@ -6,7 +6,7 @@ Plan and decisions: 2026-11-23 (the user chose: views plus portal-owned tables; 
 
 Built in three slices, all covered here: **A** (the forwarder can see the container, with its payments), **B** (its number and dates, proposed on the portal and accepted here) and **C** (its invoice, loading photos and bill of lading).
 
-Rules: `src/lib/forwarder-containers.js`. Routes: `src/services/forwarder-container-routes.js`. Tests: `tools/test-forwarder-containers-lib.js`, `tools/test-forwarder-container-routes.js` (both in `npm run test:unit`); `tools/test-portal-forwarder-container-view.js` and `tools/test-forwarder-container-races.js` (on the TEST database). Portal side: jportal README section 24. Freight quotes and bookings: `docs/freight-quotes.md`. A forwarder's payment: `docs/payment-proof-send.md`.
+Rules: `src/lib/forwarder-containers.js`. Routes: `src/services/forwarder-container-routes.js`. Tests: `tools/test-forwarder-containers-lib.js`, `tools/test-forwarder-container-routes.js` (both in `npm run test:unit`); `tools/test-portal-forwarder-container-view.js` and `tools/test-forwarder-container-races.js` (on the TEST database). Portal side: jportal README section 25. Freight quotes and bookings: `docs/freight-quotes.md`. A forwarder's payment: `docs/payment-proof-send.md`.
 
 ## Whose container it is
 
