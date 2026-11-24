@@ -13,6 +13,13 @@ async function forwarderById(conn, id) {
     return rows[0] || null;
 }
 
+// Is this forwarder on the list and not removed? A LOCKING read (shared): inside
+// a write of a pick it makes a removal of that forwarder wait for the write.
+async function onTheList(conn, id) {
+    const [rows] = await conn.query('SELECT id, deleted_at FROM forwarders WHERE id = ? FOR SHARE', [id]);
+    return Boolean(rows[0]) && !rows[0].deleted_at;
+}
+
 // The pair to write, or null for "leave it". Throws a ShipmentError (400) for
 // a forwarder that is not on the list.
 async function pairFor(conn, decision) {
@@ -35,4 +42,4 @@ async function pairFor(conn, decision) {
     }
 }
 
-module.exports = { forwarderById, pairFor };
+module.exports = { forwarderById, onTheList, pairFor };

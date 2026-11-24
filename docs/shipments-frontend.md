@@ -100,8 +100,42 @@ response carries the same three fields.
 
 ```json
 { "forwarder": "DCG", "forwarderId": 7, "forwarderSource": "booking",
-  "booking": { "id": 41, "status": "confirmed", "bookingRef": "BK-1" } }
+  "booking": { "id": 41, "status": "confirmed", "bookingRef": "BK-1", "scope": "port_to_port" } }
 ```
+
+**Three duties** (2026-11-24, `docs/forwarder-containers.md`). Those three fields are
+the **freight** forwarder: who carries the container to the UK port. A container
+also has a forwarder that **delivers** it from the port to the warehouse and one
+that makes its **customs** entry, each a pick of its own, by id:
+
+```json
+{ "deliveryForwarderId": 9, "deliveryForwarder": "UK Haulage",
+  "customsForwarderId": 9, "customsForwarder": "UK Haulage",
+  "duties": { "freight":  { "forwarderId": 7, "name": "DCG", "source": "booking", "bookingId": 41 },
+              "delivery": { "forwarderId": 9, "name": "UK Haulage", "source": "container" },
+              "customs":  { "forwarderId": null, "why": "no_forwarder" } } }
+```
+
+- `deliveryForwarder` / `customsForwarder` are the list's present names for the
+  two picks (these two were never typed text).
+- `duties` says who **holds** each duty now, which is not always the pick: a live
+  booking whose `scope` is `end_to_end` holds delivery too and outranks the
+  delivery pick; a covering booking still `requested` leaves that duty with
+  nobody (`why: "booking_not_confirmed"`); a pick taken off the list holds
+  nothing (`forwarder_removed`); nothing is held on a container that is not real
+  yet (`not_real`). One forwarder holding freight and delivery is "end to end".
+- `duties` is also in the compact entry of `GET /orders`' `shipments` map. It is
+  an object: compare it by what it says, not by identity, when deciding whether
+  an entry changed between polls.
+- `PATCH` takes `deliveryForwarderId` and `customsForwarderId`: a live
+  forwarder's id, or `null` for nobody (`400 BAD_FIELD` with `field`). Show the
+  delivery pick read-only, "freight booking #N covers delivery", while
+  `booking.scope` is `end_to_end`.
+- `PATCH` also takes `deliveryDate` (`YYYY-MM-DD` or `YYYY-MM-DDTHH:MM`;
+  `400 BAD_DATE`, `422 NOT_BOOKED`): it is written to **every member order's**
+  delivery date and nowhere else (there is no shipment column). It exists for
+  accepting a forwarder's delivery date; the card's own DELIVERY save still goes
+  through the order route.
 
 `reservedReference` / `reservedSeq`: the number an open (DRAFT / PLANNED)
 shipment's name holds (`… - 329` → `"329"`, on an AIR draft `"104. Air Freight"`),

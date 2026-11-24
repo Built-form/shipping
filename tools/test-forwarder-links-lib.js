@@ -103,6 +103,78 @@ test('merging two containers: the survivor keeps its own forwarder pair whole, e
     assert.deepEqual(FL.mergeForwarderPair({ forwarder: null, forwarder_id: null }, { forwarder: null, forwarder_id: null }), { forwarder: null, forwarder_id: null });
 });
 
+// ── three picks on a container (2026-11-24): freight, delivery, customs ──
+
+test('merging two containers: the survivor keeps its own picks, all three, when it has any; else takes the other\'s, all three', () => {
+    const none = { forwarder: null, forwarder_id: null, delivery_forwarder_id: null, customs_forwarder_id: null };
+    const loser = { forwarder: 'Beta', forwarder_id: 7, delivery_forwarder_id: 8, customs_forwarder_id: 9 };
+    assert.deepEqual(FL.mergeForwarderPicks(none, loser), loser);
+    // The survivor has only a delivery pick: it is still ITS arrangement, and nothing of the other's is mixed in.
+    assert.deepEqual(FL.mergeForwarderPicks({ ...none, delivery_forwarder_id: 4 }, loser), { ...none, delivery_forwarder_id: 4 });
+    assert.deepEqual(FL.mergeForwarderPicks({ ...none, customs_forwarder_id: 4 }, loser), { ...none, customs_forwarder_id: 4 });
+    assert.deepEqual(FL.mergeForwarderPicks({ ...none, forwarder: 'Typed' }, loser), { ...none, forwarder: 'Typed' });
+    assert.deepEqual(FL.mergeForwarderPicks(none, none), none);
+    // Rows read before the columns existed carry no pick at all.
+    assert.deepEqual(FL.mergeForwarderPicks({ forwarder: null, forwarder_id: null }, { forwarder: 'Beta', forwarder_id: 7 }),
+        { forwarder: 'Beta', forwarder_id: 7, delivery_forwarder_id: null, customs_forwarder_id: null });
+});
+
+test('a write of the delivery or customs pick: a forwarder id, or null to clear', () => {
+    assert.deepEqual(FL.decidePick(8), { id: 8 });
+    assert.deepEqual(FL.decidePick('8'), { id: 8 });
+    assert.deepEqual(FL.decidePick(null), { id: null });
+    for (const bad of [0, -2, 1.5, 'x', true, '', {}]) assert.deepEqual(FL.decidePick(bad), { error: 'must be a forwarder id, or null.' }, String(bad));
+});
+
+test('a shipment read says who holds each duty, by the list\'s present names, and the picks as stored', () => {
+    const S = require('../src/lib/shipments');
+    const row = (over = {}) => ({
+        id: 61, reference: '339', stage: 'BOOKED', mode: 'SEA', deleted_at: null, merged_into_id: null,
+        forwarder: 'DCG', forwarder_id: 3, delivery_forwarder_id: 5, customs_forwarder_id: 6,
+        pf_name: 'DCG Global', pf_live: 1, df_name: 'Haul UK', df_live: 1, cf_name: 'Broker Co', cf_live: 1,
+        bk_count: 0, bk_id: null, bk_status: null, bk_scope: null, bk_ref: null, bk_forwarder_id: null, bk_forwarder_name: null, bf_name: null, bf_live: null,
+        ...over,
+    });
+    const api = S.rowToShipment(row());
+    assert.deepEqual(api.duties, {
+        freight: { forwarderId: 3, source: 'container', name: 'DCG Global' },
+        delivery: { forwarderId: 5, source: 'container', name: 'Haul UK' },
+        customs: { forwarderId: 6, source: 'container', name: 'Broker Co' },
+    });
+    assert.equal(api.deliveryForwarderId, 5);
+    assert.equal(api.deliveryForwarder, 'Haul UK');
+    assert.equal(api.customsForwarderId, 6);
+    assert.equal(api.customsForwarder, 'Broker Co');
+    // The old fields still say what they said: the freight forwarder, by the stored name.
+    assert.equal(api.forwarder, 'DCG');
+    assert.equal(api.forwarderId, 3);
+    assert.equal(api.forwarderSource, 'container');
+
+    // An end-to-end booking, confirmed: its forwarder holds freight and delivery; the delivery pick is outranked.
+    const booked = S.rowToShipment(row({ bk_count: 1, bk_id: 41, bk_status: 'confirmed', bk_scope: 'end_to_end', bk_ref: 'BK-1', bk_forwarder_id: 7, bk_forwarder_name: 'Sent As', bf_name: 'Now Called', bf_live: 1 }));
+    assert.deepEqual(booked.duties.freight, { forwarderId: 7, source: 'booking', bookingId: 41, name: 'Now Called' });
+    assert.deepEqual(booked.duties.delivery, { forwarderId: 7, source: 'booking', bookingId: 41, name: 'Now Called' });
+    assert.deepEqual(booked.duties.customs, { forwarderId: 6, source: 'container', name: 'Broker Co' });
+    assert.equal(booked.deliveryForwarderId, 5, 'the pick stays as stored');
+    assert.equal(booked.booking.scope, 'end_to_end');
+
+    // A pick taken off the list holds nothing, and the read still names it.
+    const removed = S.rowToShipment(row({ df_live: 0 }));
+    assert.deepEqual(removed.duties.delivery, { forwarderId: null, why: 'forwarder_removed' });
+    assert.equal(removed.deliveryForwarder, 'Haul UK');
+
+    // A draft: nobody holds anything yet, the picks are there to be edited.
+    const draft = S.rowToShipment(row({ stage: 'DRAFT', reference: null }));
+    assert.deepEqual(draft.duties.freight, { forwarderId: null, why: 'not_real' });
+    assert.equal(draft.deliveryForwarderId, 5);
+
+    // A raw row (no booking join): no claim about duties at all.
+    assert.equal('duties' in S.rowToShipment({ id: 1, stage: 'BOOKED', reference: '1', forwarder: 'DCG', forwarder_id: 3 }), false);
+
+    // The compact entry of GET /orders carries the duties.
+    assert.deepEqual(S.shipmentSummary(api).duties, api.duties);
+});
+
 test('the backfill match: exact name first, a looser one only when it names exactly one, removed names always skipped', () => {
     const list = [
         { id: 7, name: 'DCG Logistics', deleted_at: null },

@@ -287,6 +287,7 @@ function rowToShipment(row) {
     // applies: a hint counts only in the shipment's own sequence.
     const hint = isOpenStage(stored) ? parseNameHint(row.name) : null;
     const reserved = hint && (!row.mode || hint.mode === row.mode) ? hint : null;
+    const duties = FL.dutiesOfRow(row);
     return {
         id: row.id,
         reference: row.reference || null,
@@ -306,6 +307,15 @@ function rowToShipment(row) {
         // (forwarder, forwarderId, forwarderSource and, read with the booking
         // join, booking) — src/lib/forwarder-links.js.
         ...FL.effectiveForwarder(row),
+        // The other two picks (2026-11-24): who delivers it from the UK port, and
+        // who handles its customs. Ids as stored; the names are the list's.
+        deliveryForwarderId: row.delivery_forwarder_id == null ? null : Number(row.delivery_forwarder_id),
+        deliveryForwarder: row.df_name || null,
+        customsForwarderId: row.customs_forwarder_id == null ? null : Number(row.customs_forwarder_id),
+        customsForwarder: row.cf_name || null,
+        // Who HOLDS each duty (freight, delivery, customs): a live booking that
+        // covers it, else the pick. Only on a row read with the booking join.
+        ...(duties === undefined ? {} : { duties }),
         vesselName: (booked && clean(row.member_vessel)) || row.vessel_name || null,
         originPort: row.origin_port || null,
         // The expected loading date (2026-11-23): on the shipment only, no order carries one.
@@ -414,6 +424,8 @@ function shipmentSummary(s) {
         forwarder: s.forwarder ?? null,
         forwarderId: s.forwarderId ?? null,
         forwarderSource: s.forwarderSource ?? null,
+        // Who holds each duty (2026-11-24): the card names every attached forwarder with its role.
+        duties: s.duties ?? null,
     };
 }
 

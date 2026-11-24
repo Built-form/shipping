@@ -83,6 +83,206 @@ test('ownerOf: a declined or cancelled booking is no booking: the container\'s o
     }
 });
 
+// ── who holds each duty (2026-11-24) ─────────────────────────────────────
+//
+// Three duties, one holder each: freight (origin to the UK port), delivery (UK
+// port to the warehouse), customs. Per duty: the live booking that covers it,
+// else the pick on the container.
+
+const nobody = why => ({ forwarderId: null, why });
+const bk = (over = {}) => ({ id: 12, status: 'confirmed', scope: 'port_to_port', forwarder_id: 4, ...over });
+const dutiesOf = (shipment, bookings = [], alive = [3, 4, 5, 6]) => FC.dutiesOf({ shipment, bookings, forwarderLive: live(alive) });
+
+test('dutiesOf: nothing picked, nothing booked: nobody holds anything', () => {
+    assert.deepEqual(dutiesOf(ship()), { freight: nobody('no_forwarder'), delivery: nobody('no_forwarder'), customs: nobody('no_forwarder') });
+});
+
+test('dutiesOf: the three picks on the container, each its own duty', () => {
+    assert.deepEqual(dutiesOf(ship({ forwarder_id: 3, delivery_forwarder_id: 5, customs_forwarder_id: 6 })), {
+        freight: { forwarderId: 3, source: 'container' },
+        delivery: { forwarderId: 5, source: 'container' },
+        customs: { forwarderId: 6, source: 'container' },
+    });
+});
+
+test('dutiesOf: end to end by hand is the same forwarder in both picks', () => {
+    const d = dutiesOf(ship({ forwarder_id: 3, delivery_forwarder_id: 3 }));
+    assert.deepEqual(d.freight, { forwarderId: 3, source: 'container' });
+    assert.deepEqual(d.delivery, { forwarderId: 3, source: 'container' });
+    assert.deepEqual(d.customs, nobody('no_forwarder'));
+});
+
+test('dutiesOf: a port-to-port booking holds freight only; delivery stays with the pick', () => {
+    assert.deepEqual(dutiesOf(ship({ forwarder_id: 3, delivery_forwarder_id: 5 }), [bk()]), {
+        freight: { forwarderId: 4, source: 'booking', bookingId: 12 },
+        delivery: { forwarderId: 5, source: 'container' },
+        customs: nobody('no_forwarder'),
+    });
+});
+
+test('dutiesOf: an end-to-end booking holds freight and delivery, and outranks both picks', () => {
+    assert.deepEqual(dutiesOf(ship({ forwarder_id: 3, delivery_forwarder_id: 5, customs_forwarder_id: 5 }), [bk({ scope: 'end_to_end' })]), {
+        freight: { forwarderId: 4, source: 'booking', bookingId: 12 },
+        delivery: { forwarderId: 4, source: 'booking', bookingId: 12 },
+        customs: { forwarderId: 5, source: 'container' },
+    });
+});
+
+test('dutiesOf: a booking still waiting leaves the duties it covers with nobody, and no other', () => {
+    assert.deepEqual(dutiesOf(ship({ forwarder_id: 3, delivery_forwarder_id: 5, customs_forwarder_id: 6 }), [bk({ status: 'requested' })]), {
+        freight: nobody('booking_not_confirmed'),
+        delivery: { forwarderId: 5, source: 'container' },
+        customs: { forwarderId: 6, source: 'container' },
+    });
+    const d = dutiesOf(ship({ forwarder_id: 3, delivery_forwarder_id: 5, customs_forwarder_id: 6 }), [bk({ status: 'requested', scope: 'end_to_end' })]);
+    assert.deepEqual(d.freight, nobody('booking_not_confirmed'));
+    assert.deepEqual(d.delivery, nobody('booking_not_confirmed'));
+    assert.deepEqual(d.customs, { forwarderId: 6, source: 'container' });
+});
+
+test('dutiesOf: a booking with no scope on its row is port to port (rows read before the column existed)', () => {
+    assert.deepEqual(dutiesOf(ship({ delivery_forwarder_id: 5 }), [{ id: 12, status: 'confirmed', forwarder_id: 4 }]).delivery, { forwarderId: 5, source: 'container' });
+});
+
+test('dutiesOf: a declined or cancelled booking is no booking', () => {
+    for (const status of ['declined', 'cancelled']) {
+        assert.deepEqual(dutiesOf(ship({ forwarder_id: 3 }), [bk({ status, scope: 'end_to_end' })]).freight, { forwarderId: 3, source: 'container' }, status);
+        assert.deepEqual(dutiesOf(ship({ forwarder_id: 3 }), [bk({ status, scope: 'end_to_end' })]).delivery, nobody('no_forwarder'), status);
+    }
+});
+
+test('dutiesOf: a holder taken off the list holds nothing, whichever duty and however it came', () => {
+    const d = dutiesOf(ship({ forwarder_id: 3, delivery_forwarder_id: 5, customs_forwarder_id: 6 }), [], [3]);
+    assert.deepEqual(d.freight, { forwarderId: 3, source: 'container' });
+    assert.deepEqual(d.delivery, nobody('forwarder_removed'));
+    assert.deepEqual(d.customs, nobody('forwarder_removed'));
+    assert.deepEqual(dutiesOf(ship({ forwarder_id: 3 }), [bk({ scope: 'end_to_end' })], [3]).delivery, nobody('forwarder_removed'), 'the booking still outranks the pick');
+});
+
+test('dutiesOf: typed text is a forwarder for freight only, and it is nobody on the portal', () => {
+    const d = dutiesOf(ship({ forwarder: 'Some Freight Ltd' }));
+    assert.deepEqual(d.freight, nobody('forwarder_not_listed'));
+    assert.deepEqual(d.delivery, nobody('no_forwarder'));
+});
+
+test('dutiesOf: only a real container has holders at all', () => {
+    const picks = { forwarder_id: 3, delivery_forwarder_id: 5, customs_forwarder_id: 6 };
+    for (const duty of FC.DUTIES) {
+        assert.deepEqual(dutiesOf(ship({ ...picks, stage: 'DRAFT' }))[duty], nobody('not_real'), duty);
+        assert.deepEqual(dutiesOf(ship({ ...picks, deleted_at: '2026-11-01 10:00:00' }))[duty], nobody('gone'), duty);
+        assert.deepEqual(dutiesOf(null)[duty], nobody('gone'), duty);
+    }
+});
+
+test('dutiesOf: the freight duty is ownerOf, on every case ownerOf is tested on', () => {
+    const cases = [
+        [ship({ forwarder_id: 3, forwarder: 'DCG' }), { status: 'confirmed', forwarder_id: 4 }],
+        [ship({ forwarder_id: 3, forwarder: 'DCG' }), { status: 'requested', forwarder_id: 4 }],
+        [ship({ forwarder_id: 3 }), null],
+        [ship({ forwarder: 'Typed' }), null],
+        [ship(), null],
+        [ship({ stage: 'DRAFT', forwarder_id: 3 }), null],
+        [ship({ forwarder_id: 3 }), { status: 'cancelled', forwarder_id: 4 }],
+    ];
+    for (const [shipment, booking] of cases) {
+        const owner = FC.ownerOf({ shipment, booking, forwarderLive: live([3, 4]) });
+        const freight = FC.dutiesOf({ shipment, bookings: booking ? [{ id: 1, ...booking }] : [], forwarderLive: live([3, 4]) }).freight;
+        assert.equal(freight.forwarderId, owner.forwarderId);
+        assert.equal(freight.why, owner.why);
+        assert.equal(freight.source, owner.source);
+    }
+});
+
+test('attachedOf: one entry per forwarder that holds something, the freight holder first', () => {
+    const d = dutiesOf(ship({ delivery_forwarder_id: 5, customs_forwarder_id: 5 }), [bk()]);
+    assert.deepEqual(FC.attachedOf(d), [
+        { forwarderId: 4, duties: ['freight'], sources: { freight: 'booking' } },
+        { forwarderId: 5, duties: ['delivery', 'customs'], sources: { delivery: 'container', customs: 'container' } },
+    ]);
+    assert.deepEqual(FC.attachedOf(dutiesOf(ship())), []);
+    // End to end and customs, one company: one entry.
+    assert.deepEqual(FC.attachedOf(dutiesOf(ship({ customs_forwarder_id: 4 }), [bk({ scope: 'end_to_end' })])), [
+        { forwarderId: 4, duties: ['freight', 'delivery', 'customs'], sources: { freight: 'booking', delivery: 'booking', customs: 'container' } },
+    ]);
+});
+
+test('heldBy: the duties one forwarder holds', () => {
+    const d = dutiesOf(ship({ delivery_forwarder_id: 5, customs_forwarder_id: 5 }), [bk()]);
+    assert.deepEqual(FC.heldBy(d, 4), ['freight']);
+    assert.deepEqual(FC.heldBy(d, '5'), ['delivery', 'customs']);
+    assert.deepEqual(FC.heldBy(d, 9), []);
+    assert.deepEqual(FC.heldBy(d, null), []);
+});
+
+test('linkSourceOf: booking or container only for the freight holder; another holder is "duty" (what an older portal cannot write for)', () => {
+    const d = dutiesOf(ship({ delivery_forwarder_id: 5, customs_forwarder_id: 6 }), [bk()]);
+    assert.equal(FC.linkSourceOf(d, 4), 'booking');
+    assert.equal(FC.linkSourceOf(d, 5), 'duty');
+    assert.equal(FC.linkSourceOf(d, 6), 'duty');
+    assert.equal(FC.linkSourceOf(d, 9), null);
+    assert.equal(FC.linkSourceOf(dutiesOf(ship({ forwarder_id: 3, delivery_forwarder_id: 3 })), 3), 'container');
+});
+
+test('accessFor: a holder of any duty sees it in full; one only paid on it sees the payment; anyone else nothing', () => {
+    const d = dutiesOf(ship({ delivery_forwarder_id: 5 }), [bk()]);
+    assert.deepEqual(FC.accessFor({ duties: d, real: true, forwarderId: 4, paidForwarderIds: [3] }), { mode: 'full', source: 'booking', duties: ['freight'] });
+    assert.deepEqual(FC.accessFor({ duties: d, real: true, forwarderId: 5, paidForwarderIds: [5] }), { mode: 'full', source: 'duty', duties: ['delivery'] });
+    assert.deepEqual(FC.accessFor({ duties: d, real: true, forwarderId: 3, paidForwarderIds: [3] }), { mode: 'payment', source: 'payment', duties: [] });
+    assert.deepEqual(FC.accessFor({ duties: d, real: true, forwarderId: 6, paidForwarderIds: [3] }), { mode: 'none', source: null, duties: [] });
+    assert.deepEqual(FC.accessFor({ duties: dutiesOf(ship({ stage: 'DRAFT' })), real: false, forwarderId: 3, paidForwarderIds: [3] }), { mode: 'none', source: null, duties: [] });
+});
+
+test('scopeGiven: what a booking is said to cover; saying nothing never grants the delivery', () => {
+    assert.deepEqual(FC.scopeGiven(undefined), { scope: 'port_to_port' });
+    assert.deepEqual(FC.scopeGiven('port_to_port'), { scope: 'port_to_port' });
+    assert.deepEqual(FC.scopeGiven('end_to_end'), { scope: 'end_to_end' });
+    for (const bad of [null, '', 'delivery', 'END_TO_END', 5, {}]) {
+        assert.deepEqual(FC.scopeGiven(bad), { error: 'scope must be one of: port_to_port, end_to_end.' }, String(bad));
+    }
+});
+
+test('dutiesOfFlags: the duties a row of the portal\'s view says its forwarder holds', () => {
+    assert.deepEqual(FC.dutiesOfFlags({ does_freight: 1, does_delivery: 0, does_customs: '1' }), ['freight', 'customs']);
+    assert.deepEqual(FC.dutiesOfFlags({ does_freight: 0, does_delivery: 0, does_customs: 0 }), []);
+    assert.deepEqual(FC.dutiesOfFlags({}), [], 'no row joined: nothing held');
+    assert.deepEqual(FC.dutiesOfFlags(null), []);
+    // The same flags, shaped as dutiesOf's answer for that one forwarder.
+    const d = FC.dutiesFromFlags({ forwarder_id: 5, does_freight: 0, does_delivery: 1, does_customs: 1 });
+    assert.deepEqual(FC.heldBy(d, 5), ['delivery', 'customs']);
+    assert.deepEqual(FC.heldBy(d, 4), []);
+    assert.deepEqual(FC.heldBy(FC.dutiesFromFlags({ forwarder_id: 5 }), 5), []);
+});
+
+test('what each duty is asked for: the fields and the kinds of file', () => {
+    assert.deepEqual(FC.DUTIES, ['freight', 'delivery', 'customs']);
+    assert.deepEqual(FC.BOOKING_SCOPES, ['port_to_port', 'end_to_end']);
+    assert.deepEqual(FC.SCOPE_DUTIES, { port_to_port: ['freight'], end_to_end: ['freight', 'delivery'] });
+    assert.equal(FC.FIELD_DUTY.ecn, 'freight');
+    assert.equal(FC.FIELD_DUTY.loadingDate, 'freight');
+    assert.equal(FC.FIELD_DUTY.etd, 'freight');
+    assert.equal(FC.KIND_DUTY.loading_photo, 'freight');
+    assert.equal(FC.KIND_DUTY.bill_of_lading, 'freight');
+    assert.equal(FC.KIND_DUTY.invoice, null, 'an invoice: any duty');
+    // Every field and every kind the rules know has a duty.
+    for (const f of FC.DETAIL_FIELDS) assert.ok(FC.DUTIES.includes(FC.FIELD_DUTY[f]), f);
+    for (const k of FC.UPLOAD_KINDS) assert.ok(FC.KIND_DUTY[k] === null || FC.DUTIES.includes(FC.KIND_DUTY[k]), k);
+});
+
+test('fieldsOutside: the fields of a proposal its forwarder does not hold the duty for', () => {
+    assert.deepEqual(FC.fieldsOutside({ ecn: 'MSKU1234565', etd: '2026-12-01' }, ['freight']), []);
+    assert.deepEqual(FC.fieldsOutside({ ecn: 'MSKU1234565', etd: '2026-12-01' }, ['delivery', 'customs']), ['ecn', 'etd']);
+    assert.deepEqual(FC.fieldsOutside({}, []), []);
+});
+
+test('kindAllowed: a file kind against the duties its forwarder holds', () => {
+    assert.equal(FC.kindAllowed('invoice', ['customs']), true);
+    assert.equal(FC.kindAllowed('invoice', []), false);
+    assert.equal(FC.kindAllowed('loading_photo', ['freight']), true);
+    assert.equal(FC.kindAllowed('loading_photo', ['delivery', 'customs']), false);
+    assert.equal(FC.kindAllowed('bill_of_lading', ['delivery']), false);
+    assert.equal(FC.kindAllowed('telex', ['freight', 'delivery', 'customs']), false);
+});
+
 // ── what a forwarder is shown of a container ─────────────────────────────
 
 test('visibility: the owner sees it in full; a forwarder only paid on it sees the payment; anyone else nothing', () => {
@@ -124,6 +324,21 @@ test('finished: more than 14 days after it arrived, by the date alone', () => {
     assert.equal(FC.isFinished('2026-11-01', '2026-11-01'), false);
     assert.equal(FC.isFinished(null, '2026-11-16'), false, 'not arrived: never finished');
     assert.equal(FC.isFinished('2026-12-20', '2027-01-04'), true, 'across a year end');
+});
+
+test('finished: the fortnight runs from the later of the arrival and the delivery day', () => {
+    assert.equal(FC.isFinished('2026-11-01', '2026-11-16', { deliveryOn: '2026-11-10' }), false, 'delivered on the 10th: open until the 24th');
+    assert.equal(FC.isFinished('2026-11-01', '2026-11-24', { deliveryOn: '2026-11-10' }), false, 'the 14th day after delivery');
+    assert.equal(FC.isFinished('2026-11-01', '2026-11-25', { deliveryOn: '2026-11-10' }), true);
+    assert.equal(FC.isFinished('2026-11-01', '2026-11-16', { deliveryOn: '2026-10-20' }), true, 'a delivery day before the arrival changes nothing');
+    assert.equal(FC.isFinished(null, '2026-12-25', { deliveryOn: '2026-11-10' }), false, 'not arrived: never finished');
+});
+
+test('finished: with a delivery holder and no delivery date held, it stays open until the container is closed', () => {
+    assert.equal(FC.isFinished('2026-11-01', '2026-12-25', { awaitingDelivery: true, closed: false }), false);
+    assert.equal(FC.isFinished('2026-11-01', '2026-12-25', { awaitingDelivery: true, closed: true }), true);
+    assert.equal(FC.isFinished('2026-11-01', '2026-11-10', { awaitingDelivery: true, closed: true }), false, 'closed, but inside the fortnight');
+    assert.equal(FC.isFinished('2026-11-01', '2026-12-25', { awaitingDelivery: false, closed: false }), true, 'no delivery holder: today\'s rule');
 });
 
 // ── a payment on a container ─────────────────────────────────────────────
@@ -194,6 +409,17 @@ test('containerAsks: the email asks only for what we do not hold yet, and always
     assert.deepEqual(FC.containerAsks({ ecn: 'MSKU1234565', loadingDate: '2026-11-28', etd: '2026-12-01' }), ['invoice', 'photos', 'billOfLading']);
 });
 
+test('containerAsks: each company is asked only for its own duties\' things', () => {
+    const none = { ecn: null, loadingDate: null, etd: null };
+    assert.deepEqual(FC.containerAsks(none, ['freight']), ['ecn', 'loadingDate', 'etd', 'invoice', 'photos', 'billOfLading']);
+    assert.deepEqual(FC.containerAsks(none, ['delivery']), ['deliveryDate', 'invoice'], 'never the number, the loading date, photos or the bill of lading');
+    assert.deepEqual(FC.containerAsks({ ...none, deliveryDate: '2026-12-20' }, ['delivery']), ['invoice'], 'a delivery date we hold is not asked for');
+    assert.deepEqual(FC.containerAsks(none, ['customs']), ['invoice', 'customsDraft']);
+    assert.deepEqual(FC.containerAsks(none, ['freight', 'delivery']), ['ecn', 'loadingDate', 'etd', 'deliveryDate', 'invoice', 'photos', 'billOfLading']);
+    assert.deepEqual(FC.containerAsks(none, ['delivery', 'customs']), ['deliveryDate', 'invoice', 'customsDraft']);
+    assert.deepEqual(FC.containerAsks(none, []), []);
+});
+
 test('containerUrl: the portal page of one container', () => {
     assert.equal(FC.containerUrl('https://portal.example', 1214), 'https://portal.example/freight-containers/1214');
     assert.equal(FC.containerUrl('https://portal.example/', 1214), 'https://portal.example/freight-containers/1214');
@@ -238,6 +464,9 @@ test('containerBlockHtml: no booking reference, nothing asked, no register addre
 
 test('containerBlockHtml: every ask the rules can make has a label', () => {
     for (const ask of FC.containerAsks({})) assert.equal(typeof F.CONTAINER_ASK_LABELS[ask], 'string', ask);
+    // ... whichever duties the company holds.
+    for (const ask of FC.containerAsks({}, FC.DUTIES)) assert.equal(typeof F.CONTAINER_ASK_LABELS[ask], 'string', ask);
+    assert.deepEqual(FC.containerAsks({}, FC.DUTIES), ['ecn', 'loadingDate', 'etd', 'deliveryDate', 'invoice', 'photos', 'billOfLading', 'customsDraft']);
 });
 
 test('the container email template: a Freight template of its own, in the defaults, outside the four the old seeds loop over', () => {
@@ -279,7 +508,124 @@ test('ecnProblem: by air it is an air waybill number, taken as text of a sensibl
     assert.equal(FC.ecnProblem('AIR', ''), 'empty');
 });
 
-test('proposalOf: what a forwarder asked for, only the three things it can ask, cleaned', () => {
+// ── the delivery date (2026-11-24): a wall-clock value, as text, to the minute ──
+
+test('normDelivery: one form, to the minute; no time and midnight are the same thing; seconds never count', () => {
+    // The vectors the portal's and ShipLine's normalisers are tested with too.
+    assert.equal(FC.normDelivery('2026-12-01'), '2026-12-01');
+    assert.equal(FC.normDelivery('2026-12-01T00:00'), '2026-12-01', 'midnight is "no time"');
+    assert.equal(FC.normDelivery('2026-12-01 00:00:30'), '2026-12-01', 'seconds do not make a time');
+    assert.equal(FC.normDelivery('2026-12-01T09:30'), '2026-12-01T09:30');
+    assert.equal(FC.normDelivery('2026-12-01 09:30:00'), '2026-12-01T09:30', 'as MySQL writes it');
+    assert.equal(FC.normDelivery('2026-12-01T09:30:59.123'), '2026-12-01T09:30');
+    assert.equal(FC.normDelivery(' 2026-12-01T23:59 '), '2026-12-01T23:59');
+    for (const bad of ['', null, undefined, 'soon', '01/12/2026', '2026-02-30', '2026-12-01T24:00', '2026-12-01T09:60', '2026-12-01T9:30', '2026-12-01T09', 20261201]) {
+        assert.equal(FC.normDelivery(bad), null, String(bad));
+    }
+});
+
+test('deliveryDay and deliverySql: the day it falls on, and how it is written to an order', () => {
+    assert.equal(FC.deliveryDay('2026-12-01T09:30'), '2026-12-01');
+    assert.equal(FC.deliveryDay('2026-12-01'), '2026-12-01');
+    assert.equal(FC.deliveryDay('never'), null);
+    assert.equal(FC.deliverySql('2026-12-01T09:30'), '2026-12-01 09:30:00');
+    assert.equal(FC.deliverySql('2026-12-01'), '2026-12-01 00:00:00', 'the shape a hand-typed value has');
+    assert.equal(FC.deliverySql('never'), null);
+});
+
+test('heldDelivery: what a container holds is what EVERY order on it holds; else it is mixed', () => {
+    assert.deepEqual(FC.heldDelivery(['2026-12-01T09:30', '2026-12-01T09:30']), { deliveryDate: '2026-12-01T09:30', deliveryMixed: null });
+    assert.deepEqual(FC.heldDelivery([null, null]), { deliveryDate: null, deliveryMixed: null });
+    assert.deepEqual(FC.heldDelivery([]), { deliveryDate: null, deliveryMixed: null }, 'no order: nothing held');
+    // One order without, or two different days: nothing is "the" date, and the tab is told what is there.
+    assert.deepEqual(FC.heldDelivery(['2026-12-01', null]), { deliveryDate: null, deliveryMixed: [null, '2026-12-01'] });
+    assert.deepEqual(FC.heldDelivery(['2026-12-03', '2026-12-01', '2026-12-03']), { deliveryDate: null, deliveryMixed: ['2026-12-01', '2026-12-03'] });
+    // Values are compared in the one form.
+    assert.deepEqual(FC.heldDelivery(['2026-12-01T00:00', '2026-12-01 00:00:00']), { deliveryDate: '2026-12-01', deliveryMixed: null });
+});
+
+test('the delivery date is the delivery duty\'s, and the fourth thing a proposal can ask', () => {
+    assert.deepEqual(FC.DETAIL_FIELDS, ['ecn', 'loadingDate', 'etd', 'deliveryDate']);
+    assert.deepEqual(FC.ORIGINAL_FIELDS, ['ecn', 'loadingDate', 'etd']);
+    assert.equal(FC.FIELD_DUTY.deliveryDate, 'delivery');
+    assert.deepEqual(FC.proposalOf('{"deliveryDate":"2026-12-20T00:00","etd":"2026-12-15"}'), { etd: '2026-12-15', deliveryDate: '2026-12-20' });
+    assert.deepEqual(FC.proposalOf({ deliveryDate: '2026-12-20 14:30:00' }), { deliveryDate: '2026-12-20T14:30' });
+    assert.deepEqual(FC.proposalOf({ deliveryDate: 'next week' }), {});
+    assert.deepEqual(FC.fieldsOutside({ etd: '2026-12-15', deliveryDate: '2026-12-20' }, ['freight']), ['deliveryDate']);
+    assert.deepEqual(FC.fieldsOutside({ etd: '2026-12-15', deliveryDate: '2026-12-20' }, ['delivery']), ['etd']);
+    assert.deepEqual(FC.fieldsOutside({ etd: '2026-12-15', deliveryDate: '2026-12-20' }, ['freight', 'delivery']), []);
+});
+
+test('clientKnows: a decision must name every field beyond the original three that it decides', () => {
+    assert.equal(FC.clientKnows({ ecn: 'MSKU1234565', etd: '2026-12-15' }, []), true, 'a proposal of the original three is decided as before');
+    assert.equal(FC.clientKnows({ ecn: 'MSKU1234565', etd: '2026-12-15' }, undefined), true);
+    assert.equal(FC.clientKnows({ deliveryDate: '2026-12-20' }, ['ecn', 'loadingDate', 'etd']), false, 'a build from before the delivery date');
+    assert.equal(FC.clientKnows({ deliveryDate: '2026-12-20' }, ['ecn', 'loadingDate', 'etd', 'deliveryDate']), true);
+    assert.equal(FC.clientKnows({ etd: '2026-12-15', deliveryDate: '2026-12-20' }, ['deliveryDate']), true);
+    assert.equal(FC.clientKnows({ deliveryDate: '2026-12-20' }, null), false);
+});
+
+test('heldDiff: the delivery date is compared when the card says it showed one, in the one form, mixed values included', () => {
+    const held = { ecn: null, loadingDate: null, etd: '2026-12-15', deliveryDate: '2026-12-20', deliveryMixed: null };
+    assert.deepEqual(FC.heldDiff({ ecn: null, loadingDate: null, etd: '2026-12-15', deliveryDate: '2026-12-20T00:00' }, held), []);
+    assert.deepEqual(FC.heldDiff({ ecn: null, loadingDate: null, etd: '2026-12-15', deliveryDate: null }, held), ['deliveryDate']);
+    // A build from before the delivery date never names it: for that card it is not compared.
+    assert.deepEqual(FC.heldDiff({ ecn: null, loadingDate: null, etd: '2026-12-15' }, held), []);
+    // Mixed values: the card must have shown the same ones.
+    const mixed = { ...held, deliveryDate: null, deliveryMixed: [null, '2026-12-20'] };
+    assert.deepEqual(FC.heldDiff({ etd: '2026-12-15', deliveryDate: null, deliveryMixed: [null, '2026-12-20'] }, mixed), []);
+    assert.deepEqual(FC.heldDiff({ etd: '2026-12-15', deliveryDate: null, deliveryMixed: null }, mixed), ['deliveryDate']);
+    assert.deepEqual(FC.heldDiff({ etd: '2026-12-15', deliveryDate: null, deliveryMixed: ['2026-12-20', '2026-12-21'] }, mixed), ['deliveryDate']);
+});
+
+test('orderProblem: loading, then departure, then every delivery day; a pair is judged only when the proposal touches it', () => {
+    const held = { loadingDate: '2026-12-10', etd: '2026-12-15', deliveryDate: '2026-12-20', deliveryMixed: null };
+    assert.equal(FC.orderProblem({ deliveryDate: '2026-12-15T08:00' }, held), null, 'delivered on the day it leaves is in order');
+    assert.deepEqual(FC.orderProblem({ deliveryDate: '2026-12-14' }, held), ['etd', 'deliveryDate']);
+    // The other direction: a freight proposal that moves the departure past a delivery date already held.
+    assert.deepEqual(FC.orderProblem({ etd: '2026-12-21' }, held), ['etd', 'deliveryDate']);
+    assert.equal(FC.orderProblem({ etd: '2026-12-20' }, held), null);
+    assert.deepEqual(FC.orderProblem({ loadingDate: '2026-12-16' }, held), ['loadingDate', 'etd']);
+    assert.deepEqual(FC.orderProblem({ loadingDate: '2026-12-22' }, { ...held, etd: null }), ['loadingDate', 'deliveryDate']);
+    // Against every delivery day held, when the orders differ.
+    assert.deepEqual(FC.orderProblem({ etd: '2026-12-19' }, { ...held, deliveryDate: null, deliveryMixed: [null, '2026-12-18', '2026-12-25'] }), ['etd', 'deliveryDate']);
+    assert.equal(FC.orderProblem({ etd: '2026-12-18' }, { ...held, deliveryDate: null, deliveryMixed: [null, '2026-12-18', '2026-12-25'] }), null);
+    // What we hold in disorder is not a proposal's to answer for when it touches neither side.
+    assert.equal(FC.orderProblem({ loadingDate: '2026-12-01' }, { loadingDate: null, etd: '2026-12-25', deliveryDate: '2026-12-20', deliveryMixed: null }), null);
+    assert.equal(FC.orderProblem({}, { loadingDate: '2026-12-30', etd: '2026-12-25', deliveryDate: '2026-12-20' }), null);
+    // datesInOrder is the same answer as yes or no.
+    assert.equal(FC.datesInOrder({ etd: '2026-12-21' }, held), false);
+    assert.equal(FC.datesInOrder({ etd: '2026-12-20' }, held), true);
+});
+
+test('finishRefusal: the orders on the container, and what each holds for delivery, are what the claim saw', () => {
+    const members = [{ id: 1, delivery_at: null }, { id: 2, delivery_at: '2026-12-01' }];
+    const claim = { ecn: null, loadingDate: null, etd: '2026-11-20', members: [1, 2], deliveryByOrder: { 1: null, 2: '2026-12-01' } };
+    const base = { requested: { deliveryDate: '2026-12-05T10:00' }, claim, ecnReset: null, memberEcns: [null, null], held: { ecn: null, loadingDate: null, etd: '2026-11-20' }, members };
+    assert.equal(FC.finishRefusal(base), null);
+    // A delivery date typed on one order since the claim.
+    assert.deepEqual(FC.finishRefusal({ ...base, members: [{ id: 1, delivery_at: '2026-12-02' }, { id: 2, delivery_at: '2026-12-01' }] }), { code: 'CONTAINER_CHANGED', fields: ['deliveryDate'] });
+    // An order joined, or one left.
+    assert.deepEqual(FC.finishRefusal({ ...base, members: [...members, { id: 3, delivery_at: null }] }), { code: 'CONTAINER_CHANGED', fields: ['members'] });
+    assert.deepEqual(FC.finishRefusal({ ...base, members: [members[0]] }), { code: 'CONTAINER_CHANGED', fields: ['members'] });
+    // The same value in another shape is no change.
+    assert.equal(FC.finishRefusal({ ...base, members: [{ id: 1, delivery_at: null }, { id: 2, delivery_at: '2026-12-01T00:00' }] }), null);
+    // A delivery date before the departure the container holds.
+    assert.deepEqual(FC.finishRefusal({ ...base, requested: { deliveryDate: '2026-11-19' } }), { code: 'DATES_OUT_OF_ORDER', fields: ['etd', 'deliveryDate'] });
+    // A delivery date needs an order to carry it.
+    assert.deepEqual(FC.finishRefusal({ ...base, members: [], claim: { ...claim, members: [], deliveryByOrder: {} } }), { code: 'NO_ORDERS', fields: ['deliveryDate'] });
+    // A claim made before this was recorded (one in flight across a deploy) is not judged on it.
+    assert.equal(FC.finishRefusal({ ...base, claim: { ecn: null, loadingDate: null, etd: '2026-11-20' }, requested: { etd: '2026-11-21' }, members: [{ id: 9, delivery_at: null }] }), null);
+});
+
+test('claimSnapshot: what a claim records of the container, per order', () => {
+    assert.deepEqual(FC.claimSnapshot({ ecn: 'MSKU1234565', loadingDate: null, etd: '2026-12-15' }, [{ id: 2, delivery_at: '2026-12-20T00:00' }, { id: 1, delivery_at: null }]), {
+        ecn: 'MSKU1234565', loadingDate: null, etd: '2026-12-15', deliveryDate: null, deliveryMixed: [null, '2026-12-20'],
+        members: [1, 2], deliveryByOrder: { 1: null, 2: '2026-12-20' },
+    });
+});
+
+test('proposalOf: what a forwarder asked for, only the things it can ask, cleaned', () => {
     assert.deepEqual(FC.proposalOf('{"ecn":"msku1234565","loadingDate":"2026-12-10","etd":"2026-12-15","vessel":"x"}'), { ecn: 'MSKU1234565', loadingDate: '2026-12-10', etd: '2026-12-15' });
     assert.deepEqual(FC.proposalOf({ etd: '2026-12-15' }), { etd: '2026-12-15' });
     assert.deepEqual(FC.proposalOf('{"loadingDate":"10/12/2026","ecn":""}'), {}, 'a date that is not a day, and an empty number, ask for nothing');
@@ -309,14 +655,18 @@ test('isWaiting: pending, or a claim that lapsed; a claim in progress and a deci
 });
 
 test('claimRefusal: only the live, waiting proposal of the container\'s own forwarder, with no other accept in progress', () => {
-    const row = (over = {}) => ({ id: 9, forwarder_id: 4, status: 'pending', lapsed: 0, claimed_by: null, claimed_at_iso: null, ...over });
-    const ok = { rows: [row()], id: 9, ownerForwarderId: 4 };
+    const row = (over = {}) => ({ id: 9, forwarder_id: 4, status: 'pending', lapsed: 0, claimed_by: null, claimed_at_iso: null, requested_json: '{"ecn":"MSKU1234565"}', ...over });
+    const ok = { rows: [row()], id: 9, duties: dutiesOf(ship({ forwarder_id: 4 })) };
     assert.equal(FC.claimRefusal(ok), null);
     assert.deepEqual(FC.claimRefusal({ ...ok, rows: [row(), row({ id: 11 })] }), { code: 'SUPERSEDED' });
     assert.deepEqual(FC.claimRefusal({ ...ok, rows: [row({ status: 'applied' })] }), { code: 'ALREADY_DECIDED' });
     assert.deepEqual(FC.claimRefusal({ ...ok, rows: [row({ status: 'rejected' })] }), { code: 'ALREADY_DECIDED' });
-    assert.deepEqual(FC.claimRefusal({ ...ok, ownerForwarderId: 3 }), { code: 'NOT_THEIR_CONTAINER' });
-    assert.deepEqual(FC.claimRefusal({ ...ok, ownerForwarderId: null }), { code: 'NOT_THEIR_CONTAINER' });
+    assert.deepEqual(FC.claimRefusal({ ...ok, duties: dutiesOf(ship({ forwarder_id: 3 })) }), { code: 'NOT_THEIR_CONTAINER' });
+    assert.deepEqual(FC.claimRefusal({ ...ok, duties: dutiesOf(ship()) }), { code: 'NOT_THEIR_CONTAINER' });
+    // Still attached, but no longer for what it asks: freight went to 3, forwarder 4 keeps customs.
+    assert.deepEqual(FC.claimRefusal({ ...ok, duties: dutiesOf(ship({ forwarder_id: 3, customs_forwarder_id: 4 })) }), { code: 'NOT_THEIR_DUTY', fields: ['ecn'] });
+    // Holding freight by booking is as good as by hand.
+    assert.equal(FC.claimRefusal({ ...ok, duties: dutiesOf(ship(), [bk()]) }), null);
     assert.deepEqual(FC.claimRefusal({ ...ok, id: 77 }), { code: 'NO_SUCH_PROPOSAL' });
     // An accept in progress on this container: by this proposal from another tab, or by another forwarder's.
     assert.deepEqual(FC.claimRefusal({ ...ok, rows: [row({ status: 'applying', claimed_by: 'ann@us.com', claimed_at_iso: '2026-11-23T10:00:00Z' })] }),
@@ -422,8 +772,28 @@ const upload = (over = {}) => ({
     upload_status: 'sent', review_status: 'open', final_key: 'files/fwd/70/' + 'a'.repeat(32) + '.pdf', s3_etag: '"e1"', ...over,
 });
 
-test('uploads: three kinds, and what each may be', () => {
-    assert.deepEqual(FC.UPLOAD_KINDS, ['invoice', 'loading_photo', 'bill_of_lading']);
+test('uploads: the draft customs entry is the customs duty\'s, the fourth kind, and kept with the forwarder documents', () => {
+    assert.deepEqual(FC.UPLOAD_KINDS, ['invoice', 'loading_photo', 'bill_of_lading', 'customs_draft']);
+    assert.deepEqual(FC.ORIGINAL_KINDS, ['invoice', 'loading_photo', 'bill_of_lading']);
+    assert.equal(FC.KIND_DUTY.customs_draft, 'customs');
+    assert.deepEqual(FC.UPLOAD_RULES.customs_draft, { types: ['application/pdf', 'image/png', 'image/jpeg'], maxBytes: 15 * MB });
+    assert.equal('customs_draft'.length <= 16, true, 'it fits the portal\'s kind column');
+    assert.equal(FC.kindAllowed('customs_draft', ['customs']), true);
+    assert.equal(FC.kindAllowed('customs_draft', ['freight', 'delivery']), false);
+    assert.match(FC.filedKeyFor({ kind: 'customs_draft', random: '3f2c9a40-1b7d-4c1e-9f51-0a2b3c4d5e6f', filename: 'entry draft.pdf', contentType: 'application/pdf' }), /^forwarder-documents\/3f2c9a40-1b7d-4c1e-9f51-0a2b3c4d5e6f\/entry_draft\.pdf$/);
+    // A decision on a kind beyond the original three must name it.
+    assert.equal(FC.clientKnowsKind('invoice', undefined), true);
+    assert.equal(FC.clientKnowsKind('customs_draft', undefined), false);
+    assert.equal(FC.clientKnowsKind('customs_draft', 'bill_of_lading'), false);
+    assert.equal(FC.clientKnowsKind('customs_draft', 'customs_draft'), true);
+    // Only the company that handles customs sends one.
+    const duties = dutiesOf(ship({ forwarder_id: 4, customs_forwarder_id: 5 }));
+    const row = { id: 70, forwarder_id: 5, kind: 'customs_draft', upload_status: 'sent', review_status: 'open', final_key: 'k' };
+    assert.equal(FC.uploadGate({ row, duties, action: 'accept' }), null);
+    assert.deepEqual(FC.uploadGate({ row: { ...row, forwarder_id: 4 }, duties, action: 'accept' }), { status: 409, code: 'NOT_THEIR_DUTY', allowedNext: ['reject'], kind: 'customs_draft' });
+});
+
+test('uploads: the original three kinds, and what each may be', () => {
     assert.deepEqual(FC.UPLOAD_RULES.invoice, { types: ['application/pdf', 'image/png', 'image/jpeg'], maxBytes: 10 * MB });
     assert.deepEqual(FC.UPLOAD_RULES.loading_photo, { types: ['image/png', 'image/jpeg'], maxBytes: 15 * MB });
     assert.deepEqual(FC.UPLOAD_RULES.bill_of_lading, { types: ['application/pdf', 'image/png', 'image/jpeg'], maxBytes: 15 * MB });
@@ -453,7 +823,7 @@ test('uploads: the bytes read at accept must be the file the portal recorded', (
 });
 
 test('uploads: what may be decided, and when', () => {
-    const gate = (row, action = 'accept', owner = 4) => FC.uploadGate({ row, ownerForwarderId: owner, action });
+    const gate = (row, action = 'accept', owner = 4) => FC.uploadGate({ row, duties: dutiesOf(ship({ forwarder_id: owner })), action });
     assert.equal(gate(upload()), null);
     assert.deepEqual(gate(null), { status: 404, code: 'NO_SUCH_UPLOAD', allowedNext: ['reload'] });
     assert.deepEqual(gate(upload({ upload_status: 'withdrawn' })), { status: 409, code: 'WITHDRAWN', allowedNext: ['reload'] });
@@ -468,6 +838,20 @@ test('uploads: what may be decided, and when', () => {
     assert.equal(gate(upload(), 'reject', null), null);
     // A file with no final key was never really sent.
     assert.deepEqual(gate(upload({ final_key: null })), { status: 409, code: 'NOT_SENT', allowedNext: ['reload'] });
+});
+
+test('uploads: a file is accepted only from the company that holds its kind\'s duty', () => {
+    // Freight is forwarder 4's (by booking), delivery and customs are forwarder 5's.
+    const duties = dutiesOf(ship({ delivery_forwarder_id: 5, customs_forwarder_id: 5 }), [bk()]);
+    const gate = (row, action = 'accept') => FC.uploadGate({ row, duties, action });
+    assert.equal(gate(upload({ kind: 'loading_photo' })), null);
+    assert.equal(gate(upload({ kind: 'bill_of_lading' })), null);
+    // An invoice: from anyone who holds a duty.
+    assert.equal(gate(upload({ forwarder_id: 5 })), null);
+    assert.deepEqual(gate(upload({ forwarder_id: 5, kind: 'loading_photo' })), { status: 409, code: 'NOT_THEIR_DUTY', allowedNext: ['reject'], kind: 'loading_photo' });
+    assert.deepEqual(gate(upload({ forwarder_id: 5, kind: 'bill_of_lading' })), { status: 409, code: 'NOT_THEIR_DUTY', allowedNext: ['reject'], kind: 'bill_of_lading' });
+    assert.equal(gate(upload({ forwarder_id: 5, kind: 'loading_photo' }), 'reject'), null, 'it can still be sent back');
+    assert.deepEqual(gate(upload({ forwarder_id: 6 })), { status: 409, code: 'NOT_THEIR_CONTAINER', allowedNext: ['reject'] });
 });
 
 test('uploads: an invoice is filed under the name its forwarder is paid under, else its name on the Forwarders list', () => {

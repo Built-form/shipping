@@ -16,6 +16,7 @@
 
 const S = require('../lib/shipments');
 const FL = require('../lib/forwarder-links');
+const FC = require('../lib/forwarder-containers');
 const forwarderPairs = require('./forwarder-pairs');
 const sync = require('./shipment-sync');
 const { makeBookShipment } = require('./shipment-book');
@@ -514,11 +515,43 @@ function registerShipmentRoutes(app, deps) {
             change('forwarder', 'forwarder', pair.name);
             change('forwarderId', 'forwarder_id', pair.id);
         }
+        // The other two picks (2026-11-24, docs/forwarder-containers.md): who
+        // delivers it from the UK port, and who handles its customs. A forwarder
+        // from the list, or null. Picking one shows the container to its portal
+        // contacts. The forwarder row is read with a shared lock: one being taken
+        // off the list waits for this write, as it does for a decision.
+        for (const [key, col] of [['deliveryForwarderId', 'delivery_forwarder_id'], ['customsForwarderId', 'customs_forwarder_id']]) {
+            if (b[key] === undefined) continue;
+            const pick = FL.decidePick(b[key]);
+            if (pick.error) throw new ShipmentError(400, 'BAD_FIELD', `${key} ${pick.error}`, { field: key });
+            if (pick.id != null && !(await forwarderPairs.onTheList(conn, pick.id))) {
+                throw new ShipmentError(400, 'BAD_FIELD', `Forwarder ${pick.id} is not on the Forwarders list.`, { field: key });
+            }
+            if (!sameValue(ship[col], pick.id)) change(key, col, pick.id);
+        }
         for (const [key, spec] of Object.entries(WRITE_THROUGH)) {
             if (b[key] === undefined) continue;
             const v = fieldValue(key, spec, b[key]);
             change(key, spec.col, v);
             if (booked) orderSets[spec.orderCol] = v;
+        }
+        // The delivery date (2026-11-24, docs/forwarder-containers.md): held on the
+        // member orders ONLY (orders.delivery_date; there is no shipment column, the
+        // orders are the authority). A day, with a time when one is booked, in the
+        // one form (lib/forwarder-containers.js normDelivery). This is how a date a
+        // forwarder proposed is written once staff accept it.
+        let deliveryChange;
+        if (b.deliveryDate !== undefined) {
+            let v = null;
+            if (b.deliveryDate !== null && b.deliveryDate !== '') {
+                v = FC.normDelivery(b.deliveryDate);
+                if (!v) throw new ShipmentError(400, 'BAD_DATE', 'deliveryDate must be a YYYY-MM-DD date, with an optional THH:MM time.', { field: 'deliveryDate' });
+            }
+            if (!booked) {
+                throw new ShipmentError(422, 'NOT_BOOKED', 'A delivery date is kept on a container\'s orders: it can be set once the shipment is booked.', { field: 'deliveryDate' });
+            }
+            deliveryChange = { value: v };
+            after.deliveryDate = v;
         }
 
         let newReference = null;
@@ -573,7 +606,7 @@ function registerShipmentRoutes(app, deps) {
             if (booked) trackingChange = { value: v };
         }
 
-        if (!sets.length && !Object.keys(orderSets).length && trackingChange === undefined) {
+        if (!sets.length && !Object.keys(orderSets).length && trackingChange === undefined && deliveryChange === undefined) {
             return { id, warnings, unchanged: true };
         }
         if (sets.length) {
@@ -586,13 +619,19 @@ function registerShipmentRoutes(app, deps) {
         }
 
         // Write-through to the member orders, one audited UPDATE each.
-        if (booked && (Object.keys(orderSets).length || trackingChange !== undefined)) {
+        if (booked && (Object.keys(orderSets).length || trackingChange !== undefined || deliveryChange !== undefined)) {
+            // `delivery_at`: what each order holds for delivery, in the one form, from SQL
+            // (the column itself comes back as a Date, which is never compared).
             const [members] = await conn.query(
-                `SELECT * FROM orders WHERE shipment_id = ? AND deleted_at IS NULL ORDER BY id FOR UPDATE`, [ship.id]
+                `SELECT *, ${FC.deliverySelect('delivery_date')} AS delivery_at FROM orders WHERE shipment_id = ? AND deleted_at IS NULL ORDER BY id FOR UPDATE`, [ship.id]
             );
             const mode = after.mode || ship.mode;
             for (const m of members) {
                 const oSets = { ...orderSets };
+                // An order that holds this delivery date already is left alone.
+                if (deliveryChange !== undefined && FC.normDelivery(m.delivery_at) !== deliveryChange.value) {
+                    oSets.delivery_date = FC.deliverySql(deliveryChange.value);
+                }
                 if (trackingChange !== undefined) {
                     const prev = S.trackingRefFor(mode, [m]);
                     if (trackingChange.value) {
@@ -603,7 +642,8 @@ function registerShipmentRoutes(app, deps) {
                         oSets[prev.sourceColumn] = null;
                     }
                 }
-                const cols = Object.keys(oSets).filter(c => !sameValue(m[c], oSets[c]));
+                // delivery_date is in oSets only when it differs (compared above, as text).
+                const cols = Object.keys(oSets).filter(c => c === 'delivery_date' || !sameValue(m[c], oSets[c]));
                 if (!cols.length) continue;
                 const [beforeRows] = await conn.query(`${ORDER_SELECT} AND orders.id = ?`, [m.id]);
                 await conn.query(

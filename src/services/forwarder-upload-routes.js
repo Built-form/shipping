@@ -69,6 +69,8 @@ const UPLOAD_REFUSAL_TEXT = Object.freeze({
     NOT_SENT: 'This file has not been sent to us yet.',
     ALREADY_DECIDED: 'This file was already accepted or sent back.',
     NOT_THEIR_CONTAINER: 'This container is no longer that forwarder’s, so their file cannot be accepted. It can be dismissed.',
+    NOT_THEIR_DUTY: 'This forwarder no longer does the part of the job this file is about, so it cannot be accepted. It can be dismissed.',
+    CLIENT_TOO_OLD: 'This page is older than what the forwarder sent, so it cannot show it. Reload ShipLine, then decide.',
     FILE_UNAVAILABLE: 'The forwarder’s file could not be read from the portal. Send it back and ask for it again.',
     FILE_NOT_ITS_TYPE: 'The file is not the kind of file it was sent as. Send it back.',
     FILE_SIZE_CHANGED: 'The file is not the size the portal recorded. Send it back and ask for it again.',
@@ -90,7 +92,7 @@ class Refusal extends Error {
     }
 }
 const refuse = (code, allowedNext = ['reload'], extra = {}, status = 409) => new Refusal(status, code, { allowedNext, ...extra });
-const gateRefusal = no => new Refusal(no.status, no.code, { allowedNext: no.allowedNext });
+const gateRefusal = no => new Refusal(no.status, no.code, { allowedNext: no.allowedNext, ...(no.kind ? { kind: no.kind } : {}) });
 // A missing table here is the portal's, unless MySQL names one of ours (a server whose own
 // migration has not run answers NOT_MIGRATED).
 const OWN_TABLES = /shipment_forwarder_documents|shipment_payment_documents|container_photos|payment_extras/i;
@@ -99,19 +101,25 @@ const portalMissing = e => Boolean(e) && (e.errno === ER_NO_SUCH_TABLE || e.errn
 const UPLOAD_COLUMNS = `u.id, u.shipment_id, u.container_ref, u.forwarder_id, u.kind, u.user_email, u.user_name, u.filename, u.content_type, u.file_size,
         u.final_key, u.s3_etag, u.note, u.upload_status, u.review_status, u.decided_note, u.decided_by, u.filed_key, u.filed_id,
         DATE_FORMAT(u.sent_at, ${ISO}) AS sent_at_iso, DATE_FORMAT(u.decided_at, ${ISO}) AS decided_at_iso, DATE_FORMAT(u.withdrawn_at, ${ISO}) AS withdrawn_at_iso`;
-// With whose it is: `theirs` is the portal's own view saying the container is still that forwarder's in full.
+// With whose it is: the portal's own view saying what that forwarder holds on the container now
+// (a full row: the freight holder's 'booking' / 'container', or since 2026-11-24 a delivery or
+// customs holder's 'duty'). `theirs` is then: it still holds the duty the file's kind belongs to.
 const UPLOAD_FROM = jp => `FROM ${jp}.forwarder_uploads u
            LEFT JOIN portal_forwarder_containers_v c
-                  ON c.shipment_id = u.shipment_id AND c.forwarder_id = u.forwarder_id AND c.link_source IN ('booking', 'container')
+                  ON c.shipment_id = u.shipment_id AND c.forwarder_id = u.forwarder_id AND c.link_source IN ('booking', 'container', 'duty')
            LEFT JOIN forwarders f ON f.id = u.forwarder_id`;
-const UPLOAD_SELECT = jp => `SELECT ${UPLOAD_COLUMNS}, f.name AS forwarder_name, (c.shipment_id IS NOT NULL) AS theirs ${UPLOAD_FROM(jp)}`;
+const UPLOAD_SELECT = jp => `SELECT ${UPLOAD_COLUMNS}, f.name AS forwarder_name, (c.shipment_id IS NOT NULL) AS theirs,
+        c.does_freight, c.does_delivery, c.does_customs ${UPLOAD_FROM(jp)}`;
 
 const STATE_OF = Object.freeze({ open: 'open', received: 'received', rejected: 'rejected', withdrawn: 'withdrawn', not_sent: 'not_sent' });
 
-/** An upload as ShipLine shows it. Never a storage key. */
-function uploadJson(row) {
+/**
+ * An upload as ShipLine shows it. Never a storage key. `held`: the duties its forwarder holds
+ * on the container (by default, what the joined view row says).
+ */
+function uploadJson(row, held = FC.dutiesOfFlags(row)) {
     const state = STATE_OF[FC.uploadReviewState(row)];
-    const theirs = Number(row.theirs) === 1;
+    const theirs = FC.kindAllowed(row.kind, held);
     return {
         id: Number(row.id),
         kind: row.kind,
@@ -127,9 +135,11 @@ function uploadJson(row) {
         sentAt: row.sent_at_iso || null,
         state,
         waiting: state === 'open',
-        // Still its forwarder's container: it can be accepted. Otherwise only dismissed.
+        // Its forwarder still holds the duty this kind of file belongs to: it can be accepted. Otherwise only dismissed.
         theirs,
         actionable: state === 'open' && theirs,
+        // What its forwarder holds on the container now.
+        duties: held,
         decidedNote: row.decided_note || null,
         decidedBy: row.decided_by || null,
         decidedAt: row.decided_at_iso || null,
@@ -137,17 +147,24 @@ function uploadJson(row) {
     };
 }
 
-const GROUP_OF = Object.freeze({ invoice: 'invoice', loading_photo: 'loadingPhotos', bill_of_lading: 'billOfLading' });
+const GROUP_OF = Object.freeze({ invoice: 'invoice', loading_photo: 'loadingPhotos', bill_of_lading: 'billOfLading', customs_draft: 'customsDraft' });
+
+const noFiles = () => Object.fromEntries(Object.values(GROUP_OF).map(group => [group, []]));
 
 /**
  * The files forwarders sent for a container, as the FORWARDER tab shows them.
- * → { unavailable, invoice, loadingPhotos, billOfLading, strays }: by kind, the
- * container's own forwarder's, newest first (what was sent, whatever became of
- * it); `strays` are undecided files of a forwarder the container is no longer
- * with: they can be dismissed, never accepted.
+ * `duties`: who holds what on the container now (dutiesOf), which is what says
+ * whose a file still is here, not the view's row.
+ * → { unavailable, byForwarder, strays }:
+ *   byForwarder  Map of forwarder id → { invoice, loadingPhotos, billOfLading }
+ *                for every forwarder that HOLDS A DUTY on the container: what it
+ *                sent, newest first, whatever became of it. A file of a kind its
+ *                forwarder no longer holds the duty for is here too, not actionable.
+ *   strays       undecided files of a forwarder that holds NOTHING on the
+ *                container now: they can be dismissed, never accepted.
  */
-async function readUploads(conn, shipmentId, ownerForwarderId, env = process.env) {
-    const out = { unavailable: false, invoice: [], loadingPhotos: [], billOfLading: [], strays: [] };
+async function readUploads(conn, shipmentId, duties, env = process.env) {
+    const out = { unavailable: false, byForwarder: new Map(), strays: [] };
     let rows;
     try {
         [rows] = await conn.query(
@@ -159,11 +176,14 @@ async function readUploads(conn, shipmentId, ownerForwarderId, env = process.env
         return { ...out, unavailable: true };
     }
     for (const row of rows) {
-        const json = uploadJson(row);
-        if (ownerForwarderId != null && Number(row.forwarder_id) === Number(ownerForwarderId)) {
-            if (GROUP_OF[row.kind]) out[GROUP_OF[row.kind]].push(json);
+        const fid = Number(row.forwarder_id);
+        const held = FC.heldBy(duties, fid);
+        const json = uploadJson(row, held);
+        if (held.length) {
+            if (!out.byForwarder.has(fid)) out.byForwarder.set(fid, noFiles());
+            if (GROUP_OF[row.kind]) out.byForwarder.get(fid)[GROUP_OF[row.kind]].push(json);
         } else if (json.waiting) {
-            out.strays.push({ ...json, actionable: false });
+            out.strays.push(json);
         }
     }
     return out;
@@ -204,6 +224,7 @@ async function listUploads(conn, all, env = process.env) {
     const jp = jportalSchema(env);
     const [rows] = await conn.query(
         `SELECT ${UPLOAD_COLUMNS}, f.name AS forwarder_name, (c.shipment_id IS NOT NULL) AS theirs,
+                c.does_freight, c.does_delivery, c.does_customs,
                 COALESCE(c.reference, s.reference, u.container_ref) AS reference, COALESCE(c.mode, s.mode) AS mode
            ${UPLOAD_FROM(jp)}
            LEFT JOIN shipments s ON s.id = u.shipment_id
@@ -211,17 +232,22 @@ async function listUploads(conn, all, env = process.env) {
           ORDER BY u.id DESC
           LIMIT ${LIST_LIMIT}`
     );
-    return rows.map((r) => {
+    const out = [];
+    for (const r of rows) {
         const u = uploadJson(r);
-        return {
+        // "Still theirs" needs the kind's duty, which the SQL above cannot say: a waiting
+        // file of a company that has since lost that duty is listed only with `all`.
+        if (!all && !u.actionable) continue;
+        out.push({
             kind: u.kind, id: u.id, shipmentId: u.shipmentId, reference: r.reference || null, mode: r.mode || null,
-            forwarderId: u.forwarderId, forwarderName: u.forwarderName,
+            forwarderId: u.forwarderId, forwarderName: u.forwarderName, duties: u.duties,
             status: u.state === 'open' ? 'pending' : u.state === 'received' ? 'applied' : u.state,
             waiting: u.waiting, live: true, theirs: u.theirs, actionable: u.actionable,
             filename: u.filename, fileSize: u.fileSize, requested: {},
             byName: u.byName, byEmail: u.byEmail, at: u.sentAt, decidedAt: u.decidedAt,
-        };
-    });
+        });
+    }
+    return out;
 }
 
 function registerForwarderUploadRoutes(app, deps) {
@@ -340,7 +366,12 @@ function registerForwarderUploadRoutes(app, deps) {
         });
         if (first.replay) return res.json(first.replay);
         const row = first.row;
-        const early = FC.uploadGate({ row, ownerForwarderId: row && Number(row.theirs) === 1 ? row.forwarder_id : null, action: 'accept' });
+        // A kind of file from after 2026-11-24 (a draft customs entry) is decided only by a
+        // ShipLine that NAMES it: a build from before it has no words for it, and must not
+        // file it (or, below, send it back) unseen.
+        if (row && !FC.clientKnowsKind(row.kind, (req.body || {}).kind)) throw refuse('CLIENT_TOO_OLD', ['reload']);
+        // Whose it is, as the portal's view has it now; asked again under the locks below.
+        const early = FC.uploadGate({ row, duties: row ? FC.dutiesFromFlags(row) : null, action: 'accept' });
         if (early) throw gateRefusal(early);
 
         // Received by a request that ran beside this one: theirs stands, and this caller is told what it filed.
@@ -361,7 +392,7 @@ function registerForwarderUploadRoutes(app, deps) {
             const locked = await lockOne(conn, id);
             if (!locked) throw refuse('NO_SUCH_UPLOAD', ['reload'], {}, 404);
             if (receivedAlready(locked)) return null;
-            const gone = FC.uploadGate({ row: locked, ownerForwarderId: null, action: 'reject' });
+            const gone = FC.uploadGate({ row: locked, duties: null, action: 'reject' });
             if (gone) throw gateRefusal(gone);
             if (locked.filed_key) return locked.filed_key;
             const key = FC.filedKeyFor({ kind: locked.kind, random: uuidv4(), filename: locked.filename, contentType: locked.content_type });
@@ -394,13 +425,17 @@ function registerForwarderUploadRoutes(app, deps) {
         // 3. One transaction under the locks.
         const { lockOwnership } = require('./forwarder-container-routes');
         const out = await withConnection(conn => inDecision(conn, async () => {
-            const { shipment, owner, forwarder } = await lockOwnership(conn, Number(row.shipment_id));
+            const { shipment, duties, forwarders } = await lockOwnership(conn, Number(row.shipment_id));
             const locked = await lockOne(conn, id);
             // Received meanwhile by a request that held these locks first: theirs stands, and
             // this caller is told what it filed (the row's lock is what serialises two accepts).
             if (receivedAlready(locked)) return { duplicate: true };
-            const no = FC.uploadGate({ row: locked, ownerForwarderId: owner.forwarderId, action: 'accept' });
+            // Its forwarder holds, on the locked rows, the duty this kind of file belongs to.
+            const no = FC.uploadGate({ row: locked, duties, action: 'accept' });
             if (no) throw gateRefusal(no);
+            // Whose file it is: the company that sent it, which the gate has just found still holds that duty.
+            const owner = { forwarderId: Number(locked.forwarder_id) };
+            const forwarder = forwarders.get(owner.forwarderId) || null;
             // Both are fixed once the row is sent: a second line of defence.
             if (locked.final_key !== row.final_key || (locked.s3_etag || null) !== (row.s3_etag || null) || locked.filed_key !== filedKey) throw refuse('FILE_CHANGED', ['reload']);
 
@@ -463,13 +498,14 @@ function registerForwarderUploadRoutes(app, deps) {
                             (shipment_id, shipment_reference, forwarder_id, forwarder_name, kind, filename, s3_key, public_url, content_type, file_size,
                              forwarder_upload_id, uploaded_by_email, accepted_by_email)
                          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                        [shipment.id, reference, Number(owner.forwarderId), (forwarder && forwarder.name) || null, 'bill_of_lading', filename, filedKey, publicS3Url(filedKey),
+                        // Kept as its own kind: a bill of lading, or (2026-11-24) an approved draft customs entry.
+                        [shipment.id, reference, Number(owner.forwarderId), (forwarder && forwarder.name) || null, locked.kind, filename, filedKey, publicS3Url(filedKey),
                             locked.content_type, bytes.length, id, uploader, actor.email || null]
                     );
                     filed = { as: 'document', id: Number(ins.insertId) };
                     await recordAudit(conn, {
                         entityType: 'shipment_forwarder_document', entityId: filed.id, action: 'create', before: null,
-                        after: { shipmentId: shipment.id, forwarderId: Number(owner.forwarderId), kind: 'bill_of_lading', filename, fileSize: bytes.length, forwarderUploadId: id },
+                        after: { shipmentId: shipment.id, forwarderId: Number(owner.forwarderId), kind: locked.kind, filename, fileSize: bytes.length, forwarderUploadId: id },
                         userEmail: actor.email,
                     });
                 }
@@ -520,8 +556,11 @@ function registerForwarderUploadRoutes(app, deps) {
         const upload = await withConnection(async (conn) => {
             await inDecision(conn, async () => {
                 const locked = await lockOne(conn, id);
-                const no = FC.uploadGate({ row: locked, ownerForwarderId: null, action: 'reject' });
+                const no = FC.uploadGate({ row: locked, duties: null, action: 'reject' });
                 if (no) throw gateRefusal(no);
+                // Sending back is a decision too: a ShipLine build that has no words for
+                // this kind of file must name it (`kind`), or it cannot send it back.
+                if (!FC.clientKnowsKind(locked.kind, (req.body || {}).kind)) throw refuse('CLIENT_TOO_OLD', ['reload']);
                 await conn.query(
                     `UPDATE ${jp()}.forwarder_uploads
                         SET review_status = 'rejected', decided_note = ?, decided_by = ?, decided_at = UTC_TIMESTAMP()

@@ -1,13 +1,16 @@
 'use strict';
 // The portal's view of a forwarder's containers, against a real database
-// (2026-11-23_11 portal_forwarder_containers_v, and portal_forwarder_payment_lines_v
-// as that migration widened it; docs/forwarder-containers.md).
+// (portal_forwarder_containers_v as 2026-11-24_11 re-created it for three
+// duties, and portal_forwarder_payment_lines_v of 2026-11-23_11;
+// docs/forwarder-containers.md).
 //
 // What only a database can show: which containers the view lists for which
-// forwarder, that it agrees with the rule the routes apply to locked rows
-// (src/lib/forwarder-containers.js ownerOf) and with the API's own read of a
-// container (stage, ECN, dates, vessel), what a payment-only row carries, and
-// that no column says anything about a supplier, a line or a price.
+// forwarder and with which duties (freight, delivery, customs), that it agrees
+// with the rule the routes apply to locked rows (src/lib/forwarder-containers.js
+// dutiesOf) and with the API's own read of a container (stage, ECN, dates,
+// vessel, duties), the delivery date in its one form, when a container is
+// finished, what a payment-only row carries, and that no column says anything
+// about a supplier, a line or a price.
 //
 // It WRITES: fixture rows of its own (forwarders, shipments, orders, freight
 // requests, options and bookings, charges, payments, lines, sends), every one
@@ -18,7 +21,9 @@
 //
 //   node tools/test-portal-forwarder-container-view.js --confirm-host <DB_HOST>
 //
-// Needs the migrations of 2026-11-23 applied here.
+// Needs the migrations of 2026-11-23 and 2026-11-24 applied here. PART OF THE
+// RELEASE GATE of the duties work: run it on TEST after its migration, before
+// anything is deployed.
 require('dotenv').config();
 const crypto = require('crypto');
 const { getPool, closePool } = require('../src/db');
@@ -37,10 +42,15 @@ const check = (name, ok, detail = '') => {
     if (ok) { passed++; console.log(`  ok    ${name}`); } else { failed++; console.log(`  FAIL  ${name}${detail ? `  [${detail}]` : ''}`); }
 };
 
+// The 20 columns of 2026-11-23_11, then the four of 2026-11-24_11, added at the end.
 const COLUMNS = ['shipment_id', 'forwarder_id', 'link_source', 'reference', 'mode', 'stage', 'ecn', 'loading_date', 'etd', 'eta',
-    'arrived_on', 'finished', 'vessel_name', 'origin_port', 'booking_ref', 'sailing_date', 'port_from', 'port_to', 'container_size', 'freight_request_id'];
-// Everything but who and which container: NULL on a payment-only row.
-const CONTAINER_FACTS = COLUMNS.filter(c => !['shipment_id', 'forwarder_id', 'link_source', 'reference', 'mode'].includes(c));
+    'arrived_on', 'finished', 'vessel_name', 'origin_port', 'booking_ref', 'sailing_date', 'port_from', 'port_to', 'container_size', 'freight_request_id',
+    'does_freight', 'does_delivery', 'does_customs', 'delivery_date'];
+const FLAGS = ['does_freight', 'does_delivery', 'does_customs'];
+// Everything but who and which container: NULL on a payment-only row (its duty flags are 0).
+const CONTAINER_FACTS = COLUMNS.filter(c => !['shipment_id', 'forwarder_id', 'link_source', 'reference', 'mode', ...FLAGS].includes(c));
+// A row's duty flags as "1/0/0" (freight / delivery / customs).
+const flagsOf = r => FLAGS.map(f => Number(r[f])).join('/');
 
 (async () => {
     if (!/test/i.test(host)) { console.error(`Refusing: ${host || '(DB_HOST unset)'} does not look like the TEST database.`); process.exit(2); }
@@ -118,7 +128,8 @@ const CONTAINER_FACTS = COLUMNS.filter(c => !['shipment_id', 'forwarder_id', 'li
         const byHand = await shipment({ forwarder_id: A, forwarder: `${TAG} A` });
         let rows = await rowsOf(byHand);
         check('a forwarder picked by hand, no booking: one row, theirs, source "container"', rows.length === 1 && Number(rows[0].forwarder_id) === A && rows[0].link_source === 'container', JSON.stringify(rows));
-        check('the view has exactly its documented columns', rows.length === 1 && Object.keys(rows[0]).join() === COLUMNS.join(), rows[0] && Object.keys(rows[0]).join());
+        check('the view has exactly its documented columns, the four new ones at the end', rows.length === 1 && Object.keys(rows[0]).join() === COLUMNS.join(), rows[0] && Object.keys(rows[0]).join());
+        check('a freight forwarder and nobody else: it does freight alone (1/0/0), as every row did before duties', rows.length === 1 && flagsOf(rows[0]) === '1/0/0', rows[0] && flagsOf(rows[0]));
         check('no column says anything of a supplier, a line, a quantity or a price', !COLUMNS.some(c => /supplier|line|unit|quantity|price|amount|cost|note/.test(c)));
 
         const booked = await shipment({ forwarder_id: B, forwarder: `${TAG} B` });
@@ -159,20 +170,91 @@ const CONTAINER_FACTS = COLUMNS.filter(c => !['shipment_id', 'forwarder_id', 'li
             check(`stored stage ${stage}: a row`, (await rowsOf(id)).length === 1);
         }
 
+        console.log('\nThree duties, one holder each: freight, delivery, customs');
+        const said = list => JSON.stringify(list.map(r => [Number(r.forwarder_id), r.link_source, flagsOf(r)]));
+        const is = (r, forwarderId, source, flags) => Boolean(r) && Number(r.forwarder_id) === forwarderId && r.link_source === source && flagsOf(r) === flags;
+
+        // Port to port by booking (a booking made without a scope is port to port), another company for delivery and customs.
+        const split = await shipment({ delivery_forwarder_id: B, customs_forwarder_id: B });
+        const splitBk = await booking(split, A, 'confirmed');
+        rows = await rowsOf(split);
+        check('port to port + a delivery forwarder that also does customs: two rows, the freight holder "booking" 1/0/0 and the other "duty" 0/1/1',
+            rows.length === 2 && is(rows.find(r => Number(r.forwarder_id) === A), A, 'booking', '1/0/0') && is(rows.find(r => Number(r.forwarder_id) === B), B, 'duty', '0/1/1'), said(rows));
+        const freightRow = rows.find(r => Number(r.forwarder_id) === A);
+        const otherRow = rows.find(r => Number(r.forwarder_id) === B);
+        check('the booking\'s reference and its quote request are on the freight holder\'s row only', Boolean(freightRow && otherRow)
+            && freightRow.booking_ref === 'BK-VIEW' && Number(freightRow.freight_request_id) === splitBk.request && otherRow.booking_ref === null && otherRow.freight_request_id === null,
+            JSON.stringify([freightRow && [freightRow.booking_ref, freightRow.freight_request_id], otherRow && [otherRow.booking_ref, otherRow.freight_request_id]]));
+        check('the sailing, the ports and the size are on both: the delivery company needs the port', Boolean(freightRow && otherRow)
+            && ['sailing_date', 'port_from', 'port_to', 'container_size', 'stage', 'reference'].every(c => freightRow[c] === otherRow[c]) && otherRow.port_to === 'Felixstowe', JSON.stringify(otherRow));
+
+        // End to end by booking: the booking's forwarder delivers too, and outranks the delivery pick.
+        const endToEnd = await shipment({ delivery_forwarder_id: B });
+        await booking(endToEnd, A, 'confirmed', { scope: 'end_to_end' });
+        rows = await rowsOf(endToEnd);
+        check('an end-to-end booking: its forwarder does freight and delivery (1/1/0), and the delivery pick has no row', rows.length === 1 && is(rows[0], A, 'booking', '1/1/0'), said(rows));
+
+        // The same booking still "requested": freight and delivery have nobody, the delivery pick included. Customs is not the booking's.
+        const e2eWaiting = await shipment({ forwarder_id: B, forwarder: `${TAG} B`, delivery_forwarder_id: B, customs_forwarder_id: B });
+        await booking(e2eWaiting, A, 'requested', { scope: 'end_to_end' });
+        rows = await rowsOf(e2eWaiting);
+        check('an end-to-end booking still "requested": nobody carries or delivers it, the company picked for customs keeps customs alone (0/0/1)', rows.length === 1 && is(rows[0], B, 'duty', '0/0/1'), said(rows));
+
+        // A port-to-port booking still "requested" leaves FREIGHT with nobody; delivery is not its to hold up.
+        const p2pWaiting = await shipment({ delivery_forwarder_id: B });
+        await booking(p2pWaiting, A, 'requested');
+        rows = await rowsOf(p2pWaiting);
+        check('a port-to-port booking still "requested": only the freight waits, the delivery forwarder has its row (0/1/0)', rows.length === 1 && is(rows[0], B, 'duty', '0/1/0'), said(rows));
+
+        // End to end by hand: the same forwarder in both picks.
+        const handE2e = await shipment({ forwarder_id: A, forwarder: `${TAG} A`, delivery_forwarder_id: A });
+        rows = await rowsOf(handE2e);
+        check('the same forwarder picked for freight and for delivery: one row, "container", 1/1/0', rows.length === 1 && is(rows[0], A, 'container', '1/1/0'), said(rows));
+
+        // A customs broker that carries nothing, on a container with no freight forwarder at all.
+        const brokerOnly = await shipment({ customs_forwarder_id: B });
+        rows = await rowsOf(brokerOnly);
+        check('a customs broker alone: one row, "duty", 0/0/1, and never a booking reference', rows.length === 1 && is(rows[0], B, 'duty', '0/0/1') && rows[0].booking_ref === null && rows[0].freight_request_id === null, said(rows));
+
+        // All three, three companies would need a third live forwarder: A carries, B delivers, A does customs.
+        const mixed = await shipment({ forwarder_id: A, forwarder: `${TAG} A`, delivery_forwarder_id: B, customs_forwarder_id: A });
+        rows = await rowsOf(mixed);
+        check('freight and customs with one company, delivery with another: 1/0/1 and 0/1/0', rows.length === 2
+            && is(rows.find(r => Number(r.forwarder_id) === A), A, 'container', '1/0/1') && is(rows.find(r => Number(r.forwarder_id) === B), B, 'duty', '0/1/0'), said(rows));
+
+        // A pick that names a forwarder taken off the list holds nothing; the others are not affected.
+        const removedPick = await shipment({ forwarder_id: A, forwarder: `${TAG} A`, delivery_forwarder_id: C, customs_forwarder_id: C });
+        rows = await rowsOf(removedPick);
+        check('a delivery and customs pick taken off the list: no row for it, the freight forwarder unchanged (1/0/0)', rows.length === 1 && is(rows[0], A, 'container', '1/0/0'), said(rows));
+
+        // A duty on a container that is not real is no duty.
+        const draftPicks = await shipment({ stage: 'DRAFT', reference: null, open_key: `D:${TAG} picks`, delivery_forwarder_id: B, customs_forwarder_id: B });
+        check('a delivery and customs pick on a draft: nobody yet', (await rowsOf(draftPicks)).length === 0);
+
+        // A forwarder that holds a duty and was sent a payment on the same container has ONE row: the full one.
+        await paymentOn(B, [{ shipment_id: split }]);
+        rows = await rowsOf(split);
+        check('the delivery forwarder paid on that container: still two rows, its own the "duty" one and never a "payment" one',
+            rows.length === 2 && is(rows.find(r => Number(r.forwarder_id) === B), B, 'duty', '0/1/1'), said(rows));
+
         console.log('\nThe rule the routes apply to locked rows says the same');
         for (const id of made.shipments) {
-            const [raw] = await q('SELECT id, reference, stage, deleted_at, merged_into_id, forwarder_id, forwarder FROM shipments WHERE id = ?', [id]);
-            const [live] = await q(
-                `SELECT fb.status, fr.forwarder_id FROM freight_bookings fb JOIN freight_quote_requests fr ON fr.id = fb.request_id
-                  WHERE fb.shipment_id = ? AND fb.status IN ('requested','confirmed') ORDER BY fb.id DESC LIMIT 1`, [id]);
-            const owner = FC.ownerOf({ shipment: raw, booking: live || null, forwarderLive: fid => liveForwarders.includes(Number(fid)) });
-            const full = (await rowsOf(id)).filter(r => r.link_source !== 'payment');
-            const same = owner.forwarderId == null
-                ? full.length === 0
-                : full.length === 1 && Number(full[0].forwarder_id) === owner.forwarderId && full[0].link_source === owner.source;
-            if (!same) check(`ownerOf agrees with the view for shipment ${id}`, false, `${JSON.stringify(owner)} vs ${JSON.stringify(full.map(r => [r.forwarder_id, r.link_source]))}`);
+            const [raw] = await q('SELECT id, reference, stage, deleted_at, merged_into_id, forwarder_id, forwarder, delivery_forwarder_id, customs_forwarder_id FROM shipments WHERE id = ?', [id]);
+            const live = await q(
+                `SELECT fb.id, fb.status, fb.scope, fr.forwarder_id FROM freight_bookings fb JOIN freight_quote_requests fr ON fr.id = fb.request_id
+                  WHERE fb.shipment_id = ? AND fb.status IN ('requested','confirmed')`, [id]);
+            const duties = FC.dutiesOf({ shipment: raw, bookings: live, forwarderLive: fid => liveForwarders.includes(Number(fid)) });
+            // What the rule says each attached forwarder's row is: who, link_source, flags.
+            const want = FC.attachedOf(duties)
+                .map(a => [a.forwarderId, FC.linkSourceOf(duties, a.forwarderId), FLAGS.map(f => (a.duties.includes(f.slice(5)) ? 1 : 0)).join('/')])
+                .sort((x, y) => x[0] - y[0]);
+            const got = (await rowsOf(id)).filter(r => r.link_source !== 'payment').map(r => [Number(r.forwarder_id), r.link_source, flagsOf(r)]).sort((x, y) => x[0] - y[0]);
+            if (JSON.stringify(want) !== JSON.stringify(got)) check(`dutiesOf agrees with the view for shipment ${id}`, false, `rule ${JSON.stringify(want)} vs view ${JSON.stringify(got)}`);
+            // The freight duty is what a container's one forwarder was before: ownerOf still says it.
+            const owner = FC.ownerOf({ shipment: raw, booking: live.find(b => (FC.SCOPE_DUTIES[b.scope || FC.DEFAULT_SCOPE] || []).includes('freight')) || null, forwarderLive: fid => liveForwarders.includes(Number(fid)) });
+            if ((owner.forwarderId ?? null) !== (duties.freight.forwarderId ?? null)) check(`ownerOf is the freight duty for shipment ${id}`, false, `${JSON.stringify(owner)} vs ${JSON.stringify(duties.freight)}`);
         }
-        check(`ownerOf agrees with the view for all ${made.shipments.length} fixture containers`, true);
+        check(`dutiesOf agrees with the view, row for row and flag for flag, for all ${made.shipments.length} fixture containers`, true);
 
         console.log('\nWhat it says of the container: the member orders win, as on the container card');
         const sea = await shipment({ forwarder_id: A, tracking_ref: 'stored-ref', etd: '2026-11-01', eta: '2026-12-01', vessel_name: 'Stored Vessel', loading_date: '2026-11-28', origin_port: 'Ningbo', booking_ref: 'OWN-REF' });
@@ -193,6 +275,15 @@ const CONTAINER_FACTS = COLUMNS.filter(c => !['shipment_id', 'forwarder_id', 'li
         await order(arrivedOrders, { status: 'ARRIVED_AT_WAREHOUSE', arrived_date: await daysAgo(3) });
         v = await rowFor(arrivedOrders, A);
         check('arrived by its orders: stage ARRIVED, arrived_on the latest order\'s', v && v.stage === 'ARRIVED' && v.arrived_on === await daysAgo(3), JSON.stringify(v && [v.stage, v.arrived_on]));
+
+        // What GET /shipments/:id says of the duties is what the view lists, on the containers of every arrangement above.
+        for (const id of [byHand, booked, split, endToEnd, e2eWaiting, p2pWaiting, handE2e, brokerOnly, mixed, removedPick]) {
+            const api = S.rowToShipment(await sync.getShipment(conn, id));
+            const want = FC.attachedOf(api.duties).map(a => [a.forwarderId, a.duties.join()]).sort((x, y) => x[0] - y[0]);
+            const got = (await rowsOf(id)).filter(r => r.link_source !== 'payment')
+                .map(r => [Number(r.forwarder_id), FC.dutiesOfFlags(r).join()]).sort((x, y) => x[0] - y[0]);
+            check(`the duties GET /shipments/${id} gives are the view's`, JSON.stringify(want) === JSON.stringify(got), `api ${JSON.stringify(want)} vs view ${JSON.stringify(got)}`);
+        }
 
         for (const id of [byHand, booked, sea, air, empty, arrivedOrders]) {
             const api = S.rowToShipment(await sync.getShipment(conn, id));
@@ -215,12 +306,57 @@ const CONTAINER_FACTS = COLUMNS.filter(c => !['shipment_id', 'forwarder_id', 'li
         check('arrival taken from the orders when the container holds none: finished', Number((await rowFor(byOrders, A)).finished) === 1);
         check('the library\'s isFinished says the same for both days', FC.isFinished(await daysAgo(14), today) === false && FC.isFinished(await daysAgo(15), today) === true);
 
+        console.log('\nThe delivery date: one form, held by every order or not at all');
+        const delivered = async (values, over = {}) => {
+            const id = await shipment({ forwarder_id: A, forwarder: `${TAG} A`, delivery_forwarder_id: B, ...over });
+            for (const v of values) await order(id, { delivery_date: v });
+            return id;
+        };
+        const dateOf = async id => (await rowFor(id, B)).delivery_date;
+        check('every order at midnight: the day alone', await dateOf(await delivered(['2026-12-20 00:00:00', '2026-12-20 00:00:00'])) === '2026-12-20');
+        check('every order at 09:30: the day and the time, to the minute', await dateOf(await delivered(['2026-12-20 09:30:00', '2026-12-20 09:30:00'])) === '2026-12-20T09:30');
+        check('seconds do not make two orders differ', await dateOf(await delivered(['2026-12-20 09:30:00', '2026-12-20 09:30:45'])) === '2026-12-20T09:30');
+        check('orders that differ: no date', await dateOf(await delivered(['2026-12-20 09:30:00', '2026-12-21 09:30:00'])) === null);
+        check('one order with a date and one without: no date', await dateOf(await delivered(['2026-12-20 00:00:00', null])) === null);
+        check('no order holds one: no date', await dateOf(await delivered([null, null])) === null);
+        check('no orders at all: no date', await dateOf(await delivered([])) === null);
+        const bothSee = await delivered(['2026-12-20 09:30:00']);
+        check('the freight holder is shown the same delivery date as the company that delivers', (await rowFor(bothSee, A)).delivery_date === '2026-12-20T09:30' && (await rowFor(bothSee, B)).delivery_date === '2026-12-20T09:30');
+        for (const values of [['2026-12-20 00:00:00', '2026-12-20 00:00:00'], ['2026-12-20 09:30:00', '2026-12-21 09:30:00'], ['2026-12-20 00:00:00', null]]) {
+            const id = await delivered(values);
+            const held = FC.heldDelivery((await q(`SELECT ${FC.deliverySelect('delivery_date')} AS d FROM orders WHERE shipment_id = ? AND deleted_at IS NULL`, [id])).map(r => r.d));
+            check(`the library's heldDelivery says what the view says for ${JSON.stringify(values)}`, (held.deliveryDate ?? null) === await dateOf(id), JSON.stringify(held));
+        }
+
+        console.log('\nFinished, when someone delivers it: 14 days after the later of the arrival and the delivery');
+        const finishedOf = async id => Number((await rowFor(id, B)).finished);
+        const lateDelivery = await delivered([`${await daysAgo(10)} 00:00:00`], { ata: await daysAgo(20) });
+        check('arrived 20 days ago, delivered 10 days ago: not finished', await finishedOf(lateDelivery) === 0);
+        const oldDelivery = await delivered([`${await daysAgo(15)} 09:30:00`], { ata: await daysAgo(20) });
+        check('arrived 20 days ago, delivered 15 days ago: finished', await finishedOf(oldDelivery) === 1);
+        check('one answer for every row of the container: the freight holder\'s row says the same', Number((await rowFor(oldDelivery, A)).finished) === 1 && Number((await rowFor(lateDelivery, A)).finished) === 0);
+        const awaiting = await shipment({ forwarder_id: A, forwarder: `${TAG} A`, delivery_forwarder_id: B, ata: await daysAgo(30) });
+        await order(awaiting, { status: 'ARRIVED_AT_WAREHOUSE' });
+        check('arrived 30 days ago, a delivery forwarder and no delivery date yet: not finished, so it can still send one', await finishedOf(awaiting) === 0);
+        const closedNoDate = await shipment({ forwarder_id: A, forwarder: `${TAG} A`, delivery_forwarder_id: B, ata: await daysAgo(30) });
+        await order(closedNoDate, { status: 'RECEIVED' });
+        check('the same, every order received (CLOSED): finished by the arrival', await finishedOf(closedNoDate) === 1);
+        const noDeliverer = await shipment({ forwarder_id: A, forwarder: `${TAG} A`, ata: await daysAgo(30) });
+        await order(noDeliverer, { status: 'ARRIVED_AT_WAREHOUSE' });
+        check('nobody delivers it and no delivery date: finished by the arrival, as before duties', Number((await rowFor(noDeliverer, A)).finished) === 1);
+        check('the library\'s isFinished says the same for each', FC.isFinished(await daysAgo(20), today, { deliveryOn: await daysAgo(10) }) === false
+            && FC.isFinished(await daysAgo(20), today, { deliveryOn: await daysAgo(15) }) === true
+            && FC.isFinished(await daysAgo(30), today, { awaitingDelivery: true, closed: false }) === false
+            && FC.isFinished(await daysAgo(30), today, { awaitingDelivery: true, closed: true }) === true
+            && FC.isFinished(await daysAgo(30), today) === true);
+
         console.log('\nA container known only through a payment that was sent');
         const paidOnly = await shipment();
         const p1 = await paymentOn(A, [{ shipment_id: paidOnly }]);
         rows = await rowsOf(paidOnly);
         check('a sent payment on a container with no forwarder: one row, that forwarder\'s, source "payment"', rows.length === 1 && Number(rows[0].forwarder_id) === A && rows[0].link_source === 'payment', JSON.stringify(rows.map(r => [r.forwarder_id, r.link_source])));
         check('a payment-only row carries the ids, the number and the mode and NULL in every other column', rows.length === 1 && rows[0].reference && rows[0].mode === 'SEA' && CONTAINER_FACTS.every(c => rows[0][c] === null), JSON.stringify(rows[0]));
+        check('and it does nothing on the container: 0/0/0', rows.length === 1 && flagsOf(rows[0]) === '0/0/0', rows[0] && flagsOf(rows[0]));
         const lineCols = await q('SELECT * FROM portal_forwarder_payment_lines_v WHERE payment_id = ?', [p1.id]);
         check('the payment\'s line names the container by id', lineCols.length === 1 && Number(lineCols[0].shipment_id) === paidOnly
             && Object.keys(lineCols[0]).sort().join() === 'amount,extra_kind,line_id,payment_id,shipment_id,shipment_reference', JSON.stringify(lineCols[0]));
@@ -273,6 +409,15 @@ const CONTAINER_FACTS = COLUMNS.filter(c => !['shipment_id', 'forwarder_id', 'li
         check('the removed forwarder is listed nothing', (await q('SELECT 1 FROM portal_forwarder_containers_v WHERE forwarder_id = ?', [C])).length === 0);
         const pairs = await q('SELECT shipment_id, forwarder_id, COUNT(*) AS n FROM portal_forwarder_containers_v WHERE shipment_id IN (?) GROUP BY shipment_id, forwarder_id HAVING n > 1', [made.shipments]);
         check('never two rows for one container and forwarder', pairs.length === 0, JSON.stringify(pairs));
+        const sources = await q('SELECT DISTINCT link_source FROM portal_forwarder_containers_v WHERE shipment_id IN (?)', [made.shipments]);
+        check('link_source is one of booking, container, duty, payment', sources.every(r => ['booking', 'container', 'duty', 'payment'].includes(r.link_source)), JSON.stringify(sources));
+        const odd = await q(
+            `SELECT shipment_id, forwarder_id, link_source, does_freight, does_delivery, does_customs FROM portal_forwarder_containers_v
+              WHERE shipment_id IN (?) AND NOT (
+                    (link_source IN ('booking', 'container') AND does_freight = 1)
+                 OR (link_source = 'duty' AND does_freight = 0 AND does_delivery + does_customs >= 1)
+                 OR (link_source = 'payment' AND does_freight + does_delivery + does_customs = 0))`, [made.shipments]);
+        check('"booking" and "container" are the freight holder\'s rows and nobody else\'s: what an older portal build may write for', odd.length === 0, JSON.stringify(odd));
     } catch (e) {
         failed++;
         console.error('\nTHE RUN STOPPED:', e);

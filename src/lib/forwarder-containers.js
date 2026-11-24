@@ -74,6 +74,144 @@ function ownerOf({ shipment, booking, forwarderLive }) {
     return found;
 }
 
+// ── three duties, one holder each (2026-11-24) ───────────────────────────
+//
+// A container is no longer one forwarder's. It has three DUTIES, each with at
+// most one holder, and one forwarder may hold several:
+//
+//   freight   origin to the UK port: the number, the loading and departure
+//             dates, the loading photos, the bill of lading (all of what a
+//             forwarder was asked for before this)
+//   delivery  UK port to the warehouse: the delivery date
+//   customs   the customs entry: the draft entry
+//
+// "End to end" is one forwarder holding freight and delivery; "port to port" is
+// freight alone. WHO HOLDS A DUTY is ownerOf's rule, applied per duty: the live
+// booking that covers it (its `scope`) outranks the pick on the container, and a
+// covering booking still waiting for the forwarder leaves THAT duty with nobody.
+// Customs is picked by hand only. ownerOf above is exactly the freight duty.
+//
+// One rule, held twice, as before: dutiesOf (on rows a route has locked) and
+// the view portal_forwarder_containers_v (2026-11-24_11).
+
+const DUTIES = Object.freeze(['freight', 'delivery', 'customs']);
+// What a booking may cover. Slice D adds 'delivery' (a booking for the UK leg alone).
+const BOOKING_SCOPES = Object.freeze(['port_to_port', 'end_to_end']);
+// A booking that says nothing covers what every booking covered before: freight.
+const DEFAULT_SCOPE = 'port_to_port';
+const SCOPE_DUTIES = Object.freeze({ port_to_port: Object.freeze(['freight']), end_to_end: Object.freeze(['freight', 'delivery']) });
+/**
+ * What a booking is said to cover. Nothing said (`undefined`) is DEFAULT_SCOPE:
+ * an older client that sends no scope can never grant the delivery duty, and
+ * the option's own service text is never read for it.
+ * → { scope } | { error }
+ */
+function scopeGiven(value) {
+    if (value === undefined) return { scope: DEFAULT_SCOPE };
+    return typeof value === 'string' && BOOKING_SCOPES.includes(value)
+        ? { scope: value }
+        : { error: `scope must be one of: ${BOOKING_SCOPES.join(', ')}.` };
+}
+// The pick on the container for each duty.
+const PICK_COLUMN = Object.freeze({ freight: 'forwarder_id', delivery: 'delivery_forwarder_id', customs: 'customs_forwarder_id' });
+
+/**
+ * Who holds each duty of a container.
+ *   shipment       the shipments row (or null), with its three picks
+ *   bookings       its bookings with the request's forwarder:
+ *                  [{ id, status, scope, forwarder_id }] (only live ones count)
+ *   forwarderLive  id => is that forwarder on the list and not removed
+ * → { freight, delivery, customs }, each
+ *   { forwarderId, source: 'booking' | 'container', bookingId? }
+ *   or { forwarderId: null, why } with ownerOf's reasons.
+ */
+function dutiesOf({ shipment, bookings, forwarderLive }) {
+    const none = why => ({ forwarderId: null, why });
+    const all = why => Object.fromEntries(DUTIES.map(d => [d, none(why)]));
+    if (!shipment || shipment.deleted_at || shipment.merged_into_id != null) return all('gone');
+    if (!isReal(shipment)) return all('not_real');
+    const liveBookings = (bookings || []).filter(b => b && LIVE_BOOKING_STATUSES.includes(b.status));
+    const out = {};
+    for (const duty of DUTIES) {
+        // At most one live booking covers a duty (a unique key); the newest, should rows ever disagree.
+        const covering = liveBookings
+            .filter(b => (SCOPE_DUTIES[b.scope || DEFAULT_SCOPE] || []).includes(duty))
+            .sort((a, b) => Number(b.id || 0) - Number(a.id || 0))[0] || null;
+        let found;
+        if (covering) {
+            if (covering.status !== 'confirmed') { out[duty] = none('booking_not_confirmed'); continue; }
+            found = { forwarderId: idOrNull(covering.forwarder_id), source: 'booking', ...(covering.id != null ? { bookingId: Number(covering.id) } : {}) };
+        } else if (shipment[PICK_COLUMN[duty]] != null) {
+            found = { forwarderId: Number(shipment[PICK_COLUMN[duty]]), source: 'container' };
+        } else {
+            // Only the freight pick was ever typed as text.
+            out[duty] = none(duty === 'freight' && String(shipment.forwarder ?? '').trim() ? 'forwarder_not_listed' : 'no_forwarder');
+            continue;
+        }
+        if (found.forwarderId == null) out[duty] = none('no_forwarder');
+        else if (!forwarderLive(found.forwarderId)) out[duty] = none('forwarder_removed');
+        else out[duty] = found;
+    }
+    return out;
+}
+
+/** The duties one forwarder holds, in DUTIES' order. */
+function heldBy(duties, forwarderId) {
+    if (forwarderId == null || !duties) return [];
+    const id = Number(forwarderId);
+    return DUTIES.filter(d => duties[d] && duties[d].forwarderId != null && Number(duties[d].forwarderId) === id);
+}
+
+/** The forwarders attached to a container: [{ forwarderId, duties, sources }], the freight holder first. */
+function attachedOf(duties) {
+    const out = [];
+    for (const duty of DUTIES) {
+        const h = duties && duties[duty];
+        if (!h || h.forwarderId == null) continue;
+        let entry = out.find(e => e.forwarderId === Number(h.forwarderId));
+        if (!entry) { entry = { forwarderId: Number(h.forwarderId), duties: [], sources: {} }; out.push(entry); }
+        entry.duties.push(duty);
+        entry.sources[duty] = h.source;
+    }
+    return out;
+}
+
+/** The duties a row of portal_forwarder_containers_v (or a row joined to it) says its forwarder holds. */
+const dutiesOfFlags = row => DUTIES.filter(d => Number(row && row[`does_${d}`]) === 1);
+
+/** Those flags shaped as dutiesOf's answer, for the one forwarder the row is of (`row.forwarder_id`). */
+function dutiesFromFlags(row) {
+    const held = dutiesOfFlags(row);
+    return Object.fromEntries(DUTIES.map(d => [d, held.includes(d) && row.forwarder_id != null
+        ? { forwarderId: Number(row.forwarder_id), source: 'view' }
+        : { forwarderId: null, why: 'no_forwarder' }]));
+}
+
+/**
+ * The view's link_source for one forwarder: 'booking' or 'container' ONLY for
+ * the freight holder (what those two words meant before, and all an older
+ * portal build treats as a row it may write for); 'duty' for a holder of
+ * delivery and/or customs without freight; null for one that holds nothing.
+ */
+function linkSourceOf(duties, forwarderId) {
+    const held = heldBy(duties, forwarderId);
+    if (!held.length) return null;
+    return held.includes('freight') ? duties.freight.source : 'duty';
+}
+
+/**
+ * What one forwarder is shown of a container, by duty.
+ * → { mode: 'full', source: 'booking' | 'container' | 'duty', duties: [...] }
+ *   { mode: 'payment', source: 'payment', duties: [] }   its payments only
+ *   { mode: 'none', source: null, duties: [] }
+ */
+function accessFor({ duties, real, forwarderId, paidForwarderIds }) {
+    const held = heldBy(duties, forwarderId);
+    if (held.length) return { mode: 'full', source: linkSourceOf(duties, forwarderId), duties: held };
+    if (real && (paidForwarderIds || []).map(Number).includes(Number(forwarderId))) return { mode: 'payment', source: 'payment', duties: [] };
+    return { mode: 'none', source: null, duties: [] };
+}
+
 /**
  * What one forwarder is shown of a container.
  *   owner             ownerOf's answer
@@ -95,12 +233,22 @@ const dayNumber = (ymd) => {
     return m ? Math.round(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])) / 86400000) : null;
 };
 
-/** Finished: more than FINISHED_AFTER_DAYS days after it arrived. Dates only. */
-function isFinished(arrivedOn, today) {
+/**
+ * Finished: more than FINISHED_AFTER_DAYS days after the later of the day it
+ * arrived and the latest delivery day held (`deliveryOn`). Dates only. One rule
+ * for every forwarder of the container, so the one that delivers is not shut
+ * out before it has. While a delivery holder exists and no order holds a
+ * delivery date (`awaitingDelivery`), it is not finished until the container
+ * is CLOSED (`closed`: every order received); then the fortnight from the
+ * arrival applies.
+ */
+function isFinished(arrivedOn, today, { deliveryOn = null, awaitingDelivery = false, closed = false } = {}) {
     const a = dayNumber(arrivedOn);
     const t = dayNumber(today);
     if (a == null || t == null) return false;
-    return t > a + FINISHED_AFTER_DAYS;
+    if (awaitingDelivery && !closed) return false;
+    const d = dayNumber(deliveryOn);
+    return t > Math.max(a, d == null ? a : d) + FINISHED_AFTER_DAYS;
 }
 
 /**
@@ -154,14 +302,27 @@ function noticeState(row, { shipmentId, forwarderId }) {
     return 'send_unconfirmed';
 }
 
-/** What the email asks for: what we do not hold yet, and always the papers. */
-function containerAsks(held) {
+/**
+ * What the email asks one company for: of ITS duties, what we do not hold yet,
+ * and always its papers. `held`: the duties that company holds (freight alone
+ * when not said, as every forwarder was before 2026-11-24). A company that
+ * carries only the UK leg, or only customs, is never asked for the number, the
+ * loading date, the loading photos or the bill of lading.
+ */
+function containerAsks(held, dutiesHeld = ['freight']) {
     const h = held || {};
+    const mine = dutiesHeld || [];
+    if (!mine.length) return [];
     const asks = [];
-    if (!h.ecn) asks.push('ecn');
-    if (!h.loadingDate) asks.push('loadingDate');
-    if (!h.etd) asks.push('etd');
-    asks.push('invoice', 'photos', 'billOfLading');
+    if (mine.includes('freight')) {
+        if (!h.ecn) asks.push('ecn');
+        if (!h.loadingDate) asks.push('loadingDate');
+        if (!h.etd) asks.push('etd');
+    }
+    if (mine.includes('delivery') && !h.deliveryDate) asks.push('deliveryDate');
+    asks.push('invoice');
+    if (mine.includes('freight')) asks.push('photos', 'billOfLading');
+    if (mine.includes('customs')) asks.push('customsDraft');
     return asks;
 }
 
@@ -182,7 +343,24 @@ const containerUrl = (base, shipmentId) => `${String(base || '').replace(/\/+$/,
 //           since the claim, and then the dates are written and the proposal
 //           is marked accepted, in one transaction.
 
-const DETAIL_FIELDS = Object.freeze(['ecn', 'loadingDate', 'etd']);
+// What a forwarder could propose before 2026-11-24, and all a ShipLine build from before then shows.
+const ORIGINAL_FIELDS = Object.freeze(['ecn', 'loadingDate', 'etd']);
+// With the delivery date (2026-11-24): proposed by whoever delivers to the warehouse.
+const DETAIL_FIELDS = Object.freeze([...ORIGINAL_FIELDS, 'deliveryDate']);
+// The duty each field belongs to: a forwarder proposes only the fields of the duties it holds.
+const FIELD_DUTY = Object.freeze({ ecn: 'freight', loadingDate: 'freight', etd: 'freight', deliveryDate: 'delivery' });
+/** The fields of a proposal (`requested`) that are outside the duties its forwarder holds. */
+const fieldsOutside = (requested, dutiesHeld) => Object.keys(requested || {}).filter(f => !(dutiesHeld || []).includes(FIELD_DUTY[f]));
+/**
+ * Does the client deciding a proposal know everything it carries? A field
+ * beyond the original three must be NAMED by the call (`named`: the keys of a
+ * claim's `expected`, a send-back's `fields`): a ShipLine build from before
+ * that field shows three rows and names three, and must not decide a fourth it
+ * cannot show. A proposal of the original three is decided exactly as before.
+ */
+const clientKnows = (requested, named) => Object.keys(requested || {})
+    .filter(f => !ORIGINAL_FIELDS.includes(f))
+    .every(f => Array.isArray(named) && named.includes(f));
 // A claim nobody finished or released is no claim after this long.
 const CLAIM_MINUTES = 10;
 const NOTE_MIN = 3;
@@ -194,6 +372,72 @@ const validDay = (v) => {
     const d = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])));
     return d.getUTCFullYear() === Number(m[1]) && d.getUTCMonth() === Number(m[2]) - 1 && d.getUTCDate() === Number(m[3]) ? m[0] : null;
 };
+
+// ── the delivery date: a wall-clock value, as text, to the minute ────────
+//
+// orders.delivery_date is a DATETIME that staff type on the container card,
+// always with a time. A forwarder proposes a day, with a time when one is
+// booked. ONE form everywhere it is compared: 'YYYY-MM-DD' when the hour and
+// minute are 00:00, else 'YYYY-MM-DDTHH:MM'. "No time" and midnight are the
+// same thing by design, and seconds never count. What we HOLD comes out of SQL
+// in this form already (DELIVERY_SQL below, the same expression the portal's
+// view uses), so no Date object is involved; what comes IN goes through
+// normDelivery. The portal and ShipLine carry the same rule and the same
+// test vectors.
+
+/** A delivery value in the one form, or null when it is not one. */
+function normDelivery(v) {
+    const m = /^(\d{4}-\d{2}-\d{2})(?:[T ](\d{2}):(\d{2})(?::\d{2}(?:\.\d+)?)?)?$/.exec(typeof v === 'string' ? v.trim() : '');
+    if (!m || !validDay(m[1])) return null;
+    if (m[2] === undefined) return m[1];
+    if (Number(m[2]) > 23 || Number(m[3]) > 59) return null;
+    return m[2] === '00' && m[3] === '00' ? m[1] : `${m[1]}T${m[2]}:${m[3]}`;
+}
+/** The day a delivery value falls on. */
+const deliveryDay = (v) => { const n = normDelivery(v); return n ? n.slice(0, 10) : null; };
+/** A delivery value as it is written to orders.delivery_date: the shape a hand-typed one has. */
+const deliverySql = (v) => { const n = normDelivery(v); return n ? `${n.slice(0, 10)} ${n.length > 10 ? n.slice(11) : '00:00'}:00` : null; };
+/**
+ * The delivery value of a column, in the one form, for a SELECT. A zero date
+ * (some imported rows hold one) is no date.
+ */
+const deliverySelect = col => `IF(${col} >= '1000-01-01 00:00:00', IF(DATE_FORMAT(${col}, '%H:%i') = '00:00', DATE_FORMAT(${col}, '%Y-%m-%d'), DATE_FORMAT(${col}, '%Y-%m-%dT%H:%i')), NULL)`;
+
+const byText = (a, b) => (a === b ? 0 : a === null ? -1 : b === null ? 1 : a < b ? -1 : 1);
+/**
+ * What a container holds for delivery, from the value of EVERY member order
+ * (null for an order without one).
+ * → { deliveryDate, deliveryMixed }: the value they all share (null when none
+ *   has one), or deliveryDate null with deliveryMixed the distinct values in
+ *   order, null first when an order has none.
+ */
+function heldDelivery(values) {
+    const distinct = [...new Set((values || []).map(v => normDelivery(v)))].sort(byText);
+    if (distinct.length <= 1) return { deliveryDate: distinct[0] ?? null, deliveryMixed: null };
+    return { deliveryDate: null, deliveryMixed: distinct };
+}
+/** The delivery days a container holds, whether its orders agree or not. */
+function heldDeliveryDays(held) {
+    const h = held || {};
+    const values = Array.isArray(h.deliveryMixed) ? h.deliveryMixed : [h.deliveryDate];
+    return values.map(deliveryDay).filter(Boolean);
+}
+
+/**
+ * What a claim records of the container: what it holds (`held`: ecn,
+ * loadingDate, etd), and, per member order (`members`: [{ id, delivery_at }],
+ * read under the lock), which orders are on it and what each holds for
+ * delivery. finishRefusal compares all of it.
+ */
+function claimSnapshot(held, members) {
+    const rows = [...(members || [])].sort((a, b) => Number(a.id) - Number(b.id));
+    return {
+        ...held,
+        ...heldDelivery(rows.map(m => m.delivery_at)),
+        members: rows.map(m => Number(m.id)),
+        deliveryByOrder: Object.fromEntries(rows.map(m => [Number(m.id), normDelivery(m.delivery_at)])),
+    };
+}
 
 /** A carrier number as it is COMPARED: upper case, no spaces or hyphens. null when empty. */
 const normEcn = (v) => String(v ?? '').toUpperCase().replace(/[\s-]+/g, '') || null;
@@ -235,7 +479,7 @@ function ecnProblem(mode, value) {
     return checkDigitOk(n) ? null : 'check_digit';
 }
 
-/** What a proposal asks for: any of ecn, loadingDate, etd, and nothing else. From requested_json. */
+/** What a proposal asks for: any of ecn, loadingDate, etd, deliveryDate, and nothing else. From requested_json. */
 function proposalOf(json) {
     let raw = json;
     if (typeof json === 'string') { try { raw = JSON.parse(json); } catch { raw = null; } }
@@ -247,6 +491,8 @@ function proposalOf(json) {
         const day = validDay(raw[key]);
         if (day) out[key] = day;
     }
+    const delivery = normDelivery(raw.deliveryDate);
+    if (delivery) out.deliveryDate = delivery;
     return out;
 }
 
@@ -265,38 +511,78 @@ const isWaiting = row => Boolean(row) && (row.status === 'pending' || (row.statu
 const claimActive = row => Boolean(row) && row.status === 'applying' && Number(row.lapsed) !== 1;
 
 /**
+ * Why a proposal's forwarder may no longer have it accepted; null when it may.
+ * `duties`: who holds what on the locked rows (dutiesOf). A proposal is
+ * accepted or dismissed WHOLE: one field outside the duties its forwarder
+ * holds now makes all of it dismiss-only.
+ *   NOT_THEIR_CONTAINER   the forwarder holds nothing on the container
+ *   NOT_THEIR_DUTY        it holds something, but not what `fields` need
+ */
+function dutyRefusal({ row, duties }) {
+    const held = heldBy(duties, row.forwarder_id);
+    if (!held.length) return { code: 'NOT_THEIR_CONTAINER' };
+    const outside = fieldsOutside(proposalOf(row.requested_json), held);
+    return outside.length ? { code: 'NOT_THEIR_DUTY', fields: outside } : null;
+}
+
+/**
  * Why a proposal cannot be claimed; null when it can. `rows`: EVERY proposal
  * row of the container (all forwarders), read under the lock, each with
- * `lapsed`; `ownerForwarderId`: whose container it is on the locked rows.
+ * `lapsed`; `duties`: who holds what on the locked rows (dutiesOf).
  */
-function claimRefusal({ rows, id, ownerForwarderId }) {
+function claimRefusal({ rows, id, duties }) {
     const row = (rows || []).find(r => Number(r.id) === Number(id));
     if (!row) return { code: 'NO_SUCH_PROPOSAL' };
     const busy = (rows || []).find(claimActive);
     if (busy) return { code: 'CLAIM_IN_PROGRESS', claimedBy: busy.claimed_by || null, claimedAt: busy.claimed_at_iso || null };
     if (!isWaiting(row)) return { code: 'ALREADY_DECIDED' };
     if (Number(liveProposal(rows, row.forwarder_id).id) !== Number(row.id)) return { code: 'SUPERSEDED' };
-    if (ownerForwarderId == null || Number(ownerForwarderId) !== Number(row.forwarder_id)) return { code: 'NOT_THEIR_CONTAINER' };
-    return null;
+    return dutyRefusal({ row, duties });
 }
 
 const sameField = (field, a, b) => (field === 'ecn' ? normEcn(a) === normEcn(b) : (a || null) === (b || null));
+const mixedKey = v => (Array.isArray(v) ? JSON.stringify(v.map(x => normDelivery(x)).sort(byText)) : '');
 
-/** The fields in which what was expected differs from what the container holds. */
+/**
+ * The fields in which what was expected differs from what the container holds.
+ * The delivery date is compared only when `expected` NAMES it (it has the key):
+ * a ShipLine build from before the delivery date names three fields, and a
+ * proposal of those three is decided on those three, as before. One that
+ * carries a delivery date cannot be decided by such a build at all (clientKnows).
+ */
 function heldDiff(expected, held) {
     const e = expected || {};
     const h = held || {};
-    return DETAIL_FIELDS.filter(f => !sameField(f, e[f], h[f]));
+    const moved = ORIGINAL_FIELDS.filter(f => !sameField(f, e[f], h[f]));
+    if (Object.prototype.hasOwnProperty.call(e, 'deliveryDate')
+        && (normDelivery(e.deliveryDate) !== normDelivery(h.deliveryDate) || mixedKey(e.deliveryMixed) !== mixedKey(h.deliveryMixed))) {
+        moved.push('deliveryDate');
+    }
+    return moved;
 }
 
-/** Loading on or before departure, once this proposal is applied over what is held. */
-function datesInOrder(requested, held) {
+/**
+ * The dates that would be out of order once this proposal is applied over what
+ * is held, or null: loading on or before departure, departure on or before
+ * EVERY delivery day (each one held, when the orders differ), by the day. A
+ * pair is judged only when the proposal touches one of its sides: what we hold
+ * in disorder already is not this proposal's to answer for. So a delivery date
+ * before the departure is refused, and so is a departure moved past a delivery
+ * date already held.
+ * → null | ['loadingDate', 'etd'] | ['etd', 'deliveryDate'] | ['loadingDate', 'deliveryDate']
+ */
+function orderProblem(requested, held) {
     const r = requested || {};
-    if (!r.loadingDate && !r.etd) return true;
-    const loading = r.loadingDate || (held && held.loadingDate) || null;
-    const etd = r.etd || (held && held.etd) || null;
-    return !(loading && etd && loading > etd);
+    const h = held || {};
+    const loading = r.loadingDate || h.loadingDate || null;
+    const etd = r.etd || h.etd || null;
+    const deliveries = r.deliveryDate ? [deliveryDay(r.deliveryDate)].filter(Boolean) : heldDeliveryDays(h);
+    if ((r.loadingDate || r.etd) && loading && etd && loading > etd) return ['loadingDate', 'etd'];
+    if ((r.etd || r.deliveryDate) && etd && deliveries.some(d => d < etd)) return ['etd', 'deliveryDate'];
+    if ((r.loadingDate || r.deliveryDate) && loading && deliveries.some(d => d < loading)) return ['loadingDate', 'deliveryDate'];
+    return null;
 }
+const datesInOrder = (requested, held) => orderProblem(requested, held) === null;
 
 /**
  * What the container must hold at finish, apart from what the proposal changes:
@@ -318,19 +604,39 @@ function finishBaseline({ claim, requested, ecnReset }) {
  * Why a claimed proposal cannot be finished; null when it can.
  *   memberEcns  the carrier number each member order holds (null for none)
  *   held        what the container holds now, as the API derives it
+ *   members     the member orders now, read under the lock: [{ id, delivery_at }]
+ * The one INTENDED difference from what the claim saw is the number: when the
+ * proposal carries one, it must be on every member order now (the browser wrote
+ * it between the claim and this), with the departure date its own reset wrote
+ * (finishBaseline). Everything else must be as the claim recorded it: the
+ * loading and departure dates, WHICH orders are on the container, and what each
+ * holds for delivery. A claim from before those two were recorded (in flight
+ * across a deploy) is not judged on them.
  */
-function finishRefusal({ requested, claim, ecnReset, memberEcns, held }) {
+function finishRefusal({ requested, claim, ecnReset, memberEcns, held, members }) {
     const r = requested || {};
     const h = held || {};
+    const c = claim || {};
     if (r.ecn) {
         const want = normEcn(r.ecn);
-        const members = memberEcns || [];
-        if (!members.length || members.some(e => normEcn(e) !== want) || normEcn(h.ecn) !== want) return { code: 'NOT_ON_CONTAINER', fields: ['ecn'] };
+        const ecns = memberEcns || [];
+        if (!ecns.length || ecns.some(e => normEcn(e) !== want) || normEcn(h.ecn) !== want) return { code: 'NOT_ON_CONTAINER', fields: ['ecn'] };
     }
     const baseline = finishBaseline({ claim, requested: r, ecnReset });
-    const moved = DETAIL_FIELDS.filter(f => !(f === 'ecn' && r.ecn) && !sameField(f, h[f], baseline[f]));
+    const moved = ORIGINAL_FIELDS.filter(f => !(f === 'ecn' && r.ecn) && !sameField(f, h[f], baseline[f]));
     if (moved.length) return { code: 'CONTAINER_CHANGED', fields: moved };
-    if (!datesInOrder(r, h)) return { code: 'DATES_OUT_OF_ORDER', fields: ['loadingDate', 'etd'] };
+    const now = claimSnapshot({}, members);
+    if (Array.isArray(c.members) && JSON.stringify(c.members.map(Number).sort((a, b) => a - b)) !== JSON.stringify(now.members)) {
+        return { code: 'CONTAINER_CHANGED', fields: ['members'] };
+    }
+    if (c.deliveryByOrder && typeof c.deliveryByOrder === 'object'
+        && now.members.some(id => normDelivery(c.deliveryByOrder[id]) !== now.deliveryByOrder[id])) {
+        return { code: 'CONTAINER_CHANGED', fields: ['deliveryDate'] };
+    }
+    // A delivery date needs an order to carry it, as a number does.
+    if (r.deliveryDate && !now.members.length) return { code: 'NO_ORDERS', fields: ['deliveryDate'] };
+    const order = orderProblem(r, { ...h, deliveryDate: now.deliveryDate, deliveryMixed: now.deliveryMixed });
+    if (order) return { code: 'DATES_OUT_OF_ORDER', fields: order };
     return null;
 }
 
@@ -356,7 +662,25 @@ function noteProblem(v) {
 // container's invoices, a photo with its photos, a bill of lading with its
 // forwarder documents) or send it back with a note the forwarder reads.
 
-const UPLOAD_KINDS = Object.freeze(['invoice', 'loading_photo', 'bill_of_lading']);
+// The kinds a forwarder could send before 2026-11-24, and all a ShipLine build from before then shows.
+const ORIGINAL_KINDS = Object.freeze(['invoice', 'loading_photo', 'bill_of_lading']);
+// With the DRAFT customs entry (2026-11-24): sent by whoever handles the container's customs, for our
+// team to approve or send back before it is lodged. 13 characters: the portal's kind column holds 16.
+const UPLOAD_KINDS = Object.freeze([...ORIGINAL_KINDS, 'customs_draft']);
+// The duty a kind of file belongs to. An invoice (null) is anyone's who holds a duty: each company bills its own part.
+const KIND_DUTY = Object.freeze({ invoice: null, loading_photo: 'freight', bill_of_lading: 'freight', customs_draft: 'customs' });
+/**
+ * Does the client deciding a file know its kind? A kind beyond the original three must be
+ * NAMED by the call (`named`: the `kind` it sends): a ShipLine build from before that kind
+ * must not accept or send back a file it has no words for.
+ */
+const clientKnowsKind = (kind, named) => ORIGINAL_KINDS.includes(kind) || named === kind;
+/** May a forwarder that holds `dutiesHeld` send a file of this kind? */
+function kindAllowed(kind, dutiesHeld) {
+    if (!Object.prototype.hasOwnProperty.call(KIND_DUTY, kind)) return false;
+    const mine = dutiesHeld || [];
+    return KIND_DUTY[kind] === null ? mine.length > 0 : mine.includes(KIND_DUTY[kind]);
+}
 const DOCUMENT_TYPES = Object.freeze(['application/pdf', 'image/png', 'image/jpeg']);
 const PICTURE_TYPES = Object.freeze(['image/png', 'image/jpeg']);
 const MB = 1024 * 1024;
@@ -365,10 +689,12 @@ const UPLOAD_RULES = Object.freeze({
     invoice: Object.freeze({ types: DOCUMENT_TYPES, maxBytes: 10 * MB }),
     loading_photo: Object.freeze({ types: PICTURE_TYPES, maxBytes: 15 * MB }),
     bill_of_lading: Object.freeze({ types: DOCUMENT_TYPES, maxBytes: 15 * MB }),
+    customs_draft: Object.freeze({ types: DOCUMENT_TYPES, maxBytes: 15 * MB }),
 });
 const UPLOAD_EXTENSIONS = Object.freeze({ 'application/pdf': 'pdf', 'image/png': 'png', 'image/jpeg': 'jpg' });
-// Our bucket's folder for each kind: an invoice beside the invoices, a photo beside the photos.
-const FILED_FOLDERS = Object.freeze({ invoice: 'shipment-payments', loading_photo: 'container-photos', bill_of_lading: 'forwarder-documents' });
+// Our bucket's folder for each kind: an invoice beside the invoices, a photo beside the photos,
+// a bill of lading and a draft customs entry with the forwarder documents.
+const FILED_FOLDERS = Object.freeze({ invoice: 'shipment-payments', loading_photo: 'container-photos', bill_of_lading: 'forwarder-documents', customs_draft: 'forwarder-documents' });
 
 const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
 const PDF_MARKER = [0x25, 0x50, 0x44, 0x46, 0x2d];
@@ -407,19 +733,22 @@ function uploadReviewState(row) {
 }
 
 /**
- * Why an upload cannot be accepted or sent back; null when it can. `ownerForwarderId`:
- * whose container it is on the locked rows. One that is no longer its forwarder's can be
- * sent back (dismissed), never accepted.
+ * Why an upload cannot be accepted or sent back; null when it can. `duties`: who holds
+ * what on the locked rows (dutiesOf). A file from a company that no longer holds its
+ * kind's duty can be sent back (dismissed), never accepted: NOT_THEIR_CONTAINER when the
+ * company holds nothing on the container, NOT_THEIR_DUTY (`kind`) when it holds another.
  */
-function uploadGate({ row, ownerForwarderId, action }) {
+function uploadGate({ row, duties, action }) {
     const no = (status, code, allowedNext = ['reload']) => ({ status, code, allowedNext });
     if (!row) return no(404, 'NO_SUCH_UPLOAD');
     const state = uploadReviewState(row);
     if (state === 'withdrawn') return no(409, 'WITHDRAWN');
     if (state === 'not_sent') return no(409, 'NOT_SENT');
     if (state !== 'open') return no(409, 'ALREADY_DECIDED');
-    if (action === 'accept' && (ownerForwarderId == null || Number(ownerForwarderId) !== Number(row.forwarder_id))) {
-        return no(409, 'NOT_THEIR_CONTAINER', ['reject']);
+    if (action === 'accept') {
+        const held = heldBy(duties, row.forwarder_id);
+        if (!held.length) return no(409, 'NOT_THEIR_CONTAINER', ['reject']);
+        if (!kindAllowed(row.kind, held)) return { ...no(409, 'NOT_THEIR_DUTY', ['reject']), kind: row.kind };
     }
     return null;
 }
@@ -473,9 +802,11 @@ function filedKeyFor({ kind, random, filename, contentType }) {
 module.exports = {
     REAL_STAGES, LIVE_BOOKING_STATUSES, FINISHED_AFTER_DAYS, DECIDE_ROLES,
     mayDecide, isReal, ownerOf, visibilityFor, isFinished, paymentsOnContainer,
+    DUTIES, BOOKING_SCOPES, DEFAULT_SCOPE, SCOPE_DUTIES, PICK_COLUMN, scopeGiven, dutiesOf, heldBy, attachedOf, linkSourceOf, accessFor, dutiesOfFlags, dutiesFromFlags,
     isSendKey, noticeState, containerAsks, containerUrl,
-    DETAIL_FIELDS, CLAIM_MINUTES, NOTE_MIN, NOTE_MAX,
-    validDay, normEcn, ecnProblem, proposalOf, liveProposal, isWaiting, claimRefusal, heldDiff, datesInOrder,
+    ORIGINAL_FIELDS, DETAIL_FIELDS, FIELD_DUTY, fieldsOutside, clientKnows, CLAIM_MINUTES, NOTE_MIN, NOTE_MAX,
+    normDelivery, deliveryDay, deliverySql, deliverySelect, heldDelivery, claimSnapshot,
+    validDay, normEcn, ecnProblem, proposalOf, liveProposal, isWaiting, dutyRefusal, claimRefusal, heldDiff, orderProblem, datesInOrder,
     finishBaseline, finishRefusal, toReviewCount, cleanNote, noteProblem,
-    UPLOAD_KINDS, UPLOAD_RULES, uploadType, uploadFileRefusal, uploadReviewState, uploadGate, filingName, filingNameClash, filedKeyFor,
+    ORIGINAL_KINDS, UPLOAD_KINDS, KIND_DUTY, kindAllowed, clientKnowsKind, UPLOAD_RULES, uploadType, uploadFileRefusal, uploadReviewState, uploadGate, filingName, filingNameClash, filedKeyFor,
 };

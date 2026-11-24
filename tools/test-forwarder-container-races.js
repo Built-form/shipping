@@ -26,6 +26,17 @@
 //     forwarder, and two accepts at once on two connections (filed once, both
 //     told the same row). The two buckets are a stand-in: no file is sent.
 //
+//   - THREE DUTIES (2026-11-24): a container's freight, delivery and customs can
+//     be three companies'. The same two things, for a company that delivers: its
+//     write waits for a change of the delivery pick, of a booking's scope, of its
+//     own place on the Forwarders list; a decision on a delivery date waits for
+//     them too, and a finish is refused when the duty moved after the claim, a
+//     delivery date was typed on an order, or an order joined or left. Also: a
+//     person who is a contact of two companies on one container writes only for
+//     the one the page's block names; a portal build from BEFORE duties, with its
+//     own statement, cannot write for a company that does not carry the freight;
+//     and a ShipLine build from before the delivery date cannot decide one.
+//
 // It WRITES: fixture rows of its own (forwarders, contacts, shipments, orders,
 // freight requests, options and bookings, rows of the portal's two tables, and
 // the forwarder documents its accepts file),
@@ -35,14 +46,19 @@
 //
 //   node tools/test-forwarder-container-races.js --confirm-host <DB_HOST>
 //
-// Needs the migrations of 2026-11-23 applied here, and the portal's
-// (jportal's 2026-11-23_jportal_forwarder_containers.sql).
+// Needs the migrations of 2026-11-23 and 2026-11-24 applied here, and the
+// portal's (jportal's 2026-11-23_jportal_forwarder_containers.sql). PART OF THE
+// RELEASE GATE of the duties work: run it on TEST after its migration, before
+// anything is deployed. If the portal's statement does not WAIT on the regrouped
+// view, the release stops there.
 require('dotenv').config();
 const crypto = require('crypto');
 const mysql = require('mysql2/promise');
 const { getPool, closePool } = require('../src/db');
 const { jportalSchema } = require('../src/lib/jportal');
 const S = require('../src/lib/shipments');
+const FC = require('../src/lib/forwarder-containers');
+const FL = require('../src/lib/forwarder-links');
 const sync = require('../src/services/shipment-sync');
 const R = require('../src/services/forwarder-container-routes');
 const U = require('../src/services/forwarder-upload-routes');
@@ -93,7 +109,7 @@ const check = (name, ok, detail = '') => {
         n += 1;
         return ins('shipments', { reference: `ZZR${HEX}-${n}`, name: `${TAG} ${n}`, mode: 'SEA', stage: 'BOOKED', origin: 'api', created_by_email: 'race-test@tools', ...over });
     };
-    const booking = async (shipmentId, forwarderId, status) => {
+    const booking = async (shipmentId, forwarderId, status, over = {}) => {
         const request = await ins('freight_quote_requests', {
             token: crypto.randomBytes(24).toString('hex'), batch_id: crypto.randomUUID(), forwarder_id: forwarderId, forwarder_name: TAG,
             window_start_date: '2026-12-01', window_end_date: '2026-12-31', container_size: '40HQ', services: '["Door to door"]',
@@ -103,17 +119,40 @@ const check = (name, ok, detail = '') => {
             request_id: request, answer_no: 1, line_no: 1, loading_date: '2026-12-10', sailing_date: '2026-12-15', transit_days: 30,
             port_from: 'Ningbo', port_to: 'Felixstowe', service: 'Door to door', container_size: '40HQ', price: 1850, currency: 'USD',
         });
-        return ins('freight_bookings', { request_id: request, option_id: option, status, requested_at: '2026-11-20 10:00:00', shipment_id: shipmentId });
+        return ins('freight_bookings', { request_id: request, option_id: option, status, requested_at: '2026-11-20 10:00:00', shipment_id: shipmentId, ...over });
     };
 
     // The portal's own statement for a container's number and dates (jportal
-    // src/handlers/forwarderContainers.js), word for word in its WHERE: the row
-    // exists only if, in this statement's own read, the container is the
-    // caller's IN FULL and takes submissions.
+    // src/handlers/forwarderContainers.js proposalSql.insert), word for word in
+    // its WHERE: the row exists only if, in this statement's own read, the
+    // container is in full the company's the page's block is for (the handler
+    // finds that company from the block's key, among the caller's own rows), that
+    // company holds the duties the fields sent need, the container takes
+    // submissions, and the caller is one of that company's contacts.
     const PORTAL_INSERT = `
         INSERT INTO ${jp}.forwarder_container_details
                (shipment_id, container_ref, forwarder_id, submit_key, user_id, user_email, user_name, base_json, requested_json, note)
-        SELECT c.shipment_id, c.reference, c.forwarder_id, ?, 0, ?, 'Race Test', '{}', '{"ecn":"ZZZU0000000"}', NULL
+        SELECT c.shipment_id, c.reference, c.forwarder_id, ?, 0, ?, 'Race Test', '{}', ?, NULL
+          FROM portal_forwarder_containers_v c
+         WHERE c.shipment_id = ?
+           AND c.link_source IN ('booking', 'container', 'duty')
+           AND c.finished = 0
+           AND c.forwarder_id = ?
+           AND (? = 0 OR c.does_freight = 1)
+           AND (? = 0 OR c.does_delivery = 1)
+           AND c.forwarder_id IN (SELECT fc.forwarder_id FROM forwarder_contacts fc WHERE fc.email = ? AND fc.deleted_at IS NULL)`;
+    // That statement's parameters: who sends, for which company, and what the fields sent need.
+    const portalParams = ({ email, shipmentId, forwarderId, requested = { ecn: 'ZZZU0000000' } }) => {
+        const needs = duty => (Object.keys(requested).some(f => FC.FIELD_DUTY[f] === duty) ? 1 : 0);
+        return [crypto.randomUUID(), email, JSON.stringify(requested), shipmentId, forwarderId, needs('freight'), needs('delivery'), email];
+    };
+    // The statement of a portal build from BEFORE duties (2026-11-23), which runs
+    // against the new view until that build is replaced: it names no company and
+    // knows two kinds of full row. Params: key, email, requested, shipmentId, email.
+    const PORTAL_INSERT_OLD = `
+        INSERT INTO ${jp}.forwarder_container_details
+               (shipment_id, container_ref, forwarder_id, submit_key, user_id, user_email, user_name, base_json, requested_json, note)
+        SELECT c.shipment_id, c.reference, c.forwarder_id, ?, 0, ?, 'Race Test', '{}', ?, NULL
           FROM portal_forwarder_containers_v c
          WHERE c.shipment_id = ?
            AND c.link_source IN ('booking', 'container')
@@ -121,12 +160,11 @@ const check = (name, ok, detail = '') => {
            AND c.forwarder_id IN (SELECT fc.forwarder_id FROM forwarder_contacts fc WHERE fc.email = ? AND fc.deleted_at IS NULL)`;
     // Runs the portal's write on `conn` while `other` holds an uncommitted change.
     // → { waited, rows }: whether it was still waiting after `holdMs`, and what it wrote once released.
-    const portalWriteDuring = async ({ shipmentId, email, change, release, holdMs = 1500 }) => {
+    const portalWriteDuring = async ({ shipmentId, email, forwarderId, requested, change, release, holdMs = 1500 }) => {
         await other.query('START TRANSACTION');
         await change();
-        const key = crypto.randomUUID();
         let settled = false;
-        const write = conn.query(PORTAL_INSERT, [key, email, shipmentId, email]).then((r) => { settled = true; return r[0]; });
+        const write = conn.query(PORTAL_INSERT, portalParams({ email, shipmentId, forwarderId, requested })).then((r) => { settled = true; return r[0]; });
         await wait(holdMs);
         const waited = !settled;
         await other.query(release);
@@ -148,12 +186,12 @@ const check = (name, ok, detail = '') => {
 
         console.log('\nThe portal\'s write against a change of ownership that is not committed yet');
         const s1 = await shipment({ forwarder_id: A, forwarder: `${TAG} A` });
-        const plain = await conn.query(PORTAL_INSERT, [crypto.randomUUID(), emailA, s1, emailA]);
+        const plain = await conn.query(PORTAL_INSERT, portalParams({ email: emailA, shipmentId: s1, forwarderId: A }));
         if (plain[0].insertId) madeDetails.push(plain[0].insertId);
         check('with nothing in the way, the container\'s own forwarder writes one row', plain[0].affectedRows === 1);
 
         let r = await portalWriteDuring({
-            shipmentId: s1, email: emailA,
+            shipmentId: s1, email: emailA, forwarderId: A,
             change: () => other.query('UPDATE shipments SET forwarder_id = ?, forwarder = ? WHERE id = ?', [B, `${TAG} B`, s1]),
             release: 'COMMIT',
         });
@@ -162,7 +200,7 @@ const check = (name, ok, detail = '') => {
 
         const s2 = await shipment({ forwarder_id: A, forwarder: `${TAG} A` });
         r = await portalWriteDuring({
-            shipmentId: s2, email: emailA,
+            shipmentId: s2, email: emailA, forwarderId: A,
             change: () => other.query('UPDATE shipments SET forwarder_id = ?, forwarder = ? WHERE id = ?', [B, `${TAG} B`, s2]),
             release: 'ROLLBACK',
         });
@@ -170,7 +208,7 @@ const check = (name, ok, detail = '') => {
 
         const s3 = await shipment({ forwarder_id: A, forwarder: `${TAG} A` });
         r = await portalWriteDuring({
-            shipmentId: s3, email: emailA,
+            shipmentId: s3, email: emailA, forwarderId: A,
             change: () => other.query('UPDATE shipments SET deleted_at = UTC_TIMESTAMP() WHERE id = ?', [s3]),
             release: 'COMMIT',
         });
@@ -178,10 +216,10 @@ const check = (name, ok, detail = '') => {
 
         const s4 = await shipment();
         const b4 = await booking(s4, A, 'requested');
-        const before = await conn.query(PORTAL_INSERT, [crypto.randomUUID(), emailA, s4, emailA]);
+        const before = await conn.query(PORTAL_INSERT, portalParams({ email: emailA, shipmentId: s4, forwarderId: A }));
         check('a booking not confirmed yet: nothing can be written', before[0].affectedRows === 0);
         r = await portalWriteDuring({
-            shipmentId: s4, email: emailA,
+            shipmentId: s4, email: emailA, forwarderId: A,
             change: () => other.query('UPDATE freight_bookings SET status = \'confirmed\' WHERE id = ?', [b4]),
             release: 'COMMIT',
         });
@@ -190,7 +228,7 @@ const check = (name, ok, detail = '') => {
         const s5 = await shipment();
         const b5 = await booking(s5, A, 'confirmed');
         r = await portalWriteDuring({
-            shipmentId: s5, email: emailA,
+            shipmentId: s5, email: emailA, forwarderId: A,
             change: () => other.query('UPDATE freight_bookings SET status = \'cancelled\' WHERE id = ?', [b5]),
             release: 'COMMIT',
         });
@@ -199,7 +237,7 @@ const check = (name, ok, detail = '') => {
         const s6 = await shipment({ forwarder_id: A, forwarder: `${TAG} A` });
         const emailGone = await contactOf(A);
         r = await portalWriteDuring({
-            shipmentId: s6, email: emailGone,
+            shipmentId: s6, email: emailGone, forwarderId: A,
             change: () => other.query('UPDATE forwarder_contacts SET deleted_at = UTC_TIMESTAMP() WHERE email = ?', [emailGone]),
             release: 'COMMIT',
         });
@@ -207,7 +245,7 @@ const check = (name, ok, detail = '') => {
 
         const s7 = await shipment({ forwarder_id: A, forwarder: `${TAG} A` });
         r = await portalWriteDuring({
-            shipmentId: s7, email: emailA,
+            shipmentId: s7, email: emailA, forwarderId: A,
             change: () => other.query('UPDATE forwarders SET deleted_at = UTC_TIMESTAMP() WHERE id = ?', [B]),
             release: 'COMMIT',
         });
@@ -235,9 +273,20 @@ const check = (name, ok, detail = '') => {
             madeDetails.push(res.insertId);
             return res.insertId;
         };
+        // What a ShipLine build from before the delivery date names in a claim: the three fields.
         const heldNow = async (shipmentId) => {
             const api = S.rowToShipment(await sync.getShipment(conn, shipmentId));
             return { ecn: api.trackingRef || null, loadingDate: api.loadingDate || null, etd: api.etd || null };
+        };
+        // The delivery value each order of a container holds, in the one form.
+        const deliveriesOf = async shipmentId => (await q(`SELECT ${FC.deliverySelect('delivery_date')} AS d FROM orders WHERE shipment_id = ? AND deleted_at IS NULL ORDER BY id`, [shipmentId])).map(x => x.d);
+        // What the present build names: those, and the delivery date as every order holds it.
+        const heldAll = async shipmentId => ({ ...(await heldNow(shipmentId)), ...FC.heldDelivery(await deliveriesOf(shipmentId)) });
+        // What the FORWARDER tab reads of one attached forwarder's proposals: { proposal, history }.
+        const tabOf = async (shipmentId, forwarderId) => {
+            const duties = FL.dutiesOfRow(await sync.getShipment(conn, shipmentId));
+            const read = await R.readDetails(conn, shipmentId, duties);
+            return read.byForwarder.get(Number(forwarderId)) || { proposal: null, history: [] };
         };
         const rowOf = async id => (await q(`SELECT status, claim_token, claimed_by, decided_by, decided_note, applied_json FROM ${jp}.forwarder_container_details WHERE id = ?`, [id]))[0];
         const audits = [];
@@ -248,6 +297,8 @@ const check = (name, ok, detail = '') => {
                 await c.query('UPDATE shipments SET etd = ? WHERE id = ?', [body.etd, id]);
                 await c.query('UPDATE orders SET estimated_departure_date = ? WHERE shipment_id = ? AND deleted_at IS NULL', [body.etd, id]);
             }
+            // A delivery date lives on the member orders alone, to the minute.
+            if (body.deliveryDate) await c.query('UPDATE orders SET delivery_date = ? WHERE shipment_id = ? AND deleted_at IS NULL', [FC.deliverySql(body.deliveryDate), id]);
         };
         const claim = (id, expected, deps = {}) => R.claimDetails(conn, { id, expected, actor }, deps);
         const finish = (id, claimToken, ecnReset = null) => R.finishDetails(conn, { id, claimToken, ecnReset, actor }, { patchShipment, recordAudit });
@@ -381,16 +432,19 @@ const check = (name, ok, detail = '') => {
         const c9 = await ownedByC();
         await order(c9, { estimated_departure_date: '2026-12-20' });
         const p9 = await propose(c9, { loadingDate: '2026-12-15' });
-        const PORTAL_DATES = PORTAL_INSERT.replace('\'{"ecn":"ZZZU0000000"}\'', '\'{"loadingDate":"2026-12-16"}\'');
         let newer = null;
         d = await changeDuringClaim({
             id: p9, expected: await heldNow(c9),
-            change: async () => { const [res] = await other.query(PORTAL_DATES, [crypto.randomUUID(), emailC, c9, emailC]); newer = res; if (res.insertId) madeDetails.push(res.insertId); },
+            change: async () => {
+                const [res] = await other.query(PORTAL_INSERT, portalParams({ email: emailC, shipmentId: c9, forwarderId: C, requested: { loadingDate: '2026-12-16' } }));
+                newer = res;
+                if (res.insertId) madeDetails.push(res.insertId);
+            },
         });
         check('a newer proposal sent from the portal during a claim WAITS for it, then is written', d.blocked && newer && newer.affectedRows === 1, `${d.blocked} ${JSON.stringify(newer)} ${codeOf(d.change)}`);
         f = await outcome(finish(p9, d.claim.result ? d.claim.result.claimToken : ''));
         check('the claimed proposal still finishes', Boolean(f.result) && (await rowOf(p9)).status === 'applied', codeOf(f));
-        const tab9 = await R.readDetails(conn, c9, C);
+        const tab9 = await tabOf(c9, C);
         check('and the newer one is the live proposal, waiting', Boolean(newer) && tab9.proposal && tab9.proposal.id === newer.insertId && tab9.proposal.waiting === true && tab9.history.some(h => h.id === p9 && h.status === 'applied'),
             JSON.stringify(tab9.proposal && { id: tab9.proposal.id, waiting: tab9.proposal.waiting }));
         again = await outcome(claim(p9, await heldNow(c9)));
@@ -452,7 +506,7 @@ const check = (name, ok, detail = '') => {
         await q(`UPDATE ${jp}.forwarder_container_details SET claimed_at = UTC_TIMESTAMP() - INTERVAL 11 MINUTE WHERE id = ?`, [p12]);
         f = await outcome(finish(p12, got12.result ? got12.result.claimToken : ''));
         check('eleven minutes old: its finish is refused', codeOf(f) === 'CLAIM_LOST', codeOf(f));
-        const tab12 = await R.readDetails(conn, c12, C);
+        const tab12 = await tabOf(c12, C);
         check('the tab reads it as waiting again', tab12.proposal && tab12.proposal.status === 'pending' && tab12.proposal.waiting === true && tab12.proposal.claimedBy === null);
         again = await outcome(claim(p12, await heldNow(c12)));
         check('and it can be claimed again, with a new token', Boolean(again.result) && again.result.claimToken !== got12.result.claimToken, codeOf(again));
@@ -494,12 +548,183 @@ const check = (name, ok, detail = '') => {
             `SELECT d.id, (c.shipment_id IS NOT NULL) AS theirs
                FROM ${jp}.forwarder_container_details d
                LEFT JOIN portal_forwarder_containers_v c
-                      ON c.shipment_id = d.shipment_id AND c.forwarder_id = d.forwarder_id AND c.link_source IN ('booking', 'container')
+                      ON c.shipment_id = d.shipment_id AND c.forwarder_id = d.forwarder_id AND c.link_source IN ('booking', 'container', 'duty')
               WHERE d.id IN (?)`,
             [[p1, p5, newer ? newer.insertId : 0]]
         );
         const theirs = Object.fromEntries(waiting.map(w => [Number(w.id), Number(w.theirs)]));
         check('the list\'s join: a proposal on a container given to another forwarder is not theirs; one on their own is', theirs[p1] === 0 && theirs[p5] === 1 && theirs[newer ? newer.insertId : 0] === 1, JSON.stringify(theirs));
+
+        // ── three duties: freight, delivery, customs (2026-11-24) ──────────
+        // C carries the container (picked by hand, or by booking); G delivers it
+        // from the UK port; H is another company that could.
+        console.log('\nThree duties: the portal\'s write for a company that delivers');
+        const G = await forwarder('G delivers');
+        const H = await forwarder('H delivers');
+        const emailG = await contactOf(G);
+        // One person, a contact of both G and H (the same group's two offices, listed apart).
+        const emailBoth = await contactOf(G);
+        await ins('forwarder_contacts', { forwarder_id: H, name: 'Race Test', email: emailBoth });
+        const DELIVERY = { deliveryDate: '2026-12-28T09:30' };
+        const portalWrite = async (params) => {
+            const [res] = await conn.query(PORTAL_INSERT, portalParams(params));
+            if (res.insertId) madeDetails.push(res.insertId);
+            return res.affectedRows;
+        };
+        const oldPortalWrite = async ({ email, shipmentId, requested = { ecn: 'ZZZU0000000' } }) => {
+            const [res] = await conn.query(PORTAL_INSERT_OLD, [crypto.randomUUID(), email, JSON.stringify(requested), shipmentId, email]);
+            if (res.insertId) madeDetails.push(res.insertId);
+            return res.affectedRows;
+        };
+        const split = (over = {}) => shipment({ forwarder_id: C, forwarder: `${TAG} C`, delivery_forwarder_id: G, ...over });
+        const deliveryTo = (shipmentId, forwarderId) => other.query('UPDATE shipments SET delivery_forwarder_id = ? WHERE id = ?', [forwarderId, shipmentId]);
+        const lastSender = async shipmentId => Number((await q(`SELECT forwarder_id FROM ${jp}.forwarder_container_details WHERE shipment_id = ? ORDER BY id DESC LIMIT 1`, [shipmentId]))[0].forwarder_id);
+
+        const d1 = await split();
+        check('the company that delivers writes its delivery date', await portalWrite({ email: emailG, shipmentId: d1, forwarderId: G, requested: DELIVERY }) === 1 && await lastSender(d1) === G);
+        check('and cannot write the container\'s number: that is the freight forwarder\'s to send', await portalWrite({ email: emailG, shipmentId: d1, forwarderId: G }) === 0);
+        check('the freight forwarder cannot write a delivery date', await portalWrite({ email: emailC, shipmentId: d1, forwarderId: C, requested: DELIVERY }) === 0);
+        check('nor can the company that delivers write as the freight forwarder: it is not its contact', await portalWrite({ email: emailG, shipmentId: d1, forwarderId: C }) === 0);
+        check('a portal build from before duties, with its own statement, writes NOTHING for the company that delivers', await oldPortalWrite({ email: emailG, shipmentId: d1 }) === 0);
+        check('and still writes for the freight forwarder, under that forwarder, as before', await oldPortalWrite({ email: emailC, shipmentId: d1 }) === 1 && await lastSender(d1) === C);
+
+        const d2 = await split();
+        r = await portalWriteDuring({ shipmentId: d2, email: emailG, forwarderId: G, requested: DELIVERY, change: () => deliveryTo(d2, H), release: 'COMMIT' });
+        check('a delivery date WAITS while delivery is being given to another company', r.waited);
+        check('and once that is committed it writes nothing', r.rows === 0, `rows ${r.rows}`);
+        const d3 = await split();
+        r = await portalWriteDuring({ shipmentId: d3, email: emailG, forwarderId: G, requested: DELIVERY, change: () => deliveryTo(d3, H), release: 'ROLLBACK' });
+        check('that change rolled back: it waited, then wrote its row', r.waited && r.rows === 1, JSON.stringify(r));
+
+        const d4 = await split();
+        await q('UPDATE shipments SET delivery_forwarder_id = ? WHERE id = ?', [H, d4]);
+        check('a contact of both companies, sending as the one that no longer delivers: nothing is written', await portalWrite({ email: emailBoth, shipmentId: d4, forwarderId: G, requested: DELIVERY }) === 0);
+        check('sending as the one that now does: one row, under that company', await portalWrite({ email: emailBoth, shipmentId: d4, forwarderId: H, requested: DELIVERY }) === 1 && await lastSender(d4) === H);
+
+        const gone = await forwarder('gone delivers');
+        const emailOfGone = await contactOf(gone);
+        const d5 = await shipment({ forwarder_id: C, forwarder: `${TAG} C`, delivery_forwarder_id: gone });
+        r = await portalWriteDuring({
+            shipmentId: d5, email: emailOfGone, forwarderId: gone, requested: DELIVERY,
+            change: () => other.query('UPDATE forwarders SET deleted_at = UTC_TIMESTAMP() WHERE id = ?', [gone]), release: 'COMMIT',
+        });
+        check('the company that delivers being taken off the Forwarders list: it waits, then writes nothing', r.waited && r.rows === 0, JSON.stringify(r));
+
+        const d6 = await shipment();
+        const b6 = await booking(d6, C, 'confirmed', { scope: 'end_to_end' });
+        check('an end-to-end booking: its forwarder writes the delivery date too', await portalWrite({ email: emailC, shipmentId: d6, forwarderId: C, requested: DELIVERY }) === 1);
+        r = await portalWriteDuring({
+            shipmentId: d6, email: emailC, forwarderId: C, requested: DELIVERY,
+            change: () => other.query('UPDATE freight_bookings SET scope = \'port_to_port\' WHERE id = ?', [b6]), release: 'COMMIT',
+        });
+        check('that booking being set back to port to port: a delivery date WAITS, then writes nothing', r.waited && r.rows === 0, JSON.stringify(r));
+        check('and its departure date still goes through: it still carries the freight', await portalWrite({ email: emailC, shipmentId: d6, forwarderId: C, requested: { etd: '2026-12-21' } }) === 1);
+
+        const d7 = await shipment();
+        const b7 = await booking(d7, C, 'requested', { scope: 'end_to_end' });
+        check('an end-to-end booking not confirmed yet: no delivery date can be written', await portalWrite({ email: emailC, shipmentId: d7, forwarderId: C, requested: DELIVERY }) === 0);
+        r = await portalWriteDuring({
+            shipmentId: d7, email: emailC, forwarderId: C, requested: DELIVERY,
+            change: () => other.query('UPDATE freight_bookings SET status = \'confirmed\' WHERE id = ?', [b7]), release: 'COMMIT',
+        });
+        check('that booking being confirmed: once it is committed the delivery date goes through', r.rows === 1, JSON.stringify(r));
+
+        console.log('\nThree duties: a decision on a delivery date');
+        const noDeliveryOn = async shipmentId => (await deliveriesOf(shipmentId)).every(v => v === null);
+        const e1 = await split();
+        await order(e1, { estimated_departure_date: '2026-12-20' });
+        const q1 = await propose(e1, DELIVERY, G);
+        r = await decideDuring({ decide: async () => claim(q1, await heldAll(e1)), change: () => deliveryTo(e1, H), release: 'COMMIT' });
+        check('a claim of a delivery date WAITS while delivery is being given to another company', r.waited);
+        check('and is then refused: that company does nothing on the container any more', codeOf(r) === 'NOT_THEIR_CONTAINER', codeOf(r));
+
+        const e2 = await split({ customs_forwarder_id: G });
+        await order(e2, { estimated_departure_date: '2026-12-20' });
+        const q2 = await propose(e2, DELIVERY, G);
+        r = await decideDuring({ decide: async () => claim(q2, await heldAll(e2)), change: () => deliveryTo(e2, H), release: 'COMMIT' });
+        check('the same when it still handles customs: refused as no longer its duty, naming the delivery date',
+            r.waited && codeOf(r) === 'NOT_THEIR_DUTY' && JSON.stringify(r.error.extra.fields) === '["deliveryDate"]', `${codeOf(r)} ${r.error ? JSON.stringify(r.error.extra) : ''}`);
+        const tab2 = await tabOf(e2, G);
+        check('the tab still lists it under that company, not to be accepted, with the field that is no longer its own',
+            Boolean(tab2.proposal) && tab2.proposal.id === q2 && tab2.proposal.actionable === false && JSON.stringify(tab2.proposal.outside) === '["deliveryDate"]', JSON.stringify(tab2.proposal && [tab2.proposal.actionable, tab2.proposal.outside]));
+
+        // A whole accept, on a container whose two orders differ: one holds a delivery date, one none.
+        const e3 = await split();
+        await order(e3, { estimated_departure_date: '2026-12-20' });
+        await order(e3, { estimated_departure_date: '2026-12-20', delivery_date: '2026-12-24 00:00:00' });
+        const q3 = await propose(e3, DELIVERY, G);
+        again = await outcome(claim(q3, await heldNow(e3)));
+        check('a ShipLine build that names no delivery date cannot claim a proposal that carries one', codeOf(again) === 'CLIENT_TOO_OLD', codeOf(again));
+        const old3 = await outcome(R.rejectDetails(conn, { id: q3, note: 'Race test: sent back', actor }, { recordAudit }));
+        check('nor send it back without naming it', codeOf(old3) === 'CLIENT_TOO_OLD' && (await rowOf(q3)).status === 'pending', codeOf(old3));
+        const seen3d = await heldAll(e3);
+        check('orders that differ are held as each distinct value, an order with none included',
+            seen3d.deliveryDate === null && JSON.stringify([...(seen3d.deliveryMixed || [])].sort()) === JSON.stringify(['2026-12-24', null].sort()), JSON.stringify(seen3d));
+        const got3 = await outcome(claim(q3, seen3d));
+        check('claimed, with the delivery date named as the card showed it', Boolean(got3.result), codeOf(got3));
+        f = await outcome(finish(q3, got3.result ? got3.result.claimToken : ''));
+        check('and finished: accepted', Boolean(f.result) && f.result.status === 'applied', codeOf(f));
+        check('every order of the container now holds the one delivery date, to the minute', JSON.stringify(await deliveriesOf(e3)) === JSON.stringify(['2026-12-28T09:30', '2026-12-28T09:30']), JSON.stringify(await deliveriesOf(e3)));
+        check('and the view gives the company that delivers that date', (await q('SELECT delivery_date FROM portal_forwarder_containers_v WHERE shipment_id = ? AND forwarder_id = ?', [e3, G]))[0].delivery_date === '2026-12-28T09:30');
+
+        const e4 = await split({ customs_forwarder_id: G });
+        await order(e4, { estimated_departure_date: '2026-12-20' });
+        const q4 = await propose(e4, DELIVERY, G);
+        d = await changeDuringClaim({ id: q4, expected: await heldAll(e4), change: () => deliveryTo(e4, H) });
+        check('giving delivery to another company WAITS for a claim in progress', d.blocked && Boolean(d.claim.result) && !d.change.error, `${d.blocked} ${codeOf(d.claim)} / ${codeOf(d.change)}`);
+        f = await outcome(finish(q4, d.claim.result ? d.claim.result.claimToken : ''));
+        check('and the finish of that claim is refused: delivery is no longer that company\'s duty', codeOf(f) === 'NOT_THEIR_DUTY', codeOf(f));
+        check('with no delivery date written', await noDeliveryOn(e4));
+
+        const e5 = await split();
+        await order(e5, { estimated_departure_date: '2026-12-20' });
+        const q5 = await propose(e5, DELIVERY, G);
+        const got5 = await outcome(claim(q5, await heldAll(e5)));
+        await q('UPDATE shipments SET customs_forwarder_id = ? WHERE id = ?', [H, e5]);
+        f = await outcome(finish(q5, got5.result ? got5.result.claimToken : ''));
+        check('a change of who handles customs between claim and finish does not undo a delivery date\'s accept: that company still delivers', Boolean(f.result) && f.result.status === 'applied', codeOf(f));
+
+        const e6 = await split();
+        const o6a = await order(e6, { estimated_departure_date: '2026-12-20' });
+        await order(e6, { estimated_departure_date: '2026-12-20' });
+        const q6 = await propose(e6, DELIVERY, G);
+        const got6 = await outcome(claim(q6, await heldAll(e6)));
+        await q('UPDATE orders SET delivery_date = ? WHERE id = ?', ['2026-12-25 14:00:00', o6a]);
+        f = await outcome(finish(q6, got6.result ? got6.result.claimToken : ''));
+        check('a delivery date typed on one order between claim and finish: refused as changed, in the delivery date',
+            codeOf(f) === 'CONTAINER_CHANGED' && JSON.stringify(f.error.extra.fields) === '["deliveryDate"]', `${codeOf(f)} ${f.error ? JSON.stringify(f.error.extra) : ''}`);
+        check('and the other order was given nothing', JSON.stringify(await deliveriesOf(e6)) === JSON.stringify(['2026-12-25T14:00', null]), JSON.stringify(await deliveriesOf(e6)));
+
+        const e7 = await split();
+        await order(e7, { estimated_departure_date: '2026-12-20' });
+        const joining = await order(null, { estimated_departure_date: '2026-12-20' });
+        const q7 = await propose(e7, DELIVERY, G);
+        d = await changeDuringClaim({ id: q7, expected: await heldAll(e7), change: () => other.query('UPDATE orders SET shipment_id = ? WHERE id = ?', [e7, joining]) });
+        check('an order joining the container WAITS for a claim of a delivery date', d.blocked && Boolean(d.claim.result) && !d.change.error, `${d.blocked} ${codeOf(d.claim)} / ${codeOf(d.change)}`);
+        f = await outcome(finish(q7, d.claim.result ? d.claim.result.claimToken : ''));
+        check('and the finish then sees it: refused as changed, in its orders, so the order that joined is not given a date nobody saw it get',
+            codeOf(f) === 'CONTAINER_CHANGED' && JSON.stringify(f.error.extra.fields) === '["members"]' && await noDeliveryOn(e7), `${codeOf(f)} ${f.error ? JSON.stringify(f.error.extra) : ''}`);
+
+        // The container holds the departure date itself too, so that only its orders change when the order leaves.
+        const e8 = await split({ etd: '2026-12-20' });
+        const o8d = await order(e8, { estimated_departure_date: '2026-12-20' });
+        const q8 = await propose(e8, DELIVERY, G);
+        const got8 = await outcome(claim(q8, await heldAll(e8)));
+        await q('UPDATE orders SET shipment_id = NULL WHERE id = ?', [o8d]);
+        f = await outcome(finish(q8, got8.result ? got8.result.claimToken : ''));
+        check('the last order leaving between claim and finish: refused as changed, in its orders', codeOf(f) === 'CONTAINER_CHANGED' && JSON.stringify(f.error.extra.fields) === '["members"]', `${codeOf(f)} ${f.error ? JSON.stringify(f.error.extra) : ''}`);
+        await R.releaseDetails(conn, { id: q8, claimToken: got8.result ? got8.result.claimToken : '' });
+        again = await outcome(claim(q8, await heldAll(e8)));
+        check('and a container with no orders cannot take a delivery date at all', codeOf(again) === 'NO_ORDERS', codeOf(again));
+
+        const e9 = await split();
+        await order(e9, { estimated_departure_date: '2026-12-30' });
+        const q9 = await propose(e9, DELIVERY, G);
+        again = await outcome(claim(q9, await heldAll(e9)));
+        check('a delivery date before the departure the container holds: refused, naming both dates',
+            codeOf(again) === 'DATES_OUT_OF_ORDER' && JSON.stringify(again.error.extra.fields) === '["etd","deliveryDate"]', `${codeOf(again)} ${again.error ? JSON.stringify(again.error.extra) : ''}`);
+        const back9 = await outcome(R.rejectDetails(conn, { id: q9, note: 'Race test: before it leaves', fields: ['deliveryDate'], actor }, { recordAudit }));
+        check('and it is sent back by a page that names the delivery date', Boolean(back9.result) && (await rowOf(q9)).status === 'rejected', codeOf(back9));
 
         // ── a forwarder's files: accept against a withdrawal, and two accepts at once ──
         // The accept route itself (src/services/forwarder-upload-routes.js), run on
@@ -571,7 +796,7 @@ const check = (name, ok, detail = '') => {
              WHERE u.id = ? AND u.upload_status = 'sent' AND u.review_status = 'open'
                AND EXISTS (SELECT 1 FROM portal_forwarder_containers_v c
                             WHERE c.shipment_id = u.shipment_id AND c.forwarder_id = u.forwarder_id
-                              AND c.link_source IN ('booking', 'container')
+                              AND c.link_source IN ('booking', 'container', 'duty')
                               AND c.forwarder_id IN (SELECT fc.forwarder_id FROM forwarder_contacts fc WHERE fc.email = ? AND fc.deleted_at IS NULL))`;
         const withdrawOn = async (c, id) => (await c.query(PORTAL_WITHDRAW, [id, emailC]))[0].affectedRows;
 

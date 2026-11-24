@@ -27,6 +27,7 @@
 const crypto = require('crypto');
 const { GetObjectCommand } = require('@aws-sdk/client-s3');
 const F = require('../lib/freight-quotes');
+const FC = require('../lib/forwarder-containers');
 const QV = require('../lib/qc-visits');
 const S = require('../lib/shipments');
 const poPortalEmail = require('../lib/po-portal-email');
@@ -510,6 +511,8 @@ function registerFreightQuoteRoutes(app, deps) {
             requestId: Number(b.request_id),
             optionId: Number(b.option_id),
             status: b.status,
+            // What it covers (2026-11-24): the freight alone, or the delivery to the warehouse too.
+            scope: b.scope || FC.DEFAULT_SCOPE,
             // Confirmed, and due to arrive more than a fortnight ago: history.
             finished: Boolean(finished),
             forwarderId: request ? Number(request.forwarder_id) : null,
@@ -1274,9 +1277,14 @@ function registerFreightQuoteRoutes(app, deps) {
     app.post('/api/v1/freight-quotes/options/:optionId(\\d+)/book', route('POST /freight-quotes/options/:optionId/book', async (req, res) => {
         refuseReadOnly(req);
         const optionId = Number(req.params.optionId);
-        const { note, shipmentId, to, subject, body } = req.body || {};
+        const { note, shipmentId, to, subject, body, scope } = req.body || {};
         const noteText = F.optionalText(note, 'note', F.NOTE_MAX);
         if (noteText.code) throw invalid(noteText);
+        // What the booking covers (2026-11-24, docs/forwarder-containers.md): the
+        // freight alone, or the delivery to the warehouse too. Left out, the freight
+        // alone: the option's service text is never read for it.
+        const covers = FC.scopeGiven(scope);
+        if (covers.error) throw new Fail(400, 'BAD_FIELD', covers.error, { field: 'scope' });
         const portalBase = poPortalEmail.portalBaseOf();
         if (!portalBase) {
             throw new Fail(409, 'PORTAL_URL_UNSET', 'The supplier portal address (SUPPLIER_PORTAL_URL) is not configured, so the booking link cannot be sent.');
@@ -1315,11 +1323,11 @@ function registerFreightQuoteRoutes(app, deps) {
                     const [ins] = await conn.query(
                         `INSERT INTO freight_bookings
                             (request_id, option_id, status, requested_by_email, requested_at, request_note, sent_to,
-                             subject, shipment_id, draft_container_name)
-                         VALUES (?, ?, 'requested', ?, UTC_TIMESTAMP(), ?, ?, ?, ?, ?)`,
+                             subject, shipment_id, draft_container_name, scope)
+                         VALUES (?, ?, 'requested', ?, UTC_TIMESTAMP(), ?, ?, ?, ?, ?, ?)`,
                         [
                             request.id, optionId, req.userEmail || null, noteText.value, JSON.stringify(addresses),
-                            finalSubject, ship ? ship.id : null, ship ? (ship.name || ship.reference || null) : null,
+                            finalSubject, ship ? ship.id : null, ship ? (ship.name || ship.reference || null) : null, covers.scope,
                         ]
                     );
                     bookingId = Number(ins.insertId);
@@ -1403,12 +1411,15 @@ function registerFreightQuoteRoutes(app, deps) {
         const id = Number(req.params.id);
         const patch = req.body || {};
         const has = key => Object.prototype.hasOwnProperty.call(patch, key);
-        if (!has('shipmentId') && !has('status')) {
-            throw new Fail(400, 'BAD_FIELD', 'Nothing to change: send shipmentId or status.', { field: 'body' });
+        if (!has('shipmentId') && !has('status') && !has('scope')) {
+            throw new Fail(400, 'BAD_FIELD', 'Nothing to change: send shipmentId, status or scope.', { field: 'body' });
         }
         if (has('status') && patch.status !== 'confirmed' && patch.status !== 'cancelled') {
             throw new Fail(400, 'BAD_FIELD', "status must be 'confirmed' or 'cancelled'.", { field: 'status' });
         }
+        // What the booking covers, corrected while it is live. Sent, it must be a scope: null is not one.
+        const covers = has('scope') ? FC.scopeGiven(patch.scope === undefined ? null : patch.scope) : null;
+        if (covers && covers.error) throw new Fail(400, 'BAD_FIELD', covers.error, { field: 'scope' });
 
         const board = await withConnection(async (conn) => {
             const confirmed = await inTransaction(conn, async () => {
@@ -1435,6 +1446,16 @@ function registerFreightQuoteRoutes(app, deps) {
                         after.shipmentId = wanted;
                         after.container = ship ? (ship.name || ship.reference || null) : null;
                     }
+                }
+
+                // Changing what it covers changes who holds the delivery duty on its
+                // container: written on the booking row, which a decision on that
+                // container locks (forwarder-container-routes.js lockOwnership).
+                if (covers && covers.scope !== (b.scope || FC.DEFAULT_SCOPE)) {
+                    sets.push('scope = ?');
+                    params.push(covers.scope);
+                    before.scope = b.scope || FC.DEFAULT_SCOPE;
+                    after.scope = covers.scope;
                 }
 
                 let becameConfirmed = false;

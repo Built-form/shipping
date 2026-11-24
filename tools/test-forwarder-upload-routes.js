@@ -47,9 +47,14 @@ const UPLOAD = (over = {}) => ({
     filename: 'invoice 339.pdf', content_type: 'application/pdf', file_size: PDF.length, final_key: FINAL_KEY, s3_etag: '"e1"', note: null,
     upload_status: 'sent', review_status: 'open', decided_note: null, decided_by: null, filed_key: null, filed_id: null,
     sent_at_iso: '2026-11-23T09:01:00Z', decided_at_iso: null, withdrawn_at_iso: null, forwarder_name: 'test2forwarder', theirs: 1,
+    // What the portal's view says its forwarder holds on the container (2026-11-24): the freight.
+    does_freight: 1, does_delivery: 0, does_customs: 0,
     ...over,
 });
-const SHIPMENT = (over = {}) => ({ id: 1214, reference: '339', mode: 'SEA', stage: 'BOOKED', deleted_at: null, merged_into_id: null, forwarder_id: 4, forwarder: 'test2forwarder', ...over });
+const SHIPMENT = (over = {}) => ({
+    id: 1214, reference: '339', mode: 'SEA', stage: 'BOOKED', deleted_at: null, merged_into_id: null, forwarder_id: 4, forwarder: 'test2forwarder',
+    delivery_forwarder_id: null, customs_forwarder_id: null, ...over,
+});
 
 // `row`: the upload as it stands; a decision's own writes change it, so a later read sees them.
 function build({ row = UPLOAD(), shipment = SHIPMENT(), bookings = [], forwarders = [{ id: 3, name: 'DCG', deleted_at: null }, { id: 4, name: 'test2forwarder', deleted_at: null }],
@@ -194,10 +199,109 @@ test('accept: refused, with nothing filed, when the container is no longer that 
         assert.equal(t.db.wrote(/SET review_status/).length, 0);
         assert.deepEqual(t.extracted, []);
     }
-    // Said by the portal's own view before anything is copied.
-    const t = build({ row: UPLOAD({ theirs: 0 }) });
+    // Said by the portal's own view before anything is copied: it has no row for that forwarder.
+    const t = build({ row: UPLOAD({ theirs: 0, does_freight: null, does_delivery: null, does_customs: null }) });
     assert.equal((await t.call(ACCEPT)).body.code, 'NOT_THEIR_CONTAINER');
     assert.deepEqual(t.s3Calls, []);
+});
+
+// ── several forwarders on one container, by duty (2026-11-24) ────────────
+
+test('accept: a file is taken only from the company that holds its kind\'s duty; the delivery company\'s loading photo is refused', async () => {
+    // Freight is forwarder 4's (picked), delivery is forwarder 3's.
+    const shipment = SHIPMENT({ delivery_forwarder_id: 3 });
+    const photo = UPLOAD({ forwarder_id: 3, forwarder_name: 'DCG', kind: 'loading_photo', filename: 'door.jpg', content_type: 'image/jpeg', file_size: JPG.length });
+    // The view already says it: nothing is copied.
+    let t = build({ shipment, row: { ...photo, does_freight: 0, does_delivery: 1 } });
+    let r = await t.call(ACCEPT);
+    assert.deepEqual(r, { status: 409, body: refusal('NOT_THEIR_DUTY', ['reject'], { kind: 'loading_photo' }) });
+    assert.deepEqual(t.s3Calls, []);
+    // The view said freight when the page was read, and the pick moved since: refused under the locks, nothing filed.
+    t = build({ shipment, row: { ...photo, does_freight: 1 }, object: { bytes: JPG } });
+    r = await t.call(ACCEPT);
+    assert.deepEqual(r, { status: 409, body: refusal('NOT_THEIR_DUTY', ['reject'], { kind: 'loading_photo' }) });
+    assert.equal(t.db.wrote(/^INSERT INTO/).length, 0);
+    assert.equal(t.db.wrote(/SET review_status/).length, 0);
+    // It can still be sent back.
+    r = await build({ shipment, row: photo }).call(REJECT, { body: { note: 'Not yours to send' } });
+    assert.equal(r.status, 200);
+});
+
+// ── the draft customs entry (2026-11-24) ─────────────────────────────────
+//
+// Forwarder 4 carries the freight; forwarder 3 (DCG) handles customs.
+
+const CUSTOMS_SHIPMENT = (over = {}) => SHIPMENT({ customs_forwarder_id: 3, ...over });
+const DRAFT = (over = {}) => UPLOAD({
+    id: 70, forwarder_id: 3, forwarder_name: 'DCG', kind: 'customs_draft', filename: 'entry draft.pdf',
+    does_freight: 0, does_delivery: 0, does_customs: 1, ...over,
+});
+
+test('accept a draft customs entry: approved, it is kept with the container\'s forwarder documents as its own kind', async () => {
+    const t = build({ shipment: CUSTOMS_SHIPMENT(), row: DRAFT() });
+    const r = await t.call(ACCEPT, { body: { kind: 'customs_draft' } });
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.body.filed.as, 'document');
+    const [insert] = t.db.wrote(/^INSERT INTO shipment_forwarder_documents/);
+    // shipment, reference, forwarder id, forwarder name, kind, filename, key, ...
+    assert.deepEqual(insert.params.slice(0, 6), [1214, '339', 3, 'DCG', 'customs_draft', 'entry draft.pdf']);
+    assert.match(insert.params[6], /^forwarder-documents\/[0-9a-f-]{36}\/entry_draft\.pdf$/);
+    assert.equal(t.db.wrote(/SET review_status = 'received'/).length, 1);
+    const audit = t.audits.find(a => a.entityType === 'shipment_forwarder_document');
+    assert.equal(audit.after.kind, 'customs_draft');
+    assert.equal(audit.after.forwarderId, 3);
+    // A bill of lading is still filed as a bill of lading.
+    const bl = build({ row: UPLOAD({ kind: 'bill_of_lading' }) });
+    await bl.call(ACCEPT);
+    assert.equal(bl.db.wrote(/^INSERT INTO shipment_forwarder_documents/)[0].params[4], 'bill_of_lading');
+});
+
+test('a draft customs entry is decided only by a ShipLine that names its kind: an older build can neither accept it nor send it back', async () => {
+    for (const body of [{}, { kind: 'bill_of_lading' }, { preset: 'Proof of loading' }]) {
+        const t = build({ shipment: CUSTOMS_SHIPMENT(), row: DRAFT() });
+        const r = await t.call(ACCEPT, { body });
+        assert.deepEqual(r, { status: 409, body: refusal('CLIENT_TOO_OLD', ['reload']) }, JSON.stringify(body));
+        assert.deepEqual(t.s3Calls, [], 'nothing is copied');
+        assert.equal(t.db.wrote(/^INSERT INTO|^UPDATE/).length, 0);
+    }
+    let t = build({ shipment: CUSTOMS_SHIPMENT(), row: DRAFT() });
+    let r = await t.call(REJECT, { body: { note: 'The commodity code is wrong' } });
+    assert.deepEqual(r, { status: 409, body: refusal('CLIENT_TOO_OLD', ['reload']) });
+    assert.equal(t.db.wrote(/SET review_status/).length, 0);
+    t = build({ shipment: CUSTOMS_SHIPMENT(), row: DRAFT() });
+    r = await t.call(REJECT, { body: { note: 'The commodity code is wrong', kind: 'customs_draft' } });
+    assert.equal(r.status, 200);
+    assert.equal(t.state.row.review_status, 'rejected');
+    // The original three kinds are decided exactly as before, with no kind named.
+    assert.equal((await build().call(REJECT, { body: { note: 'Wrong container' } })).status, 200);
+});
+
+test('a draft customs entry is taken only from the company that handles customs', async () => {
+    // Sent by the freight forwarder: it does not handle customs here.
+    let t = build({ shipment: CUSTOMS_SHIPMENT(), row: DRAFT({ forwarder_id: 4, forwarder_name: 'test2forwarder', does_freight: 1, does_customs: 0 }) });
+    let r = await t.call(ACCEPT, { body: { kind: 'customs_draft' } });
+    assert.deepEqual(r, { status: 409, body: refusal('NOT_THEIR_DUTY', ['reject'], { kind: 'customs_draft' }) });
+    assert.deepEqual(t.s3Calls, []);
+    // Customs was handed to another company after the page was read: refused under the locks, nothing filed.
+    t = build({ shipment: SHIPMENT({ customs_forwarder_id: 4 }), row: DRAFT() });
+    r = await t.call(ACCEPT, { body: { kind: 'customs_draft' } });
+    assert.deepEqual(r, { status: 409, body: refusal('NOT_THEIR_CONTAINER', ['reject']) });
+    assert.equal(t.db.wrote(/^INSERT INTO/).length, 0);
+});
+
+test('accept an invoice from the company that delivers: filed under ITS name and id, not the freight forwarder\'s', async () => {
+    const shipment = SHIPMENT({ delivery_forwarder_id: 3 });
+    const t = build({ shipment, row: UPLOAD({ forwarder_id: 3, forwarder_name: 'DCG', does_freight: 0, does_delivery: 1 }) });
+    const r = await t.call(ACCEPT);
+    assert.equal(r.status, 200);
+    const [insert] = t.db.wrote(/^INSERT INTO shipment_payment_documents/);
+    assert.equal(insert.params[2], 'DCG', 'the name it is filed under');
+    assert.equal(insert.params[insert.params.length - 1], 3, 'the forwarder id on the document');
+    // The payee names looked up are that forwarder's on that container.
+    assert.deepEqual(t.db.wrote(/FROM payment_extras ex WHERE ex\.shipment_id = \? AND ex\.forwarder_id = \?/)[0].params, [1214, 3]);
+    // Every forwarder the container's rows name is locked with the decision: both picks.
+    const locked = t.db.wrote(/FROM forwarders WHERE id IN \(\?\) ORDER BY id FOR SHARE/).pop();
+    assert.deepEqual([...locked.params[0]].sort(), [3, 4]);
 });
 
 test('accept: an upload that was withdrawn, never sent, or already sent back is refused before anything is copied', async () => {

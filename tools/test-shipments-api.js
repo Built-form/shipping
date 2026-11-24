@@ -79,6 +79,22 @@ async function run() {
     check('PATCH loadingDate that is not a date: 400 BAD_DATE, and the date held stays', r.status === 400 && r.data.code === 'BAD_DATE' && (await H.shipment(s.id)).loadingDate === '2026-12-15', r.data);
     r = await api.patch(`/api/v1/shipments/${s.id}`, { loadingDate: null });
     check('PATCH loadingDate null clears it', r.status === 200 && r.data.loadingDate === null, r.data);
+    // The delivery and customs picks (2026-11-24): a forwarder from the list, or null. Skipped on a database with no forwarder.
+    const fwds = ((await api.get('/api/v1/forwarders')).data.forwarders || []);
+    if (fwds.length) {
+        const f = fwds[0];
+        r = await api.patch(`/api/v1/shipments/${s.id}`, { deliveryForwarderId: f.id, customsForwarderId: f.id });
+        check('PATCH deliveryForwarderId / customsForwarderId: kept, with the list\'s name', r.status === 200 && r.data.deliveryForwarderId === f.id && r.data.deliveryForwarder === f.name && r.data.customsForwarderId === f.id && r.data.customsForwarder === f.name, r.data);
+        check('a draft has picks and no holders yet', r.data.duties && r.data.duties.delivery.forwarderId === null && r.data.duties.delivery.why === 'not_real', r.data.duties);
+        r = await api.patch(`/api/v1/shipments/${s.id}`, { deliveryForwarderId: 'x' });
+        check('PATCH deliveryForwarderId that is not an id: 400 BAD_FIELD, and the pick stays', r.status === 400 && r.data.code === 'BAD_FIELD' && r.data.field === 'deliveryForwarderId' && (await H.shipment(s.id)).deliveryForwarderId === f.id, r.data);
+        r = await api.patch(`/api/v1/shipments/${s.id}`, { customsForwarderId: 999999999 });
+        check('PATCH customsForwarderId not on the list: 400 BAD_FIELD', r.status === 400 && r.data.code === 'BAD_FIELD' && r.data.field === 'customsForwarderId', r.data);
+        r = await api.patch(`/api/v1/shipments/${s.id}`, { deliveryForwarderId: null, customsForwarderId: null });
+        check('PATCH both picks null clears them', r.status === 200 && r.data.deliveryForwarderId === null && r.data.customsForwarderId === null, r.data);
+    } else {
+        check('the delivery and customs picks: SKIPPED (no forwarder on this database)', true);
+    }
     await api.patch(`/api/v1/shipments/${s.id}`, { mode: 'SEA' });
 
     section('5. Lines: PUT / DELETE /shipments/:id/lines/:orderId');

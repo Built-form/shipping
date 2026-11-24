@@ -15,6 +15,8 @@
 //   as it is (a renamed or removed forwarder's pair is never re-resolved).
 // - The payment side (payment_extras.forwarder_id) is in src/lib/payment-extras.js.
 
+const FC = require('./forwarder-containers');
+
 const FORWARDER_MAX = 255;
 
 // The same key as supplierKey (src/services/shipment-payments.js).
@@ -36,10 +38,63 @@ function effectiveForwarder(row) {
             forwarder: row.bk_forwarder_name || null,
             forwarderId: idOrNull(row.bk_forwarder_id),
             forwarderSource: 'booking',
-            booking: { id: Number(row.bk_id), status: row.bk_status, bookingRef: row.bk_ref || null },
+            // `scope` (2026-11-24): what the booking covers; only on a row read with it.
+            booking: { id: Number(row.bk_id), status: row.bk_status, bookingRef: row.bk_ref || null, ...(row.bk_scope !== undefined ? { scope: row.bk_scope || FC.DEFAULT_SCOPE } : {}) },
         };
     }
     return { ...own, forwarderSource: ownSource, booking: null };
+}
+
+// ── three picks, three duties (2026-11-24; src/lib/forwarder-containers.js) ──
+//
+// A container has a pick per duty: the freight pair above (forwarder +
+// forwarder_id), delivery_forwarder_id and customs_forwarder_id. The two new
+// picks are ids only: their names are always read from the list.
+
+// Who holds each duty, from a row of shipmentSelect (the booking join's bk_*
+// columns, and pf_ / df_ / cf_ / bf_ `name` and `live` for the three picks and
+// the booking's forwarder). Each holder carries the list's PRESENT name.
+// undefined for a raw shipments row: it makes no claim about a booking.
+function dutiesOfRow(row) {
+    if (!row || row.bk_count === undefined) return undefined;
+    const facts = new Map();
+    const know = (id, name, live) => { if (id != null) facts.set(Number(id), { name: name || null, live: Number(live) === 1 }); };
+    know(row.forwarder_id, row.pf_name, row.pf_live);
+    know(row.delivery_forwarder_id, row.df_name, row.df_live);
+    know(row.customs_forwarder_id, row.cf_name, row.cf_live);
+    know(row.bk_forwarder_id, row.bf_name, row.bf_live);
+    const bookings = Number(row.bk_count) > 0 && row.bk_id != null
+        ? [{ id: row.bk_id, status: row.bk_status, scope: row.bk_scope, forwarder_id: row.bk_forwarder_id }]
+        : [];
+    const duties = FC.dutiesOf({ shipment: row, bookings, forwarderLive: id => Boolean(facts.get(Number(id))?.live) });
+    const out = {};
+    for (const duty of FC.DUTIES) {
+        const h = duties[duty];
+        out[duty] = h.forwarderId == null ? h : { ...h, name: facts.get(Number(h.forwarderId))?.name ?? null };
+    }
+    return out;
+}
+
+// PATCH /shipments/:id — deliveryForwarderId / customsForwarderId: a forwarder
+// id, or null to clear. → { id } or { error } (the caller names the field).
+function decidePick(value) {
+    if (value === null) return { id: null };
+    const n = strictId(value);
+    return Number.isNaN(n) ? { error: 'must be a forwarder id, or null.' } : { id: n };
+}
+
+// A merge: the survivor keeps its own picks, all three, when it has any; else
+// takes the loser's, all three. An arrangement is never mixed from two containers.
+function mergeForwarderPicks(survivor, loser) {
+    const has = s => s.forwarder_id != null || Boolean(s.forwarder && String(s.forwarder).trim())
+        || s.delivery_forwarder_id != null || s.customs_forwarder_id != null;
+    const from = has(survivor) ? survivor : loser;
+    return {
+        forwarder: from.forwarder ?? null,
+        forwarder_id: from.forwarder_id ?? null,
+        delivery_forwarder_id: from.delivery_forwarder_id ?? null,
+        customs_forwarder_id: from.customs_forwarder_id ?? null,
+    };
 }
 
 // PATCH /shipments/:id — { forwarderId?, forwarder? } against the stored pair
@@ -171,6 +226,9 @@ module.exports = {
     FORWARDER_MAX,
     nameKey,
     effectiveForwarder,
+    dutiesOfRow,
+    decidePick,
+    mergeForwarderPicks,
     decideShipmentForwarder,
     decideBookForwarder,
     pairFromText,

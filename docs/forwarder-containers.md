@@ -32,9 +32,82 @@ One rule, held twice: `ownerOf` (applied by the routes to rows they have locked)
 
 A forwarder that is not the owner but was **sent** a payment with a charge on a real container sees that container for the payment only (`link_source = 'payment'`): its number, and nothing else of it. Two forwarders paid on one container each see it this way. A payment-only container takes no ECN, dates or files.
 
+## Several forwarders on one container: three duties (2026-11-24)
+
+A quote is often **port to port** (China to a UK port), and another company carries the container from the port to our warehouse; other forwarders are **end to end**; and the customs entry is made by one of them or by a broker that carries nothing. So a container has three **duties**, each with at most one holder. One forwarder may hold several. **Where this section and the ones below differ, this one is right**: the sections below were written when a container had one forwarder, and what they call "its forwarder" is the holder of the **freight** duty.
+
+| Duty | Means | What its holder sends on the portal |
+|---|---|---|
+| `freight` | origin to the UK port | the number, loading date, departure date, loading photos, bill of lading (everything a forwarder sent before) |
+| `delivery` | UK port to our warehouse | the **delivery date**, with a time when it has one |
+| `customs` | the customs entry | a **draft customs entry**, for us to approve or send back |
+| any duty | | its own invoice; the payments sent to it |
+
+"End to end" is one forwarder holding `freight` and `delivery`; "port to port" is `freight` alone.
+
+**Who holds a duty** is the rule above ("a live booking outranks the pick on the container"), per duty:
+
+- `freight`: the live booking that covers freight (`freight_bookings.scope` `port_to_port` or `end_to_end`), else `shipments.forwarder_id`.
+- `delivery`: the live booking that covers delivery (`scope` `end_to_end`), else `shipments.delivery_forwarder_id`.
+- `customs`: `shipments.customs_forwarder_id`. Picked by hand only; any forwarder on the list.
+- A covering booking still `requested` leaves **that** duty with nobody, its pick included; the other duties are not affected. The holder must be on the list and not removed. The container must be real.
+
+Rules: `dutiesOf`, `heldBy`, `attachedOf`, `linkSourceOf`, `FIELD_DUTY`, `KIND_DUTY` in `src/lib/forwarder-containers.js` (`ownerOf` is still the freight duty). A forwarder that holds at least one duty is **attached**: it has one full row in the view. One that holds none and was sent a payment is payment-only, as before.
+
+### Five rules that hold everywhere
+
+1. **An older portal build can never write for a new kind of holder.** `link_source` stays `booking` / `container` on the freight holder's row and nobody else's; a forwarder that holds delivery and/or customs without freight has `link_source = 'duty'`. A portal build from before duties treats only the first two as rows it may write for, so to it a `duty` row is read-only.
+2. **An older ShipLine can never decide what it cannot show: every decision names what it decides.** A proposal that carries a field beyond the original three: `claim`'s `expected` must have a key for each, and `reject` must send `fields` naming them all. A file of a kind beyond the original three: `accept` and `reject` must send its `kind`. Otherwise `409 CLIENT_TOO_OLD` (`allowedNext: ['reload']`). On the tab read the fields from before describe the freight holder only; another attached forwarder's things are **never** in the old `strays` (which an older build offers for dismissal), and the old `documents` lists bills of lading only.
+3. **Leaving something out never grants a duty.** A booking made without `scope` is `port_to_port`.
+4. **Who holds what is asked at the moment of deciding, under the locks**, at the claim and again at the finish. A change of pick or scope after the claim counts only if it took away a duty the proposal needs.
+5. **A proposal is accepted or dismissed whole.** One that carries a field its forwarder no longer holds the duty for (it was end to end when it sent a delivery date) is dismiss-only; the tab read lists such fields in the proposal's `outside`.
+
+### What changed, by place
+
+- **Migrations** `2026-11-24_10` (`shipments.delivery_forwarder_id`, `.customs_forwarder_id`, each indexed; `freight_bookings.scope VARCHAR(16) NOT NULL DEFAULT 'port_to_port'` with a CHECK) and `_11` (the view, re-created; a helper view `forwarder_duty_holders_v`, one row per container and duty that has a holder, **not** granted to the portal). No new grant: a view re-created with `CREATE OR REPLACE` keeps its grants.
+- **The view** has four more columns, at the end: `does_freight`, `does_delivery`, `does_customs` (0 or 1: what this row's forwarder holds) and `delivery_date`. `booking_ref` and `freight_request_id` are the freight booking's and are on the freight holder's row only (another company is never handed a link to that quote); `sailing_date`, `port_from`, `port_to`, `container_size` are on every full row. A payment-only row has 0 in the three flags.
+- **`finished`**: arrived, and more than 14 days after the **later** of the arrival and the latest delivery day held. While a delivery holder exists and no order holds a delivery date, not finished until the container is CLOSED (every order received). One answer for every row of the container.
+- **`PATCH /api/v1/shipments/:id`**: `deliveryForwarderId`, `customsForwarderId` (a live forwarder's id, or `null`; `400 BAD_FIELD` with `field`). Audited. `GET /shipments/:id` and the compact entry of `GET /orders` answer `duties: { freight, delivery, customs }`, each `{ forwarderId, name, source, bookingId? }` or `{ forwarderId: null, why }`, and the read answers the two picks with their names (`deliveryForwarder`, `customsForwarder`). `forwarder`, `forwarderId`, `forwarderSource` and `booking` keep their meaning: the freight duty.
+- **A booking's `scope`**: `docs/freight-quotes.md`.
+- **The tab read** adds `duties` (each holder with its `name`, or `why`, `whyText` and the `picked` forwarder behind an empty one), `forwarders` (one section per attached forwarder, the freight holder first: `{ id, name, duties, sources, visibility, contacts, asks, lastNotice, details: { proposal, history }, uploads: { invoice, loadingPhotos, billOfLading, customsDraft }, toReview }`), `strays: { details, uploads }` (what a company that holds **nothing** here left undecided: dismiss only) and `keptDocuments` (every kept document, whatever its kind). `held` gains `deliveryDate` and `deliveryMixed`. A proposal gains `outside`; an upload and a list row gain `duties` (what that forwarder holds now).
+- **The email** (`POST …/forwarder-notice`) takes `forwarderId`: which attached forwarder it goes to (left out: the only one attached, else the freight holder; `409 NOT_VISIBLE` when that forwarder holds nothing; `400 BAD_FIELD`). It asks each company only for what is its own (`containerAsks`): the delivery holder for the delivery date, the customs holder for the draft customs entry.
+- **The list** (`/forwarder-submissions`) joins rows with `link_source` `booking`, `container` or `duty`; a row is `theirs` when its forwarder still holds every duty it needs.
+- **Locks**: the order is the same. Step 2 takes **all** the container's live bookings; step 3 the forwarders named by the bookings **and by all three picks**.
+- **A merge** keeps the survivor's own picks, all three, when it has any, else takes the loser's, all three: never a mix.
+
+### The delivery date
+
+One form, as text, to the minute: `YYYY-MM-DD` when the stored hour and minute are `00:00`, else `YYYY-MM-DDTHH:MM`. "No time" and midnight are the same thing (the column is a DATETIME and the card always stores a time); seconds never count. What we hold is produced **in SQL** by one expression (`deliverySelect`), used by the view and by a decision's locked read of the member orders; what comes in goes through `normDelivery`. The same rule with the same test vectors is in the portal (`src/lib/forwarderContainers.js`, `web/src/lib/forwarderContainers.ts`) and in ShipLine (`forwarderPortal.ts`). Written as `YYYY-MM-DD HH:MM:00`, the shape a hand-typed value has.
+
+- **It is held per order.** `held.deliveryDate` is the one value every member order shares, else `null` with `held.deliveryMixed` (each distinct value, `null` for an order with none). The view's `delivery_date` is the shared value or NULL.
+- **A claim records** which orders are on the container and what each holds for delivery; **a finish refuses** `CONTAINER_CHANGED` with `fields: ['members']` when an order joined or left, and `['deliveryDate']` when one order's value moved. A delivery date needs at least one member order to carry it (`NO_ORDERS`).
+- **Accepting writes the one proposed value to every member order**, through `patchShipmentIn`'s `deliveryDate` (written to the orders only: no shipment column; `422` when the container is not booked). That is also how orders that differ are put right.
+- **The order of dates** is decided at the claim and again at the finish: loading on or before departure, departure on or before **every** delivery day that would then be held. A pair is judged only when the proposal touches one of its sides. `DATES_OUT_OF_ORDER` carries `fields` (`['loadingDate', 'etd']`, `['etd', 'deliveryDate']` or `['loadingDate', 'deliveryDate']`).
+- An accepted delivery date moves whatever reads the orders' delivery date (payment due dates, the calendar, the ARRIVED gate) exactly as typing it does. ShipLine's "45 days ahead" guard is for typing by hand and is not applied to a date staff accept. The card's own DELIVERY save and the order form are not changed.
+
+### The draft customs entry
+
+A fourth kind of file, `customs_draft` (PDF, PNG or JPEG; 15 MB), sent by the customs holder. Accepting it is **approving** it: the same four steps and locks as any file, filed as a `shipment_forwarder_documents` row with `kind = 'customs_draft'` under the forwarder that sent it. Approved drafts are listed newest approval first with who sent each; nothing is called "current", and one approved under a former customs holder stays listed under that forwarder's name. There is no final entry (C88 / MRN) in this work.
+
+New refusals, both `409`: `NOT_THEIR_DUTY` (the forwarder holds something on the container, but not what `fields` or `kind` need; `allowedNext: ['reject']`) and `CLIENT_TOO_OLD` (rule 2; `allowedNext: ['reload']`).
+
+### Rolling back (all user-triggered)
+
+Released together, shipping → portal → ShipLine: ShipLine is the only place a delivery or customs holder, or an end-to-end booking, can be made, so until it is out every row is a freight holder and all three apps behave as before.
+
+| Rolling back | Allowed when | What then happens |
+|---|---|---|
+| ShipLine | any time | it cannot make duties; `CLIENT_TOO_OLD` stops it deciding what it cannot show |
+| the portal | any time | rule 1: delivery-only and customs-only companies see their containers read-only; a freight holder keeps its page |
+| shipping | only after ShipLine is back **and** `node tools/list-forwarder-duties.js` lists nothing (exit 0): no pick, no scope other than `port_to_port`, no undecided delivery or customs submission, **and no approved customs draft on file**. Once one is on file shipping is not rolled back below this release: older code lists every kept document as a bill of lading, and approved records are never deleted to make a rollback possible | the new columns and the view **stay**: they are additive, and every older build reads them as before. Claims in flight lapse in 10 minutes |
+
+### Tests
+
+`npm run test:unit` covers the rules and the routes with scripted statements. **The release gate runs on TEST after its migration**, before anything is deployed: `tools/test-portal-forwarder-container-view.js` (the view against `dutiesOf` on the same fixtures, row for row and flag for flag; the delivery date's form; `finished`) and `tools/test-forwarder-container-races.js` (the portal's own statements and the decisions on two connections: a delivery pick, a booking's scope and a holder's removal against a write and against a claim; a finish after the duty moved, after a delivery date was typed on one order, after an order joined or left; one person who is a contact of two companies; the statement of a portal build from before duties). If the portal's statement does not **wait** on the regrouped view, the release stops there. Not included: more than one holder per duty, a third leg, proof-of-delivery uploads, a forwarder seeing another forwarder's files, and the delivery leg through Freight quotes (a second live booking per container: planned, not built).
+
 ## The view
 
-`portal_forwarder_containers_v` (`2026-11-23_11`), `SQL SECURITY DEFINER`, `GRANT SELECT` to the portal's login (`_12`). The portal's login gains no right on `shipments`, `orders` or `freight_bookings`.
+`portal_forwarder_containers_v` (`2026-11-23_11`; re-created by `2026-11-24_11` with the duty flags and the delivery date, see above), `SQL SECURITY DEFINER`, `GRANT SELECT` to the portal's login (`_12`). The portal's login gains no right on `shipments`, `orders` or `freight_bookings`.
 
 One row per container and forwarder; a full row outranks a payment-only one.
 

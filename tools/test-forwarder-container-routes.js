@@ -42,14 +42,15 @@ function scripted(rules) {
 // booking columns of shipmentSelect.
 const SHIP_ROW = (over = {}) => ({
     id: 1214, reference: '339', name: 'DRAFT-SEA-261101 - 339', mode: 'SEA', stage: 'BOOKED', deleted_at: null, merged_into_id: null,
-    forwarder_id: null, forwarder: null, tracking_ref: null, booking_ref: null, bl_number: null, vessel_name: null, origin_port: 'Ningbo',
+    forwarder_id: null, forwarder: null, delivery_forwarder_id: null, customs_forwarder_id: null,
+    tracking_ref: null, booking_ref: null, bl_number: null, vessel_name: null, origin_port: 'Ningbo',
     etd: '2026-10-21', eta: null, ata: null, loading_date: null,
-    bk_count: 1, bk_id: 12, bk_status: 'confirmed', bk_ref: 'hello', bk_forwarder_id: 4, bk_forwarder_name: 'test2forwarder',
+    bk_count: 1, bk_id: 12, bk_status: 'confirmed', bk_scope: 'port_to_port', bk_ref: 'hello', bk_forwarder_id: 4, bk_forwarder_name: 'test2forwarder',
     member_count: 4, member_eta: null, member_etd: '2026-10-21', member_vessel: null, member_ext: null, member_awb: null,
     derived_stage: 'BOOKED', effective_stage: 'BOOKED',
     ...over,
 });
-const NO_BOOKING = { bk_count: 0, bk_id: null, bk_status: null, bk_ref: null, bk_forwarder_id: null, bk_forwarder_name: null };
+const NO_BOOKING = { bk_count: 0, bk_id: null, bk_status: null, bk_scope: null, bk_ref: null, bk_forwarder_id: null, bk_forwarder_name: null };
 
 const FORWARDERS = [{ id: 3, name: 'DCG', deleted_at: null }, { id: 4, name: 'test2forwarder', deleted_at: null }];
 const CONTACTS = [{ id: 9, forwarder_id: 4, name: 'Mei', email: 'mei@fwd.example' }, { id: 10, forwarder_id: 4, name: null, email: 'ops@fwd.example' }];
@@ -73,8 +74,12 @@ const baseRules = ({ forwarders = FORWARDERS, contacts = CONTACTS, notices = [],
 // By default they say what the unlocked read said; `locked` makes them differ,
 // as when something changed between the page's read and the decision.
 const lockedOf = (shipment) => ({
-    shipment: shipment && { id: shipment.id, reference: shipment.reference, stage: shipment.stage, deleted_at: shipment.deleted_at, merged_into_id: shipment.merged_into_id, forwarder_id: shipment.forwarder_id, forwarder: shipment.forwarder },
-    bookings: shipment && shipment.bk_id != null ? [{ id: shipment.bk_id, status: shipment.bk_status, booking_ref: shipment.bk_ref, forwarder_id: shipment.bk_forwarder_id }] : [],
+    shipment: shipment && {
+        id: shipment.id, reference: shipment.reference, stage: shipment.stage, deleted_at: shipment.deleted_at, merged_into_id: shipment.merged_into_id,
+        forwarder_id: shipment.forwarder_id, forwarder: shipment.forwarder,
+        delivery_forwarder_id: shipment.delivery_forwarder_id ?? null, customs_forwarder_id: shipment.customs_forwarder_id ?? null,
+    },
+    bookings: shipment && shipment.bk_id != null ? [{ id: shipment.bk_id, status: shipment.bk_status, scope: shipment.bk_scope, booking_ref: shipment.bk_ref, forwarder_id: shipment.bk_forwarder_id }] : [],
 });
 
 // `proposals`: the container's rows of the portal's forwarder_container_details,
@@ -158,7 +163,7 @@ test('tab: a container with a confirmed booking is its forwarder\'s, in full', a
     assert.deepEqual(r.body.forwarder, { id: 4, name: 'test2forwarder', source: 'booking' });
     assert.deepEqual(r.body.visibility, { mode: 'full', why: null });
     assert.deepEqual(r.body.contacts, [{ name: 'Mei', email: 'mei@fwd.example' }, { name: null, email: 'ops@fwd.example' }]);
-    assert.deepEqual(r.body.held, { ecn: null, loadingDate: null, etd: '2026-10-21', eta: null, bookingRef: 'hello', stage: 'BOOKED' });
+    assert.deepEqual(r.body.held, { ecn: null, loadingDate: null, etd: '2026-10-21', eta: null, bookingRef: 'hello', stage: 'BOOKED', deliveryDate: null, deliveryMixed: null });
     assert.deepEqual(r.body.asks, ['ecn', 'loadingDate', 'invoice', 'photos', 'billOfLading']);
     assert.equal(r.body.portalUrl, 'https://portal.example/freight-containers/1214');
     assert.equal(r.body.canDecide, true);
@@ -170,7 +175,7 @@ test('tab: a container with a confirmed booking is its forwarder\'s, in full', a
 test('tab: what we hold comes from the member orders, as the container card shows it', async () => {
     const t = build(baseRules(), { shipment: SHIP_ROW({ member_ext: 'MSKU1234565', member_etd: '2026-12-01', member_eta: '2027-01-10', loading_date: '2026-11-28', effective_stage: 'IN_TRANSIT' }) });
     const r = await t.call(TAB);
-    assert.deepEqual(r.body.held, { ecn: 'MSKU1234565', loadingDate: '2026-11-28', etd: '2026-12-01', eta: '2027-01-10', bookingRef: 'hello', stage: 'IN_TRANSIT' });
+    assert.deepEqual(r.body.held, { ecn: 'MSKU1234565', loadingDate: '2026-11-28', etd: '2026-12-01', eta: '2027-01-10', bookingRef: 'hello', stage: 'IN_TRANSIT', deliveryDate: null, deliveryMixed: null });
     assert.deepEqual(r.body.asks, ['invoice', 'photos', 'billOfLading']);
 });
 
@@ -510,6 +515,11 @@ const ECN = 'CSQU3054383';
 const ASKED = { ecn: ECN, loadingDate: '2026-10-18', etd: '2026-10-22' };
 // What SHIP_ROW() holds, as the card shows it.
 const SEEN = { ecn: null, loadingDate: null, etd: '2026-10-21' };
+// The same with the delivery date a read or a refusal now tells too: none held, and the orders agree.
+const NO_DELIVERY = { deliveryDate: null, deliveryMixed: null };
+const HELD = { ...SEEN, ...NO_DELIVERY };
+// What a claim records: that, the two member orders, and what each holds for delivery.
+const SNAP = { ...HELD, members: [1, 2], deliveryByOrder: { 1: null, 2: null } };
 const PROPOSAL = (over = {}) => ({
     id: 51, shipment_id: 1214, forwarder_id: 4, status: 'pending',
     requested_json: JSON.stringify(ASKED), base_json: JSON.stringify(SEEN),
@@ -556,7 +566,7 @@ test('tab: the live proposal of the container\'s forwarder, and its older ones a
     assert.equal(r.status, 200);
     assert.equal(r.body.unavailable, false);
     assert.deepEqual(r.body.details.proposal, {
-        id: 52, forwarderId: 4, forwarderName: 'test2forwarder', status: 'pending', waiting: true, live: true, actionable: true,
+        id: 52, forwarderId: 4, forwarderName: 'test2forwarder', status: 'pending', waiting: true, live: true, actionable: true, outside: [],
         requested: ASKED, base: { etd: '2026-10-21' }, note: 'Loaded on the 18th', byName: 'Mei', byEmail: 'mei@fwd.example',
         at: '2026-11-23T09:00:00Z', claimedBy: null, claimedAt: null, decidedNote: null, decidedBy: null, decidedAt: null,
     });
@@ -671,10 +681,10 @@ test('claim: the live, waiting proposal of the container\'s own forwarder is cla
     const r = await t.call(CLAIM, on(51, { expected: SEEN }));
     assert.equal(r.status, 200);
     assert.match(r.body.claimToken, /^[a-f0-9]{32}$/);
-    assert.deepEqual({ ...r.body, claimToken: null }, { claimToken: null, expiresInSeconds: 600, requested: ASKED, held: SEEN });
+    assert.deepEqual({ ...r.body, claimToken: null }, { claimToken: null, expiresInSeconds: 600, requested: ASKED, held: HELD });
     const w = marked(t, 'applying');
     assert.equal(w.length, 1);
-    assert.deepEqual(w[0].params, [r.body.claimToken, JSON.stringify(SEEN), 'ops@us.com', 51]);
+    assert.deepEqual(w[0].params, [r.body.claimToken, JSON.stringify(SNAP), 'ops@us.com', 51]);
     assert.match(w[0].sql, /claimed_at = UTC_TIMESTAMP\(\) WHERE id = \? AND status = 'pending'$/);
     assert.equal(sqlOf(t).at(-1), 'COMMIT');
     assert.deepEqual(t.patched, []);
@@ -710,9 +720,9 @@ test('claim: each refusal says why and what can be done, and writes nothing', as
             refusal('NOT_THEIR_CONTAINER', ['reject'], { why: 'booking_not_confirmed' })],
         ['the container was deleted', { proposals: [PROPOSAL()], locked: { shipment: null, bookings: [] } }, SEEN, refusal('NOT_THEIR_CONTAINER', ['reject'], { why: 'gone' })],
         ['the container holds another date than the card showed', { proposals: [PROPOSAL()] }, { ...SEEN, etd: '2026-10-20' },
-            refusal('CONTAINER_CHANGED', ['reload'], { fields: ['etd'], held: SEEN })],
+            refusal('CONTAINER_CHANGED', ['reload'], { fields: ['etd'], held: HELD })],
         ['the container already has a number the card did not show', { proposals: [PROPOSAL()], shipment: SHIP_ROW({ member_ext: 'MSKU1234565' }) }, SEEN,
-            refusal('CONTAINER_CHANGED', ['reload'], { fields: ['ecn'], held: { ...SEEN, ecn: 'MSKU1234565' } })],
+            refusal('CONTAINER_CHANGED', ['reload'], { fields: ['ecn'], held: { ...HELD, ecn: 'MSKU1234565' } })],
         ['a number is proposed and the container has no order to carry it', { proposals: [PROPOSAL()], members: [] }, SEEN, refusal('NO_ORDERS', ['reject'])],
         ['the number proposed fails its check digit', { proposals: [PROPOSAL({ requested_json: JSON.stringify({ ecn: 'CSQU3054384' }) })] }, SEEN, refusal('BAD_PROPOSAL', ['reject'], { fields: ['ecn'] })],
         ['the proposal asks for nothing', { proposals: [PROPOSAL({ requested_json: '{}' })] }, SEEN, refusal('EMPTY_PROPOSAL', ['reject'])],
@@ -734,7 +744,7 @@ test('claim: a number is compared as it is read, so its case and spacing are not
     const r = await t.call(CLAIM, on(51, { expected: { ecn: 'msku 123456-5', loadingDate: null, etd: '2026-10-21' } }));
     assert.equal(r.status, 200);
     // What the claim keeps is what the container HOLDS, read under the locks, not what the card sent.
-    assert.equal(marked(t, 'applying')[0].params[1], JSON.stringify({ ecn: 'MSKU1234565', loadingDate: null, etd: '2026-10-21' }));
+    assert.equal(marked(t, 'applying')[0].params[1], JSON.stringify({ ...SNAP, ecn: 'MSKU1234565' }));
 });
 
 test('claim: a proposal of dates only needs no order on the container', async () => {
@@ -868,7 +878,7 @@ test('finish: refused, with nothing written, when the container is no longer tha
 });
 
 test('finish: refused while the proposed number is not on every order of the container', async () => {
-    const heldNow = { ecn: ECN, loadingDate: null, etd: '2026-10-21' };
+    const heldNow = { ecn: ECN, loadingDate: null, etd: '2026-10-21', ...NO_DELIVERY };
     const cases = [
         ['one order has none', [{ id: 1, external_container_number: ECN, awb_number: null }, { id: 2, external_container_number: null, awb_number: null }]],
         ['one order has another', [{ id: 1, external_container_number: ECN, awb_number: null }, { id: 2, external_container_number: 'MSKU1234565', awb_number: null }]],
@@ -884,7 +894,7 @@ test('finish: refused while the proposed number is not on every order of the con
     // Not written at all yet: the container still holds none.
     const t = build(baseRules(), { proposals: [CLAIMED()] });
     const r = await t.call(FINISH, on(51, { claimToken: TOKEN }));
-    assert.deepEqual(r, { status: 409, body: refusal('NOT_ON_CONTAINER', ['reload'], { fields: ['ecn'], held: SEEN }) });
+    assert.deepEqual(r, { status: 409, body: refusal('NOT_ON_CONTAINER', ['reload'], { fields: ['ecn'], held: HELD }) });
 });
 
 test('finish: an air waybill number is read from the orders as the card reads it', async () => {
@@ -901,7 +911,7 @@ test('finish: an air waybill number is read from the orders as the card reads it
 test('finish: refused when someone else changed a date since the claim', async () => {
     const t = build(baseRules(), { shipment: WITH_ECN({ member_etd: '2026-10-25' }), proposals: [CLAIMED()] });
     const r = await t.call(FINISH, on(51, { claimToken: TOKEN }));
-    assert.deepEqual(r, { status: 409, body: refusal('CONTAINER_CHANGED', ['reload'], { fields: ['etd'], held: { ecn: ECN, loadingDate: null, etd: '2026-10-25' } }) });
+    assert.deepEqual(r, { status: 409, body: refusal('CONTAINER_CHANGED', ['reload'], { fields: ['etd'], held: { ecn: ECN, loadingDate: null, etd: '2026-10-25', ...NO_DELIVERY } }) });
     assert.deepEqual(t.patched, []);
     assert.equal(marked(t, 'applied').length, 0);
     assert.equal(sqlOf(t).at(-1), 'ROLLBACK');
@@ -919,7 +929,7 @@ test('finish: the departure date ShipLine\'s own reset wrote is the one differen
     // Not told of a reset: the cleared date is someone else's change.
     t = build(baseRules(), { shipment: cleared, proposals: [replacing] });
     r = await t.call(FINISH, on(51, { claimToken: TOKEN }));
-    assert.deepEqual(r, { status: 409, body: refusal('CONTAINER_CHANGED', ['reload'], { fields: ['etd'], held: { ecn: ECN, loadingDate: null, etd: null } }) });
+    assert.deepEqual(r, { status: 409, body: refusal('CONTAINER_CHANGED', ['reload'], { fields: ['etd'], held: { ecn: ECN, loadingDate: null, etd: null, ...NO_DELIVERY } }) });
 
     // The reset wrote the 10th; someone then set the 15th: refused, whatever the proposal asks.
     t = build(baseRules(), { shipment: WITH_ECN({ member_etd: '2026-10-15' }), proposals: [replacing] });
@@ -941,7 +951,7 @@ test('finish: a loading date the reset left after the departure date is refused 
     });
     const t = build(baseRules(), { shipment: WITH_ECN({ member_etd: '2026-10-12' }), proposals: [replacing] });
     const r = await t.call(FINISH, on(51, { claimToken: TOKEN, ecnReset: { etd: '2026-10-12' } }));
-    assert.deepEqual(r, { status: 409, body: refusal('DATES_OUT_OF_ORDER', ['reject'], { fields: ['loadingDate', 'etd'], held: { ecn: ECN, loadingDate: null, etd: '2026-10-12' } }) });
+    assert.deepEqual(r, { status: 409, body: refusal('DATES_OUT_OF_ORDER', ['reject'], { fields: ['loadingDate', 'etd'], held: { ecn: ECN, loadingDate: null, etd: '2026-10-12', ...NO_DELIVERY } }) });
     assert.deepEqual(t.patched, []);
 });
 
@@ -1057,8 +1067,11 @@ const LISTED = (over = {}) => ({
     id: 51, shipment_id: 1214, forwarder_id: 4, status: 'pending', requested_json: JSON.stringify(ASKED),
     user_email: 'mei@fwd.example', user_name: 'Mei', created_at_iso: '2026-11-23T09:00:00Z', decided_at_iso: null, lapsed: 0,
     reference: '339', mode: 'SEA', forwarder_name: 'test2forwarder', theirs: 1, live: 1,
+    // What the portal's view says its forwarder holds on that container (2026-11-24); NULL when it has no row there.
+    does_freight: 1, does_delivery: 0, does_customs: 0,
     ...over,
 });
+const NO_ROW = { theirs: 0, does_freight: null, does_delivery: null, does_customs: null };
 // The list reads proposals, then files (none unless a test puts its own rule in front).
 const listRules = rows => [
     [/forwarder_container_details d LEFT JOIN portal_forwarder_containers_v c/, () => (rows instanceof Error ? rows : [rows])],
@@ -1067,7 +1080,7 @@ const listRules = rows => [
 ];
 const LIST_ROWS = [
     LISTED({ id: 61, shipment_id: 9, reference: '301', status: 'applying' }),
-    LISTED({ id: 60, shipment_id: 8, reference: '300', theirs: 0 }),
+    LISTED({ id: 60, shipment_id: 8, reference: '300', ...NO_ROW }),
     LISTED(),
     LISTED({ id: 50, live: 0 }),
     LISTED({ id: 49, shipment_id: 7, reference: '299', status: 'applying', lapsed: 1 }),
@@ -1081,7 +1094,7 @@ test('list: what waits for our team on containers that are still their forwarder
     assert.equal(r.body.canDecide, true);
     assert.deepEqual(r.body.data.map(d => [d.id, d.status]), [[61, 'applying'], [51, 'pending'], [49, 'pending']]);
     assert.deepEqual(r.body.data[1], {
-        kind: 'details', id: 51, shipmentId: 1214, reference: '339', mode: 'SEA', forwarderId: 4, forwarderName: 'test2forwarder',
+        kind: 'details', id: 51, shipmentId: 1214, reference: '339', mode: 'SEA', forwarderId: 4, forwarderName: 'test2forwarder', duties: ['freight'],
         status: 'pending', waiting: true, live: true, theirs: true, actionable: true, requested: ASKED, byName: 'Mei', byEmail: 'mei@fwd.example',
         at: '2026-11-23T09:00:00Z', decidedAt: null,
     });
@@ -1130,6 +1143,7 @@ const FILE_ROW = (over = {}) => ({
     filename: 'invoice 339.pdf', content_type: 'application/pdf', file_size: 120000, final_key: `files/fwd/70/${'a'.repeat(32)}.pdf`, s3_etag: '"e1"', note: null,
     upload_status: 'sent', review_status: 'open', decided_note: null, decided_by: null, filed_key: null, filed_id: null,
     sent_at_iso: '2026-11-23T09:01:00Z', decided_at_iso: null, withdrawn_at_iso: null, forwarder_name: 'test2forwarder', theirs: 1,
+    does_freight: 1, does_delivery: 0, does_customs: 0,
     reference: '339', mode: 'SEA',
     ...over,
 });
@@ -1146,7 +1160,7 @@ test('tab: the files the forwarder sent, by kind, with what became of each; neve
     assert.equal(r.status, 200);
     assert.deepEqual(r.body.uploads.invoice, [{
         id: 70, kind: 'invoice', shipmentId: 1214, forwarderId: 4, forwarderName: 'test2forwarder', filename: 'invoice 339.pdf', contentType: 'application/pdf', fileSize: 120000,
-        note: null, byName: 'Mei', byEmail: 'mei@fwd.example', sentAt: '2026-11-23T09:01:00Z', state: 'open', waiting: true, theirs: true, actionable: true,
+        note: null, byName: 'Mei', byEmail: 'mei@fwd.example', sentAt: '2026-11-23T09:01:00Z', state: 'open', waiting: true, theirs: true, actionable: true, duties: ['freight'],
         decidedNote: null, decidedBy: null, decidedAt: null, filedId: null,
     }]);
     assert.deepEqual(r.body.uploads.loadingPhotos.map(u => [u.id, u.state, u.actionable, u.filedId]), [[72, 'open', true, null], [71, 'received', false, 901]]);
@@ -1161,8 +1175,8 @@ test('tab: a file of a forwarder the container is no longer with can be dismisse
     // 82: the view still says it is theirs (it lags the locked rows by a moment): this read decides, and it is not.
     const t = build(baseRules({ uploads: [
         FILE_ROW({ id: 82, forwarder_id: 3, forwarder_name: 'DCG', theirs: 1 }),
-        FILE_ROW({ id: 80, forwarder_id: 3, forwarder_name: 'DCG', theirs: 0 }),
-        FILE_ROW({ id: 81, forwarder_id: 3, forwarder_name: 'DCG', theirs: 0, review_status: 'rejected' }),
+        FILE_ROW({ id: 80, forwarder_id: 3, forwarder_name: 'DCG', ...NO_ROW }),
+        FILE_ROW({ id: 81, forwarder_id: 3, forwarder_name: 'DCG', ...NO_ROW, review_status: 'rejected' }),
     ] }));
     const r = await t.call(TAB);
     assert.deepEqual(r.body.uploads.strays.map(u => [u.id, u.forwarderName, u.waiting, u.actionable]), [[82, 'DCG', true, false], [80, 'DCG', true, false]]);
@@ -1199,7 +1213,7 @@ test('list: files and proposals together, the newest first, and the badge counts
     const r = await build(rules).call(LIST);
     assert.deepEqual(r.body.data.map(d => [d.kind, d.id, d.at]), [['loading_photo', 72, '2026-11-23T09:30:00Z'], ['details', 51, '2026-11-23T09:00:00Z'], ['invoice', 70, '2026-11-23T08:00:00Z']]);
     assert.deepEqual(r.body.data[0], {
-        kind: 'loading_photo', id: 72, shipmentId: 1214, reference: '339', mode: 'SEA', forwarderId: 4, forwarderName: 'test2forwarder', status: 'pending',
+        kind: 'loading_photo', id: 72, shipmentId: 1214, reference: '339', mode: 'SEA', forwarderId: 4, forwarderName: 'test2forwarder', duties: ['freight'], status: 'pending',
         waiting: true, live: true, theirs: true, actionable: true, filename: 'b.jpg', fileSize: 120000, requested: {}, byName: 'Mei', byEmail: 'mei@fwd.example',
         at: '2026-11-23T09:30:00Z', decidedAt: null,
     });
@@ -1214,7 +1228,7 @@ test('list: with status=all, files that were decided or are no longer theirs are
     const files = [
         FILE_ROW({ id: 75, review_status: 'received', decided_at_iso: '2026-11-23T12:00:00Z' }),
         FILE_ROW({ id: 74, review_status: 'rejected' }),
-        FILE_ROW({ id: 73, theirs: 0 }),
+        FILE_ROW({ id: 73, ...NO_ROW }),
     ];
     const asked = build([fileListRule(files), ...listRules([])]);
     const r = await asked.call(LIST, { query: { status: 'all' } });
@@ -1226,4 +1240,355 @@ test('list: where the portal\'s uploads table is missing, nothing is listed and 
     const r = await build([fileListRule(err(1146)), ...listRules([LISTED()])]).call(LIST);
     assert.deepEqual(r, { status: 200, body: { data: [], unavailable: true, canDecide: true } });
     assert.equal((await build([fileListRule(err(1142)), ...listRules([])]).call(LIST)).status, 500);
+});
+
+// ── several forwarders on one container, by duty (2026-11-24) ────────────
+//
+// Freight is forwarder 4's (its confirmed booking); delivery and customs are
+// forwarder 3's (DCG), picked by hand.
+
+const TWO = (over = {}) => SHIP_ROW({ delivery_forwarder_id: 3, customs_forwarder_id: 3, ...over });
+const BOTH_CONTACTS = [...CONTACTS, { id: 1, forwarder_id: 3, name: 'Li', email: 'li@dcg.example' }];
+
+test('tab: one section per forwarder that holds a duty, the freight holder first, each asked only for its own things', async () => {
+    const t = build(baseRules({ contacts: BOTH_CONTACTS, notices: [{ id: 6, status: 'sent', forwarder_id: 3, sent_to: '["li@dcg.example"]', subject: 's', sent_by_email: 'ops@us.com', created_at_iso: 'c', sent_at_iso: 'd' }] }), { shipment: TWO() });
+    const r = await t.call(TAB);
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.body.forwarders.map(f => [f.id, f.name, f.duties, f.sources]), [
+        [4, 'test2forwarder', ['freight'], { freight: 'booking' }],
+        [3, 'DCG', ['delivery', 'customs'], { delivery: 'container', customs: 'container' }],
+    ]);
+    const [freight, delivery] = r.body.forwarders;
+    assert.deepEqual(freight.asks, ['ecn', 'loadingDate', 'invoice', 'photos', 'billOfLading']);
+    assert.deepEqual(delivery.asks, ['deliveryDate', 'invoice', 'customsDraft'], 'never the number, the loading date, photos or the bill of lading');
+    assert.deepEqual(freight.contacts.map(c => c.email), ['mei@fwd.example', 'ops@fwd.example']);
+    assert.deepEqual(delivery.contacts, [{ name: 'Li', email: 'li@dcg.example' }]);
+    assert.deepEqual(freight.visibility, { mode: 'full', why: null });
+    assert.equal(freight.lastNotice, null);
+    assert.equal(delivery.lastNotice.id, 6);
+    assert.deepEqual(delivery.details, { proposal: null, history: [] });
+    assert.deepEqual(delivery.uploads, { invoice: [], loadingPhotos: [], billOfLading: [], customsDraft: [] });
+    // The old field keeps its old shape: three kinds and the strays.
+    assert.deepEqual(r.body.uploads, { invoice: [], loadingPhotos: [], billOfLading: [], strays: [] });
+    // Who holds each duty, by the list's name.
+    assert.deepEqual(r.body.duties, {
+        freight: { forwarderId: 4, source: 'booking', bookingId: 12, name: 'test2forwarder' },
+        delivery: { forwarderId: 3, source: 'container', name: 'DCG' },
+        customs: { forwarderId: 3, source: 'container', name: 'DCG' },
+    });
+    // The fields from before still describe the freight forwarder, exactly as they did.
+    assert.deepEqual(r.body.forwarder, { id: 4, name: 'test2forwarder', source: 'booking' });
+    assert.deepEqual(r.body.visibility, { mode: 'full', why: null });
+    assert.deepEqual(r.body.asks, ['ecn', 'loadingDate', 'invoice', 'photos', 'billOfLading']);
+});
+
+test('tab: a duty nobody holds says why, and names the pick behind it', async () => {
+    const t = build(baseRules({ forwarders: [...FORWARDERS, { id: 7, name: 'Gone Ltd', deleted_at: '2026-11-01 10:00:00' }] }), { shipment: SHIP_ROW({ delivery_forwarder_id: 7 }) });
+    const r = await t.call(TAB);
+    assert.deepEqual(r.body.duties.delivery, { forwarderId: null, why: 'forwarder_removed', whyText: 'Its forwarder has been removed from the Forwarders list.', picked: { id: 7, name: 'Gone Ltd' } });
+    assert.deepEqual(r.body.duties.customs, { forwarderId: null, why: 'no_forwarder', whyText: 'No forwarder is on this container.', picked: null });
+    assert.deepEqual(r.body.forwarders.map(f => f.id), [4]);
+});
+
+test('tab: an end-to-end booking gives its forwarder the delivery too, over the pick', async () => {
+    const r = await build(baseRules({ contacts: BOTH_CONTACTS }), { shipment: TWO({ bk_scope: 'end_to_end' }) }).call(TAB);
+    assert.deepEqual(r.body.forwarders.map(f => [f.id, f.duties]), [[4, ['freight', 'delivery']], [3, ['customs']]]);
+});
+
+test('tab: what another attached forwarder sent is in ITS section, and never among the strays an older ShipLine could dismiss', async () => {
+    const t = build(baseRules({
+        contacts: BOTH_CONTACTS,
+        // The delivery company sent a number and a loading date (an older portal let it): not its to ask for.
+        details: [PROPOSAL({ id: 60, forwarder_id: 3, forwarder_name: 'DCG' }), PROPOSAL({ id: 51 })],
+        uploads: [FILE_ROW({ id: 81, forwarder_id: 3, forwarder_name: 'DCG', kind: 'loading_photo' }), FILE_ROW({ id: 80, forwarder_id: 3, forwarder_name: 'DCG' })],
+    }), { shipment: TWO() });
+    const r = await t.call(TAB);
+    const [freight, delivery] = r.body.forwarders;
+    assert.equal(freight.details.proposal.id, 51);
+    assert.deepEqual([delivery.details.proposal.id, delivery.details.proposal.actionable, delivery.details.proposal.outside], [60, false, Object.keys(ASKED)]);
+    // Its invoice can be accepted (any duty), its loading photo cannot (freight's).
+    assert.deepEqual(delivery.uploads.invoice.map(u => [u.id, u.theirs, u.actionable]), [[80, true, true]]);
+    assert.deepEqual(delivery.uploads.loadingPhotos.map(u => [u.id, u.theirs, u.actionable]), [[81, false, false]]);
+    assert.equal(delivery.toReview, 1);
+    assert.equal(freight.toReview, 1);
+    assert.equal(r.body.toReview, 2);
+    // Nothing of an attached forwarder is a stray, in the new field or the old ones.
+    assert.deepEqual(r.body.strays, { details: [], uploads: [] });
+    assert.deepEqual(r.body.details.strays, []);
+    assert.deepEqual(r.body.uploads.strays, []);
+    // The old fields carry the freight forwarder's things only.
+    assert.equal(r.body.details.proposal.id, 51);
+    assert.deepEqual(r.body.uploads.invoice, []);
+});
+
+test('tab: what a company that holds nothing sent is a stray, in the new field and the old ones alike', async () => {
+    const t = build(baseRules({ details: [PROPOSAL({ id: 60, forwarder_id: 5, forwarder_name: 'Other Ltd' })], uploads: [FILE_ROW({ id: 80, forwarder_id: 5, forwarder_name: 'Other Ltd', ...NO_ROW })] }), { shipment: TWO() });
+    const r = await t.call(TAB);
+    assert.deepEqual(r.body.strays.details.map(s => [s.id, s.actionable]), [[60, false]]);
+    assert.deepEqual(r.body.strays.uploads.map(s => [s.id, s.actionable]), [[80, false]]);
+    assert.deepEqual(r.body.details.strays.map(s => s.id), [60]);
+    assert.deepEqual(r.body.uploads.strays.map(s => s.id), [80]);
+    assert.equal(r.body.toReview, 0);
+});
+
+test('tab: the old documents field lists bills of lading only; every kind kept is in keptDocuments', async () => {
+    const doc = (id, kind) => ({ id, shipment_id: 1214, forwarder_id: 4, forwarder_name: 'test2forwarder', kind, filename: `${kind}.pdf`, public_url: `https://po.example/${kind}.pdf`,
+        content_type: 'application/pdf', file_size: 9, forwarder_upload_id: id, uploaded_by_email: 'mei@fwd.example', accepted_by_email: 'kim@us.com', deleted_at: null, created_at_iso: '2026-11-23T12:00:00Z' });
+    const r = await build(baseRules({ documents: [doc(903, 'customs_draft'), doc(902, 'bill_of_lading')] })).call(TAB);
+    assert.deepEqual(r.body.documents.map(d => [d.id, d.kind]), [[902, 'bill_of_lading']]);
+    assert.deepEqual(r.body.keptDocuments.map(d => [d.id, d.kind]), [[903, 'customs_draft'], [902, 'bill_of_lading']]);
+});
+
+test('claim: refused when its forwarder holds another duty than the one its fields need; every forwarder the rows name is locked', async () => {
+    const t = build(baseRules(), { shipment: TWO(), proposals: [PROPOSAL({ id: 60, forwarder_id: 3 })] });
+    const r = await t.call(CLAIM, on(60, { expected: SEEN }));
+    assert.deepEqual(r, { status: 409, body: refusal('NOT_THEIR_DUTY', ['reject'], { why: null, fields: Object.keys(ASKED) }) });
+    assert.equal(marked(t, 'applying').length, 0);
+    const locked = t.db.wrote(/FROM forwarders WHERE id IN \(\?\) ORDER BY id FOR SHARE/)[0];
+    assert.deepEqual([...locked.params[0]].sort(), [3, 4], 'the picks\' forwarder and the booking\'s');
+    // The locks are the same ones, in the same order.
+    assert.deepEqual(locksOf(t).map(tableOf), ['shipments', 'freight_bookings', 'forwarders', 'orders', 'forwarder_container_details']);
+});
+
+test('claim: the freight forwarder\'s proposal is claimed with a second forwarder on the container', async () => {
+    const t = build(baseRules(), { shipment: TWO(), proposals: [PROPOSAL()] });
+    const r = await t.call(CLAIM, on(51, { expected: SEEN }));
+    assert.equal(r.status, 200);
+    assert.equal(marked(t, 'applying').length, 1);
+});
+
+test('finish: refused, with nothing written, when its forwarder lost the freight since the claim and holds only another duty', async () => {
+    // Under the lock: the booking is gone, freight is forwarder 3's now, and forwarder 4 was given customs.
+    const locked = { shipment: { ...lockedOf(TWO()).shipment, forwarder_id: 3, delivery_forwarder_id: null, customs_forwarder_id: 4 }, bookings: [] };
+    const t = build(baseRules(), { shipment: WITH_ECN(), locked, proposals: [CLAIMED()] });
+    const r = await t.call(FINISH, on(51, { claimToken: TOKEN }));
+    assert.deepEqual(r, { status: 409, body: refusal('NOT_THEIR_DUTY', ['reject'], { why: null, fields: Object.keys(ASKED) }) });
+    assert.equal(t.patched.length, 0);
+    assert.equal(marked(t, 'applied').length, 0);
+});
+
+test('finish: a change of pick that leaves its forwarder the duty it needs does not stop it', async () => {
+    // Customs was handed to another company since the claim: nothing to do with a number and a loading date.
+    const locked = { ...lockedOf(WITH_ECN()), shipment: { ...lockedOf(WITH_ECN()).shipment, customs_forwarder_id: 3 } };
+    const t = build(baseRules(), { shipment: WITH_ECN(), locked, proposals: [CLAIMED()] });
+    const r = await t.call(FINISH, on(51, { claimToken: TOKEN }));
+    assert.equal(r.status, 200);
+    assert.equal(marked(t, 'applied').length, 1);
+});
+
+test('email: forwarderId says which attached company is emailed, and it is asked only for its own things', async () => {
+    const t = build(noticeRules({ contacts: BOTH_CONTACTS }), { shipment: TWO() });
+    const r = await t.call(NOTICE, { body: { sendKey: KEY, forwarderId: 3 } });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.outcome, 'sent');
+    assert.deepEqual(t.sent[0].to, ['li@dcg.example']);
+    assert.doesNotMatch(t.sent[0].html, /hello/, 'not the freight forwarder\'s booking reference');
+    assert.ok(t.sent[0].html.includes('<li>Your invoice / 贵司发票</li>'));
+    for (const freightAsk of ['Container number', 'Expected loading date', 'Photos of the loading', 'Bill of lading']) {
+        assert.ok(!t.sent[0].html.includes(`<li>${freightAsk}`), `the delivery company is not asked for: ${freightAsk}`);
+    }
+    const [insert] = t.db.wrote(/^INSERT INTO freight_container_notices/);
+    assert.equal(insert.params[2], 3, 'the notice is that forwarder\'s');
+    // The freight forwarder's contacts were never read for it.
+    assert.deepEqual(t.db.wrote(/FROM forwarder_contacts WHERE forwarder_id = \?/).map(a => a.params[0]), [3]);
+});
+
+test('email: with no forwarderId, the only attached company, else the one that carries the freight', async () => {
+    let t = build(noticeRules({ contacts: BOTH_CONTACTS }), { shipment: TWO() });
+    await t.call(NOTICE, { body: { sendKey: KEY } });
+    assert.deepEqual(t.sent[0].to, ['mei@fwd.example', 'ops@fwd.example']);
+    // A container with a delivery company only: it is the one emailed.
+    t = build(noticeRules({ contacts: BOTH_CONTACTS }), { shipment: SHIP_ROW({ ...NO_BOOKING, delivery_forwarder_id: 3 }) });
+    await t.call(NOTICE, { body: { sendKey: KEY } });
+    assert.deepEqual(t.sent[0].to, ['li@dcg.example']);
+});
+
+test('email: a company that does nothing on the container is refused, as is a forwarderId that is not an id', async () => {
+    const t = build(noticeRules({ contacts: BOTH_CONTACTS }), { shipment: TWO() });
+    let r = await t.call(NOTICE, { body: { sendKey: KEY, forwarderId: 9 } });
+    assert.deepEqual([r.status, r.body.code, r.body.why], [409, 'NOT_VISIBLE', null]);
+    assert.deepEqual(t.sent, []);
+    assert.equal(t.db.wrote(/^INSERT INTO freight_container_notices/).length, 0);
+    r = await build(noticeRules()).call(NOTICE, { body: { sendKey: KEY, forwarderId: 'x' } });
+    assert.deepEqual([r.status, r.body.code, r.body.field], [400, 'BAD_FIELD', 'forwarderId']);
+});
+
+test('list: a waiting proposal is theirs only while its forwarder holds the duty its fields need', async () => {
+    const rows = [
+        // The delivery company's number and loading date: on the container, but not its to ask for.
+        LISTED({ id: 62, forwarder_id: 3, forwarder_name: 'DCG', does_freight: 0, does_delivery: 1 }),
+        LISTED(),
+    ];
+    let t = build(listRules(rows));
+    let r = await t.call(LIST);
+    assert.deepEqual(r.body.data.map(d => d.id), [51], 'only what can be accepted waits for our team');
+    // The list reads every full row of the view, the two kinds of holder an older build did not know included.
+    assert.match(t.db.asked[0].sql, /c\.link_source IN \('booking', 'container', 'duty'\)/);
+    t = build(listRules(rows));
+    r = await t.call(LIST, { query: { status: 'all' } });
+    assert.deepEqual(r.body.data.map(d => [d.id, d.duties, d.theirs, d.actionable]), [[62, ['delivery'], false, false], [51, ['freight'], true, true]]);
+});
+
+test('list: a waiting file is theirs only while its forwarder holds the duty its kind belongs to', async () => {
+    const files = [
+        FILE_ROW({ id: 76, forwarder_id: 3, forwarder_name: 'DCG', kind: 'loading_photo', does_freight: 0, does_delivery: 1 }),
+        FILE_ROW({ id: 75, forwarder_id: 3, forwarder_name: 'DCG', does_freight: 0, does_delivery: 1 }),
+    ];
+    let r = await build([fileListRule(files), ...listRules([])]).call(LIST);
+    assert.deepEqual(r.body.data.map(d => [d.id, d.kind]), [[75, 'invoice']]);
+    r = await build([fileListRule(files), ...listRules([])]).call(LIST, { query: { status: 'all' } });
+    assert.deepEqual(r.body.data.map(d => [d.id, d.duties, d.theirs, d.actionable]), [[76, ['delivery'], false, false], [75, ['delivery'], true, true]]);
+});
+
+// ── the delivery date (2026-11-24): proposed by whoever delivers, accepted here ──
+//
+// Freight is forwarder 4's (its booking); DCG (3) is picked to deliver.
+
+const DELIVERY = '2026-12-20T09:30';
+const WITH_DELIVERY = (over = {}) => SHIP_ROW({ delivery_forwarder_id: 3, ...over });
+const DELIVERY_PROPOSAL = (over = {}) => PROPOSAL({ id: 70, forwarder_id: 3, forwarder_name: 'DCG', requested_json: JSON.stringify({ deliveryDate: DELIVERY }), base_json: '{}', ...over });
+// What the card showed, by a ShipLine that knows the delivery date.
+const SEEN4 = { ...SEEN, deliveryDate: null, deliveryMixed: null };
+const ORDERS = values => values.map((delivery_at, i) => ({ id: i + 1, external_container_number: null, awb_number: null, delivery_at }));
+const SNAPSHOT = (values, held = SEEN) => require('../src/lib/forwarder-containers').claimSnapshot(held, ORDERS(values));
+const DELIVERY_CLAIMED = (values = [null, null], over = {}) => DELIVERY_PROPOSAL({
+    status: 'applying', claim_token: TOKEN, claim_json: JSON.stringify(SNAPSHOT(values)), claimed_by: 'ops@us.com', claimed_at_iso: '2026-11-23T10:00:00Z', ...over,
+});
+
+test('claim: a delivery date is claimed for the company that delivers, and what every order holds is recorded with it', async () => {
+    const t = build(baseRules(), { shipment: WITH_DELIVERY(), proposals: [DELIVERY_PROPOSAL()], members: ORDERS([null, null]) });
+    const r = await t.call(CLAIM, on(70, { expected: SEEN4 }));
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.body.requested, { deliveryDate: DELIVERY });
+    assert.deepEqual(r.body.held, { ...SEEN, deliveryDate: null, deliveryMixed: null });
+    const [write] = marked(t, 'applying');
+    assert.deepEqual(JSON.parse(write.params[1]), { ...SEEN, deliveryDate: null, deliveryMixed: null, members: [1, 2], deliveryByOrder: { 1: null, 2: null } });
+    // The orders are read under the lock with what each holds for delivery, in the one form, from SQL.
+    const members = t.db.wrote(/FROM orders WHERE shipment_id = \? AND deleted_at IS NULL ORDER BY id FOR UPDATE/)[0];
+    assert.match(members.sql, /DATE_FORMAT\(delivery_date, '%H:%i'\) = '00:00'.* AS delivery_at/);
+});
+
+test('claim: a ShipLine from before the delivery date cannot decide one: naming three fields is refused, and nothing is written', async () => {
+    const t = build(baseRules(), { shipment: WITH_DELIVERY(), proposals: [DELIVERY_PROPOSAL()], members: ORDERS([null, null]) });
+    const r = await t.call(CLAIM, on(70, { expected: SEEN }));
+    assert.deepEqual(r, { status: 409, body: refusal('CLIENT_TOO_OLD', ['reload']) });
+    assert.equal(marked(t, 'applying').length, 0);
+});
+
+test('claim: that older ShipLine still decides a proposal of the original three, on a container that holds a delivery date', async () => {
+    const t = build(baseRules(), { proposals: [PROPOSAL()], members: ORDERS(['2026-12-20', '2026-12-20']) });
+    const r = await t.call(CLAIM, on(51, { expected: SEEN }));
+    assert.equal(r.status, 200);
+    assert.equal(marked(t, 'applying').length, 1);
+});
+
+test('claim: what the card showed for delivery must be what every order holds now, mixed values included', async () => {
+    const mixed = { shipment: WITH_DELIVERY(), proposals: [DELIVERY_PROPOSAL()], members: ORDERS(['2026-12-01', null]) };
+    let r = await build(baseRules(), mixed).call(CLAIM, on(70, { expected: SEEN4 }));
+    assert.deepEqual(r, { status: 409, body: refusal('CONTAINER_CHANGED', ['reload'], { fields: ['deliveryDate'], held: { ...SEEN, deliveryDate: null, deliveryMixed: [null, '2026-12-01'] } }) });
+    r = await build(baseRules(), mixed).call(CLAIM, on(70, { expected: { ...SEEN, deliveryDate: null, deliveryMixed: [null, '2026-12-01'] } }));
+    assert.equal(r.status, 200);
+});
+
+test('claim: a delivery date before the departure, or on a container with no order, cannot be accepted as it is', async () => {
+    let t = build(baseRules(), { shipment: WITH_DELIVERY(), proposals: [DELIVERY_PROPOSAL({ requested_json: '{"deliveryDate":"2026-10-20"}' })], members: ORDERS([null]) });
+    let r = await t.call(CLAIM, on(70, { expected: SEEN4 }));
+    assert.deepEqual([r.status, r.body.code, r.body.fields, r.body.allowedNext], [409, 'DATES_OUT_OF_ORDER', ['etd', 'deliveryDate'], ['reject']]);
+    t = build(baseRules(), { shipment: WITH_DELIVERY(), proposals: [DELIVERY_PROPOSAL()], members: [] });
+    r = await t.call(CLAIM, on(70, { expected: SEEN4 }));
+    assert.deepEqual([r.status, r.body.code], [409, 'NO_ORDERS']);
+    assert.equal(marked(t, 'applying').length, 0);
+});
+
+test('claim: a freight proposal that moves the departure past a delivery date already held is out of order', async () => {
+    const t = build(baseRules(), { proposals: [PROPOSAL({ requested_json: '{"etd":"2026-12-25"}' })], members: ORDERS(['2026-12-20', '2026-12-20']) });
+    const r = await t.call(CLAIM, on(51, { expected: { ...SEEN, deliveryDate: '2026-12-20', deliveryMixed: null } }));
+    assert.deepEqual([r.status, r.body.code, r.body.fields], [409, 'DATES_OUT_OF_ORDER', ['etd', 'deliveryDate']]);
+});
+
+test('finish: the delivery date is written through PATCH\'s own code, and the proposal marked accepted', async () => {
+    const t = build(baseRules(), { shipment: WITH_DELIVERY(), proposals: [DELIVERY_CLAIMED()], members: ORDERS([null, null]) });
+    const r = await t.call(FINISH, on(70, { claimToken: TOKEN }));
+    assert.deepEqual(r, { status: 200, body: { ok: true, status: 'applied', requested: { deliveryDate: DELIVERY } } });
+    assert.deepEqual(t.patched, [{ id: 1214, body: { deliveryDate: DELIVERY }, userEmail: 'ops@us.com' }]);
+    assert.equal(marked(t, 'applied').length, 1);
+});
+
+test('finish: refused, with nothing written, when an order\'s delivery date or the orders themselves changed since the claim', async () => {
+    // Someone typed a delivery date on one order.
+    let t = build(baseRules(), { shipment: WITH_DELIVERY(), proposals: [DELIVERY_CLAIMED()], members: ORDERS([null, '2026-12-02']) });
+    let r = await t.call(FINISH, on(70, { claimToken: TOKEN }));
+    assert.deepEqual([r.status, r.body.code, r.body.fields], [409, 'CONTAINER_CHANGED', ['deliveryDate']]);
+    assert.deepEqual([t.patched.length, marked(t, 'applied').length], [0, 0]);
+    // An order joined the container.
+    t = build(baseRules(), { shipment: WITH_DELIVERY(), proposals: [DELIVERY_CLAIMED()], members: ORDERS([null, null, null]) });
+    r = await t.call(FINISH, on(70, { claimToken: TOKEN }));
+    assert.deepEqual([r.status, r.body.code, r.body.fields], [409, 'CONTAINER_CHANGED', ['members']]);
+    assert.deepEqual([t.patched.length, marked(t, 'applied').length], [0, 0]);
+});
+
+test('finish: refused when the delivery was handed to another company since the claim', async () => {
+    const locked = { ...lockedOf(WITH_DELIVERY()), shipment: { ...lockedOf(WITH_DELIVERY()).shipment, delivery_forwarder_id: 4 } };
+    const t = build(baseRules(), { shipment: WITH_DELIVERY(), locked, proposals: [DELIVERY_CLAIMED()], members: ORDERS([null, null]) });
+    const r = await t.call(FINISH, on(70, { claimToken: TOKEN }));
+    assert.deepEqual(r, { status: 409, body: refusal('NOT_THEIR_CONTAINER', ['reject'], { why: null }) });
+    assert.equal(t.patched.length, 0);
+});
+
+test('send back: a proposal that carries a delivery date must be named by the call that sends it back', async () => {
+    let t = build(baseRules(), { shipment: WITH_DELIVERY(), proposals: [DELIVERY_PROPOSAL()] });
+    let r = await t.call(REJECT, on(70, { note: 'Too early for us' }));
+    assert.deepEqual(r, { status: 409, body: refusal('CLIENT_TOO_OLD', ['reload']) });
+    assert.equal(marked(t, 'rejected').length, 0);
+    t = build(baseRules(), { shipment: WITH_DELIVERY(), proposals: [DELIVERY_PROPOSAL()] });
+    r = await t.call(REJECT, on(70, { note: 'Too early for us', fields: ['deliveryDate'] }));
+    assert.equal(r.status, 200);
+    assert.equal(marked(t, 'rejected').length, 1);
+    // A proposal of the original three is sent back exactly as before.
+    t = build(baseRules(), { proposals: [PROPOSAL()] });
+    assert.equal((await t.call(REJECT, on(51, { note: 'Wrong container' }))).status, 200);
+});
+
+test('tab: what the container holds for delivery, shared or mixed, and the company that delivers is asked for it while none is held', async () => {
+    let r = await build(baseRules({ contacts: BOTH_CONTACTS }), { shipment: WITH_DELIVERY({ member_deliveries: '2026-12-01|2026-12-03', member_delivery_missing: 1 }) }).call(TAB);
+    assert.deepEqual([r.body.held.deliveryDate, r.body.held.deliveryMixed], [null, [null, '2026-12-01', '2026-12-03']]);
+    assert.deepEqual(r.body.forwarders[1].asks, ['deliveryDate', 'invoice']);
+    r = await build(baseRules({ contacts: BOTH_CONTACTS }), { shipment: WITH_DELIVERY({ member_deliveries: '2026-12-01T09:30', member_delivery_missing: 0 }) }).call(TAB);
+    assert.deepEqual([r.body.held.deliveryDate, r.body.held.deliveryMixed], ['2026-12-01T09:30', null]);
+    assert.deepEqual(r.body.forwarders[1].asks, ['invoice']);
+    // The freight forwarder is never asked for it.
+    assert.equal(r.body.forwarders[0].asks.includes('deliveryDate'), false);
+});
+
+test('tab: a draft customs entry is in the section of the company that handles customs, and the email asks it for one', async () => {
+    const draft = FILE_ROW({ id: 90, forwarder_id: 3, forwarder_name: 'DCG', kind: 'customs_draft', filename: 'entry draft.pdf' });
+    const t = build(baseRules({ contacts: BOTH_CONTACTS, uploads: [draft, FILE_ROW({ id: 91, kind: 'customs_draft', filename: 'not mine.pdf' })] }), { shipment: TWO() });
+    const r = await t.call(TAB);
+    const [freight, customs] = r.body.forwarders;
+    assert.deepEqual(customs.uploads.customsDraft.map(u => [u.id, u.kind, u.theirs, u.actionable]), [[90, 'customs_draft', true, true]]);
+    assert.equal(customs.asks.includes('customsDraft'), true);
+    // The freight forwarder sent one too: it does not handle customs here, so it can only be sent back.
+    assert.deepEqual(freight.uploads.customsDraft.map(u => [u.id, u.theirs, u.actionable]), [[91, false, false]]);
+    assert.equal(freight.asks.includes('customsDraft'), false);
+    assert.equal(r.body.toReview, 1);
+    // The old fields have no place for the kind, so a ShipLine from before it shows none of it.
+    assert.deepEqual(Object.keys(r.body.uploads).sort(), ['billOfLading', 'invoice', 'loadingPhotos', 'strays']);
+});
+
+test('tab: what a company that holds nothing sent, of a kind or with a field an older ShipLine has no words for, is in the new strays only', async () => {
+    const t = build(baseRules({
+        details: [PROPOSAL({ id: 60, forwarder_id: 5, forwarder_name: 'Other Ltd', requested_json: JSON.stringify({ deliveryDate: DELIVERY }) })],
+        uploads: [FILE_ROW({ id: 80, forwarder_id: 5, forwarder_name: 'Other Ltd', kind: 'customs_draft', ...NO_ROW })],
+    }), { shipment: TWO() });
+    const r = await t.call(TAB);
+    assert.deepEqual([r.body.strays.details.map(s => s.id), r.body.strays.uploads.map(s => s.id)], [[60], [80]]);
+    assert.deepEqual([r.body.details.strays, r.body.uploads.strays], [[], []]);
+});
+
+test('tab: a delivery proposal is in the delivery company\'s section, ready to accept; the freight forwarder sending one is not', async () => {
+    const t = build(baseRules({ contacts: BOTH_CONTACTS, details: [DELIVERY_PROPOSAL(), PROPOSAL({ id: 71, requested_json: JSON.stringify({ deliveryDate: DELIVERY }) })] }), { shipment: WITH_DELIVERY() });
+    const r = await t.call(TAB);
+    const [freight, delivery] = r.body.forwarders;
+    assert.deepEqual([delivery.details.proposal.id, delivery.details.proposal.actionable, delivery.details.proposal.outside], [70, true, []]);
+    assert.deepEqual([freight.details.proposal.id, freight.details.proposal.actionable, freight.details.proposal.outside], [71, false, ['deliveryDate']]);
 });

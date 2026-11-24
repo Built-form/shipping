@@ -679,12 +679,13 @@ async function mergeShipments(conn, survivorId, loserId, { reference = null, use
     for (const col of MERGE_COALESCE) {
         if (survivor[col] == null && loser[col] != null) { sets.push(`${col} = ?`); vals.push(loser[col]); }
     }
-    // The forwarder pair (2026-11-20): the survivor's own whole, else the
-    // loser's whole — copied as stored, never re-resolved from the list.
-    const pair = FL.mergeForwarderPair(survivor, loser);
-    if ((pair.forwarder ?? null) !== (survivor.forwarder ?? null) || (pair.forwarder_id ?? null) !== (survivor.forwarder_id ?? null)) {
-        sets.push('forwarder = ?', 'forwarder_id = ?');
-        vals.push(pair.forwarder, pair.forwarder_id);
+    // The forwarder picks (the pair of 2026-11-20, and the delivery and customs
+    // picks of 2026-11-24): the survivor's own, all of them, when it has any;
+    // else the loser's, all of them — copied as stored, never re-resolved from
+    // the list, and never one container's freight with the other's delivery.
+    const picks = FL.mergeForwarderPicks(survivor, loser);
+    for (const col of ['forwarder', 'forwarder_id', 'delivery_forwarder_id', 'customs_forwarder_id']) {
+        if ((picks[col] ?? null) !== (survivor[col] ?? null)) { sets.push(`${col} = ?`); vals.push(picks[col]); }
     }
     if (!survivor.mode && loser.mode) {
         sets.push('mode = ?', 'mode_source = ?');
@@ -916,6 +917,8 @@ function validDate(v) {
 // effectiveStage), plus the member-derived eta / vessel / carrier refs that the
 // API shows for booked shipments. Open shipments count their lines the way the
 // legacy Draft tab does: INNER JOIN to a live order.
+const DELIVERY_AT = require('../lib/forwarder-containers').deliverySelect('o.delivery_date');
+
 function shipmentSelect({ where = [], effectiveWhere = [], orderBy = 'COALESCE(z.booked_at, z.created_at) DESC, z.id DESC', limit = null, idFilter = null } = {}) {
     const memberScope = idFilter ? ` AND o.shipment_id IN (${idFilter})` : '';
     const lineScope = idFilter ? ` WHERE sl.shipment_id IN (${idFilter})` : '';
@@ -933,7 +936,12 @@ function shipmentSelect({ where = [], effectiveWhere = [], orderBy = 'COALESCE(z
                       ELSE y.stage END AS effective_stage
             FROM (
               SELECT s.*,
-                     bk.bk_count, bk.bk_id, bk.bk_status, bk.bk_ref, bk.bk_forwarder_id, bk.bk_forwarder_name,
+                     bk.bk_count, bk.bk_id, bk.bk_status, bk.bk_scope, bk.bk_ref, bk.bk_forwarder_id, bk.bk_forwarder_name,
+                     m.member_deliveries, COALESCE(m.member_delivery_missing, 0) AS member_delivery_missing,
+                     pf.name AS pf_name, (pf.id IS NOT NULL AND pf.deleted_at IS NULL) AS pf_live,
+                     df.name AS df_name, (df.id IS NOT NULL AND df.deleted_at IS NULL) AS df_live,
+                     cf.name AS cf_name, (cf.id IS NOT NULL AND cf.deleted_at IS NULL) AS cf_live,
+                     bf.name AS bf_name, (bf.id IS NOT NULL AND bf.deleted_at IS NULL) AS bf_live,
                      COALESCE(m.member_count, 0) AS member_count,
                      m.member_eta, m.member_etd, m.member_vessel, m.member_ext, m.member_awb,
                      COALESCE(l.line_count, 0) AS line_count,
@@ -956,7 +964,11 @@ function shipmentSelect({ where = [], effectiveWhere = [], orderBy = 'COALESCE(z
                            MAX(o.estimated_departure_date) AS member_etd,
                            MAX(NULLIF(TRIM(o.vessel_name), '')) AS member_vessel,
                            MAX(NULLIF(TRIM(o.external_container_number), '')) AS member_ext,
-                           MAX(NULLIF(TRIM(o.awb_number), '')) AS member_awb
+                           MAX(NULLIF(TRIM(o.awb_number), '')) AS member_awb,
+                           -- What its orders hold for delivery (2026-11-24): the distinct values in the one
+                           -- form (lib/forwarder-containers.js deliverySelect), and how many orders have none.
+                           GROUP_CONCAT(DISTINCT ${DELIVERY_AT} ORDER BY ${DELIVERY_AT} SEPARATOR '|') AS member_deliveries,
+                           SUM(${DELIVERY_AT} IS NULL) AS member_delivery_missing
                       FROM orders o
                      WHERE o.deleted_at IS NULL AND o.shipment_id IS NOT NULL${memberScope}
                      GROUP BY o.shipment_id
@@ -969,13 +981,19 @@ function shipmentSelect({ where = [], effectiveWhere = [], orderBy = 'COALESCE(z
                 ) l ON l.shipment_id = s.id
                 LEFT JOIN (
                     SELECT fb.shipment_id, COUNT(*) AS bk_count,
-                           MAX(fb.id) AS bk_id, MAX(fb.status) AS bk_status, MAX(fb.booking_ref) AS bk_ref,
+                           MAX(fb.id) AS bk_id, MAX(fb.status) AS bk_status, MAX(fb.scope) AS bk_scope, MAX(fb.booking_ref) AS bk_ref,
                            MAX(fr.forwarder_id) AS bk_forwarder_id, MAX(fr.forwarder_name) AS bk_forwarder_name
                       FROM freight_bookings fb
                       JOIN freight_quote_requests fr ON fr.id = fb.request_id
                      WHERE fb.status IN ('requested', 'confirmed') AND fb.shipment_id IS NOT NULL${bookingScope}
                      GROUP BY fb.shipment_id
                 ) bk ON bk.shipment_id = s.id
+                -- Who holds each duty (2026-11-24, src/lib/forwarder-links.js dutiesOfRow): the three
+                -- picks and the booking's forwarder as the Forwarders list has them NOW (name, on the list).
+                LEFT JOIN forwarders pf ON pf.id = s.forwarder_id
+                LEFT JOIN forwarders df ON df.id = s.delivery_forwarder_id
+                LEFT JOIN forwarders cf ON cf.id = s.customs_forwarder_id
+                LEFT JOIN forwarders bf ON bf.id = bk.bk_forwarder_id
                ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
             ) y
         ) z

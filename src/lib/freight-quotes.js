@@ -710,9 +710,12 @@ const CONTAINER_ASK_LABELS = Object.freeze({
     ecn: 'Container number / 柜号',
     loadingDate: 'Expected loading date / 预计装柜日期',
     etd: 'Expected departure date / 预计开船日期',
+    // 2026-11-24: asked of whoever delivers it to our warehouse, and of whoever handles its customs.
+    deliveryDate: 'Delivery date to our warehouse / 送仓日期',
     invoice: 'Your invoice / 贵司发票',
     photos: 'Photos of the loading / 装柜照片',
     billOfLading: 'Bill of lading / 提单',
+    customsDraft: 'Draft customs entry, for us to check / 报关单草稿（供我方核对）',
 });
 
 /**

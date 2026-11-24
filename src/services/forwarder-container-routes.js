@@ -97,18 +97,20 @@ const REFUSAL_TEXT = Object.freeze({
     ALREADY_DECIDED: 'This proposal was already accepted or sent back.',
     SUPERSEDED: 'The forwarder has sent a newer proposal since this one was shown. Reload to see it.',
     NOT_THEIR_CONTAINER: 'This container is no longer that forwarder’s, so their proposal cannot be accepted. It can be dismissed.',
+    NOT_THEIR_DUTY: 'This forwarder no longer does the part of the job this is about, so it cannot be accepted. It can be dismissed.',
     CONTAINER_CHANGED: 'The container has changed since this was shown. Reload and look again.',
-    NO_ORDERS: 'This container has no orders to carry a container number.',
+    NO_ORDERS: 'This container has no orders to carry what is proposed.',
     BAD_PROPOSAL: 'The number proposed is not a valid one. Send it back.',
     EMPTY_PROPOSAL: 'This proposal asks for nothing. Send it back.',
-    DATES_OUT_OF_ORDER: 'The loading date would fall after the departure date. Send it back, or set the dates by hand.',
+    DATES_OUT_OF_ORDER: 'The dates would be out of order: loading, then departure, then delivery. Send it back, or set the dates by hand.',
+    CLIENT_TOO_OLD: 'This page is older than what the forwarder sent, so it cannot show all of it. Reload ShipLine, then decide.',
     NOT_ON_CONTAINER: 'The proposed container number is not on every order of this container, so the proposal is not accepted yet.',
     CLAIM_LOST: 'This accept is no longer in progress (it took too long, or was started again elsewhere). Reload and accept again.',
 });
 const ALLOWED_NEXT = Object.freeze({
     NO_SUCH_PROPOSAL: ['reload'], CLAIM_IN_PROGRESS: ['reload'], ALREADY_DECIDED: ['reload'], SUPERSEDED: ['reload'],
-    NOT_THEIR_CONTAINER: ['reject'], CONTAINER_CHANGED: ['reload'], NO_ORDERS: ['reject'], BAD_PROPOSAL: ['reject'], EMPTY_PROPOSAL: ['reject'],
-    DATES_OUT_OF_ORDER: ['reject'], NOT_ON_CONTAINER: ['reload'], CLAIM_LOST: ['reload'],
+    NOT_THEIR_CONTAINER: ['reject'], NOT_THEIR_DUTY: ['reject'], CONTAINER_CHANGED: ['reload'], NO_ORDERS: ['reject'], BAD_PROPOSAL: ['reject'], EMPTY_PROPOSAL: ['reject'],
+    DATES_OUT_OF_ORDER: ['reject'], NOT_ON_CONTAINER: ['reload'], CLAIM_LOST: ['reload'], CLIENT_TOO_OLD: ['reload'],
 });
 
 class Fail extends Error {
@@ -121,6 +123,15 @@ class Fail extends Error {
     }
 }
 const refuse = (code, extra = {}) => new Fail(code === 'NO_SUCH_PROPOSAL' ? 404 : 409, code, REFUSAL_TEXT[code] || code, { allowedNext: ALLOWED_NEXT[code] || ['reload'], ...extra });
+// What a NOT_THEIR_CONTAINER or NOT_THEIR_DUTY refusal of a proposal carries: why the
+// duty it needs has no holder (null when another company holds it), and the fields that
+// are no longer its forwarder's.
+function notTheirs(refusal, duties, row) {
+    if (refusal.code !== 'NOT_THEIR_CONTAINER' && refusal.code !== 'NOT_THEIR_DUTY') return {};
+    const requested = row ? FC.proposalOf(row.requested_json) : {};
+    const needed = [...new Set(Object.keys(requested).map(f => FC.FIELD_DUTY[f]).filter(Boolean))];
+    return { why: whyNot(duties, needed), ...(refusal.fields ? { fields: refusal.fields } : {}) };
+}
 
 const jsonList = (v) => {
     if (Array.isArray(v)) return v;
@@ -167,26 +178,50 @@ async function contactsOf(conn, forwarderId) {
     return rows.map(r => ({ name: r.name || null, email: r.email }));
 }
 
-// The shipment row as getShipment returns it, read as ownerOf reads rows.
-const bookingOfRow = row => (row && row.bk_id != null && Number(row.bk_count) > 0
-    ? { status: row.bk_status, forwarder_id: row.bk_forwarder_id }
-    : null);
+// The live bookings of a shipment row as getShipment returns it (at most one
+// until a container can hold one per leg), read as dutiesOf reads rows.
+const bookingsOfRow = row => (row && row.bk_id != null && Number(row.bk_count) > 0
+    ? [{ id: row.bk_id, status: row.bk_status, scope: row.bk_scope, booking_ref: row.bk_ref, forwarder_id: row.bk_forwarder_id }]
+    : []);
+// Every forwarder a container's rows name: its three picks and its bookings' forwarders.
+const namedForwarders = (shipment, bookings) => [
+    shipment && shipment.forwarder_id, shipment && shipment.delivery_forwarder_id, shipment && shipment.customs_forwarder_id,
+    ...(bookings || []).map(b => b.forwarder_id),
+];
+const liveIn = forwarders => (id) => { const f = forwarders.get(Number(id)); return Boolean(f) && !f.deleted_at; };
+// The view's rows that make a container a forwarder's in full: the freight holder's
+// ('booking', 'container') and, since 2026-11-24, a delivery or customs holder's ('duty').
+const FULL_SOURCES_SQL = "'booking', 'container', 'duty'";
+const { dutiesOfFlags } = FC;
+// Why a forwarder cannot have something of its own accepted: the reason the duty it needs has
+// no holder (null when another company holds it). `needed`: the duties its fields or file need.
+const whyNot = (duties, needed) => {
+    for (const duty of (needed.length ? needed : FC.DUTIES)) {
+        const h = duties[duty];
+        if (h && h.forwarderId == null && h.why) return h.why;
+    }
+    return null;
+};
 
 /**
- * Whose container it is, on rows read UNDER A LOCK: the shipment row, then
- * its live booking (at most one: uq_freight_bookings_live_shipment), then the
- * forwarders they name (shared). Every read here is a locking read. Call
- * inside a transaction, as its FIRST statement.
- * → { shipment, booking, owner, forwarder }.
+ * Who holds each duty of a container, on rows read UNDER A LOCK: the shipment
+ * row (which carries the three picks), then EVERY live booking of it, then
+ * the forwarders any of them names (shared: the picks' and the bookings').
+ * Every read here is a locking read. Call inside a transaction, as its FIRST
+ * statement.
+ * → { shipment, bookings, duties, forwarders, booking, owner, forwarder }: the
+ *   last three are the freight duty's (the freight booking, ownerOf's answer
+ *   and the freight holder's row), as before 2026-11-24.
  */
 async function lockOwnership(conn, shipmentId) {
     const [ships] = await conn.query(
-        'SELECT id, reference, mode, stage, deleted_at, merged_into_id, forwarder_id, forwarder FROM shipments WHERE id = ? FOR UPDATE',
+        `SELECT id, reference, mode, stage, deleted_at, merged_into_id, forwarder_id, forwarder, delivery_forwarder_id, customs_forwarder_id
+           FROM shipments WHERE id = ? FOR UPDATE`,
         [shipmentId]
     );
     const shipment = ships[0] || null;
     const [bookings] = await conn.query(
-        `SELECT fb.id, fb.status, fb.booking_ref, fr.forwarder_id
+        `SELECT fb.id, fb.status, fb.scope, fb.booking_ref, fr.forwarder_id
            FROM freight_bookings fb
            JOIN freight_quote_requests fr ON fr.id = fb.request_id
           WHERE fb.shipment_id = ? AND fb.status IN (?)
@@ -194,19 +229,21 @@ async function lockOwnership(conn, shipmentId) {
             FOR UPDATE OF fb`,
         [shipmentId, FC.LIVE_BOOKING_STATUSES]
     );
-    const booking = bookings[0] || null;
-    const forwarders = await forwardersById(conn, [shipment && shipment.forwarder_id, booking && booking.forwarder_id], { locking: true });
-    const owner = FC.ownerOf({
-        shipment, booking,
-        forwarderLive: id => { const f = forwarders.get(Number(id)); return Boolean(f) && !f.deleted_at; },
-    });
-    return { shipment, booking, owner, forwarder: owner.forwarderId == null ? null : forwarders.get(owner.forwarderId) };
+    const forwarders = await forwardersById(conn, namedForwarders(shipment, bookings), { locking: true });
+    const duties = FC.dutiesOf({ shipment, bookings, forwarderLive: liveIn(forwarders) });
+    const owner = duties.freight;
+    const booking = owner.bookingId != null
+        ? bookings.find(b => Number(b.id) === Number(owner.bookingId)) || null
+        : bookings.find(b => (FC.SCOPE_DUTIES[b.scope || FC.DEFAULT_SCOPE] || []).includes('freight')) || null;
+    return { shipment, bookings, duties, forwarders, booking, owner, forwarder: owner.forwarderId == null ? null : forwarders.get(owner.forwarderId) };
 }
 
 /** The container's member orders, locked: an order joining or leaving it waits too. */
 async function lockMembers(conn, shipmentId) {
+    // `delivery_at`: what each order holds for delivery, in the one form, straight
+    // from SQL (src/lib/forwarder-containers.js deliverySelect): no Date object.
     const [rows] = await conn.query(
-        'SELECT id, external_container_number, awb_number FROM orders WHERE shipment_id = ? AND deleted_at IS NULL ORDER BY id FOR UPDATE',
+        `SELECT id, external_container_number, awb_number, ${FC.deliverySelect('delivery_date')} AS delivery_at FROM orders WHERE shipment_id = ? AND deleted_at IS NULL ORDER BY id FOR UPDATE`,
         [shipmentId]
     );
     return rows;
@@ -231,6 +268,11 @@ async function lockProposals(conn, jp, shipmentId) {
 // member orders win over the stored copies).
 function heldOf(row) {
     const api = S.rowToShipment(row);
+    // What its orders hold for delivery (shipmentSelect: the distinct values in the
+    // one form, and how many orders have none). An unlocked read, for the tab; a
+    // decision reads each order's own value under its lock (lockMembers).
+    const deliveries = String(row.member_deliveries || '').split('|').filter(Boolean);
+    if (Number(row.member_delivery_missing) > 0) deliveries.push(null);
     return {
         ecn: api.trackingRef || null,
         loadingDate: api.loadingDate || null,
@@ -238,9 +280,13 @@ function heldOf(row) {
         eta: api.eta || null,
         bookingRef: (api.booking && api.booking.bookingRef) || api.bookingRef || null,
         stage: api.stage,
+        ...FC.heldDelivery(deliveries),
     };
 }
 const detailsOf = held => ({ ecn: held.ecn, loadingDate: held.loadingDate, etd: held.etd });
+// What a decision compares: the number and dates as the card reads them, and the
+// delivery date as every LOCKED member order holds it.
+const lockedHeld = (shipRow, members) => ({ ...detailsOf(heldOf(shipRow)), ...FC.heldDelivery(members.map(m => m.delivery_at)) });
 
 async function inTransaction(conn, fn) {
     await conn.beginTransaction();
@@ -284,7 +330,7 @@ async function claimDetails(conn, { id, expected, actor }, { getShipment = sync.
     const jp = jportalSchema(env);
     const shipmentId = await shipmentOfProposal(conn, jp, id);
     return inDecision(conn, async () => {
-        const { owner } = await lockOwnership(conn, shipmentId);
+        const { duties } = await lockOwnership(conn, shipmentId);
         const members = await lockMembers(conn, shipmentId);
         const rows = await lockProposals(conn, jp, shipmentId);
         // A claim nobody finished or released is put back, so it is not in the way.
@@ -297,32 +343,42 @@ async function claimDetails(conn, { id, expected, actor }, { getShipment = sync.
                 [lapsed.map(r => r.id)]
             );
         }
-        const no = FC.claimRefusal({ rows, id, ownerForwarderId: owner.forwarderId });
-        if (no) throw refuse(no.code, { ...(no.claimedBy !== undefined ? { claimedBy: no.claimedBy, claimedAt: no.claimedAt } : {}), ...(no.code === 'NOT_THEIR_CONTAINER' ? { why: owner.why || null } : {}) });
+        const no = FC.claimRefusal({ rows, id, duties });
+        if (no) throw refuse(no.code, { ...(no.claimedBy !== undefined ? { claimedBy: no.claimedBy, claimedAt: no.claimedAt } : {}), ...notTheirs(no, duties, rows.find(r => Number(r.id) === Number(id))) });
         const row = rows.find(r => Number(r.id) === Number(id));
         const requested = FC.proposalOf(row.requested_json);
         if (!Object.keys(requested).length) throw refuse('EMPTY_PROPOSAL');
+        // A ShipLine build that does not know every field this proposal carries
+        // (it names three, and this carries a delivery date) cannot decide it.
+        if (!FC.clientKnows(requested, Object.keys(expected || {}))) throw refuse('CLIENT_TOO_OLD');
 
-        // After the locks: the container as the card reads it.
+        // After the locks: the container as the card reads it, and for delivery
+        // what each locked member order holds.
         const shipRow = await getShipment(conn, shipmentId);
-        const held = detailsOf(heldOf(shipRow));
+        const held = lockedHeld(shipRow, members);
         const moved = FC.heldDiff(expected, held);
         if (moved.length) throw refuse('CONTAINER_CHANGED', { fields: moved, held });
         if (requested.ecn) {
             if (!members.length) throw refuse('NO_ORDERS');
             if (FC.ecnProblem(shipRow.mode, requested.ecn)) throw refuse('BAD_PROPOSAL', { fields: ['ecn'] });
         }
-        if (!FC.datesInOrder(requested, held)) throw refuse('DATES_OUT_OF_ORDER', { fields: ['loadingDate', 'etd'] });
+        // A delivery date is written onto the orders: it needs one to carry it.
+        if (requested.deliveryDate && !members.length) throw refuse('NO_ORDERS');
+        const outOfOrder = FC.orderProblem(requested, held);
+        if (outOfOrder) throw refuse('DATES_OUT_OF_ORDER', { fields: outOfOrder });
 
         const claimToken = crypto.randomBytes(16).toString('hex');
         const [done] = await conn.query(
             `UPDATE ${jp}.forwarder_container_details
                 SET status = 'applying', claim_token = ?, claim_json = ?, claimed_by = ?, claimed_at = UTC_TIMESTAMP()
               WHERE id = ? AND status = 'pending'`,
-            [claimToken, JSON.stringify(held), actor.email || 'shipline', id]
+            // What the claim saw: the number and dates, WHICH orders are on the container,
+            // and what each holds for delivery. finish compares all of it.
+            [claimToken, JSON.stringify(FC.claimSnapshot(detailsOf(held), members)), actor.email || 'shipline', id]
         );
         if (done.affectedRows !== 1) throw refuse('ALREADY_DECIDED');
         return { claimToken, expiresInSeconds: FC.CLAIM_MINUTES * 60, requested, held };
+        // (`held` carries deliveryDate and deliveryMixed since 2026-11-24.)
     });
 }
 
@@ -335,26 +391,33 @@ async function finishDetails(conn, { id, claimToken, ecnReset, actor }, { getShi
     const jp = jportalSchema(env);
     const shipmentId = await shipmentOfProposal(conn, jp, id);
     return inDecision(conn, async () => {
-        const { owner } = await lockOwnership(conn, shipmentId);
+        const { duties } = await lockOwnership(conn, shipmentId);
         const members = await lockMembers(conn, shipmentId);
         const rows = await lockProposals(conn, jp, shipmentId);
         const row = rows.find(r => Number(r.id) === Number(id));
         if (!row) throw refuse('NO_SUCH_PROPOSAL');
         const mine = row.status === 'applying' && Number(row.lapsed) !== 1 && typeof claimToken === 'string' && claimToken !== '' && row.claim_token === claimToken;
         if (!mine) throw refuse('CLAIM_LOST');
-        if (owner.forwarderId == null || Number(owner.forwarderId) !== Number(row.forwarder_id)) throw refuse('NOT_THEIR_CONTAINER', { why: owner.why || null });
+        // Authority is asked again here, on the rows as they are NOW: a pick or a
+        // booking's scope that changed since the claim counts only if it took away
+        // a duty this proposal needs.
+        const lost = FC.dutyRefusal({ row, duties });
+        if (lost) throw refuse(lost.code, notTheirs(lost, duties, row));
 
         const requested = FC.proposalOf(row.requested_json);
         const claim = jsonObject(row.claim_json);
         const shipRow = await getShipment(conn, shipmentId);
-        const held = detailsOf(heldOf(shipRow));
+        const held = lockedHeld(shipRow, members);
         const memberEcns = members.map(m => S.trackingRefFor(shipRow.mode, [m]).trackingRef);
-        const no = FC.finishRefusal({ requested, claim, ecnReset: ecnReset || null, memberEcns, held });
+        const no = FC.finishRefusal({ requested, claim, ecnReset: ecnReset || null, memberEcns, held, members });
         if (no) throw refuse(no.code, { fields: no.fields, held });
 
+        // Written by PATCH /shipments/:id's own code: the loading and departure
+        // dates, and the delivery date onto every member order.
         const dates = {};
         if (requested.loadingDate) dates.loadingDate = requested.loadingDate;
         if (requested.etd) dates.etd = requested.etd;
+        if (requested.deliveryDate) dates.deliveryDate = requested.deliveryDate;
         if (Object.keys(dates).length) await patchShipment(conn, shipmentId, dates, actor.email || null);
 
         const [done] = await conn.query(
@@ -388,13 +451,16 @@ async function releaseDetails(conn, { id, claimToken }, { env = process.env } = 
 }
 
 /** Send a proposal back (or dismiss one that is no longer its forwarder's): the forwarder reads the note. */
-async function rejectDetails(conn, { id, note, actor }, { recordAudit, env = process.env } = {}) {
+async function rejectDetails(conn, { id, note, fields, actor }, { recordAudit, env = process.env } = {}) {
     const jp = jportalSchema(env);
     const shipmentId = await shipmentOfProposal(conn, jp, id);
     return inDecision(conn, async () => {
         const rows = await lockProposals(conn, jp, shipmentId);
         const row = rows.find(r => Number(r.id) === Number(id));
         if (!row) throw refuse('NO_SUCH_PROPOSAL');
+        // Sending back is a decision too: a ShipLine build that cannot show a field
+        // this proposal carries must name it (`fields`), or it cannot send it back.
+        if (!FC.clientKnows(FC.proposalOf(row.requested_json), fields)) throw refuse('CLIENT_TOO_OLD');
         if (row.status === 'applying' && Number(row.lapsed) !== 1) throw refuse('CLAIM_IN_PROGRESS', { claimedBy: row.claimed_by || null, claimedAt: row.claimed_at_iso || null });
         if (!FC.isWaiting(row)) throw refuse('ALREADY_DECIDED');
         if (Number(FC.liveProposal(rows, row.forwarder_id).id) !== Number(row.id)) throw refuse('SUPERSEDED');
@@ -415,10 +481,14 @@ async function rejectDetails(conn, { id, note, actor }, { recordAudit, env = pro
     });
 }
 
-// A proposal row as the tab shows it. `ownerForwarderId`: whose container it is now.
-function proposalJson(row, { live, ownerForwarderId, forwarderName }) {
+// A proposal row as the tab shows it. `duties`: who holds what on the container now.
+function proposalJson(row, { live, duties, forwarderName }) {
     const claimed = row.status === 'applying' && Number(row.lapsed) !== 1;
     const waiting = FC.isWaiting(row);
+    const requested = FC.proposalOf(row.requested_json);
+    // The fields it asks for that its forwarder no longer holds the duty for. A
+    // proposal is accepted or dismissed whole: one such field makes it dismiss-only.
+    const outside = FC.fieldsOutside(requested, FC.heldBy(duties, row.forwarder_id));
     return {
         id: Number(row.id),
         forwarderId: Number(row.forwarder_id),
@@ -426,9 +496,10 @@ function proposalJson(row, { live, ownerForwarderId, forwarderName }) {
         status: claimed ? 'applying' : waiting ? 'pending' : row.status,
         waiting,
         live,
-        // Still its forwarder's container: it can be accepted. Otherwise only dismissed.
-        actionable: live && (waiting || claimed) && ownerForwarderId != null && Number(ownerForwarderId) === Number(row.forwarder_id),
-        requested: FC.proposalOf(row.requested_json),
+        // Still its forwarder's to ask for: it can be accepted. Otherwise only dismissed.
+        actionable: live && (waiting || claimed) && FC.dutyRefusal({ row, duties }) === null,
+        outside,
+        requested,
         base: FC.proposalOf(row.base_json),
         note: row.note || null,
         byName: row.user_name || null,
@@ -444,13 +515,17 @@ function proposalJson(row, { live, ownerForwarderId, forwarderName }) {
 
 /**
  * What forwarders sent about a container's number and dates, as the tab shows
- * it. → { unavailable, proposal, history, strays }:
- *   proposal  the live proposal of the container's own forwarder (or null)
- *   history   that forwarder's older ones, newest first
- *   strays    live, undecided proposals of a forwarder the container is no
- *             longer with: they can be dismissed, never accepted
+ * it. `duties`: who holds what on the container now (dutiesOf).
+ * → { unavailable, byForwarder, strays }:
+ *   byForwarder  Map of forwarder id → { proposal, history }, for every
+ *                forwarder that HOLDS A DUTY on the container: its live proposal
+ *                (its newest row, whatever became of it, or null) and its older
+ *                ones, newest first. A live proposal that asks for something
+ *                outside its forwarder's duties is here too, not actionable.
+ *   strays       live, undecided proposals of a forwarder that holds NOTHING on
+ *                the container now: they can be dismissed, never accepted
  */
-async function readDetails(conn, shipmentId, ownerForwarderId, env = process.env) {
+async function readDetails(conn, shipmentId, duties, env = process.env) {
     let rows;
     try {
         [rows] = await conn.query(
@@ -462,17 +537,19 @@ async function readDetails(conn, shipmentId, ownerForwarderId, env = process.env
         );
     } catch (e) {
         if (!portalMissing(e)) throw e;
-        return { unavailable: true, proposal: null, history: [], strays: [] };
+        return { unavailable: true, byForwarder: new Map(), strays: [] };
     }
-    const out = { unavailable: false, proposal: null, history: [], strays: [] };
+    const out = { unavailable: false, byForwarder: new Map(), strays: [] };
     const seen = new Set();
     for (const row of rows) {
         const fid = Number(row.forwarder_id);
         const live = !seen.has(fid);
         seen.add(fid);
-        const json = proposalJson(row, { live, ownerForwarderId, forwarderName: row.forwarder_name });
-        if (ownerForwarderId != null && fid === Number(ownerForwarderId)) {
-            if (live) out.proposal = json; else out.history.push(json);
+        const json = proposalJson(row, { live, duties, forwarderName: row.forwarder_name });
+        if (FC.heldBy(duties, fid).length) {
+            if (!out.byForwarder.has(fid)) out.byForwarder.set(fid, { proposal: null, history: [] });
+            const mine = out.byForwarder.get(fid);
+            if (live) mine.proposal = json; else mine.history.push(json);
         } else if (live && (json.waiting || json.status === 'applying')) {
             out.strays.push(json);
         }
@@ -571,11 +648,13 @@ function registerForwarderContainerRoutes(app, deps) {
             const row = await getShipment(conn, id);
             if (!row) throw new Fail(404, 'NO_SUCH_SHIPMENT', `Shipment ${id} not found.`);
             const api = S.rowToShipment(row);
-            const forwarders = await forwardersById(conn, [row.forwarder_id, row.bk_forwarder_id]);
-            const owner = FC.ownerOf({
-                shipment: row, booking: bookingOfRow(row),
-                forwarderLive: fid => { const f = forwarders.get(Number(fid)); return Boolean(f) && !f.deleted_at; },
-            });
+            const bookings = bookingsOfRow(row);
+            const forwarders = await forwardersById(conn, namedForwarders(row, bookings));
+            // Who holds each duty (2026-11-24): freight, delivery, customs. `owner`
+            // is the freight duty, which is all a container's forwarder was before.
+            const duties = FC.dutiesOf({ shipment: row, bookings, forwarderLive: liveIn(forwarders) });
+            const owner = duties.freight;
+            const nameOf = (fid) => { const f = forwarders.get(Number(fid)); return f ? f.name : null; };
             // The forwarder the card shows (the booking's, else the container's
             // own), whether or not it may see the container.
             const forwarder = api.forwarder || api.forwarderId != null
@@ -592,16 +671,56 @@ function registerForwarderContainerRoutes(app, deps) {
             const held = heldOf(row);
             const paymentOnly = [];
             for (const p of payments) {
-                const v = FC.visibilityFor({ owner, real: FC.isReal(row), forwarderId: p.forwarderId, paidForwarderIds: [p.forwarderId] });
+                const v = FC.accessFor({ duties, real: FC.isReal(row), forwarderId: p.forwarderId, paidForwarderIds: [p.forwarderId] });
                 if (v.mode === 'payment' && !paymentOnly.some(x => x.forwarderId === p.forwarderId)) {
                     paymentOnly.push({ forwarderId: p.forwarderId, forwarderName: p.forwarderName });
                 }
             }
-            const details = await readDetails(conn, id, owner.forwarderId, env);
-            // The files they sent (src/services/forwarder-upload-routes.js), and the bills of lading filed from them.
-            const uploads = await readUploads(conn, id, owner.forwarderId, env);
+            const details = await readDetails(conn, id, duties, env);
+            // The files they sent (src/services/forwarder-upload-routes.js), and the documents filed from them.
+            const uploads = await readUploads(conn, id, duties, env);
             const documents = await readDocuments(conn, id, { email: req.userEmail || null, userType: req.userType });
-            const files = [...uploads.invoice, ...uploads.loadingPhotos, ...uploads.billOfLading];
+            const noticeList = notices.map(noticeJson);
+            const noProposals = { proposal: null, history: [] };
+            const noFiles = () => ({ invoice: [], loadingPhotos: [], billOfLading: [], customsDraft: [] });
+            const reviewOf = (d, u) => FC.toReviewCount({
+                proposals: [d.proposal].filter(Boolean).map(p => ({ waiting: p.waiting || p.status === 'applying', actionable: p.actionable })),
+                uploads: Object.values(u).flat(),
+            });
+            // One section per forwarder that holds a duty, the freight holder first:
+            // who it is, what it does, who can sign in for it, what its email would
+            // ask for, and what it sent.
+            const sections = [];
+            for (const a of FC.attachedOf(duties)) {
+                const mine = details.byForwarder.get(a.forwarderId) || noProposals;
+                const files = uploads.byForwarder.get(a.forwarderId) || noFiles();
+                sections.push({
+                    id: a.forwarderId,
+                    name: nameOf(a.forwarderId),
+                    duties: a.duties,
+                    sources: a.sources,
+                    visibility: { mode: 'full', why: null },
+                    contacts: forwarder && forwarder.id === a.forwarderId ? contacts : await contactsOf(conn, a.forwarderId),
+                    asks: FC.containerAsks(held, a.duties),
+                    // The newest email sent to it about this container (the list is newest first).
+                    lastNotice: noticeList.find(n => n.forwarderId === a.forwarderId) || null,
+                    details: { proposal: mine.proposal, history: mine.history },
+                    uploads: files,
+                    toReview: reviewOf(mine, files),
+                });
+            }
+            // The fields from before 2026-11-24 describe the FREIGHT holder only, so a
+            // ShipLine build from before then shows what it showed. Another attached
+            // forwarder's things are in `forwarders`, and NEVER in the old `strays`:
+            // that build offers a stray for dismissal.
+            const freight = owner.forwarderId == null ? null : sections.find(s => s.id === owner.forwarderId) || null;
+            const freightFiles = freight ? freight.uploads : noFiles();
+            // ... and only what such a build can decide: a stray it has no words for (a draft
+            // customs entry, a proposal with a delivery date) is in the new `strays` alone.
+            const oldStrays = {
+                details: details.strays.filter(p => Object.keys(p.requested).every(f => FC.ORIGINAL_FIELDS.includes(f))),
+                uploads: uploads.strays.filter(u => FC.ORIGINAL_KINDS.includes(u.kind)),
+            };
             const base = poPortalEmail.portalBaseOf(env);
             return {
                 shipmentId: id,
@@ -614,18 +733,28 @@ function registerForwarderContainerRoutes(app, deps) {
                 held,
                 asks: FC.containerAsks(held),
                 portalUrl: base ? FC.containerUrl(base, id) : null,
-                notices: notices.map(noticeJson),
+                notices: noticeList,
                 payments,
                 paymentOnly,
                 // The portal's own tables are not on this server yet: nothing a forwarder sent can be read.
                 unavailable: details.unavailable || uploads.unavailable,
-                details: { proposal: details.proposal, history: details.history, strays: details.strays },
-                uploads: { invoice: uploads.invoice, loadingPhotos: uploads.loadingPhotos, billOfLading: uploads.billOfLading, strays: uploads.strays },
-                documents,
-                toReview: FC.toReviewCount({
-                    proposals: [details.proposal, ...details.strays].filter(Boolean).map(p => ({ waiting: p.waiting || p.status === 'applying', actionable: p.actionable })),
-                    uploads: files,
-                }),
+                details: { ...(freight ? freight.details : noProposals), strays: oldStrays.details },
+                uploads: { invoice: freightFiles.invoice, loadingPhotos: freightFiles.loadingPhotos, billOfLading: freightFiles.billOfLading, strays: oldStrays.uploads },
+                documents: documents.filter(d => d.kind === 'bill_of_lading'),
+                // Who holds each duty, or why nobody does; with the pick behind an empty one.
+                duties: Object.fromEntries(FC.DUTIES.map((duty) => {
+                    const h = duties[duty];
+                    const pickId = row[FC.PICK_COLUMN[duty]] ?? null;
+                    return [duty, h.forwarderId != null
+                        ? { ...h, name: nameOf(h.forwarderId) }
+                        : { forwarderId: null, why: h.why, whyText: WHY_TEXT[h.why] || null, picked: pickId == null ? null : { id: Number(pickId), name: nameOf(pickId) } }];
+                })),
+                forwarders: sections,
+                // What a company that holds NOTHING here sent and is still undecided: dismiss only.
+                strays: { details: details.strays, uploads: uploads.strays },
+                // Every document kept for the container, whatever its kind.
+                keptDocuments: documents,
+                toReview: sections.reduce((n, s) => n + s.toReview, 0),
                 canDecide: FC.mayDecide(req.userType),
             };
         });
@@ -645,11 +774,12 @@ function registerForwarderContainerRoutes(app, deps) {
                         (d.claimed_at IS NOT NULL AND d.claimed_at < UTC_TIMESTAMP() - INTERVAL ${FC.CLAIM_MINUTES} MINUTE) AS lapsed,
                         COALESCE(c.reference, s.reference, d.container_ref) AS reference, COALESCE(c.mode, s.mode) AS mode, f.name AS forwarder_name,
                         (c.shipment_id IS NOT NULL) AS theirs,
+                        c.does_freight, c.does_delivery, c.does_customs,
                         (d.id = (SELECT MAX(x.id) FROM ${jp}.forwarder_container_details x
                                   WHERE x.shipment_id = d.shipment_id AND x.forwarder_id = d.forwarder_id)) AS live
                    FROM ${jp}.forwarder_container_details d
                    LEFT JOIN portal_forwarder_containers_v c
-                          ON c.shipment_id = d.shipment_id AND c.forwarder_id = d.forwarder_id AND c.link_source IN ('booking', 'container')
+                          ON c.shipment_id = d.shipment_id AND c.forwarder_id = d.forwarder_id AND c.link_source IN (${FULL_SOURCES_SQL})
                    LEFT JOIN shipments s ON s.id = d.shipment_id
                    LEFT JOIN forwarders f ON f.id = d.forwarder_id
                   ${all ? '' : "WHERE d.status IN ('pending', 'applying') HAVING theirs = 1 AND live = 1"}
@@ -660,6 +790,11 @@ function registerForwarderContainerRoutes(app, deps) {
                 const waiting = FC.isWaiting(r) || r.status === 'applying';
                 // A claim that lapsed reads as waiting again, as on the tab.
                 const claimed = r.status === 'applying' && Number(r.lapsed) !== 1;
+                const requested = FC.proposalOf(r.requested_json);
+                // What its forwarder holds on the container now, as the portal's view says.
+                const held = dutiesOfFlags(r);
+                // Still its forwarder's to ask for: it holds every duty the fields need.
+                const theirs = Number(r.theirs) === 1 && FC.fieldsOutside(requested, held).length === 0;
                 return {
                     kind: 'details',
                     id: Number(r.id),
@@ -668,14 +803,15 @@ function registerForwarderContainerRoutes(app, deps) {
                     mode: r.mode || null,
                     forwarderId: Number(r.forwarder_id),
                     forwarderName: r.forwarder_name || null,
+                    duties: held,
                     status: claimed ? 'applying' : FC.isWaiting(r) ? 'pending' : r.status,
                     waiting,
-                    // Why it can no longer be acted on: a newer one replaced it (`live`), or the
-                    // container is no longer that forwarder's (`theirs`).
+                    // Why it can no longer be acted on: a newer one replaced it (`live`), or its
+                    // forwarder no longer holds what it is about on that container (`theirs`).
                     live: Number(r.live) === 1,
-                    theirs: Number(r.theirs) === 1,
-                    actionable: waiting && Number(r.live) === 1 && Number(r.theirs) === 1,
-                    requested: FC.proposalOf(r.requested_json),
+                    theirs,
+                    actionable: waiting && Number(r.live) === 1 && theirs,
+                    requested,
                     byName: r.user_name || null,
                     byEmail: r.user_email || null,
                     at: r.created_at_iso || null,
@@ -740,7 +876,8 @@ function registerForwarderContainerRoutes(app, deps) {
         if (problem) {
             throw new Fail(400, 'NOTE_REQUIRED', problem === 'long' ? `The note must be ${FC.NOTE_MAX} characters or fewer.` : `Say what is wrong in at least ${FC.NOTE_MIN} characters: the forwarder reads it.`, { field: 'note' });
         }
-        res.json(await withConnection(conn => rejectDetails(conn, { id, note: FC.cleanNote(req.body.note), actor: actorOf(req) }, { recordAudit, env })));
+        const named = Array.isArray(req.body.fields) ? req.body.fields.filter(f => typeof f === 'string') : undefined;
+        res.json(await withConnection(conn => rejectDetails(conn, { id, note: FC.cleanNote(req.body.note), fields: named, actor: actorOf(req) }, { recordAudit, env })));
     }));
 
     // ── POST /api/v1/shipments/:id/forwarder-notice ─────────────────────────
@@ -756,8 +893,14 @@ function registerForwarderContainerRoutes(app, deps) {
     app.post('/api/v1/shipments/:id(\\d+)/forwarder-notice', route('POST /shipments/:id/forwarder-notice', async (req, res) => {
         refuseCannotDecide(req);
         const id = Number(req.params.id);
-        const { sendKey, to, subject, body } = req.body || {};
+        const { sendKey, to, subject, body, forwarderId: wanted } = req.body || {};
         if (!FC.isSendKey(sendKey)) throw new Fail(400, 'BAD_FIELD', 'sendKey must be the key the dialog made.', { field: 'sendKey' });
+        // Which of the container's forwarders to email (2026-11-24). Left out: the
+        // only one it has, else the one that carries the freight.
+        const wantedId = wanted === undefined || wanted === null ? null : Number(wanted);
+        if (wantedId !== null && !(Number.isSafeInteger(wantedId) && wantedId > 0)) {
+            throw new Fail(400, 'BAD_FIELD', 'forwarderId must be a forwarder id.', { field: 'forwarderId' });
+        }
         const portalBase = poPortalEmail.portalBaseOf(env);
         if (!portalBase) {
             throw new Fail(409, 'PORTAL_URL_UNSET', 'The supplier portal address (SUPPLIER_PORTAL_URL) is not configured, so the container link cannot be sent.');
@@ -768,11 +911,20 @@ function registerForwarderContainerRoutes(app, deps) {
             if (!row) throw new Fail(404, 'NO_SUCH_SHIPMENT', `Shipment ${id} not found.`);
 
             const claimed = await inTransaction(conn, async () => {
-                const { shipment, booking, owner, forwarder } = await lockOwnership(conn, id);
-                if (owner.forwarderId == null) {
+                const { shipment, booking, owner, duties, forwarders } = await lockOwnership(conn, id);
+                // Whom to email, on the locked rows: a company that holds a duty here.
+                const attached = FC.attachedOf(duties);
+                const target = wantedId !== null
+                    ? attached.find(a => a.forwarderId === wantedId) || null
+                    : (attached.length === 1 ? attached[0] : attached.find(a => a.duties.includes('freight')) || null);
+                if (!target) {
+                    if (wantedId !== null && attached.length) {
+                        throw new Fail(409, 'NOT_VISIBLE', 'That forwarder does nothing on this container, so it has no page to link to.', { why: null });
+                    }
                     throw new Fail(409, 'NOT_VISIBLE', `This container is not on a forwarder's page, so there is nothing to link to. ${WHY_TEXT[owner.why] || ''}`.trim(), { why: owner.why });
                 }
-                const contacts = await contactsOf(conn, owner.forwarderId);
+                const forwarder = forwarders.get(target.forwarderId) || null;
+                const contacts = await contactsOf(conn, target.forwarderId);
                 let addresses = contacts.map(c => String(c.email).trim().toLowerCase());
                 if (to !== undefined && to !== null) {
                     const parsed = poPortalEmail.parseRecipients(to);
@@ -791,7 +943,7 @@ function registerForwarderContainerRoutes(app, deps) {
                     `SELECT id, shipment_id, forwarder_id, status FROM ${NOTICE_TABLE} WHERE send_key = ? FOR UPDATE`,
                     [sendKey]
                 );
-                const state = FC.noticeState(existing[0] || null, { shipmentId: id, forwarderId: owner.forwarderId });
+                const state = FC.noticeState(existing[0] || null, { shipmentId: id, forwarderId: target.forwarderId });
                 if (state === 'clash') throw new Fail(409, 'SEND_KEY_CLASH', 'This send key belongs to another container or forwarder. Open the email dialog again.');
                 if (state === 'already_sent' || state === 'send_unconfirmed') return { replay: state, noticeId: Number(existing[0].id) };
 
@@ -803,15 +955,19 @@ function registerForwarderContainerRoutes(app, deps) {
                     const [ins] = await conn.query(
                         `INSERT INTO ${NOTICE_TABLE} (shipment_id, shipment_reference, forwarder_id, send_key, status, sent_by_email)
                          VALUES (?, ?, ?, ?, 'sending', ?)`,
-                        [id, shipment.reference || null, owner.forwarderId, sendKey, req.userEmail || null]
+                        [id, shipment.reference || null, target.forwarderId, sendKey, req.userEmail || null]
                     );
                     noticeId = Number(ins.insertId);
                 }
+                const carriesFreight = target.duties.includes('freight');
                 return {
-                    noticeId, addresses, forwarderId: owner.forwarderId,
+                    noticeId, addresses, forwarderId: target.forwarderId,
                     forwarderName: (forwarder && forwarder.name) || '',
                     reference: shipment.reference || '',
-                    bookingRef: (booking && booking.booking_ref) || row.booking_ref || null,
+                    // The freight booking's reference is the freight forwarder's own: no other company is told it.
+                    bookingRef: carriesFreight ? ((booking && booking.booking_ref) || row.booking_ref || null) : null,
+                    // What this company is asked for: only the things of the duties it holds.
+                    duties: target.duties,
                 };
             });
             if (claimed.replay) return { ok: true, outcome: claimed.replay, noticeId: claimed.noticeId };
@@ -830,7 +986,7 @@ function registerForwarderContainerRoutes(app, deps) {
             const html = wrapEmail({
                 title: finalSubject,
                 bodyHtml: inner + F.containerBlockHtml({
-                    containerName: claimed.reference, bookingRef: claimed.bookingRef, asks: FC.containerAsks(held),
+                    containerName: claimed.reference, bookingRef: claimed.bookingRef, asks: FC.containerAsks(held, claimed.duties),
                     url: FC.containerUrl(portalBase, id), registerUrl: poPortalEmail.registerUrl(portalBase),
                 }),
             });

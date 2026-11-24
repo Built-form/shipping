@@ -311,13 +311,14 @@ function harness({ userType = 'standard', frontOk = () => true, documentSet = nu
                 return [db.bookings.filter(b => b.shipment_id === params[0] && live(b) && b.id !== params[2])];
             }
             if (s.startsWith('INSERT INTO freight_bookings')) {
-                const [request_id, option_id, requested_by_email, request_note, sent_to, subject, shipment_id, draft_container_name] = params;
+                assert.match(s, /shipment_id, draft_container_name, scope\)/, 'what the booking covers is written with it');
+                const [request_id, option_id, requested_by_email, request_note, sent_to, subject, shipment_id, draft_container_name, scope] = params;
                 if (db.bookings.some(b => b.request_id === request_id && live(b))) throw Object.assign(new Error('dup'), { errno: 1062 });
                 // Another booking took the container between the check and this insert.
                 if (shipment_id != null && db.raceShipment === shipment_id) throw containerDup(shipment_id);
                 const id = db.bookings.length + 1;
                 db.bookings.push({
-                    id, request_id, option_id, status: 'requested', requested_by_email, requested_at: NOW(), request_note, sent_to,
+                    id, request_id, option_id, status: 'requested', scope, requested_by_email, requested_at: NOW(), request_note, sent_to,
                     subject, shipment_id, draft_container_name, booking_ref: null, response_note: null, responded_at: null,
                     responded_by_name: null, responded_by_email: null, response_source: null, cancelled_at: null, cancel_reason: null,
                     contents_sent_at: null, contents_sent_to: null, contents_json: null, contents_document_ids: null, row_version: 1,
@@ -364,6 +365,7 @@ function harness({ userType = 'standard', frontOk = () => true, documentSet = nu
                     if (p[0] != null && db.raceShipment === p[0]) throw containerDup(p[0]);
                     Object.assign(b, { shipment_id: p.shift(), draft_container_name: p.shift(), contents_json: null, contents_sent_at: null, contents_document_ids: null });
                 }
+                if (s.includes('scope = ?')) b.scope = p.shift();
                 if (s.includes("status = 'confirmed'")) Object.assign(b, { status: 'confirmed', booking_ref: p.shift(), response_note: p.shift(), responded_by_email: p.shift(), response_source: 'staff', responded_at: NOW() });
                 if (s.includes("status = 'cancelled'")) Object.assign(b, { status: 'cancelled', cancel_reason: 'staff', cancelled_by_email: p.shift(), cancelled_at: NOW() });
                 b.row_version += 1;
@@ -720,6 +722,39 @@ test('booking: an option from an older answer is refused; a Front failure cancel
     assert.equal(out.status, 502);
     assert.equal(f.db.bookings[0].status, 'cancelled');
     assert.equal(f.db.bookings[0].cancel_reason, 'send_failed');
+});
+
+test('booking: what it covers is said by staff; left out, it covers the freight only, whatever the option is called', async () => {
+    const h = harness();
+    await answered(h);
+    const booked = await h.call('POST', '/api/v1/freight-quotes/options/1/book', {});
+    assert.equal(booked.body.bookings[0].scope, 'port_to_port');
+    assert.equal(h.db.bookings[0].scope, 'port_to_port');
+    // Corrected while it is live.
+    const patched = await h.call('PATCH', '/api/v1/freight-bookings/1', { scope: 'end_to_end' });
+    assert.equal(patched.status, 200);
+    assert.equal(patched.body.bookings[0].scope, 'end_to_end');
+    assert.deepEqual(h.db.audits.filter(a => a.entityType === 'freight_booking' && a.action === 'update').map(a => [a.before, a.after]), [[{ scope: 'port_to_port' }, { scope: 'end_to_end' }]]);
+    // The same again changes nothing.
+    const version = h.db.bookings[0].row_version;
+    assert.equal((await h.call('PATCH', '/api/v1/freight-bookings/1', { scope: 'end_to_end' })).status, 200);
+    assert.equal(h.db.bookings[0].row_version, version);
+    // Not something a booking can cover.
+    for (const bad of ['delivery', 'door', '', 5, null]) {
+        const r = await h.call('PATCH', '/api/v1/freight-bookings/1', { scope: bad });
+        assert.deepEqual([r.status, r.body.code, r.body.field], [400, 'BAD_FIELD', 'scope'], String(bad));
+    }
+    assert.equal(h.db.bookings[0].scope, 'end_to_end');
+
+    // Said when booking.
+    const g = harness();
+    await answered(g);
+    assert.equal((await g.call('POST', '/api/v1/freight-quotes/options/1/book', { scope: 'end_to_end' })).body.bookings[0].scope, 'end_to_end');
+    const wrong = harness();
+    await answered(wrong);
+    const r = await wrong.call('POST', '/api/v1/freight-quotes/options/1/book', { scope: 'everything' });
+    assert.deepEqual([r.status, r.body.code, r.body.field], [400, 'BAD_FIELD', 'scope']);
+    assert.equal(wrong.db.bookings.length, 0);
 });
 
 test('a confirmation closes the other forwarder\'s link as filled; cancelling reopens it', async () => {
