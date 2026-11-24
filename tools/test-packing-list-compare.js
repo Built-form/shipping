@@ -288,3 +288,8 @@ test('active lines: not in production yet, or written off, are never expected', 
         assert.equal(isActiveLine({ status }), true, String(status));
     }
 });
+
+test('a packed row carries the net weight of a carton as the list gives it (clearance instructions read it)', () => {
+    const c = comparePackingList([order()], pl([row({ grossWeightPerCarton: 12, netWeightPerCarton: 10.5 }), row({ netWeightPerCarton: null })]));
+    assert.deepEqual(c.lines[0].packed.rows.map(r => r.netWeightPerCarton), [10.5, null]);
+});

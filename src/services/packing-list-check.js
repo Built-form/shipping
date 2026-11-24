@@ -980,6 +980,8 @@ function packedSummary(p) {
         mfgDate: toMonth(p.mfgDate),
         expDate: toMonth(p.expDate),
         grossWeightPerCarton: num(p.grossWeightPerCarton),
+        // Read off the list with the gross weight; ShipLine fills a clearance row from it (2026-11-24).
+        netWeightPerCarton: num(p.netWeightPerCarton),
         cartonDimensionsCm: p.cartonDimensionsCm || null,
         description: p.description || null,
     };

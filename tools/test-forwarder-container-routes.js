@@ -1592,3 +1592,165 @@ test('tab: a delivery proposal is in the delivery company\'s section, ready to a
     assert.deepEqual([delivery.details.proposal.id, delivery.details.proposal.actionable, delivery.details.proposal.outside], [70, true, []]);
     assert.deepEqual([freight.details.proposal.id, freight.details.proposal.actionable, freight.details.proposal.outside], [71, false, ['deliveryDate']]);
 });
+
+// ── clearance instructions: the sheet sent to whoever handles the container's customs ──
+// (docs/clearance-instructions.md). It rides the same email, key and row as
+// "Email forwarder", with the file attached and kept.
+
+const CLEARANCE_LIST = 'GET /api/v1/shipments/:id(\\d+)/clearance-instructions';
+const CLEARANCE_PREVIEW = 'POST /api/v1/shipments/:id(\\d+)/clearance-instructions/preview';
+const C_ROW = (over = {}) => ({
+    supplier: 'Roosin', invoiceNumber: 'ROOSIN-38', company: 'JFA', description: 'Burning Dressings JF1010', origin: 'China', cartons: 88, unitType: 'Carton',
+    netKg: 924, grossKg: 994.4, cbm: 3.232, commodityCode: '3005909900', dutyPercent: 2.5, valueUsd: 8272, jfCodes: ['JF1010'], ...over,
+});
+const SHEET = (over = {}) => ({ containerCostUsd: 3450, rows: [C_ROW(), C_ROW({ description: 'Foam Dressings JF1051', cartons: 12, netKg: 21.6, grossKg: 27.6, cbm: 0.335, valueUsd: 792, dutyPercent: 0, commodityCode: '3005100000' })], ...over });
+// DCG (3) handles the customs of a container test2forwarder (4) carries.
+const BROKER_CONTACTS = [{ id: 11, forwarder_id: 3, name: 'Ana', email: 'ana@dcg.example' }, ...CONTACTS];
+const WITH_BROKER = (over = {}) => SHIP_ROW({ customs_forwarder_id: 3, ...over });
+const clearanceRules = ({ existing = null, sent = [], rates = [], next = 3, updated = 1 } = {}) => [
+    [/SELECT COALESCE\(MAX\(version\), 0\) \+ 1 AS next FROM shipment_clearance_instructions WHERE shipment_id = \?/, () => [[{ next }]]],
+    [/INSERT INTO shipment_clearance_instructions/, () => [{ insertId: 5, affectedRows: 1 }]],
+    [/UPDATE shipment_clearance_instructions SET .* WHERE notice_id = \?/, () => [{ affectedRows: updated }]],
+    [/SELECT id, version FROM shipment_clearance_instructions WHERE notice_id = \?/, () => [[{ id: 5, version: 2 }]]],
+    [/INSERT INTO clearance_duty_rates/, () => [{ affectedRows: 1 }]],
+    [/FROM shipment_clearance_instructions c JOIN freight_container_notices n/, () => [sent]],
+    [/FROM clearance_duty_rates/, () => [rates]],
+    ...noticeRules({ existing, contacts: BROKER_CONTACTS }),
+];
+
+test('clearance: an incomplete sheet is refused before anything is read, with every blank named', async () => {
+    const t = build(clearanceRules(), { shipment: WITH_BROKER() });
+    const r = await t.call(NOTICE, { body: { sendKey: KEY, clearance: SHEET({ rows: [C_ROW({ invoiceNumber: '', dutyPercent: null })] }) } });
+    assert.equal(r.status, 422);
+    assert.equal(r.body.code, 'CLEARANCE_INCOMPLETE');
+    assert.deepEqual(r.body.allowedNext, ['fill']);
+    assert.deepEqual(r.body.problems.map(x => [x.row, x.field]), [[0, 'invoiceNumber'], [0, 'dutyPercent']]);
+    assert.equal(t.db.asked.length, 0);
+    assert.equal(t.sent.length, 0);
+    // A role that may not decide is refused first, as for any email to a forwarder.
+    assert.equal((await t.call(NOTICE, { body: { sendKey: KEY, clearance: SHEET() }, userType: 'accountant' })).status, 403);
+});
+
+test('clearance: goes to whoever handles the container\'s customs, with the file attached, kept as the next version', async () => {
+    const t = build(clearanceRules(), { shipment: WITH_BROKER({ member_ext: 'seku6400902' }) });
+    const r = await t.call(NOTICE, { body: { sendKey: KEY, clearance: SHEET() } });
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.body, { ok: true, outcome: 'sent', noticeId: 77, clearanceId: 5, version: 3 });
+    // Not the freight forwarder: the company picked for customs.
+    assert.deepEqual(t.sent[0].to, ['ana@dcg.example']);
+    assert.equal(t.sent[0].attachments.length, 1);
+    const file = t.sent[0].attachments[0];
+    assert.equal(file.filename, 'Clearance Instructions - SEKU6400902.csv');
+    assert.equal(file.contentType, 'text/csv');
+    const csv = file.bytes.toString('utf8');
+    assert.ok(csv.startsWith('SEKU6400902 - Clearance Instructions,'));
+    assert.ok(csv.includes('Roosin,ROOSIN-38,JFA,Burning Dressings JF1010,China,88,Carton,924,994.4,3.232,3005909900,2.50%,3450,3.57,3123,8272.00,'));
+    // The email says what it is and links the container's page; it asks for nothing else.
+    assert.ok(t.sent[0].html.includes('Clearance Instructions - SEKU6400902.csv'));
+    assert.ok(t.sent[0].html.includes('href="https://portal.example/freight-containers/1214"'));
+    assert.ok(!t.sent[0].html.includes('What we need for this container'));
+    // Kept under the email's own row, in the transaction that claims the send, before Front is called.
+    const sqls = t.db.asked.map(a => a.sql);
+    const kept = sqls.findIndex(s => /INSERT INTO shipment_clearance_instructions/.test(s));
+    const commit = sqls.findIndex((s, i) => i > kept && s === 'COMMIT');
+    const marked = sqls.findIndex(s => /UPDATE freight_container_notices SET status = 'sent'/.test(s));
+    assert.ok(kept > sqls.findIndex(s => /INSERT INTO freight_container_notices/.test(s)) && commit > kept && marked > commit);
+    const ins = t.db.asked[kept].params;
+    assert.deepEqual(ins.slice(0, 8), [1214, 3, 77, 3, 'SEKU6400902', 'Clearance Instructions - SEKU6400902.csv', 3450, 3.57]);
+    assert.deepEqual(JSON.parse(ins[8]).map(x => x.description), ['Burning Dressings JF1010', 'Foam Dressings JF1051']);
+    assert.equal(ins[9], csv);
+    assert.equal(ins[10], 'ops@us.com');
+    // What each commodity code was sent with is remembered, once it has gone.
+    const rates = t.db.wrote(/INSERT INTO clearance_duty_rates/);
+    assert.deepEqual(rates.map(a => a.params.slice(0, 2)), [['3005909900', 2.5], ['3005100000', 0]]);
+    assert.ok(t.db.asked.indexOf(rates[0]) > marked);
+    // On the receipts list as an email with nothing to confirm; audited with what was sent.
+    assert.deepEqual([t.receipts[0].emailType, t.receipts[0].confirmVia], ['freight_clearance_instructions', 'none']);
+    assert.deepEqual(t.audits[0].after.clearance, { id: 5, version: 3, filename: 'Clearance Instructions - SEKU6400902.csv', rows: 2 });
+});
+
+test('clearance: a container with no carrier number yet is named by our own', async () => {
+    const t = build(clearanceRules(), { shipment: WITH_BROKER() });
+    await t.call(NOTICE, { body: { sendKey: KEY, clearance: SHEET() } });
+    assert.equal(t.sent[0].attachments[0].filename, 'Clearance Instructions - 339.csv');
+});
+
+test('clearance: nobody handles the customs, or the company named does not: refused, nothing kept or sent', async () => {
+    const none = build(clearanceRules(), { shipment: SHIP_ROW() });
+    const r = await none.call(NOTICE, { body: { sendKey: KEY, clearance: SHEET() } });
+    assert.deepEqual([r.status, r.body.code, r.body.allowedNext], [409, 'NO_CUSTOMS_HOLDER', ['pick']]);
+    const wrong = build(clearanceRules(), { shipment: WITH_BROKER() });
+    const w = await wrong.call(NOTICE, { body: { sendKey: KEY, forwarderId: 4, clearance: SHEET() } });
+    assert.deepEqual([w.status, w.body.code, w.body.kind], [409, 'NOT_THEIR_DUTY', 'clearance']);
+    for (const t of [none, wrong]) {
+        assert.equal(t.sent.length, 0);
+        assert.equal(t.db.wrote(/INSERT INTO (shipment_clearance_instructions|freight_container_notices|clearance_duty_rates)/).length, 0);
+    }
+});
+
+test('clearance: when Front refuses, no duty is remembered, and the same key sends again over the same kept row', async () => {
+    const failed = build(clearanceRules(), { shipment: WITH_BROKER(), front: () => ({ ok: false, status: 500, detail: 'no' }) });
+    const r = await failed.call(NOTICE, { body: { sendKey: KEY, clearance: SHEET() } });
+    assert.equal(r.status, 502);
+    assert.equal(failed.db.wrote(/INSERT INTO clearance_duty_rates/).length, 0);
+    assert.equal(failed.db.wrote(/UPDATE freight_container_notices SET status = 'failed'/).length, 1);
+
+    const again = build(clearanceRules({ existing: { id: 77, shipment_id: 1214, forwarder_id: 3, status: 'failed' } }), { shipment: WITH_BROKER() });
+    const a = await again.call(NOTICE, { body: { sendKey: KEY, clearance: SHEET({ containerCostUsd: 3500 }) } });
+    assert.deepEqual(a.body, { ok: true, outcome: 'sent', noticeId: 77, clearanceId: 5, version: 2 });
+    // The corrected sheet replaces what the failed attempt kept: one row per email, never two.
+    assert.equal(again.db.wrote(/INSERT INTO shipment_clearance_instructions/).length, 0);
+    const upd = again.db.wrote(/UPDATE shipment_clearance_instructions SET/)[0];
+    assert.equal(upd.params[2], 3500);
+    assert.equal(upd.params[upd.params.length - 1], 77);
+});
+
+test('clearance: a key that already sent is answered as sent, and nothing is kept or emailed again', async () => {
+    const t = build(clearanceRules({ existing: { id: 77, shipment_id: 1214, forwarder_id: 3, status: 'sent' } }), { shipment: WITH_BROKER() });
+    const r = await t.call(NOTICE, { body: { sendKey: KEY, clearance: SHEET() } });
+    assert.deepEqual([r.body.outcome, r.body.noticeId], ['already_sent', 77]);
+    assert.equal(t.sent.length, 0);
+    assert.equal(t.db.wrote(/(INSERT INTO|UPDATE) shipment_clearance_instructions/).length, 0);
+});
+
+test('email: an ordinary "Email forwarder" carries no file and keeps nothing', async () => {
+    const t = build(clearanceRules(), { shipment: WITH_BROKER() });
+    await t.call(NOTICE, { body: { sendKey: KEY } });
+    assert.equal(t.sent[0].attachments, undefined);
+    assert.deepEqual(t.sent[0].to, ['mei@fwd.example', 'ops@fwd.example']);
+    assert.equal(t.db.wrote(/shipment_clearance_instructions|clearance_duty_rates/).length, 0);
+    assert.equal(t.receipts[0].confirmVia, 'portal');
+});
+
+test('clearance: what was sent for a container, newest first, and the duty each commodity code last went with', async () => {
+    const sent = [{
+        id: 5, shipment_id: 1214, forwarder_id: 3, forwarder_name: 'DCG', notice_id: 77, version: 2, title: '339', filename: 'Clearance Instructions - 339.csv',
+        container_cost_usd: '3450.00', total_cbm: '3.57', rows_json: JSON.stringify(SHEET().rows), csv: 'x', created_by_email: 'ops@us.com',
+        status: 'sent', sent_at: '2026-11-24T10:00:00Z', sent_to: JSON.stringify(['ana@dcg.example']),
+    }];
+    const t = build(clearanceRules({ sent, rates: [{ commodity_code: '3005909900', duty_percent: '2.50' }, { commodity_code: '3005100000', duty_percent: '0.00' }] }), { shipment: WITH_BROKER({ member_ext: 'SEKU6400902' }) });
+    const r = await t.call(CLEARANCE_LIST);
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.body.dutyRates, { 3005909900: 2.5, 3005100000: 0 });
+    assert.deepEqual([r.body.title, r.body.filename, r.body.canSend], ['SEKU6400902', 'Clearance Instructions - SEKU6400902.csv', true]);
+    assert.deepEqual(r.body.customs, { forwarderId: 3, name: 'DCG' });
+    assert.deepEqual(r.body.sent.map(s => [s.id, s.version, s.forwarderName, s.status, s.sentAt, s.sentByEmail, s.sentTo, s.containerCostUsd, s.totalCbm, s.rows.length, s.csv]), [
+        [5, 2, 'DCG', 'sent', '2026-11-24T10:00:00Z', 'ops@us.com', ['ana@dcg.example'], 3450, 3.57, 2, 'x'],
+    ]);
+    // Read by anyone on the team; a role that may not decide is told it cannot send.
+    assert.equal((await t.call(CLEARANCE_LIST, { userType: 'accountant' })).body.canSend, false);
+    // Nobody picked for customs: said, so the page can say who to pick.
+    const none = build(clearanceRules(), { shipment: SHIP_ROW() });
+    assert.equal((await none.call(CLEARANCE_LIST)).body.customs, null);
+    assert.equal((await build(clearanceRules(), { shipment: null }).call(CLEARANCE_LIST)).status, 404);
+});
+
+test('clearance: the file can be had at any time, blanks and all, and having it writes nothing', async () => {
+    const t = build(clearanceRules(), { shipment: WITH_BROKER() });
+    const r = await t.call(CLEARANCE_PREVIEW, { body: SHEET({ containerCostUsd: null, rows: [C_ROW({ invoiceNumber: '' })] }), userType: 'accountant' });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.filename, 'Clearance Instructions - 339.csv');
+    assert.ok(r.body.csv.includes('Roosin,,JFA,Burning Dressings JF1010,China,88,Carton,924,994.4,3.232,3005909900,2.50%,,3.23,,8272.00,'));
+    assert.deepEqual(r.body.problems.map(x => x.field), ['containerCostUsd', 'invoiceNumber']);
+    assert.equal(t.db.wrote(/^(INSERT|UPDATE)/).length, 0);
+});

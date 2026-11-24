@@ -656,6 +656,32 @@ const FREIGHT_CONTAINER_TEMPLATE = {
 };
 DEFAULT_EMAIL_TEMPLATES.push(FREIGHT_CONTAINER_TEMPLATE);
 
+// "Here are the clearance instructions for a container" (docs/clearance-instructions.md;
+// seeded by 2026-11-24_23_seed_freight_clearance_template.js). Sent from ShipLine's
+// clearance instructions dialog to the forwarder that handles the container's customs,
+// with the sheet attached. The sender appends a fixed block under this body: the
+// container, the file's name, and the button to the container's page on the supplier
+// portal, where the same file can be downloaded. {forwarder} {containerName} {bookingRef}
+// are HTML-escaped by the sender ({bookingRef} is always empty here: a booking reference
+// is the freight forwarder's own).
+const FREIGHT_CLEARANCE_TEMPLATE_KEY = 'freight_clearance_instructions';
+const FREIGHT_CLEARANCE_TEMPLATE = {
+    key: FREIGHT_CLEARANCE_TEMPLATE_KEY,
+    name: 'Freight clearance instructions',
+    category: 'Freight',
+    description: 'Emailed to the forwarder that handles a container’s customs, with our clearance instructions attached (the goods by commercial invoice, their commodity codes, weights, volume and value). The container and the button to its page on the supplier portal are added under this text. Tokens: {forwarder}, {containerName}.',
+    subject: 'Container {containerName} – clearance instructions / 集装箱 {containerName} 清关资料',
+    bodyHtml: [
+        FREIGHT_GREETING,
+        '<p>Greetings,</p>',
+        '<p>Please find attached our clearance instructions for container <strong>{containerName}</strong>. The same file is on the container’s page on our supplier portal.</p>',
+        '<p>您好，</p>',
+        '<p>随函附上集装箱 <strong>{containerName}</strong> 的清关资料。该文件也可在供应商门户的集装箱页面下载。</p>',
+        FREIGHT_SIGNOFF,
+    ].join(''),
+};
+DEFAULT_EMAIL_TEMPLATES.push(FREIGHT_CLEARANCE_TEMPLATE);
+
 // "We are waiting for ready dates" (src/services/ready-date-reminders.js,
 // docs/ready-date-reminders.md; seeded by
 // 2026-11-18_20_seed_ready_date_reminder_template.js). Sent by the system, not
@@ -695,6 +721,7 @@ module.exports = {
     FREIGHT_BOOKING_CONTENTS_TEMPLATE_KEY, FREIGHT_MOVEMENT_REQUEST_TEMPLATE_KEY,
     FREIGHT_DELIVERY_TEMPLATES, FREIGHT_DELIVERY_REQUEST_TEMPLATE_KEY, FREIGHT_DELIVERY_BOOKING_TEMPLATE_KEY,
     FREIGHT_CONTAINER_TEMPLATE_KEY, FREIGHT_CONTAINER_TEMPLATE,
+    FREIGHT_CLEARANCE_TEMPLATE_KEY, FREIGHT_CLEARANCE_TEMPLATE,
     DEFAULT_EMAIL_TEMPLATES, SUPPLIER_PI_TEMPLATE_KEYS, QC_VISIT_TEMPLATE_KEYS, PO_PORTAL_TEMPLATE_KEY,
     SIGNED_PI_TEMPLATE_KEY,
     FILE_TRANSFER_TEMPLATE_KEY, FILE_TRANSFER_TEMPLATE,
