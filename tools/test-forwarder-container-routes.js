@@ -1160,7 +1160,7 @@ test('tab: the files the forwarder sent, by kind, with what became of each; neve
     assert.equal(r.status, 200);
     assert.deepEqual(r.body.uploads.invoice, [{
         id: 70, kind: 'invoice', shipmentId: 1214, forwarderId: 4, forwarderName: 'test2forwarder', filename: 'invoice 339.pdf', contentType: 'application/pdf', fileSize: 120000,
-        note: null, byName: 'Mei', byEmail: 'mei@fwd.example', sentAt: '2026-11-23T09:01:00Z', state: 'open', waiting: true, theirs: true, actionable: true, duties: ['freight'],
+        note: null, reference: null, byName: 'Mei', byEmail: 'mei@fwd.example', sentAt: '2026-11-23T09:01:00Z', state: 'open', waiting: true, theirs: true, actionable: true, duties: ['freight'],
         decidedNote: null, decidedBy: null, decidedAt: null, filedId: null,
     }]);
     assert.deepEqual(r.body.uploads.loadingPhotos.map(u => [u.id, u.state, u.actionable, u.filedId]), [[72, 'open', true, null], [71, 'received', false, 901]]);
@@ -1188,7 +1188,7 @@ test('tab: the bills of lading filed for the container, and who may remove each'
         content_type: 'application/pdf', file_size: 9, forwarder_upload_id: 73, uploaded_by_email: 'mei@fwd.example', accepted_by_email: 'kim@us.com', deleted_at: null, created_at_iso: '2026-11-23T12:00:00Z' }];
     let r = await build(baseRules({ documents })).call(TAB);
     assert.deepEqual(r.body.documents, [{
-        id: 902, kind: 'bill_of_lading', forwarderId: 4, forwarderName: 'test2forwarder', filename: 'bl.pdf', url: 'https://po.example/forwarder-documents/x/bl.pdf', contentType: 'application/pdf', fileSize: 9,
+        id: 902, kind: 'bill_of_lading', reference: null, forwarderId: 4, forwarderName: 'test2forwarder', filename: 'bl.pdf', url: 'https://po.example/forwarder-documents/x/bl.pdf', contentType: 'application/pdf', fileSize: 9,
         uploadedByEmail: 'mei@fwd.example', acceptedByEmail: 'kim@us.com', createdAt: '2026-11-23T12:00:00Z', canRemove: false,
     }]);
     r = await build(baseRules({ documents })).call(TAB, { userType: 'admin' });
@@ -1260,14 +1260,14 @@ test('tab: one section per forwarder that holds a duty, the freight holder first
     ]);
     const [freight, delivery] = r.body.forwarders;
     assert.deepEqual(freight.asks, ['ecn', 'loadingDate', 'invoice', 'photos', 'billOfLading']);
-    assert.deepEqual(delivery.asks, ['deliveryDate', 'invoice', 'customsDraft'], 'never the number, the loading date, photos or the bill of lading');
+    assert.deepEqual(delivery.asks, ['deliveryDate', 'invoice', 'customsDraft', 'customsEntry'], 'never the number, the loading date, photos or the bill of lading');
     assert.deepEqual(freight.contacts.map(c => c.email), ['mei@fwd.example', 'ops@fwd.example']);
     assert.deepEqual(delivery.contacts, [{ name: 'Li', email: 'li@dcg.example' }]);
     assert.deepEqual(freight.visibility, { mode: 'full', why: null });
     assert.equal(freight.lastNotice, null);
     assert.equal(delivery.lastNotice.id, 6);
     assert.deepEqual(delivery.details, { proposal: null, history: [] });
-    assert.deepEqual(delivery.uploads, { invoice: [], loadingPhotos: [], billOfLading: [], customsDraft: [] });
+    assert.deepEqual(delivery.uploads, { invoice: [], loadingPhotos: [], billOfLading: [], customsDraft: [], customsEntry: [] });
     // The old field keeps its old shape: three kinds and the strays.
     assert.deepEqual(r.body.uploads, { invoice: [], loadingPhotos: [], billOfLading: [], strays: [] });
     // Who holds each duty, by the list's name.

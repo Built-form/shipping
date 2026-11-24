@@ -37,6 +37,7 @@ const log = require('../lib/logger');
 const { recordAudit } = require('../lib/audit');
 const S = require('../lib/shipments');
 const FL = require('../lib/forwarder-links');
+const FC = require('../lib/forwarder-containers');
 
 const BACKFILL_MARKER = 'shipments_backfill_v1';
 const KILL_SWITCH = 'shipments_shadow_off';
@@ -714,18 +715,34 @@ async function mergeShipments(conn, survivorId, loserId, { reference = null, use
     await conn.query(`UPDATE draft_container_documents SET shipment_id = ? WHERE shipment_id = ?`, [survivor.id, loser.id]);
     await conn.query(`UPDATE quality_assurance_documents SET shipment_id = ? WHERE shipment_id = ?`, [survivor.id, loser.id]);
     await conn.query(`UPDATE draft_containers SET shipment_id = ? WHERE shipment_id = ?`, [survivor.id, loser.id]);
-    // Freight bookings (2026-11-20) follow their container. A live one only
-    // into a survivor that holds none (one live booking per container): this
-    // runs inside a draft's conversion, so it never refuses — a live booking
-    // left on the merged loser is reported by tools/verify-shipments.js.
-    const [bookedRows] = await conn.query(
-        `SELECT COUNT(*) AS n FROM freight_bookings WHERE shipment_id = ? AND status IN ('requested', 'confirmed')`, [survivor.id]
-    );
-    const survivorBooked = Array.isArray(bookedRows) && bookedRows[0] ? Number(bookedRows[0].n) : 0;
-    if (!(survivorBooked > 0)) {
-        await conn.query(
-            `UPDATE freight_bookings SET shipment_id = ? WHERE shipment_id = ? AND status IN ('requested', 'confirmed')`, [survivor.id, loser.id]
+    // Freight bookings (2026-11-20) follow their container. A container takes one
+    // live booking per LEG (2026-11-24: one that covers the freight, one that
+    // covers the delivery; an end-to-end booking covers both), so a live one
+    // moves only when no live booking of the survivor covers a duty it covers.
+    // One that cannot move stays on the merged loser, as before, and is
+    // reported by tools/verify-shipments.js: this runs inside a draft's
+    // conversion and does not refuse for it.
+    const liveOn = async (id) => {
+        const [found] = await conn.query(
+            `SELECT id, scope FROM freight_bookings WHERE shipment_id = ? AND status IN ('requested', 'confirmed') ORDER BY id`, [id]
         );
+        return Array.isArray(found) ? found.filter(b => b && b.id != null) : [];
+    };
+    const kept = await liveOn(survivor.id);
+    for (const b of await liveOn(loser.id)) {
+        if (kept.some(k => FC.scopesOverlap(k.scope, b.scope))) continue;
+        try {
+            await conn.query('UPDATE freight_bookings SET shipment_id = ? WHERE id = ?', [survivor.id, b.id]);
+        } catch (e) {
+            // An attach locks the booking, not the container, so one can land on the
+            // survivor between the read above and this move. The keys refuse it; the
+            // whole merge is then given up (nothing half-moved) and can be tried again.
+            if (e && e.errno === 1062 && /uq_freight_bookings_live_/.test(e.message || '')) {
+                throw new S.ShipmentError(409, 'RETRY', 'A freight booking was attached to this container at the same moment. Try again.', { allowedNext: ['retry'] });
+            }
+            throw e;
+        }
+        kept.push(b);
     }
     await conn.query(
         `UPDATE freight_bookings SET shipment_id = ? WHERE shipment_id = ? AND status NOT IN ('requested', 'confirmed')`, [survivor.id, loser.id]
@@ -937,6 +954,8 @@ function shipmentSelect({ where = [], effectiveWhere = [], orderBy = 'COALESCE(z
             FROM (
               SELECT s.*,
                      bk.bk_count, bk.bk_id, bk.bk_status, bk.bk_scope, bk.bk_ref, bk.bk_forwarder_id, bk.bk_forwarder_name,
+                     dbk.dbk_id, dbk.dbk_status, dbk.dbk_ref, dbk.dbk_forwarder_id, dbk.dbk_forwarder_name,
+                     dbf.name AS dbf_name, (dbf.id IS NOT NULL AND dbf.deleted_at IS NULL) AS dbf_live,
                      m.member_deliveries, COALESCE(m.member_delivery_missing, 0) AS member_delivery_missing,
                      pf.name AS pf_name, (pf.id IS NOT NULL AND pf.deleted_at IS NULL) AS pf_live,
                      df.name AS df_name, (df.id IS NOT NULL AND df.deleted_at IS NULL) AS df_live,
@@ -985,15 +1004,28 @@ function shipmentSelect({ where = [], effectiveWhere = [], orderBy = 'COALESCE(z
                            MAX(fr.forwarder_id) AS bk_forwarder_id, MAX(fr.forwarder_name) AS bk_forwarder_name
                       FROM freight_bookings fb
                       JOIN freight_quote_requests fr ON fr.id = fb.request_id
-                     WHERE fb.status IN ('requested', 'confirmed') AND fb.shipment_id IS NOT NULL${bookingScope}
+                     WHERE fb.status IN ('requested', 'confirmed') AND fb.shipment_id IS NOT NULL AND fb.scope IN ('port_to_port', 'end_to_end')${bookingScope}
                      GROUP BY fb.shipment_id
                 ) bk ON bk.shipment_id = s.id
+                -- The live booking for the DELIVERY alone (2026-11-24, a booking on a delivery
+                -- request): at most one per container too (uq_freight_bookings_live_delivery),
+                -- read apart so the two legs' bookings never blend into one row.
+                LEFT JOIN (
+                    SELECT fb.shipment_id,
+                           MAX(fb.id) AS dbk_id, MAX(fb.status) AS dbk_status, MAX(fb.booking_ref) AS dbk_ref,
+                           MAX(fr.forwarder_id) AS dbk_forwarder_id, MAX(fr.forwarder_name) AS dbk_forwarder_name
+                      FROM freight_bookings fb
+                      JOIN freight_quote_requests fr ON fr.id = fb.request_id
+                     WHERE fb.status IN ('requested', 'confirmed') AND fb.shipment_id IS NOT NULL AND fb.scope = 'delivery'${bookingScope}
+                     GROUP BY fb.shipment_id
+                ) dbk ON dbk.shipment_id = s.id
                 -- Who holds each duty (2026-11-24, src/lib/forwarder-links.js dutiesOfRow): the three
                 -- picks and the booking's forwarder as the Forwarders list has them NOW (name, on the list).
                 LEFT JOIN forwarders pf ON pf.id = s.forwarder_id
                 LEFT JOIN forwarders df ON df.id = s.delivery_forwarder_id
                 LEFT JOIN forwarders cf ON cf.id = s.customs_forwarder_id
                 LEFT JOIN forwarders bf ON bf.id = bk.bk_forwarder_id
+                LEFT JOIN forwarders dbf ON dbf.id = dbk.dbk_forwarder_id
                ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
             ) y
         ) z

@@ -34,8 +34,22 @@ const poPortalEmail = require('../lib/po-portal-email');
 const { escapeHtml, wrapEmail } = require('../lib/email-layout');
 const {
     FREIGHT_QUOTE_REQUEST_TEMPLATE_KEY, FREIGHT_BOOKING_REQUEST_TEMPLATE_KEY, FREIGHT_BOOKING_CONTENTS_TEMPLATE_KEY,
-    FREIGHT_MOVEMENT_REQUEST_TEMPLATE_KEY,
+    FREIGHT_MOVEMENT_REQUEST_TEMPLATE_KEY, FREIGHT_DELIVERY_REQUEST_TEMPLATE_KEY, FREIGHT_DELIVERY_BOOKING_TEMPLATE_KEY,
 } = require('../lib/email-template-defaults');
+
+// ── delivery requests are answered only to a caller that asks for them ───
+//
+// A request has a kind (2026-11-24): freight, or delivery (a UK haulier, port
+// to warehouse). A ShipLine build from before delivery requests would show one
+// as a sailing, and offer to copy its "sailing date" onto a container or email
+// it the container's contents. So the board, every write that answers with the
+// board, the badge's counts and a container's charges give delivery requests,
+// their options and their bookings ONLY to a caller that sends `?legs=all`:
+// an older build never holds one. The present ShipLine sends it on every call.
+const legsOf = req => (req && req.query && req.query.legs === 'all' ? 'all' : 'freight');
+/** The template of a request's emails, by its kind. */
+const requestTemplateKey = kind => (kind === 'delivery' ? FREIGHT_DELIVERY_REQUEST_TEMPLATE_KEY : FREIGHT_QUOTE_REQUEST_TEMPLATE_KEY);
+const bookingTemplateKey = kind => (kind === 'delivery' ? FREIGHT_DELIVERY_BOOKING_TEMPLATE_KEY : FREIGHT_BOOKING_REQUEST_TEMPLATE_KEY);
 const { sendFrontMessage: defaultSend } = require('./front-send');
 const { preapprovePortalAddresses: defaultPreapprove } = require('./portal-access');
 const { logSentEmail, recordReminderSend } = require('../lib/email-receipt');
@@ -71,7 +85,7 @@ const REQUEST_COLUMNS = `r.id, r.token, r.batch_id, r.forwarder_id, r.forwarder_
         r.window_end_date, r.origin, r.destination, r.container_size, r.services, r.staff_note, r.sent_to,
         r.subject, r.created_by_email, r.created_at, r.sent_at, r.expires_at, r.revoked_at, r.revoke_reason,
         r.answer_count, r.answered_at, r.answered_by_name, r.answered_by_email, r.answer_source, r.answer_note,
-        r.declined, r.row_version, r.reminded_at, r.reminder_count, (r.expires_at <= UTC_TIMESTAMP()) AS expired`;
+        r.declined, r.row_version, r.reminded_at, r.reminder_count, r.kind, (r.expires_at <= UTC_TIMESTAMP()) AS expired`;
 
 function optionJson(o) {
     return {
@@ -117,6 +131,8 @@ function movementJson(m) {
 // The request's own facts, as the emails and the validators read them.
 function requestFactsOf(row) {
     return {
+        // Freight, or delivery (a UK haulier). Set when the request is made; never changed after.
+        kind: row.kind || FC.DEFAULT_KIND,
         windowStart: F.toYmd(row.window_start_date),
         windowEnd: F.toYmd(row.window_end_date),
         origin: row.origin || '',
@@ -602,12 +618,12 @@ function registerFreightQuoteRoutes(app, deps) {
 
     // Requests (newest first) with their current options, their stock
     // movements and every booking. `where` filters freight_quote_requests r.
-    async function readBoard(conn, where, params, { withDrift = true } = {}) {
+    async function readBoard(conn, where, params, { withDrift = true, legs = 'freight' } = {}) {
         const portalBase = poPortalEmail.portalBaseOf();
         const [rows] = await conn.query(
             `SELECT ${REQUEST_COLUMNS}
                FROM freight_quote_requests r
-              WHERE ${where}
+              WHERE (${where})${legs === 'all' ? '' : " AND r.kind = 'freight'"}
               ORDER BY r.created_at DESC, r.id DESC
               LIMIT ${BOARD_LIMIT}`,
             params
@@ -704,7 +720,7 @@ function registerFreightQuoteRoutes(app, deps) {
         return { where: where.join(' AND '), params };
     }
 
-    const defaultBoard = (conn) => readBoard(conn, 'r.window_end_date >= ?', [F.addDays(londonToday(), -BOARD_DAYS_BACK)]);
+    const defaultBoard = (conn, legs) => readBoard(conn, 'r.window_end_date >= ?', [F.addDays(londonToday(), -BOARD_DAYS_BACK)], { legs });
 
     // ── GET /api/v1/freight-quotes?from=&to= ────────────────────────────────
     // { enabled, requests: [{ …, state, options: [...] }], bookings: [...] }
@@ -715,7 +731,7 @@ function registerFreightQuoteRoutes(app, deps) {
         const board = await withConnection(async (conn) => {
             try {
                 await syncFilled(conn);
-                return await readBoard(conn, filter.where, filter.params);
+                return await readBoard(conn, filter.where, filter.params, { legs: legsOf(req) });
             } catch (e) {
                 if (e.errno !== TABLE_MISSING) throw e;
                 return { enabled: false, requests: [], bookings: [] };
@@ -746,7 +762,9 @@ function registerFreightQuoteRoutes(app, deps) {
                        JOIN freight_quote_requests r ON r.id = b.request_id
                        JOIN freight_quote_options o ON o.id = b.option_id
                       WHERE b.status = 'confirmed' AND b.contents_sent_at IS NULL AND r.revoked_at IS NULL
-                        AND DATE_ADD(o.sailing_date, INTERVAL (o.transit_days + ?) DAY) >= ?`,
+                        AND DATE_ADD(o.sailing_date, INTERVAL (o.transit_days + ?) DAY) >= ?
+                        AND b.scope <> 'delivery'`,
+                    // A delivery booking is never sent the container's contents: it is owed none.
                     [F.FINISHED_AFTER_DAYS, londonToday()]
                 );
                 const [[row]] = await conn.query(
@@ -755,11 +773,12 @@ function registerFreightQuoteRoutes(app, deps) {
                        JOIN forwarders f ON f.id = r.forwarder_id AND f.deleted_at IS NULL
                       WHERE r.revoked_at IS NULL AND r.expires_at > UTC_TIMESTAMP()
                         AND r.answered_at IS NOT NULL AND r.declined = 0
+                        AND (? = 'all' OR r.kind = 'freight')
                         AND NOT EXISTS (SELECT 1
                                           FROM freight_bookings b
                                           JOIN freight_quote_requests br ON br.id = b.request_id
                                          WHERE br.batch_id = r.batch_id AND b.status IN (?))`,
-                    [LIVE]
+                    [legsOf(req), LIVE]
                 );
                 return { answered: Number(row.n) || 0, contentsDue: Number(due.n) || 0 };
             } catch (e) {
@@ -806,7 +825,7 @@ function registerFreightQuoteRoutes(app, deps) {
             const missing = want.forwarderIds.filter(id => !forwarders.some(f => f.id === id));
             if (missing.length) throw new Fail(400, 'BAD_FIELD', `Forwarder ${missing.join(', ')} not found.`, { field: 'forwarderIds' });
 
-            const tpl = await getEmailTemplate(conn, FREIGHT_QUOTE_REQUEST_TEMPLATE_KEY);
+            const tpl = await getEmailTemplate(conn, requestTemplateKey(want.kind));
             const expiresOn = F.addDays(new Date().toISOString().slice(0, 10), want.expiryDays);
             const results = [];
 
@@ -875,12 +894,13 @@ function registerFreightQuoteRoutes(app, deps) {
                             `INSERT INTO freight_quote_requests
                                 (token, batch_id, forwarder_id, forwarder_name, window_start_date, window_end_date, origin,
                                  destination, container_size, services, staff_note, sent_to, subject,
-                                 created_by_email, expires_at)
-                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP() + INTERVAL ? DAY)`,
+                                 created_by_email, kind, expires_at)
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP() + INTERVAL ? DAY)`,
                             [
                                 token, batchId, fw.id, fw.name, want.windowStart, want.windowEnd, want.origin,
                                 want.destination, want.containerSize, JSON.stringify(want.services), want.note,
-                                JSON.stringify(addresses), finalSubject, req.userEmail || null, want.expiryDays,
+                                // The kind is written here and by no later statement: a request never changes kind.
+                                JSON.stringify(addresses), finalSubject, req.userEmail || null, want.kind, want.expiryDays,
                             ]
                         );
                         requestId = Number(ins.insertId);
@@ -951,7 +971,7 @@ function registerFreightQuoteRoutes(app, deps) {
                 });
                 results.push({ ...base, requestId, outcome: 'sent' });
             }
-            return { batchId, results, ...(await defaultBoard(conn)) };
+            return { batchId, results, ...(await defaultBoard(conn, legsOf(req))) };
         });
         res.json(out);
     }));
@@ -1021,7 +1041,7 @@ function registerFreightQuoteRoutes(app, deps) {
                     before: null, after: { reason: 'staff' }, userEmail: req.userEmail,
                 });
             });
-            return defaultBoard(conn);
+            return defaultBoard(conn, legsOf(req));
         });
         res.json(board);
     }));
@@ -1082,7 +1102,7 @@ function registerFreightQuoteRoutes(app, deps) {
                 );
 
                 const facts = requestFactsOf(request);
-                const tpl = await getEmailTemplate(conn, kind === 'quote' ? FREIGHT_QUOTE_REQUEST_TEMPLATE_KEY : FREIGHT_MOVEMENT_REQUEST_TEMPLATE_KEY);
+                const tpl = await getEmailTemplate(conn, kind === 'quote' ? requestTemplateKey(facts.kind) : FREIGHT_MOVEMENT_REQUEST_TEMPLATE_KEY);
                 const vars = {
                     forwarder: request.forwarder_name || '', windowStart: facts.windowStart, windowEnd: facts.windowEnd,
                     origin: facts.origin, destination: facts.destination, containerSize: facts.containerSize,
@@ -1151,7 +1171,7 @@ function registerFreightQuoteRoutes(app, deps) {
                 },
                 userEmail: req.userEmail,
             });
-            return { ok: true, kind: made.kind, ...(await defaultBoard(conn)) };
+            return { ok: true, kind: made.kind, ...(await defaultBoard(conn, legsOf(req))) };
         });
         res.json(out);
     }));
@@ -1205,7 +1225,7 @@ function registerFreightQuoteRoutes(app, deps) {
                     userEmail: req.userEmail,
                 });
             });
-            return defaultBoard(conn);
+            return defaultBoard(conn, legsOf(req));
         });
         res.json(board);
     }));
@@ -1215,7 +1235,10 @@ function registerFreightQuoteRoutes(app, deps) {
     // A container a booking may carry: a live shipment that documents can be
     // generated for (a DRAFT, or one already booked), not held by another live
     // booking.
-    async function attachableShipment(conn, shipmentId, exceptBookingId = null) {
+    // `scope`: what the booking being attached covers. A container takes one live
+    // booking per leg: one that covers the freight, one that covers the delivery
+    // (an end-to-end booking covers both).
+    async function attachableShipment(conn, shipmentId, exceptBookingId = null, scope = FC.DEFAULT_SCOPE) {
         const [[ship]] = await conn.query(
             'SELECT id, name, reference, stage, deleted_at, merged_into_id FROM shipments WHERE id = ?',
             [shipmentId]
@@ -1224,18 +1247,24 @@ function registerFreightQuoteRoutes(app, deps) {
             throw new Fail(400, 'BAD_FIELD', `Container ${shipmentId} not found.`, { field: 'shipmentId' });
         }
         S.documentSource(ship); // throws a ShipmentError for a PLANNED or CANCELLED one
-        const [[taken]] = await conn.query(
-            'SELECT id FROM freight_bookings WHERE shipment_id = ? AND status IN (?) AND id <> ? LIMIT 1',
+        const [others] = await conn.query(
+            'SELECT id, scope FROM freight_bookings WHERE shipment_id = ? AND status IN (?) AND id <> ?',
             [shipmentId, LIVE, exceptBookingId || 0]
         );
-        if (taken) throw new Fail(409, 'CONTAINER_TAKEN', `${S.containerLabel(ship)} is already attached to another booking.`, { bookingId: Number(taken.id) });
+        const taken = others.find(b => FC.scopesOverlap(b.scope, scope));
+        if (taken) {
+            throw new Fail(409, 'CONTAINER_TAKEN', scope === 'delivery'
+                ? `${S.containerLabel(ship)} already has a booking that covers its delivery.`
+                : `${S.containerLabel(ship)} is already attached to another booking.`, { bookingId: Number(taken.id) });
+        }
         return ship;
     }
 
-    // One live booking per container is a unique key (2026-11-20,
-    // uq_freight_bookings_live_shipment): the check above runs under the
+    // One live booking per LEG of a container is two unique keys (2026-11-24,
+    // uq_freight_bookings_live_freight and _delivery; before then one key,
+    // _live_shipment, for the whole container): the check above runs under the
     // booking's lock, not the container's, so two attaches at once meet here.
-    const isContainerTaken = e => /uq_freight_bookings_live_shipment/.test((e && e.message) || '');
+    const isContainerTaken = e => /uq_freight_bookings_live_(shipment|freight|delivery)/.test((e && e.message) || '');
     const containerTaken = () => new Fail(409, 'CONTAINER_TAKEN', 'That container was attached to another booking a moment ago.');
 
     async function contactAddresses(conn, forwarderId) {
@@ -1283,8 +1312,8 @@ function registerFreightQuoteRoutes(app, deps) {
         // What the booking covers (2026-11-24, docs/forwarder-containers.md): the
         // freight alone, or the delivery to the warehouse too. Left out, the freight
         // alone: the option's service text is never read for it.
-        const covers = FC.scopeGiven(scope);
-        if (covers.error) throw new Fail(400, 'BAD_FIELD', covers.error, { field: 'scope' });
+        // The scope FOLLOWS the request's kind (below, once the request is read): a
+        // delivery request books the delivery alone, whatever the body says.
         const portalBase = poPortalEmail.portalBaseOf();
         if (!portalBase) {
             throw new Fail(409, 'PORTAL_URL_UNSET', 'The supplier portal address (SUPPLIER_PORTAL_URL) is not configured, so the booking link cannot be sent.');
@@ -1302,12 +1331,15 @@ function registerFreightQuoteRoutes(app, deps) {
                 if (await liveBookingOf(conn, Number(request.id))) {
                     throw new Fail(409, 'ALREADY_BOOKED', 'A booking is already in progress on this request.');
                 }
+                const kind = request.kind || FC.DEFAULT_KIND;
+                const covers = FC.scopeFor(kind, scope);
+                if (covers.error) throw new Fail(400, 'BAD_FIELD', covers.error, { field: 'scope' });
                 const addresses = await recipientsFor(conn, to, Number(request.forwarder_id));
                 const ship = shipmentId === undefined || shipmentId === null || shipmentId === ''
-                    ? null : await attachableShipment(conn, Number(shipmentId));
+                    ? null : await attachableShipment(conn, Number(shipmentId), null, covers.scope);
 
                 const o = optionJson(option);
-                const tpl = await getEmailTemplate(conn, FREIGHT_BOOKING_REQUEST_TEMPLATE_KEY);
+                const tpl = await getEmailTemplate(conn, bookingTemplateKey(kind));
                 const vars = {
                     forwarder: request.forwarder_name || '', sailingDate: o.sailingDate, loadingDate: o.loadingDate,
                     portFrom: o.portFrom, portTo: o.portTo, service: F.serviceName(o.service),
@@ -1347,7 +1379,7 @@ function registerFreightQuoteRoutes(app, deps) {
                 const inner = renderTemplate((typeof body === 'string' && body.trim()) ? body : tpl.bodyHtml, escaped);
                 const html = wrapEmail({
                     title: finalSubject,
-                    bodyHtml: inner + F.bookingBlockHtml({ option: o, url: F.freightUrl(portalBase, request.token), note: noteText.value }),
+                    bodyHtml: inner + F.bookingBlockHtml({ option: o, url: F.freightUrl(portalBase, request.token), note: noteText.value, kind }),
                 });
                 return { bookingId, requestId: Number(request.id), batchId: request.batch_id, addresses, finalSubject, html, option: o, forwarder: request.forwarder_name };
             });
@@ -1383,7 +1415,7 @@ function registerFreightQuoteRoutes(app, deps) {
                 },
                 userEmail: req.userEmail,
             });
-            return { ok: true, bookingId: made.bookingId, ...(await defaultBoard(conn)) };
+            return { ok: true, bookingId: made.bookingId, ...(await defaultBoard(conn, legsOf(req))) };
         });
         res.json(out);
     }));
@@ -1417,14 +1449,21 @@ function registerFreightQuoteRoutes(app, deps) {
         if (has('status') && patch.status !== 'confirmed' && patch.status !== 'cancelled') {
             throw new Fail(400, 'BAD_FIELD', "status must be 'confirmed' or 'cancelled'.", { field: 'status' });
         }
-        // What the booking covers, corrected while it is live. Sent, it must be a scope: null is not one.
-        const covers = has('scope') ? FC.scopeGiven(patch.scope === undefined ? null : patch.scope) : null;
-        if (covers && covers.error) throw new Fail(400, 'BAD_FIELD', covers.error, { field: 'scope' });
-
         const board = await withConnection(async (conn) => {
             const confirmed = await inTransaction(conn, async () => {
                 const b = await lockBooking(conn, id);
+                // A delivery booking is changed only by a ShipLine that knows what one is.
+                if (b.scope === 'delivery' && legsOf(req) !== 'all') {
+                    throw new Fail(409, 'CLIENT_TOO_OLD', 'This is a UK delivery booking, which this page is too old to show. Reload ShipLine.', { allowedNext: ['reload'] });
+                }
                 if (!isLive(b)) throw new Fail(409, 'NOT_LIVE', `This booking is ${b.status} and can no longer be changed.`);
+                // What the booking covers, corrected while it is live. Sent, it must be a
+                // scope its request's kind allows (null is not one): a delivery booking
+                // stays a delivery booking, a freight booking never becomes one.
+                const held = b.scope || FC.DEFAULT_SCOPE;
+                const covers = has('scope') ? FC.scopeFor(held === 'delivery' ? 'delivery' : 'freight', patch.scope === undefined ? null : patch.scope) : null;
+                if (covers && covers.error) throw new Fail(400, 'BAD_FIELD', covers.error, { field: 'scope' });
+                const scopeAfter = covers ? covers.scope : held;
                 const wasConfirmed = b.status === 'confirmed';
                 const sets = [];
                 const params = [];
@@ -1438,7 +1477,7 @@ function registerFreightQuoteRoutes(app, deps) {
                     }
                     const current = b.shipment_id != null ? Number(b.shipment_id) : null;
                     if (wanted !== current) {
-                        const ship = wanted === null ? null : await attachableShipment(conn, wanted, id);
+                        const ship = wanted === null ? null : await attachableShipment(conn, wanted, id, scopeAfter);
                         // Another container: what was sent about the old one says nothing about this one.
                         sets.push('shipment_id = ?', 'draft_container_name = ?', 'contents_sent_at = NULL', 'contents_sent_to = NULL', 'contents_json = NULL', 'contents_document_ids = NULL');
                         params.push(wanted, ship ? (ship.name || ship.reference || null) : null);
@@ -1451,10 +1490,15 @@ function registerFreightQuoteRoutes(app, deps) {
                 // Changing what it covers changes who holds the delivery duty on its
                 // container: written on the booking row, which a decision on that
                 // container locks (forwarder-container-routes.js lockOwnership).
-                if (covers && covers.scope !== (b.scope || FC.DEFAULT_SCOPE)) {
+                if (covers && covers.scope !== held) {
+                    // Covering more must not step on the container's other booking (an
+                    // end-to-end booking beside a delivery booking). Asked here unless the
+                    // container itself is changing, which asked it above with the new scope.
+                    const stays = has('shipmentId') ? null : (b.shipment_id != null ? Number(b.shipment_id) : null);
+                    if (stays !== null) await attachableShipment(conn, stays, id, covers.scope);
                     sets.push('scope = ?');
                     params.push(covers.scope);
-                    before.scope = b.scope || FC.DEFAULT_SCOPE;
+                    before.scope = held;
                     after.scope = covers.scope;
                 }
 
@@ -1508,7 +1552,7 @@ function registerFreightQuoteRoutes(app, deps) {
                 return becameConfirmed;
             });
             if (confirmed) await syncFilled(conn);
-            return defaultBoard(conn);
+            return defaultBoard(conn, legsOf(req));
         });
         res.json(board);
     }));
@@ -1684,7 +1728,7 @@ function registerFreightQuoteRoutes(app, deps) {
                 },
                 userEmail: req.userEmail,
             });
-            return defaultBoard(conn);
+            return defaultBoard(conn, legsOf(req));
         });
         res.json(board);
     }));
@@ -1766,7 +1810,7 @@ function registerFreightQuoteRoutes(app, deps) {
                 });
                 return { request, addresses, finalSubject, html };
             });
-            if (!made) return { ok: true, added: 0, alreadyAdded: true, ...(await defaultBoard(conn)) };
+            if (!made) return { ok: true, added: 0, alreadyAdded: true, ...(await defaultBoard(conn, legsOf(req))) };
 
             let sent = null;
             if (wantEmail) {
@@ -1790,7 +1834,7 @@ function registerFreightQuoteRoutes(app, deps) {
                 },
                 userEmail: req.userEmail,
             });
-            return { ok: true, added: added.length, alreadyAdded: false, ...(await defaultBoard(conn)) };
+            return { ok: true, added: added.length, alreadyAdded: false, ...(await defaultBoard(conn, legsOf(req))) };
         });
         res.json(out);
     }));
@@ -1831,7 +1875,7 @@ function registerFreightQuoteRoutes(app, deps) {
                     userEmail: req.userEmail,
                 });
             });
-            return defaultBoard(conn);
+            return defaultBoard(conn, legsOf(req));
         });
         res.json(board);
     }));
@@ -1846,50 +1890,62 @@ function registerFreightQuoteRoutes(app, deps) {
     app.get('/api/v1/shipments/:id(\\d+)/forwarder-charges', route('GET /shipments/:id/forwarder-charges', async (req, res) => {
         const shipmentId = Number(req.params.id);
         const out = await withConnection(async (conn) => {
-            const [[b]] = await conn.query(
-                `SELECT b.id, b.status, b.booking_ref, b.request_id, b.option_id, r.forwarder_id, r.forwarder_name
+            // The container's live bookings: at most one that covers the freight, and
+            // (2026-11-24) at most one for the delivery alone, each priced apart.
+            const [live] = await conn.query(
+                `SELECT b.id, b.status, b.scope, b.booking_ref, b.request_id, b.option_id, r.forwarder_id, r.forwarder_name
                    FROM freight_bookings b
                    JOIN freight_quote_requests r ON r.id = b.request_id
                   WHERE b.shipment_id = ? AND b.status IN (?)
-                  ORDER BY b.id DESC LIMIT 1`,
+                  ORDER BY b.id DESC`,
                 [shipmentId, LIVE]
             );
-            if (!b) return { booking: null, movements: [] };
-            const [[o]] = await conn.query('SELECT * FROM freight_quote_options WHERE id = ?', [b.option_id]);
-            const [[f]] = b.forwarder_id != null
-                ? await conn.query('SELECT id, name, deleted_at FROM forwarders WHERE id = ?', [b.forwarder_id])
-                : [[null]];
-            const [moves] = await conn.query(
-                'SELECT id, factory, cbm, price, currency FROM freight_stock_movements WHERE request_id = ? AND deleted_at IS NULL ORDER BY id ASC',
-                [b.request_id]
-            );
+            const b = live.find(x => x.scope !== 'delivery') || null;
+            // The delivery booking is told only to a caller that asks for both legs (legsOf).
+            const d = legsOf(req) === 'all' ? (live.find(x => x.scope === 'delivery') || null) : null;
+            if (!b && !d) return { booking: null, movements: [] };
+            const [moves] = b
+                ? await conn.query(
+                    'SELECT id, factory, cbm, price, currency FROM freight_stock_movements WHERE request_id = ? AND deleted_at IS NULL ORDER BY id ASC',
+                    [b.request_id]
+                )
+                : [[]];
             const [held] = await conn.query(
                 `SELECT id, freight_booking_id, freight_movement_id, amount, currency FROM payment_extras
-                  WHERE deleted_at IS NULL AND (freight_booking_id = ? OR freight_movement_id IN (?))`,
-                [b.id, moves.length ? moves.map(m => m.id) : [0]]
+                  WHERE deleted_at IS NULL AND (freight_booking_id IN (?) OR freight_movement_id IN (?))`,
+                [[b, d].filter(Boolean).map(x => x.id), moves.length ? moves.map(m => m.id) : [0]]
             );
             const holder = (match) => {
                 const x = held.find(match);
                 return x ? { extraId: Number(x.id), extraAmount: Number(x.amount), extraCurrency: x.currency } : { extraId: null, extraAmount: null, extraCurrency: null };
             };
-            const opt = o ? optionJson(o) : null;
-            return {
-                booking: {
-                    id: Number(b.id), status: b.status, bookingRef: b.booking_ref || null,
-                    forwarderId: b.forwarder_id != null ? Number(b.forwarder_id) : null,
-                    forwarderName: b.forwarder_name || null,
+            const bookingOf = async (row) => {
+                const [[o]] = await conn.query('SELECT * FROM freight_quote_options WHERE id = ?', [row.option_id]);
+                const [[f]] = row.forwarder_id != null
+                    ? await conn.query('SELECT id, name, deleted_at FROM forwarders WHERE id = ?', [row.forwarder_id])
+                    : [[null]];
+                const opt = o ? optionJson(o) : null;
+                return {
+                    id: Number(row.id), status: row.status, bookingRef: row.booking_ref || null,
+                    forwarderId: row.forwarder_id != null ? Number(row.forwarder_id) : null,
+                    forwarderName: row.forwarder_name || null,
                     forwarderLive: Boolean(f && !f.deleted_at),
                     option: opt ? {
                         price: opt.price, currency: opt.currency, service: opt.service, portFrom: opt.portFrom, portTo: opt.portTo,
                         sailingDate: opt.sailingDate, arrivalDate: opt.arrivalDate, containerSize: opt.containerSize,
                     } : null,
-                    ...holder(x => x.freight_booking_id != null && Number(x.freight_booking_id) === Number(b.id)),
-                },
+                    ...holder(x => x.freight_booking_id != null && Number(x.freight_booking_id) === Number(row.id)),
+                };
+            };
+            return {
+                booking: b ? await bookingOf(b) : null,
                 movements: moves.map(m => ({
                     id: Number(m.id), from: m.factory, cbm: Number(m.cbm),
                     price: m.price == null ? null : Number(m.price), currency: m.currency || null,
                     ...holder(x => x.freight_movement_id != null && Number(x.freight_movement_id) === Number(m.id)),
                 })),
+                // The delivery leg's own booking: its price is a delivery charge, never part of the freight's.
+                ...(d ? { deliveryBooking: await bookingOf(d) } : {}),
             };
         });
         res.json(out);
@@ -1922,7 +1978,7 @@ function registerFreightQuoteRoutes(app, deps) {
                     after: null, userEmail: req.userEmail,
                 });
             });
-            return defaultBoard(conn);
+            return defaultBoard(conn, legsOf(req));
         });
         res.json(board);
     }));

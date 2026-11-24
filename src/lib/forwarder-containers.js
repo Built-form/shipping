@@ -95,11 +95,56 @@ function ownerOf({ shipment, booking, forwarderLive }) {
 // the view portal_forwarder_containers_v (2026-11-24_11).
 
 const DUTIES = Object.freeze(['freight', 'delivery', 'customs']);
-// What a booking may cover. Slice D adds 'delivery' (a booking for the UK leg alone).
-const BOOKING_SCOPES = Object.freeze(['port_to_port', 'end_to_end']);
+// What a booking may cover: the freight to the UK port, the freight and the
+// delivery to the warehouse, or the delivery alone (a booking for the UK leg,
+// made on a delivery request to a UK haulier).
+const BOOKING_SCOPES = Object.freeze(['port_to_port', 'end_to_end', 'delivery']);
 // A booking that says nothing covers what every booking covered before: freight.
 const DEFAULT_SCOPE = 'port_to_port';
-const SCOPE_DUTIES = Object.freeze({ port_to_port: Object.freeze(['freight']), end_to_end: Object.freeze(['freight', 'delivery']) });
+const SCOPE_DUTIES = Object.freeze({
+    port_to_port: Object.freeze(['freight']),
+    end_to_end: Object.freeze(['freight', 'delivery']),
+    delivery: Object.freeze(['delivery']),
+});
+
+// ── a quote request's kind, and the scope its booking may have ───────────
+//
+// A request is for FREIGHT (sailings, to a freight forwarder) or for DELIVERY
+// (collection at the UK port and delivery to the warehouse, to a UK haulier).
+// The kind is set when the request is made and never changes: its options and
+// its bookings are read by it. A booking's scope FOLLOWS its request's kind,
+// so a client can never turn a haulier's booking into a freight booking (or
+// the reverse) by what it sends: a delivery request books delivery only, and a
+// freight request never does. That is what lets a container hold two live
+// bookings, one per leg, without either reading as the other.
+const REQUEST_KINDS = Object.freeze(['freight', 'delivery']);
+const DEFAULT_KIND = 'freight';
+const KIND_SCOPES = Object.freeze({ freight: Object.freeze(['port_to_port', 'end_to_end']), delivery: Object.freeze(['delivery']) });
+/** The kind a new request is given. Nothing said is a freight request, as every request was. → { kind } | { error } */
+function kindGiven(value) {
+    if (value === undefined) return { kind: DEFAULT_KIND };
+    return typeof value === 'string' && REQUEST_KINDS.includes(value)
+        ? { kind: value }
+        : { error: `kind must be one of: ${REQUEST_KINDS.join(', ')}.` };
+}
+/**
+ * The scope of a booking on a request of `kind` (a row from before kinds has
+ * none: freight), given what the caller sent. → { scope } | { error }
+ */
+function scopeFor(kind, given) {
+    if (kind === 'delivery') {
+        return given === undefined || given === 'delivery' ? { scope: 'delivery' } : { error: 'a delivery request books delivery only: scope cannot be set on it.' };
+    }
+    if (given === undefined) return { scope: DEFAULT_SCOPE };
+    return typeof given === 'string' && KIND_SCOPES.freight.includes(given)
+        ? { scope: given }
+        : { error: `scope must be one of: ${KIND_SCOPES.freight.join(', ')}.` };
+}
+/** Do two bookings' scopes cover a duty in common? Then they cannot both be live on one container. */
+function scopesOverlap(a, b) {
+    const of = s => SCOPE_DUTIES[s || DEFAULT_SCOPE] || [];
+    return of(a).some(duty => of(b).includes(duty));
+}
 /**
  * What a booking is said to cover. Nothing said (`undefined`) is DEFAULT_SCOPE:
  * an older client that sends no scope can never grant the delivery duty, and
@@ -107,10 +152,11 @@ const SCOPE_DUTIES = Object.freeze({ port_to_port: Object.freeze(['freight']), e
  * → { scope } | { error }
  */
 function scopeGiven(value) {
+    // What a FREIGHT booking may be given: never 'delivery', which only a delivery request's booking has (scopeFor).
     if (value === undefined) return { scope: DEFAULT_SCOPE };
-    return typeof value === 'string' && BOOKING_SCOPES.includes(value)
+    return typeof value === 'string' && ['port_to_port', 'end_to_end'].includes(value)
         ? { scope: value }
-        : { error: `scope must be one of: ${BOOKING_SCOPES.join(', ')}.` };
+        : { error: 'scope must be one of: port_to_port, end_to_end.' };
 }
 // The pick on the container for each duty.
 const PICK_COLUMN = Object.freeze({ freight: 'forwarder_id', delivery: 'delivery_forwarder_id', customs: 'customs_forwarder_id' });
@@ -322,7 +368,8 @@ function containerAsks(held, dutiesHeld = ['freight']) {
     if (mine.includes('delivery') && !h.deliveryDate) asks.push('deliveryDate');
     asks.push('invoice');
     if (mine.includes('freight')) asks.push('photos', 'billOfLading');
-    if (mine.includes('customs')) asks.push('customsDraft');
+    // The draft first, for us to check, when they send one (some never do); then the entry itself.
+    if (mine.includes('customs')) asks.push('customsDraft', 'customsEntry');
     return asks;
 }
 
@@ -666,9 +713,11 @@ function noteProblem(v) {
 const ORIGINAL_KINDS = Object.freeze(['invoice', 'loading_photo', 'bill_of_lading']);
 // With the DRAFT customs entry (2026-11-24): sent by whoever handles the container's customs, for our
 // team to approve or send back before it is lodged. 13 characters: the portal's kind column holds 16.
-const UPLOAD_KINDS = Object.freeze([...ORIGINAL_KINDS, 'customs_draft']);
+// customs_draft: a draft entry, for us to approve or send back. customs_entry: the entry
+// itself, as customs took it, with its MRN. Neither needs the other.
+const UPLOAD_KINDS = Object.freeze([...ORIGINAL_KINDS, 'customs_draft', 'customs_entry']);
 // The duty a kind of file belongs to. An invoice (null) is anyone's who holds a duty: each company bills its own part.
-const KIND_DUTY = Object.freeze({ invoice: null, loading_photo: 'freight', bill_of_lading: 'freight', customs_draft: 'customs' });
+const KIND_DUTY = Object.freeze({ invoice: null, loading_photo: 'freight', bill_of_lading: 'freight', customs_draft: 'customs', customs_entry: 'customs' });
 /**
  * Does the client deciding a file know its kind? A kind beyond the original three must be
  * NAMED by the call (`named`: the `kind` it sends): a ShipLine build from before that kind
@@ -690,11 +739,42 @@ const UPLOAD_RULES = Object.freeze({
     loading_photo: Object.freeze({ types: PICTURE_TYPES, maxBytes: 15 * MB }),
     bill_of_lading: Object.freeze({ types: DOCUMENT_TYPES, maxBytes: 15 * MB }),
     customs_draft: Object.freeze({ types: DOCUMENT_TYPES, maxBytes: 15 * MB }),
+    customs_entry: Object.freeze({ types: DOCUMENT_TYPES, maxBytes: 15 * MB }),
 });
 const UPLOAD_EXTENSIONS = Object.freeze({ 'application/pdf': 'pdf', 'image/png': 'png', 'image/jpeg': 'jpg' });
 // Our bucket's folder for each kind: an invoice beside the invoices, a photo beside the photos,
 // a bill of lading and a draft customs entry with the forwarder documents.
-const FILED_FOLDERS = Object.freeze({ invoice: 'shipment-payments', loading_photo: 'container-photos', bill_of_lading: 'forwarder-documents', customs_draft: 'forwarder-documents' });
+const FILED_FOLDERS = Object.freeze({ invoice: 'shipment-payments', loading_photo: 'container-photos', bill_of_lading: 'forwarder-documents', customs_draft: 'forwarder-documents', customs_entry: 'forwarder-documents' });
+
+// ── the MRN of a customs entry ───────────────────────────────────────────
+//
+// A customs entry is sent with its MRN (Movement Reference Number): 18
+// characters, two digits (the year), two letters (the country), then fourteen
+// letters or digits. The shape is checked, not the check character.
+//
+// The portal keeps it in the upload's `note`: the one text column of that row
+// its login may write, so no new column and no new grant there. For this kind
+// the note IS the MRN and nothing else; on accept it is written, in its one
+// form, to shipment_forwarder_documents.reference.
+
+/** An MRN as it is kept and compared: upper case, no spaces or hyphens. */
+const normMrn = v => String(v ?? '').toUpperCase().replace(/[\s-]+/g, '');
+/** What is wrong with an MRN: 'missing' | 'shape' | null. */
+function mrnProblem(v) {
+    const mrn = normMrn(v);
+    if (!mrn) return 'missing';
+    return /^\d{2}[A-Z]{2}[A-Z0-9]{14}$/.test(mrn) ? null : 'shape';
+}
+/**
+ * The reference number a file carries, for a kind that has one:
+ * { reference } | { problem: 'missing' | 'shape' }; null for a kind with none
+ * (its note is a note).
+ */
+function uploadReference(row) {
+    if (!row || row.kind !== 'customs_entry') return null;
+    const problem = mrnProblem(row.note);
+    return problem ? { problem } : { reference: normMrn(row.note) };
+}
 
 const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
 const PDF_MARKER = [0x25, 0x50, 0x44, 0x46, 0x2d];
@@ -802,11 +882,11 @@ function filedKeyFor({ kind, random, filename, contentType }) {
 module.exports = {
     REAL_STAGES, LIVE_BOOKING_STATUSES, FINISHED_AFTER_DAYS, DECIDE_ROLES,
     mayDecide, isReal, ownerOf, visibilityFor, isFinished, paymentsOnContainer,
-    DUTIES, BOOKING_SCOPES, DEFAULT_SCOPE, SCOPE_DUTIES, PICK_COLUMN, scopeGiven, dutiesOf, heldBy, attachedOf, linkSourceOf, accessFor, dutiesOfFlags, dutiesFromFlags,
+    DUTIES, BOOKING_SCOPES, DEFAULT_SCOPE, SCOPE_DUTIES, REQUEST_KINDS, DEFAULT_KIND, KIND_SCOPES, kindGiven, scopeFor, scopesOverlap, PICK_COLUMN, scopeGiven, dutiesOf, heldBy, attachedOf, linkSourceOf, accessFor, dutiesOfFlags, dutiesFromFlags,
     isSendKey, noticeState, containerAsks, containerUrl,
     ORIGINAL_FIELDS, DETAIL_FIELDS, FIELD_DUTY, fieldsOutside, clientKnows, CLAIM_MINUTES, NOTE_MIN, NOTE_MAX,
     normDelivery, deliveryDay, deliverySql, deliverySelect, heldDelivery, claimSnapshot,
     validDay, normEcn, ecnProblem, proposalOf, liveProposal, isWaiting, dutyRefusal, claimRefusal, heldDiff, orderProblem, datesInOrder,
     finishBaseline, finishRefusal, toReviewCount, cleanNote, noteProblem,
-    ORIGINAL_KINDS, UPLOAD_KINDS, KIND_DUTY, kindAllowed, clientKnowsKind, UPLOAD_RULES, uploadType, uploadFileRefusal, uploadReviewState, uploadGate, filingName, filingNameClash, filedKeyFor,
+    ORIGINAL_KINDS, UPLOAD_KINDS, KIND_DUTY, kindAllowed, clientKnowsKind, normMrn, mrnProblem, uploadReference, UPLOAD_RULES, uploadType, uploadFileRefusal, uploadReviewState, uploadGate, filingName, filingNameClash, filedKeyFor,
 };

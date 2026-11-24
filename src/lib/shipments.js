@@ -316,6 +316,9 @@ function rowToShipment(row) {
         // Who HOLDS each duty (freight, delivery, customs): a live booking that
         // covers it, else the pick. Only on a row read with the booking join.
         ...(duties === undefined ? {} : { duties }),
+        // The live booking for the delivery leg alone, when the container has one beside
+        // its freight booking. `booking` above stays the freight booking.
+        ...(FL.deliveryBookingOf(row) === undefined ? {} : { deliveryBooking: FL.deliveryBookingOf(row) }),
         vesselName: (booked && clean(row.member_vessel)) || row.vessel_name || null,
         originPort: row.origin_port || null,
         // The expected loading date (2026-11-23): on the shipment only, no order carries one.

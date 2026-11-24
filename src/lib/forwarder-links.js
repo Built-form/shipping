@@ -63,9 +63,12 @@ function dutiesOfRow(row) {
     know(row.delivery_forwarder_id, row.df_name, row.df_live);
     know(row.customs_forwarder_id, row.cf_name, row.cf_live);
     know(row.bk_forwarder_id, row.bf_name, row.bf_live);
+    know(row.dbk_forwarder_id, row.dbf_name, row.dbf_live);
     const bookings = Number(row.bk_count) > 0 && row.bk_id != null
         ? [{ id: row.bk_id, status: row.bk_status, scope: row.bk_scope, forwarder_id: row.bk_forwarder_id }]
         : [];
+    // The live booking for the delivery alone (dbk_*), read by a join of its own.
+    if (row.dbk_id != null) bookings.push({ id: row.dbk_id, status: row.dbk_status, scope: 'delivery', forwarder_id: row.dbk_forwarder_id });
     const duties = FC.dutiesOf({ shipment: row, bookings, forwarderLive: id => Boolean(facts.get(Number(id))?.live) });
     const out = {};
     for (const duty of FC.DUTIES) {
@@ -73,6 +76,19 @@ function dutiesOfRow(row) {
         out[duty] = h.forwarderId == null ? h : { ...h, name: facts.get(Number(h.forwarderId))?.name ?? null };
     }
     return out;
+}
+
+// The container's live booking for the delivery leg alone (a booking on a
+// delivery request, 2026-11-24), from a row of shipmentSelect: { id, status,
+// bookingRef, forwarderId, forwarder } or null. undefined for a row read
+// without that join: it makes no claim.
+function deliveryBookingOf(row) {
+    if (!row || row.dbk_id === undefined) return undefined;
+    if (row.dbk_id == null) return null;
+    return {
+        id: Number(row.dbk_id), status: row.dbk_status, bookingRef: row.dbk_ref || null,
+        forwarderId: idOrNull(row.dbk_forwarder_id), forwarder: row.dbk_forwarder_name || null,
+    };
 }
 
 // PATCH /shipments/:id — deliveryForwarderId / customsForwarderId: a forwarder
@@ -226,7 +242,7 @@ module.exports = {
     FORWARDER_MAX,
     nameKey,
     effectiveForwarder,
-    dutiesOfRow,
+    dutiesOfRow, deliveryBookingOf,
     decidePick,
     mergeForwarderPicks,
     decideShipmentForwarder,

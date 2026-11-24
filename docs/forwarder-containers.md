@@ -64,7 +64,7 @@ Rules: `dutiesOf`, `heldBy`, `attachedOf`, `linkSourceOf`, `FIELD_DUTY`, `KIND_D
 
 ### What changed, by place
 
-- **Migrations** `2026-11-24_10` (`shipments.delivery_forwarder_id`, `.customs_forwarder_id`, each indexed; `freight_bookings.scope VARCHAR(16) NOT NULL DEFAULT 'port_to_port'` with a CHECK) and `_11` (the view, re-created; a helper view `forwarder_duty_holders_v`, one row per container and duty that has a holder, **not** granted to the portal). No new grant: a view re-created with `CREATE OR REPLACE` keeps its grants.
+- **Migrations** `2026-11-24_10` (`shipments.delivery_forwarder_id`, `.customs_forwarder_id`, each indexed; `freight_bookings.scope VARCHAR(16) NOT NULL DEFAULT 'port_to_port'` with a CHECK of three values; `freight_quote_requests.kind`; the two per-leg unique keys; `shipment_forwarder_documents.reference`; and, **last and the one step that is not additive**, `DROP INDEX uq_freight_bookings_live_shipment`, only once both new keys exist), `_11` (the view, re-created; a helper view `forwarder_duty_holders_v`, one row per container and duty that has a holder, **not** granted to the portal), `_12` (**one new grant**, approved by the user on 2026-11-24: `SELECT (kind)` on `freight_quote_requests` for the portal's login) and `_13` (the two delivery email templates, `INSERT IGNORE`). The view needs no grant: one re-created with `CREATE OR REPLACE` keeps its own.
 - **The view** has four more columns, at the end: `does_freight`, `does_delivery`, `does_customs` (0 or 1: what this row's forwarder holds) and `delivery_date`. `booking_ref` and `freight_request_id` are the freight booking's and are on the freight holder's row only (another company is never handed a link to that quote); `sailing_date`, `port_from`, `port_to`, `container_size` are on every full row. A payment-only row has 0 in the three flags.
 - **`finished`**: arrived, and more than 14 days after the **later** of the arrival and the latest delivery day held. While a delivery holder exists and no order holds a delivery date, not finished until the container is CLOSED (every order received). One answer for every row of the container.
 - **`PATCH /api/v1/shipments/:id`**: `deliveryForwarderId`, `customsForwarderId` (a live forwarder's id, or `null`; `400 BAD_FIELD` with `field`). Audited. `GET /shipments/:id` and the compact entry of `GET /orders` answer `duties: { freight, delivery, customs }`, each `{ forwarderId, name, source, bookingId? }` or `{ forwarderId: null, why }`, and the read answers the two picks with their names (`deliveryForwarder`, `customsForwarder`). `forwarder`, `forwarderId`, `forwarderSource` and `booking` keep their meaning: the freight duty.
@@ -89,7 +89,26 @@ One form, as text, to the minute: `YYYY-MM-DD` when the stored hour and minute a
 
 A fourth kind of file, `customs_draft` (PDF, PNG or JPEG; 15 MB), sent by the customs holder. Accepting it is **approving** it: the same four steps and locks as any file, filed as a `shipment_forwarder_documents` row with `kind = 'customs_draft'` under the forwarder that sent it. Approved drafts are listed newest approval first with who sent each; nothing is called "current", and one approved under a former customs holder stays listed under that forwarder's name. There is no final entry (C88 / MRN) in this work.
 
-New refusals, both `409`: `NOT_THEIR_DUTY` (the forwarder holds something on the container, but not what `fields` or `kind` need; `allowedNext: ['reject']`) and `CLIENT_TOO_OLD` (rule 2; `allowedNext: ['reload']`).
+### The customs entry itself
+
+A fifth kind, `customs_entry` (PDF, PNG or JPEG; 15 MB): the entry as customs took it, sent by the customs holder **with its MRN**. **It needs no draft before it** (some forwarders never send one), and our team accept it or send it back like any other file.
+
+- **The MRN is required**: 18 characters after upper-casing and dropping spaces and hyphens, two digits, two letters, then fourteen letters or digits (`normMrn`, `mrnProblem`; the check character is not verified). The same rule and test vectors are in the portal.
+- **Where it travels.** The portal keeps it in the upload's `note`, the one text column of that row its login may write, so this needed **no portal migration and no new grant**: for this kind the note IS the MRN and nothing else (the page shows an MRN field in place of a note). The tab read gives it as the upload's `reference` (and `note: null`).
+- **On accept** it is written, in its one form, to `shipment_forwarder_documents.reference` (new, `2026-11-24_10`), and the document is listed with it. An entry whose note is not an MRN is refused before anything is copied: `409 BAD_REFERENCE` (`allowedNext: ['reject']`).
+- The container email asks the customs holder for both: the draft "if you send one", and the entry with its MRN.
+
+### A delivery booking (the delivery leg through Freight quotes)
+
+A quote request has a **kind** (`docs/freight-quotes.md`, "A delivery request"): a `delivery` request goes to a UK haulier, and its booking has scope `delivery`: it covers the delivery duty alone. So a container can hold **two live bookings, one per leg**: one that covers the freight and one that covers the delivery (an end-to-end booking covers both, and leaves room for neither).
+
+- Two unique keys replace the one of 2026-11-20: `uq_freight_bookings_live_freight` (scope `port_to_port` or `end_to_end`) and `uq_freight_bookings_live_delivery` (scope `end_to_end` or `delivery`). The check that answers `409 CONTAINER_TAKEN` asks whether another live booking on the container covers a duty the new one covers; the keys settle two attaches at once.
+- `dutiesOf` is unchanged: per duty, the live booking that covers it. A delivery booking still `requested` leaves the delivery with nobody, the delivery pick included; the freight is not its to hold up.
+- Its forwarder holds delivery and not freight, so its row in the view is a `duty` row, as for a hand pick: rule 1 is untouched.
+- The shipment read answers `deliveryBooking: { id, status, bookingRef, forwarderId, forwarder } | null` beside `booking` (which stays the freight booking). Two joins read the two bookings apart, so they never blend into one row.
+- A merge moves a loser's live booking only when no live booking of the survivor covers a duty it covers. A booking attached to the survivor at the same moment fails the **whole** merge (`409 RETRY`), nothing half-moved.
+
+New refusals, all `409`: `BAD_REFERENCE` (above), `NOT_THEIR_DUTY` (the forwarder holds something on the container, but not what `fields` or `kind` need; `allowedNext: ['reject']`) and `CLIENT_TOO_OLD` (rule 2; `allowedNext: ['reload']`).
 
 ### Rolling back (all user-triggered)
 
@@ -99,7 +118,8 @@ Released together, shipping → portal → ShipLine: ShipLine is the only place 
 |---|---|---|
 | ShipLine | any time | it cannot make duties; `CLIENT_TOO_OLD` stops it deciding what it cannot show |
 | the portal | any time | rule 1: delivery-only and customs-only companies see their containers read-only; a freight holder keeps its page |
-| shipping | only after ShipLine is back **and** `node tools/list-forwarder-duties.js` lists nothing (exit 0): no pick, no scope other than `port_to_port`, no undecided delivery or customs submission, **and no approved customs draft on file**. Once one is on file shipping is not rolled back below this release: older code lists every kept document as a bill of lading, and approved records are never deleted to make a rollback possible | the new columns and the view **stay**: they are additive, and every older build reads them as before. Claims in flight lapse in 10 minutes |
+| the portal, once a **delivery request** exists | **not at all**: fix forward | an older build shows a UK haulier the sea-freight form (loading date, sailing date, transit of at least a day) |
+| shipping | only after ShipLine is back **and** `node tools/list-forwarder-duties.js` lists nothing (exit 0): no pick, no scope other than `port_to_port`, no undecided delivery or customs submission, no container with two live bookings, **no kept customs document (an approved draft, or an entry with its MRN), and no delivery request in any state**. Once either of the last two exists shipping is not rolled back below this release: older code lists every kept document as a bill of lading, and reads a delivery request as a freight request (its booking would make the haulier the container's freight forwarder, with no key left behind "one live booking per container"). Neither kind of record is deleted to make a rollback possible | the new columns and the view **stay**: they are additive, and every older build reads them as before. Claims in flight lapse in 10 minutes |
 
 ### Tests
 

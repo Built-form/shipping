@@ -474,8 +474,9 @@ test('accept a bill of lading: kept with the container\'s forwarder documents', 
     const put = t.s3Calls[1].input;
     assert.match(put.Key, /^forwarder-documents\/[0-9a-f-]{36}\/B_L_339\.pdf$/);
     const ins = t.db.wrote(/^INSERT INTO shipment_forwarder_documents/)[0];
-    assert.match(ins.sql, /\(shipment_id, shipment_reference, forwarder_id, forwarder_name, kind, filename, s3_key, public_url, content_type, file_size, forwarder_upload_id, uploaded_by_email, accepted_by_email\)/);
-    assert.deepEqual(ins.params, [1214, '339', 4, 'test2forwarder', 'bill_of_lading', 'B/L 339.pdf', put.Key, `https://po.example/${put.Key}`, 'application/pdf', PDF.length, 70, 'mei@fwd.example', 'ops@us.com']);
+    assert.match(ins.sql, /\(shipment_id, shipment_reference, forwarder_id, forwarder_name, kind, filename, s3_key, public_url, content_type, file_size, forwarder_upload_id, uploaded_by_email, accepted_by_email, reference\)/);
+    // The last one is a customs entry's MRN: a bill of lading has none.
+    assert.deepEqual(ins.params, [1214, '339', 4, 'test2forwarder', 'bill_of_lading', 'B/L 339.pdf', put.Key, `https://po.example/${put.Key}`, 'application/pdf', PDF.length, 70, 'mei@fwd.example', 'ops@us.com', null]);
     // Never the B/L number on the shipment: that drives a payment flag.
     assert.equal(sqlOf(t).some(s => /bl_number/.test(s)), false);
 });
@@ -551,4 +552,52 @@ test('where the portal\'s table is not on this server, a decision says so', asyn
     const t = build({ rules: [[/FROM `jportal`\.forwarder_uploads u/, () => err(1146)]] });
     const r = await t.call(ACCEPT);
     assert.deepEqual([r.status, r.body.code], [503, 'PORTAL_UNAVAILABLE']);
+});
+
+// ── the customs entry itself, with its MRN (2026-11-24) ──────────────────
+
+const MRN = '26GB1A2B3C4D5E6F7G';
+const ENTRY = (over = {}) => UPLOAD({
+    id: 71, forwarder_id: 3, forwarder_name: 'DCG', kind: 'customs_entry', filename: 'entry.pdf', note: ' 26gb1a2b3c4d5e6f7g ',
+    does_freight: 0, does_delivery: 0, does_customs: 1, ...over,
+});
+
+test('accept a customs entry: kept with the forwarder documents as its own kind, with its MRN, and no draft is needed first', async () => {
+    const t = build({ shipment: CUSTOMS_SHIPMENT(), row: ENTRY() });
+    const r = await t.call(ACCEPT, { body: { kind: 'customs_entry' } });
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.body.filed.as, 'document');
+    const [insert] = t.db.wrote(/^INSERT INTO shipment_forwarder_documents/);
+    assert.match(insert.sql, /accepted_by_email, reference\)/);
+    assert.deepEqual(insert.params.slice(0, 6), [1214, '339', 3, 'DCG', 'customs_entry', 'entry.pdf']);
+    assert.equal(insert.params.at(-1), MRN, 'the MRN is kept in its one form');
+    assert.match(insert.params[6], /^forwarder-documents\/[0-9a-f-]{36}\/entry\.pdf$/);
+    const audit = t.audits.find(a => a.entityType === 'shipment_forwarder_document');
+    assert.equal(audit.after.kind, 'customs_entry');
+    assert.equal(audit.after.reference, MRN);
+    // Any other kind is kept with no reference.
+    const draft = build({ shipment: CUSTOMS_SHIPMENT(), row: DRAFT({ note: 'Please check box 33' }) });
+    await draft.call(ACCEPT, { body: { kind: 'customs_draft' } });
+    assert.equal(draft.db.wrote(/^INSERT INTO shipment_forwarder_documents/)[0].params.at(-1), null);
+});
+
+test('a customs entry with no MRN, or one that is not an MRN, is refused before anything is copied: it can only be sent back', async () => {
+    for (const note of [null, '', 'see attached', '26GB1A2B3C4D5E6F7']) {
+        const t = build({ shipment: CUSTOMS_SHIPMENT(), row: ENTRY({ note }) });
+        const r = await t.call(ACCEPT, { body: { kind: 'customs_entry' } });
+        assert.deepEqual(r, { status: 409, body: refusal('BAD_REFERENCE', ['reject']) }, String(note));
+        assert.equal(t.db.wrote(/shipment_forwarder_documents|SET filed_key/).length, 0);
+    }
+    // It can still be sent back, by a page that names its kind.
+    const t = build({ shipment: CUSTOMS_SHIPMENT(), row: ENTRY({ note: 'see attached' }) });
+    const r = await t.call(REJECT, { body: { note: 'The MRN is missing', kind: 'customs_entry' } });
+    assert.equal(r.status, 200);
+});
+
+test('a customs entry is decided only by a ShipLine that names its kind', async () => {
+    for (const body of [{}, { kind: 'customs_draft' }]) {
+        const t = build({ shipment: CUSTOMS_SHIPMENT(), row: ENTRY() });
+        assert.deepEqual(await t.call(ACCEPT, { body }), { status: 409, body: refusal('CLIENT_TOO_OLD', ['reload']) });
+        assert.deepEqual(await t.call(REJECT, { body: { note: 'Wrong container', ...body } }), { status: 409, body: refusal('CLIENT_TOO_OLD', ['reload']) });
+    }
 });

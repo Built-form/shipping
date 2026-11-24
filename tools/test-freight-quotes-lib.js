@@ -78,6 +78,8 @@ test('validateRequest: forwarders, a range, services; defaults filled in', () =>
     };
     const ok = F.validateRequest(body, '2026-11-16');
     assert.deepEqual(ok.value, {
+        // A request made with no kind is a freight request.
+        kind: 'freight',
         forwarderIds: [3, 7], batchId: 'a1b2c3d4-0000-4000-8000-000000000001',
         windowStart: '2026-12-01', windowEnd: '2026-12-31', origin: 'China', destination: 'UK',
         // The delivery options as text, in the order chosen; no stock movements.
@@ -378,4 +380,76 @@ test('sendFrontMessage: attachments ride along as files; none by default', async
     assert.equal(files.length, 1);
     assert.equal(files[0].name, 'q.pdf');
     assert.equal(files[0].type, 'application/pdf');
+});
+
+// ── a delivery request: a UK haulier, port to warehouse (2026-11-24) ──────
+
+test('validateRequest: a request has a kind, freight unless it says delivery', () => {
+    const body = { forwarderIds: [3], windowStart: '2026-12-01', windowEnd: '2026-12-10', services: ['UK port to warehouse'] };
+    assert.equal(F.validateRequest(body, '2026-11-24').value.kind, 'freight');
+    assert.equal(F.validateRequest({ ...body, kind: 'freight' }, '2026-11-24').value.kind, 'freight');
+    assert.equal(F.validateRequest({ ...body, kind: 'delivery' }, '2026-11-24').value.kind, 'delivery');
+    for (const kind of ['air', '', null, 7]) assert.equal(F.validateRequest({ ...body, kind }, '2026-11-24').field, 'kind', String(kind));
+});
+
+const DELIVERY_REQUEST = { kind: 'delivery', windowStart: '2026-12-01', windowEnd: '2026-12-10', services: ['UK port to warehouse'], containerSize: '40HQ' };
+const DELIVERY_OPTION = { sailingDate: '2026-12-04', transitDays: 0, portFrom: 'Felixstowe', portTo: 'Unit 5, Leeds', service: 'UK port to warehouse', price: '650', currency: 'GBP' };
+
+test('validateOptions: a delivery option is a collection day and the days to deliver; it has no loading date of its own', () => {
+    const { options } = F.validateOptions([DELIVERY_OPTION], DELIVERY_REQUEST);
+    // Stored in the same columns: the collection day is the sailing date, and the loading date is that day too.
+    assert.deepEqual(options[0], {
+        loadingDate: '2026-12-04', sailingDate: '2026-12-04', transitDays: 0, portFrom: 'Felixstowe', portTo: 'Unit 5, Leeds',
+        service: 'UK port to warehouse', containerSize: '40HQ', price: '650.00', currency: 'GBP', carrier: null, validUntil: null, note: null,
+    });
+    // Delivered the same day is 0; a number of days is as it is.
+    assert.equal(F.validateOptions([{ ...DELIVERY_OPTION, transitDays: 2 }], DELIVERY_REQUEST).options[0].transitDays, 2);
+    assert.equal(F.arrivalDate('2026-12-04', 0), '2026-12-04');
+    // A loading date sent with it is not kept: the collection day is.
+    assert.equal(F.validateOptions([{ ...DELIVERY_OPTION, loadingDate: '2026-11-20' }], DELIVERY_REQUEST).options[0].loadingDate, '2026-12-04');
+    const field = patch => F.validateOptions([{ ...DELIVERY_OPTION, ...patch }], DELIVERY_REQUEST).field;
+    assert.equal(field({ sailingDate: 'soon' }), 'options[0].sailingDate');
+    assert.equal(field({ sailingDate: '2027-02-01' }), 'options[0].sailingDate', 'the collection day is inside the range asked for, give or take the margin');
+    assert.equal(field({ transitDays: -1 }), 'options[0].transitDays');
+    assert.equal(field({ transitDays: 1.5 }), 'options[0].transitDays');
+    assert.equal(field({ transitDays: '' }), 'options[0].transitDays');
+    assert.equal(field({ portFrom: '' }), 'options[0].portFrom');
+    assert.equal(field({ portTo: '' }), 'options[0].portTo');
+    assert.match(F.validateOptions([{ ...DELIVERY_OPTION, sailingDate: 'soon' }], DELIVERY_REQUEST).error, /collection date/);
+    assert.match(F.validateOptions([{ ...DELIVERY_OPTION, transitDays: -1 }], DELIVERY_REQUEST).error, /0 to/);
+});
+
+test('validateOptions: a freight option is judged exactly as before, a kind or none on the request', () => {
+    for (const request of [REQUEST, { ...REQUEST, kind: 'freight' }]) {
+        assert.equal(F.validateOptions([OPTION], request).options[0].loadingDate, '2026-12-05');
+        assert.equal(F.validateOptions([{ ...OPTION, transitDays: 0 }], request).field, 'options[0].transitDays', 'a sailing takes at least a day');
+        const noLoading = { ...OPTION };
+        delete noLoading.loadingDate;
+        assert.equal(F.validateOptions([noLoading], request).field, 'options[0].loadingDate');
+    }
+});
+
+test('the words of a delivery request and of its options: collection and delivery, never sailing or loading', () => {
+    const request = { kind: 'delivery', windowStart: '2026-12-01', windowEnd: '2026-12-10', origin: 'Felixstowe', destination: 'Unit 5, Leeds', containerSize: '40HQ', services: ['UK port to warehouse'], note: null };
+    const url = 'https://portal.example/freight/abc';
+    const asked = F.quoteBlockHtml({ request, url, expiresOn: '2026-12-31', registerUrl: '' });
+    assert.match(asked, /UK delivery quote request/);
+    assert.match(asked, /Collection between/);
+    assert.match(asked, /Collect from/);
+    assert.match(asked, /Deliver to/);
+    assert.doesNotMatch(asked, /Sailing between|sailing|开船|装柜|航程/);
+    const option = { loadingDate: '2026-12-04', sailingDate: '2026-12-04', transitDays: 1, portFrom: 'Felixstowe', portTo: 'Unit 5, Leeds', service: 'UK port to warehouse', containerSize: '40HQ', price: '650.00', currency: 'GBP', carrier: null };
+    const booked = F.bookingBlockHtml({ option, url, note: null, kind: 'delivery' });
+    assert.match(booked, /Please book this delivery/);
+    assert.match(booked, /Collection/);
+    assert.match(booked, /Delivered/);
+    assert.match(booked, /2026-12-05/, 'the day it is delivered: collection plus the days');
+    assert.doesNotMatch(booked, /Loading|Sailing|Transit|sailing|装柜|开船|航程/);
+    // A freight request and option read as before, a kind said or not.
+    assert.match(F.quoteBlockHtml({ request: { ...request, kind: 'freight' }, url, expiresOn: '2026-12-31', registerUrl: '' }), /Sailing between/);
+    for (const kind of [undefined, 'freight']) {
+        const sea = F.bookingBlockHtml({ option, url, note: null, kind });
+        assert.match(sea, /Please book this sailing/);
+        assert.match(sea, /Loading \/ 装柜日期/);
+    }
 });

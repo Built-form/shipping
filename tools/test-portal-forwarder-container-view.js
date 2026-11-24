@@ -222,6 +222,27 @@ const flagsOf = r => FLAGS.map(f => Number(r[f])).join('/');
         check('freight and customs with one company, delivery with another: 1/0/1 and 0/1/0', rows.length === 2
             && is(rows.find(r => Number(r.forwarder_id) === A), A, 'container', '1/0/1') && is(rows.find(r => Number(r.forwarder_id) === B), B, 'duty', '0/1/0'), said(rows));
 
+        // Two live bookings, one per leg (the delivery leg through Freight quotes): a
+        // freight booking and a booking for the delivery alone, each its forwarder's leg.
+        const twoLegs = await shipment({ delivery_forwarder_id: A });
+        const freightLeg = await booking(twoLegs, A, 'confirmed');
+        await booking(twoLegs, B, 'confirmed', { scope: 'delivery', booking_ref: 'JOB-VIEW' });
+        rows = await rowsOf(twoLegs);
+        check('a freight booking and a delivery booking on one container: "booking" 1/0/0 for the first, "duty" 0/1/0 for the second, and the delivery pick outranked',
+            rows.length === 2 && is(rows.find(r => Number(r.forwarder_id) === A), A, 'booking', '1/0/0') && is(rows.find(r => Number(r.forwarder_id) === B), B, 'duty', '0/1/0'), said(rows));
+        const legA = rows.find(r => Number(r.forwarder_id) === A);
+        const legB = rows.find(r => Number(r.forwarder_id) === B);
+        check('the freight booking\'s reference and request stay on the freight row; the delivery company is handed neither, nor its own as the freight\'s',
+            Boolean(legA && legB) && legA.booking_ref === 'BK-VIEW' && Number(legA.freight_request_id) === freightLeg.request && legB.booking_ref === null && legB.freight_request_id === null,
+            JSON.stringify([legA && [legA.booking_ref, legA.freight_request_id], legB && [legB.booking_ref, legB.freight_request_id]]));
+        check('and the sailing shown to both is the freight booking\'s, never the collection day', Boolean(legA && legB) && legA.sailing_date === '2026-12-15' && legB.sailing_date === '2026-12-15');
+        const legWaiting = await shipment({ forwarder_id: A, forwarder: `${TAG} A`, delivery_forwarder_id: A });
+        await booking(legWaiting, B, 'requested', { scope: 'delivery' });
+        rows = await rowsOf(legWaiting);
+        check('a delivery booking still "requested": nobody delivers yet (the pick included), the freight forwarder keeps the freight (1/0/0)', rows.length === 1 && is(rows[0], A, 'container', '1/0/0'), said(rows));
+        const dupFreight = await q('SELECT COUNT(*) AS n FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = \'freight_bookings\' AND INDEX_NAME IN (\'uq_freight_bookings_live_freight\', \'uq_freight_bookings_live_delivery\', \'uq_freight_bookings_live_shipment\')');
+        check('the two per-leg keys are there, and the key for the whole container is gone', Number(dupFreight[0].n) === 2, `index rows ${dupFreight[0].n}`);
+
         // A pick that names a forwarder taken off the list holds nothing; the others are not affected.
         const removedPick = await shipment({ forwarder_id: A, forwarder: `${TAG} A`, delivery_forwarder_id: C, customs_forwarder_id: C });
         rows = await rowsOf(removedPick);
@@ -277,7 +298,7 @@ const flagsOf = r => FLAGS.map(f => Number(r[f])).join('/');
         check('arrived by its orders: stage ARRIVED, arrived_on the latest order\'s', v && v.stage === 'ARRIVED' && v.arrived_on === await daysAgo(3), JSON.stringify(v && [v.stage, v.arrived_on]));
 
         // What GET /shipments/:id says of the duties is what the view lists, on the containers of every arrangement above.
-        for (const id of [byHand, booked, split, endToEnd, e2eWaiting, p2pWaiting, handE2e, brokerOnly, mixed, removedPick]) {
+        for (const id of [byHand, booked, split, endToEnd, e2eWaiting, p2pWaiting, handE2e, brokerOnly, mixed, removedPick, twoLegs, legWaiting]) {
             const api = S.rowToShipment(await sync.getShipment(conn, id));
             const want = FC.attachedOf(api.duties).map(a => [a.forwarderId, a.duties.join()]).sort((x, y) => x[0] - y[0]);
             const got = (await rowsOf(id)).filter(r => r.link_source !== 'payment')

@@ -76,6 +76,7 @@ const UPLOAD_REFUSAL_TEXT = Object.freeze({
     FILE_SIZE_CHANGED: 'The file is not the size the portal recorded. Send it back and ask for it again.',
     FILE_TOO_LARGE: 'The file is too large for its kind. Send it back.',
     FILE_CHANGED: 'The upload changed while it was being accepted. Reload and look again.',
+    BAD_REFERENCE: 'This customs entry came with no valid MRN (18 letters and digits), so it cannot be kept. Send it back.',
     NO_FILING_NAME: 'This forwarder has no name to file an invoice under. Send it back, or fix the forwarder on the Forwarders list.',
     FILING_NAME_CLASH: 'The name this invoice would be filed under is that of a supplier with goods on this container, so it would be taken for theirs. Send it back, or upload it by hand in the INVOICES tab.',
     DUPLICATE_DOCUMENT: 'A file of this name and size is already on this shipment.',
@@ -120,6 +121,9 @@ const STATE_OF = Object.freeze({ open: 'open', received: 'received', rejected: '
 function uploadJson(row, held = FC.dutiesOfFlags(row)) {
     const state = STATE_OF[FC.uploadReviewState(row)];
     const theirs = FC.kindAllowed(row.kind, held);
+    // A customs entry's note is its MRN (the portal has one text column to write): shown as
+    // the file's reference. A value that is not an MRN stays readable as the note it is.
+    const ref = FC.uploadReference(row);
     return {
         id: Number(row.id),
         kind: row.kind,
@@ -129,7 +133,8 @@ function uploadJson(row, held = FC.dutiesOfFlags(row)) {
         filename: row.filename,
         contentType: row.content_type || null,
         fileSize: Number(row.file_size),
-        note: row.note || null,
+        note: ref && ref.reference ? null : (row.note || null),
+        reference: (ref && ref.reference) || null,
         byName: row.user_name || null,
         byEmail: row.user_email || null,
         sentAt: row.sent_at_iso || null,
@@ -147,7 +152,7 @@ function uploadJson(row, held = FC.dutiesOfFlags(row)) {
     };
 }
 
-const GROUP_OF = Object.freeze({ invoice: 'invoice', loading_photo: 'loadingPhotos', bill_of_lading: 'billOfLading', customs_draft: 'customsDraft' });
+const GROUP_OF = Object.freeze({ invoice: 'invoice', loading_photo: 'loadingPhotos', bill_of_lading: 'billOfLading', customs_draft: 'customsDraft', customs_entry: 'customsEntry' });
 
 const noFiles = () => Object.fromEntries(Object.values(GROUP_OF).map(group => [group, []]));
 
@@ -156,7 +161,7 @@ const noFiles = () => Object.fromEntries(Object.values(GROUP_OF).map(group => [g
  * `duties`: who holds what on the container now (dutiesOf), which is what says
  * whose a file still is here, not the view's row.
  * → { unavailable, byForwarder, strays }:
- *   byForwarder  Map of forwarder id → { invoice, loadingPhotos, billOfLading }
+ *   byForwarder  Map of forwarder id → { invoice, loadingPhotos, billOfLading, customsDraft, customsEntry }
  *                for every forwarder that HOLDS A DUTY on the container: what it
  *                sent, newest first, whatever became of it. A file of a kind its
  *                forwarder no longer holds the duty for is here too, not actionable.
@@ -189,11 +194,13 @@ async function readUploads(conn, shipmentId, duties, env = process.env) {
     return out;
 }
 
-const DOCUMENT_COLUMNS = `d.id, d.shipment_id, d.forwarder_id, d.forwarder_name, d.kind, d.filename, d.public_url, d.content_type, d.file_size,
+const DOCUMENT_COLUMNS = `d.id, d.shipment_id, d.forwarder_id, d.forwarder_name, d.kind, d.reference, d.filename, d.public_url, d.content_type, d.file_size,
         d.forwarder_upload_id, d.uploaded_by_email, d.accepted_by_email, d.deleted_at, DATE_FORMAT(d.created_at, ${ISO}) AS created_at_iso`;
 const documentJson = (d, actor) => ({
     id: Number(d.id),
     kind: d.kind,
+    // A customs entry's MRN; null for every other kind.
+    reference: d.reference || null,
     forwarderId: d.forwarder_id == null ? null : Number(d.forwarder_id),
     forwarderName: d.forwarder_name || null,
     filename: d.filename,
@@ -373,6 +380,10 @@ function registerForwarderUploadRoutes(app, deps) {
         // Whose it is, as the portal's view has it now; asked again under the locks below.
         const early = FC.uploadGate({ row, duties: row ? FC.dutiesFromFlags(row) : null, action: 'accept' });
         if (early) throw gateRefusal(early);
+        // A customs entry is kept under its MRN: one that came with none, or with something
+        // that is not one, is refused here, before anything is copied. It can be sent back.
+        const reference = FC.uploadReference(row);
+        if (reference && reference.problem) throw refuse('BAD_REFERENCE', ['reject']);
 
         // Received by a request that ran beside this one: theirs stands, and this caller is told what it filed.
         const toldWhatWasFiled = async () => {
@@ -440,6 +451,9 @@ function registerForwarderUploadRoutes(app, deps) {
             if (locked.final_key !== row.final_key || (locked.s3_etag || null) !== (row.s3_etag || null) || locked.filed_key !== filedKey) throw refuse('FILE_CHANGED', ['reload']);
 
             const reference = shipment.reference || String(shipment.id);
+            // The file's own reference number (a customs entry's MRN), from the locked row.
+            const fileRef = FC.uploadReference(locked);
+            if (fileRef && fileRef.problem) throw refuse('BAD_REFERENCE', ['reject']);
             const filename = String(locked.filename || shownName).trim().slice(0, 200) || shownName;
             const uploader = locked.user_email || null;
             let filed;
@@ -496,16 +510,17 @@ function registerForwarderUploadRoutes(app, deps) {
                     const [ins] = await conn.query(
                         `INSERT INTO shipment_forwarder_documents
                             (shipment_id, shipment_reference, forwarder_id, forwarder_name, kind, filename, s3_key, public_url, content_type, file_size,
-                             forwarder_upload_id, uploaded_by_email, accepted_by_email)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                        // Kept as its own kind: a bill of lading, or (2026-11-24) an approved draft customs entry.
+                             forwarder_upload_id, uploaded_by_email, accepted_by_email, reference)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                        // Kept as its own kind: a bill of lading, or (2026-11-24) an approved draft customs
+                        // entry, or the customs entry itself with its MRN as `reference`.
                         [shipment.id, reference, Number(owner.forwarderId), (forwarder && forwarder.name) || null, locked.kind, filename, filedKey, publicS3Url(filedKey),
-                            locked.content_type, bytes.length, id, uploader, actor.email || null]
+                            locked.content_type, bytes.length, id, uploader, actor.email || null, fileRef ? fileRef.reference : null]
                     );
                     filed = { as: 'document', id: Number(ins.insertId) };
                     await recordAudit(conn, {
                         entityType: 'shipment_forwarder_document', entityId: filed.id, action: 'create', before: null,
-                        after: { shipmentId: shipment.id, forwarderId: Number(owner.forwarderId), kind: locked.kind, filename, fileSize: bytes.length, forwarderUploadId: id },
+                        after: { shipmentId: shipment.id, forwarderId: Number(owner.forwarderId), kind: locked.kind, filename, fileSize: bytes.length, forwarderUploadId: id, ...(fileRef ? { reference: fileRef.reference } : {}) },
                         userEmail: actor.email,
                     });
                 }

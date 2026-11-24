@@ -33,7 +33,11 @@ function harness({ userType = 'standard', frontOk = () => true, documentSet = nu
         ],
         requests: [], options: [], bookings: [], movements: [], movementSeq: 0,
         deliveryOptions: [{ id: 1, label: 'Door to door', deleted_at: null }, { id: 2, label: 'Door to port', deleted_at: null }],
-        shipments: [{ id: 50, name: 'Draft 12', reference: null, stage: 'DRAFT', deleted_at: null, merged_into_id: null }],
+        shipments: [
+            { id: 50, name: 'Draft 12', reference: null, stage: 'DRAFT', deleted_at: null, merged_into_id: null },
+            // A booked container: a delivery leg is usually booked when it is already on the water.
+            { id: 51, name: null, reference: '339', stage: 'IN_TRANSIT', deleted_at: null, merged_into_id: null },
+        ],
         audits: [], receipts: [], receiptReminders: [], sent: [], preapproved: [],
         // draft_container_documents rows and their sends (a contents email with documents).
         documents: [], documentSends: [],
@@ -42,8 +46,11 @@ function harness({ userType = 'standard', frontOk = () => true, documentSet = nu
         // A shipment id another booking takes at the last moment (the unique key refuses).
         raceShipment: null,
     };
-    const containerDup = id => Object.assign(
-        new Error(`Duplicate entry '${id}' for key 'freight_bookings.uq_freight_bookings_live_shipment'`), { errno: 1062, code: 'ER_DUP_ENTRY' });
+    // One live booking per LEG of a container: two unique keys (2026-11-24).
+    const containerDup = (id, leg = 'freight') => Object.assign(
+        new Error(`Duplicate entry '${id}' for key 'freight_bookings.uq_freight_bookings_live_${leg}'`), { errno: 1062, code: 'ER_DUP_ENTRY' });
+    const legsOfScope = scope => ({ port_to_port: ['freight'], end_to_end: ['freight', 'delivery'], delivery: ['delivery'] }[scope || 'port_to_port']);
+    const kindOf = requestId => (db.requests.find(r => r.id === requestId) || {}).kind || 'freight';
     const live = b => b.status === 'requested' || b.status === 'confirmed';
     const requestRow = r => ({ ...r, expired: r.expires_at <= NOW() ? 1 : 0 });
     // DATE_ADD(o.sailing_date, INTERVAL (o.transit_days + days) DAY), as 'YYYY-MM-DD'.
@@ -155,24 +162,28 @@ function harness({ userType = 'standard', frontOk = () => true, documentSet = nu
             // the badge
             if (s.startsWith("SELECT COUNT(*) AS n FROM freight_bookings b JOIN freight_quote_requests r ON r.id = b.request_id JOIN freight_quote_options o ON o.id = b.option_id WHERE b.status = 'confirmed' AND b.contents_sent_at IS NULL AND r.revoked_at IS NULL")) {
                 const [days, today] = params;
-                return [[{ n: db.bookings.filter(b => b.status === 'confirmed' && !b.contents_sent_at
+                assert.match(s, /AND b\.scope <> 'delivery'$/, 'a delivery booking is owed no contents email');
+                return [[{ n: db.bookings.filter(b => b.status === 'confirmed' && !b.contents_sent_at && b.scope !== 'delivery'
                     && !db.requests.find(r => r.id === b.request_id).revoked_at && arrivesPlus(b, days) >= today).length }]];
             }
             if (s.startsWith('SELECT COUNT(DISTINCT r.batch_id) AS n FROM freight_quote_requests r JOIN forwarders f')) {
+                assert.match(s, /AND \(\? = 'all' OR r\.kind = 'freight'\)/);
                 const batches = new Set(db.requests.filter(r => !r.revoked_at && r.expires_at > NOW() && r.answered_at && !r.declined
+                    && (params[0] === 'all' || r.kind === 'freight')
                     && !db.forwarders.find(f => f.id === r.forwarder_id).deleted_at
                     && !db.bookings.some(b => live(b) && db.requests.find(x => x.id === b.request_id).batch_id === r.batch_id))
                     .map(r => r.batch_id));
                 return [[{ n: batches.size }]];
             }
             if (s.startsWith('INSERT INTO freight_quote_requests')) {
+                assert.match(s, /created_by_email, kind, expires_at\)/, 'the kind is written with the request');
                 const [token, batch_id, forwarder_id, forwarder_name, window_start_date, window_end_date, origin, destination,
-                    container_size, services, staff_note, sent_to, subject, created_by_email, days] = params;
+                    container_size, services, staff_note, sent_to, subject, created_by_email, kind, days] = params;
                 assert.doesNotMatch(s, /stock_movements/); // the old JSON column is no longer written
                 const id = db.requests.length + 1;
                 db.requests.push({
                     id, token, batch_id, forwarder_id, forwarder_name, window_start_date, window_end_date, origin, destination,
-                    container_size, services, staff_note, sent_to, subject, created_by_email, created_at: NOW(), sent_at: null,
+                    container_size, services, staff_note, sent_to, subject, created_by_email, kind, created_at: NOW(), sent_at: null,
                     expires_at: future(days), revoked_at: null, revoke_reason: null, answer_count: 0, answered_at: null,
                     answered_by_name: null, answered_by_email: null, answer_source: null, answer_note: null, declined: 0, row_version: 1,
                     reminded_at: null, reminder_count: 0,
@@ -203,7 +214,9 @@ function harness({ userType = 'standard', frontOk = () => true, documentSet = nu
                 return [db.requests.filter(r => r.id === params[0]).map(requestRow)];
             }
             if (s.startsWith('SELECT r.id, r.token')) { // the board
-                return [[...db.requests].reverse().map(requestRow)];
+                // Delivery requests are read only for a caller that asked for both legs.
+                const both = !s.includes("AND r.kind = 'freight'");
+                return [[...db.requests].reverse().filter(r => both || r.kind === 'freight').map(requestRow)];
             }
             // closing and reopening `filled` requests
             if (s.startsWith('SELECT r.id FROM freight_quote_requests r WHERE r.revoked_at IS NULL AND EXISTS')) {
@@ -307,15 +320,17 @@ function harness({ userType = 'standard', frontOk = () => true, documentSet = nu
             if (s.startsWith('SELECT * FROM freight_bookings WHERE id = ?')) {
                 return [db.bookings.filter(b => b.id === params[0])];
             }
-            if (s.startsWith('SELECT id FROM freight_bookings WHERE shipment_id = ? AND status IN (?) AND id <> ?')) {
-                return [db.bookings.filter(b => b.shipment_id === params[0] && live(b) && b.id !== params[2])];
+            if (s.startsWith('SELECT id, scope FROM freight_bookings WHERE shipment_id = ? AND status IN (?) AND id <> ?')) {
+                return [db.bookings.filter(b => b.shipment_id === params[0] && live(b) && b.id !== params[2]).map(b => ({ id: b.id, scope: b.scope }))];
             }
             if (s.startsWith('INSERT INTO freight_bookings')) {
                 assert.match(s, /shipment_id, draft_container_name, scope\)/, 'what the booking covers is written with it');
                 const [request_id, option_id, requested_by_email, request_note, sent_to, subject, shipment_id, draft_container_name, scope] = params;
                 if (db.bookings.some(b => b.request_id === request_id && live(b))) throw Object.assign(new Error('dup'), { errno: 1062 });
                 // Another booking took the container between the check and this insert.
-                if (shipment_id != null && db.raceShipment === shipment_id) throw containerDup(shipment_id);
+                if (shipment_id != null && db.raceShipment === shipment_id) throw containerDup(shipment_id, scope === 'delivery' ? 'delivery' : 'freight');
+                // The request's kind decides the scope: the route never writes one the kind does not allow.
+                assert.equal(scope === 'delivery', kindOf(request_id) === 'delivery', 'a delivery request books delivery, and only a delivery request does');
                 const id = db.bookings.length + 1;
                 db.bookings.push({
                     id, request_id, option_id, status: 'requested', scope, requested_by_email, requested_at: NOW(), request_note, sent_to,
@@ -365,7 +380,14 @@ function harness({ userType = 'standard', frontOk = () => true, documentSet = nu
                     if (p[0] != null && db.raceShipment === p[0]) throw containerDup(p[0]);
                     Object.assign(b, { shipment_id: p.shift(), draft_container_name: p.shift(), contents_json: null, contents_sent_at: null, contents_document_ids: null });
                 }
-                if (s.includes('scope = ?')) b.scope = p.shift();
+                if (s.includes('scope = ?')) {
+                    const scope = p.shift();
+                    // The keys: no other live booking on its container covers a leg this scope covers.
+                    const clash = db.bookings.some(x => x.id !== b.id && live(x) && b.shipment_id != null && x.shipment_id === b.shipment_id
+                        && legsOfScope(x.scope).some(l => legsOfScope(scope).includes(l)));
+                    if (clash) throw containerDup(b.shipment_id, 'delivery');
+                    b.scope = scope;
+                }
                 if (s.includes("status = 'confirmed'")) Object.assign(b, { status: 'confirmed', booking_ref: p.shift(), response_note: p.shift(), responded_by_email: p.shift(), response_source: 'staff', responded_at: NOW() });
                 if (s.includes("status = 'cancelled'")) Object.assign(b, { status: 'cancelled', cancel_reason: 'staff', cancelled_by_email: p.shift(), cancelled_at: NOW() });
                 b.row_version += 1;
@@ -380,11 +402,12 @@ function harness({ userType = 'standard', frontOk = () => true, documentSet = nu
             }
             if (s.startsWith('INSERT INTO email_receipts')) { db.receipts.push(params); return [{ insertId: db.receipts.length }]; }
             // forwarder charges of a container (2026-11-20)
-            if (s.startsWith('SELECT b.id, b.status, b.booking_ref, b.request_id, b.option_id, r.forwarder_id, r.forwarder_name FROM freight_bookings b JOIN freight_quote_requests r ON r.id = b.request_id WHERE b.shipment_id = ? AND b.status IN (?) ORDER BY b.id DESC LIMIT 1')) {
-                const b = db.bookings.filter(x => x.shipment_id === params[0] && params[1].includes(x.status)).sort((x, y) => y.id - x.id)[0];
-                if (!b) return [[]];
-                const r = db.requests.find(x => x.id === b.request_id);
-                return [[{ id: b.id, status: b.status, booking_ref: b.booking_ref, request_id: b.request_id, option_id: b.option_id, forwarder_id: r.forwarder_id, forwarder_name: r.forwarder_name }]];
+            if (s.startsWith('SELECT b.id, b.status, b.scope, b.booking_ref, b.request_id, b.option_id, r.forwarder_id, r.forwarder_name FROM freight_bookings b JOIN freight_quote_requests r ON r.id = b.request_id WHERE b.shipment_id = ? AND b.status IN (?) ORDER BY b.id DESC')) {
+                assert.doesNotMatch(s, /LIMIT 1/, 'a container may hold a booking per leg');
+                return [db.bookings.filter(x => x.shipment_id === params[0] && params[1].includes(x.status)).sort((x, y) => y.id - x.id).map((b) => {
+                    const r = db.requests.find(x => x.id === b.request_id);
+                    return { id: b.id, status: b.status, scope: b.scope, booking_ref: b.booking_ref, request_id: b.request_id, option_id: b.option_id, forwarder_id: r.forwarder_id, forwarder_name: r.forwarder_name };
+                })];
             }
             if (s.startsWith('SELECT id, name, deleted_at FROM forwarders WHERE id = ?')) {
                 return [db.forwarders.filter(f => f.id === params[0])];
@@ -392,8 +415,8 @@ function harness({ userType = 'standard', frontOk = () => true, documentSet = nu
             if (s.startsWith('SELECT id, factory, cbm, price, currency FROM freight_stock_movements WHERE request_id = ? AND deleted_at IS NULL ORDER BY id ASC')) {
                 return [db.movements.filter(m => m.request_id === params[0] && !m.deleted_at).sort((a, b) => a.id - b.id)];
             }
-            if (s.startsWith('SELECT id, freight_booking_id, freight_movement_id, amount, currency FROM payment_extras WHERE deleted_at IS NULL AND (freight_booking_id = ? OR freight_movement_id IN (?))')) {
-                return [db.extras.filter(x => !x.deleted_at && (x.freight_booking_id === params[0] || params[1].includes(x.freight_movement_id)))];
+            if (s.startsWith('SELECT id, freight_booking_id, freight_movement_id, amount, currency FROM payment_extras WHERE deleted_at IS NULL AND (freight_booking_id IN (?) OR freight_movement_id IN (?))')) {
+                return [db.extras.filter(x => !x.deleted_at && (params[0].includes(x.freight_booking_id) || params[1].includes(x.freight_movement_id)))];
             }
             throw new Error(`unexpected statement: ${s.slice(0, 140)}`);
         },
@@ -1129,4 +1152,173 @@ test('forwarder charges: the live booking on a container, its all-in price, and 
     // Cancelled: nothing to price from any more.
     await h.call('PATCH', '/api/v1/freight-bookings/1', { status: 'cancelled' });
     assert.deepEqual((await h.call('GET', '/api/v1/shipments/50/forwarder-charges')).body, { booking: null, movements: [] });
+});
+
+// ── the delivery leg through Freight quotes (2026-11-24) ─────────────────
+//
+// A request has a kind. A DELIVERY request goes to a UK haulier: collect at the
+// UK port, deliver to the warehouse. Its booking covers the delivery alone, so
+// a container can hold it beside its freight booking: one live booking per leg.
+
+const BATCH_D = 'a1b2c3d4-0000-4000-8000-0000000000d1';
+const DELIVERY_SEND = { kind: 'delivery', forwarderIds: [2], batchId: BATCH_D, windowStart: '2026-12-20', windowEnd: '2026-12-31', services: ['UK port to warehouse'], containerSize: '40HQ' };
+const DELIVERY_OPTION = { sailingDate: '2026-12-22', transitDays: 0, portFrom: 'Felixstowe', portTo: 'Unit 5, Leeds', service: 'UK port to warehouse', price: '650', currency: 'GBP' };
+const ALL = '?legs=all';
+// The freight requests 1 and 2 (answered), then the delivery request 3 to forwarder 2, answered with option 3.
+async function withDelivery(h) {
+    await answered(h);
+    const sent = await h.call('POST', `/api/v1/freight-quotes${ALL}`, DELIVERY_SEND);
+    assert.equal(sent.status, 200, JSON.stringify(sent.body));
+    const typed = await h.call('POST', `/api/v1/freight-quotes/3/options${ALL}`, { options: [DELIVERY_OPTION] });
+    assert.equal(typed.status, 200, JSON.stringify(typed.body));
+}
+
+test('a delivery request: its kind is written with it, its email has its own template, and its option needs no loading date', async () => {
+    const h = harness();
+    await withDelivery(h);
+    assert.deepEqual(h.db.requests.map(r => r.kind), ['freight', 'freight', 'delivery']);
+    assert.match(h.db.requests[2].subject, /^freight_delivery_request /, 'not the sailing template');
+    assert.match(h.db.requests[0].subject, /^freight_quote_request /);
+    // Left blank, it is collected at the UK port and delivered to our warehouse.
+    assert.deepEqual([h.db.requests[2].origin, h.db.requests[2].destination], ['UK port', 'Our UK warehouse']);
+    const o = h.db.options.find(x => x.request_id === 3);
+    assert.deepEqual([String(o.loading_date).slice(0, 10), String(o.sailing_date).slice(0, 10), Number(o.transit_days)], ['2026-12-22', '2026-12-22', 0], 'the collection day in both, delivered the same day');
+    assert.match(h.db.sent.at(-1).html, /UK delivery quote request/);
+    assert.match(h.db.sent.at(-1).html, /Collection between/);
+    // A kind that is not one is refused.
+    const bad = await h.call('POST', '/api/v1/freight-quotes', { ...DELIVERY_SEND, batchId: 'a1b2c3d4-0000-4000-8000-0000000000d2', kind: 'air' });
+    assert.deepEqual([bad.status, bad.body.field], [400, 'kind']);
+});
+
+test('the board gives delivery requests, their options and their bookings only to a caller that asks for both legs', async () => {
+    const h = harness();
+    await withDelivery(h);
+    await h.call('POST', `/api/v1/freight-quotes/options/3/book${ALL}`, {});
+    const old = await h.call('GET', '/api/v1/freight-quotes');
+    assert.deepEqual(old.body.requests.map(r => r.id).sort(), [1, 2], 'a ShipLine from before delivery requests never holds one');
+    assert.deepEqual(old.body.bookings, []);
+    assert.equal(JSON.stringify(old.body).includes('Unit 5, Leeds'), false);
+    const now = await h.call('GET', `/api/v1/freight-quotes${ALL}`);
+    assert.deepEqual(now.body.requests.map(r => [r.id, r.kind]).sort(), [[1, 'freight'], [2, 'freight'], [3, 'delivery']]);
+    assert.deepEqual(now.body.bookings.map(b => [b.requestId, b.scope]), [[3, 'delivery']]);
+    // A write answers with the board the same way.
+    const wrote = await h.call('POST', '/api/v1/freight-quotes/options/1/book', {});
+    assert.deepEqual(wrote.body.requests.map(r => r.id).sort(), [1, 2]);
+    assert.deepEqual(wrote.body.bookings.map(b => b.requestId), [1]);
+});
+
+test('booking: the scope follows the request\'s kind, whatever the body says', async () => {
+    const h = harness();
+    await withDelivery(h);
+    // A delivery request books the delivery alone.
+    for (const scope of ['end_to_end', 'port_to_port']) {
+        const r = await h.call('POST', `/api/v1/freight-quotes/options/3/book${ALL}`, { scope });
+        assert.deepEqual([r.status, r.body.code, r.body.field], [400, 'BAD_FIELD', 'scope'], scope);
+    }
+    assert.equal(h.db.bookings.length, 0);
+    const booked = await h.call('POST', `/api/v1/freight-quotes/options/3/book${ALL}`, {});
+    assert.equal(booked.status, 200, JSON.stringify(booked.body));
+    assert.equal(h.db.bookings[0].scope, 'delivery');
+    assert.match(h.db.bookings[0].subject, /^freight_delivery_booking /);
+    assert.match(h.db.sent.at(-1).html, /Please book this delivery/);
+    assert.doesNotMatch(h.db.sent.at(-1).html, /this sailing|Loading \/ /);
+    // A freight request never books the delivery alone.
+    const wrong = await h.call('POST', '/api/v1/freight-quotes/options/1/book', { scope: 'delivery' });
+    assert.deepEqual([wrong.status, wrong.body.code, wrong.body.field], [400, 'BAD_FIELD', 'scope']);
+});
+
+test('one live booking per leg: a delivery booking sits beside the freight booking, and nothing else does', async () => {
+    const h = harness();
+    await withDelivery(h);
+    // The freight booking (port to port) on container 51, then the delivery booking on the same one.
+    assert.equal((await h.call('POST', '/api/v1/freight-quotes/options/1/book', { shipmentId: 51 })).status, 200);
+    const both = await h.call('POST', `/api/v1/freight-quotes/options/3/book${ALL}`, { shipmentId: 51 });
+    assert.equal(both.status, 200, JSON.stringify(both.body));
+    assert.deepEqual(h.db.bookings.map(b => [b.shipment_id, b.scope, b.status]), [[51, 'port_to_port', 'requested'], [51, 'delivery', 'requested']]);
+    // A second freight booking on it is still refused.
+    const second = await h.call('POST', '/api/v1/freight-quotes/options/2/book', { shipmentId: 51 });
+    assert.deepEqual([second.status, second.body.code], [409, 'CONTAINER_TAKEN']);
+    // The freight booking cannot grow to end to end while another booking delivers it.
+    const grow = await h.call('PATCH', '/api/v1/freight-bookings/1', { scope: 'end_to_end' });
+    assert.deepEqual([grow.status, grow.body.code], [409, 'CONTAINER_TAKEN']);
+    assert.equal(h.db.bookings[0].scope, 'port_to_port');
+    // Once the delivery booking is cancelled, it can.
+    assert.equal((await h.call('PATCH', `/api/v1/freight-bookings/2${ALL}`, { status: 'cancelled' })).status, 200);
+    assert.equal((await h.call('PATCH', '/api/v1/freight-bookings/1', { scope: 'end_to_end' })).status, 200);
+});
+
+test('an end-to-end booking already covers the delivery: a delivery booking cannot join it, by the check or by the key', async () => {
+    const h = harness();
+    await withDelivery(h);
+    await h.call('POST', '/api/v1/freight-quotes/options/1/book', { shipmentId: 51, scope: 'end_to_end' });
+    const r = await h.call('POST', `/api/v1/freight-quotes/options/3/book${ALL}`, { shipmentId: 51 });
+    assert.deepEqual([r.status, r.body.code], [409, 'CONTAINER_TAKEN']);
+    assert.match(r.body.error, /already has a booking that covers its delivery/);
+    assert.equal(h.db.bookings.length, 1);
+    // Another delivery booking took the container between the check and the insert: the key, read the same way.
+    const g = harness();
+    await withDelivery(g);
+    g.db.raceShipment = 51;
+    const raced = await g.call('POST', `/api/v1/freight-quotes/options/3/book${ALL}`, { shipmentId: 51 });
+    assert.deepEqual([raced.status, raced.body.code], [409, 'CONTAINER_TAKEN']);
+});
+
+test('a delivery booking stays a delivery booking, and is changed only by a ShipLine that knows what one is', async () => {
+    const h = harness();
+    await withDelivery(h);
+    await h.call('POST', `/api/v1/freight-quotes/options/3/book${ALL}`, {});
+    for (const scope of ['port_to_port', 'end_to_end', null]) {
+        const r = await h.call('PATCH', `/api/v1/freight-bookings/1${ALL}`, { scope });
+        assert.deepEqual([r.status, r.body.code, r.body.field], [400, 'BAD_FIELD', 'scope'], String(scope));
+    }
+    assert.equal(h.db.bookings[0].scope, 'delivery');
+    // An older build (no legs=all) cannot attach, confirm or cancel it.
+    for (const body of [{ shipmentId: 51 }, { status: 'confirmed', bookingRef: 'JOB-1' }, { status: 'cancelled' }]) {
+        const r = await h.call('PATCH', '/api/v1/freight-bookings/1', body);
+        assert.deepEqual([r.status, r.body.code, r.body.allowedNext], [409, 'CLIENT_TOO_OLD', ['reload']], JSON.stringify(body));
+    }
+    assert.deepEqual([h.db.bookings[0].status, h.db.bookings[0].shipment_id], ['requested', null]);
+    // The present one attaches it to a booked container and confirms it.
+    assert.equal((await h.call('PATCH', `/api/v1/freight-bookings/1${ALL}`, { shipmentId: 51 })).status, 200);
+    assert.equal((await h.call('PATCH', `/api/v1/freight-bookings/1${ALL}`, { status: 'confirmed', bookingRef: 'JOB-1' })).status, 200);
+    assert.deepEqual([h.db.bookings[0].status, h.db.bookings[0].shipment_id, h.db.bookings[0].scope], ['confirmed', 51, 'delivery']);
+});
+
+test('the badge: a delivery booking is owed no contents email, and a delivery quote counts only for a caller that sees them', async () => {
+    const h = harness();
+    await withDelivery(h);
+    // Three answered requests wait: two freight (one batch), one delivery.
+    assert.equal((await h.call('GET', '/api/v1/freight-quotes/summary')).body.answered, 1);
+    assert.equal((await h.call('GET', `/api/v1/freight-quotes/summary${ALL}`)).body.answered, 2);
+    await h.call('POST', `/api/v1/freight-quotes/options/3/book${ALL}`, { shipmentId: 51 });
+    await h.call('PATCH', `/api/v1/freight-bookings/1${ALL}`, { status: 'confirmed', bookingRef: 'JOB-1' });
+    assert.equal((await h.call('GET', `/api/v1/freight-quotes/summary${ALL}`)).body.contentsDue, 0, 'confirmed, and nothing to send it');
+});
+
+test('a container\'s charges: the freight booking as before, and the delivery booking beside it for a caller that asks', async () => {
+    const h = harness();
+    await withDelivery(h);
+    await h.call('POST', '/api/v1/freight-quotes/options/1/book', { shipmentId: 51 });
+    await h.call('POST', `/api/v1/freight-quotes/options/3/book${ALL}`, { shipmentId: 51 });
+    const old = await h.call('GET', '/api/v1/shipments/51/forwarder-charges');
+    assert.equal(old.body.booking.id, 1);
+    assert.equal(old.body.booking.option.price, 1850);
+    assert.equal('deliveryBooking' in old.body, false);
+    const now = await h.call('GET', `/api/v1/shipments/51/forwarder-charges${ALL}`);
+    assert.equal(now.body.booking.id, 1, 'the freight booking, never the newer delivery one');
+    assert.deepEqual([now.body.deliveryBooking.id, now.body.deliveryBooking.forwarderName, now.body.deliveryBooking.option.price, now.body.deliveryBooking.option.currency], [2, 'Savino', 650, 'GBP']);
+    // A container with a delivery booking alone has no freight booking to price.
+    const g = harness();
+    await withDelivery(g);
+    await g.call('POST', `/api/v1/freight-quotes/options/3/book${ALL}`, { shipmentId: 51 });
+    assert.deepEqual((await g.call('GET', '/api/v1/shipments/51/forwarder-charges')).body, { booking: null, movements: [] });
+    const alone = (await g.call('GET', `/api/v1/shipments/51/forwarder-charges${ALL}`)).body;
+    assert.deepEqual([alone.booking, alone.movements, alone.deliveryBooking.id], [null, [], 1]);
+});
+
+test('a request never changes kind: no statement that updates a request names it', () => {
+    const source = require('fs').readFileSync(require('path').join(__dirname, '..', 'src', 'services', 'freight-quote-routes.js'), 'utf8');
+    const updates = source.match(/UPDATE freight_quote_requests[\s\S]*?(?:`|'\s*[,)])/g) || [];
+    assert.ok(updates.length >= 8, `found ${updates.length} updates`);
+    for (const u of updates) assert.doesNotMatch(u, /\bkind\b/, u.slice(0, 120));
 });

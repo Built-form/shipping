@@ -179,10 +179,16 @@ async function contactsOf(conn, forwarderId) {
 }
 
 // The live bookings of a shipment row as getShipment returns it (at most one
-// until a container can hold one per leg), read as dutiesOf reads rows.
-const bookingsOfRow = row => (row && row.bk_id != null && Number(row.bk_count) > 0
-    ? [{ id: row.bk_id, status: row.bk_status, scope: row.bk_scope, booking_ref: row.bk_ref, forwarder_id: row.bk_forwarder_id }]
-    : []);
+// that covers the freight, and one for the delivery alone), read as dutiesOf
+// reads rows.
+const bookingsOfRow = row => [
+    ...(row && row.bk_id != null && Number(row.bk_count) > 0
+        ? [{ id: row.bk_id, status: row.bk_status, scope: row.bk_scope, booking_ref: row.bk_ref, forwarder_id: row.bk_forwarder_id }]
+        : []),
+    ...(row && row.dbk_id != null
+        ? [{ id: row.dbk_id, status: row.dbk_status, scope: 'delivery', booking_ref: row.dbk_ref, forwarder_id: row.dbk_forwarder_id }]
+        : []),
+];
 // Every forwarder a container's rows name: its three picks and its bookings' forwarders.
 const namedForwarders = (shipment, bookings) => [
     shipment && shipment.forwarder_id, shipment && shipment.delivery_forwarder_id, shipment && shipment.customs_forwarder_id,
@@ -682,7 +688,7 @@ function registerForwarderContainerRoutes(app, deps) {
             const documents = await readDocuments(conn, id, { email: req.userEmail || null, userType: req.userType });
             const noticeList = notices.map(noticeJson);
             const noProposals = { proposal: null, history: [] };
-            const noFiles = () => ({ invoice: [], loadingPhotos: [], billOfLading: [], customsDraft: [] });
+            const noFiles = () => ({ invoice: [], loadingPhotos: [], billOfLading: [], customsDraft: [], customsEntry: [] });
             const reviewOf = (d, u) => FC.toReviewCount({
                 proposals: [d.proposal].filter(Boolean).map(p => ({ waiting: p.waiting || p.status === 'applying', actionable: p.actionable })),
                 uploads: Object.values(u).flat(),

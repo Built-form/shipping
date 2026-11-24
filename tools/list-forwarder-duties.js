@@ -14,12 +14,16 @@
 //      than freight: a proposal with a field of another duty, a file of another
 //      duty's kind, or anything sent by a company that holds no freight there;
 //   4. documents kept for a container that are not bills of lading (an approved
-//      draft customs entry).
+//      draft customs entry, or a customs entry with its MRN);
+//   5. delivery requests (a quote request of kind 'delivery'), in any state;
+//   6. containers with two live bookings, one per leg.
 //
-// Shipping may go back only when 1 to 3 are empty (clear the picks, set the
-// scopes back, decide what waits). 4 is different: an older build lists every
-// kept document as a bill of lading, and approved records are never deleted to
-// make a rollback possible. Once 4 lists anything, fix forward instead.
+// Shipping may go back only when 1 to 3 and 6 are empty (clear the picks, set
+// the scopes back, decide what waits). 4 and 5 are different: an older build
+// lists every kept document as a bill of lading, and reads a delivery request
+// as a freight request (its booking would make the haulier the container's
+// forwarder); neither kind of record is deleted to make a rollback possible.
+// Once 4 or 5 lists anything, fix forward instead. 5 holds for the portal too.
 //
 // Exit code 0 when it lists nothing, 1 when it lists something, 2 on a fault.
 require('dotenv').config();
@@ -115,6 +119,30 @@ const missing = e => Boolean(e) && (e.errno === ER_NO_SUCH_TABLE || e.errno === 
         );
         section('4. Documents kept that are not bills of lading', documents.map(d => `document ${d.id} (${d.kind}, container ${d.shipment_reference || d.shipment_id}, ${d.forwarder_name || '?'}): ${d.filename}`),
             'these are never deleted for a rollback: do NOT roll shipping back below 2026-11-24, fix forward');
+
+        // 5. The delivery leg through Freight quotes. A build from before it reads a
+        // delivery request as a freight request and a delivery booking as a freight
+        // booking (the container's forwarder would become the haulier), and it no
+        // longer has a key behind "one live booking per container".
+        const [deliveries] = await conn.query(
+            `SELECT r.id, r.forwarder_name, r.revoked_at, r.created_at,
+                    (SELECT COUNT(*) FROM freight_bookings b WHERE b.request_id = r.id) AS bookings
+               FROM freight_quote_requests r
+              WHERE r.kind = 'delivery'
+              ORDER BY r.id`
+        );
+        section('5. Delivery requests (a UK haulier, port to warehouse), in any state',
+            deliveries.map(r => `request ${r.id} (${r.forwarder_name || '?'}${r.revoked_at ? ', closed' : ''}): ${Number(r.bookings)} booking(s)`),
+            'once one exists, do NOT roll shipping or the portal back below 2026-11-24: fix forward');
+        const [twice] = await conn.query(
+            `SELECT b.shipment_id, COUNT(*) AS n, GROUP_CONCAT(CONCAT(b.id, ':', b.scope) ORDER BY b.id SEPARATOR ', ') AS which
+               FROM freight_bookings b
+              WHERE b.status IN ('requested', 'confirmed') AND b.shipment_id IS NOT NULL
+              GROUP BY b.shipment_id
+             HAVING COUNT(*) > 1`
+        );
+        section('6. Containers with two live bookings (one per leg)', twice.map(t => `shipment ${t.shipment_id}: bookings ${t.which}`),
+            'an older build allows one live booking per container');
 
         console.log(listed ? `\n${listed} thing(s) listed. Shipping is NOT safe to roll back below 2026-11-24 yet.` : '\nNothing listed: an older shipping build would read this database as it did.');
         process.exitCode = listed ? 1 : 0;

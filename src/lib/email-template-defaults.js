@@ -593,6 +593,43 @@ const FREIGHT_TEMPLATES = [
 // the seed has run.
 DEFAULT_EMAIL_TEMPLATES.push(...FREIGHT_TEMPLATES);
 
+// A DELIVERY request (2026-11-24, docs/freight-quotes.md "A delivery request"): a UK
+// haulier is asked to collect a container at the UK port and deliver it to the
+// warehouse. Its own two templates, so the words are not a sailing's. Seeded by
+// 2026-11-24_13; kept out of FREIGHT_TEMPLATES, which earlier seed migrations read.
+const FREIGHT_DELIVERY_REQUEST_TEMPLATE_KEY = 'freight_delivery_request';
+const FREIGHT_DELIVERY_BOOKING_TEMPLATE_KEY = 'freight_delivery_booking';
+const FREIGHT_DELIVERY_TEMPLATES = [
+    {
+        key: FREIGHT_DELIVERY_REQUEST_TEMPLATE_KEY,
+        name: 'UK delivery quote request',
+        category: 'Freight',
+        description: 'Emailed to a UK haulier to ask for a price to collect a container at the UK port and deliver it to the warehouse. The request’s details and an "Enter your quote" button are appended automatically: the button opens a page on the supplier portal (no sign-in) where they list each collection they can offer. Tokens: {forwarder} {windowStart} {windowEnd} {origin} {destination} {containerSize} {services}.',
+        subject: 'UK delivery quote request – {containerSize} – collection {windowStart} to {windowEnd}',
+        bodyHtml: [
+            FREIGHT_GREETING,
+            '<p>Greetings,</p>',
+            '<p>We would like your price to collect one <strong>{containerSize}</strong> container from <strong>{origin}</strong> and deliver it to <strong>{destination}</strong>, collecting between <strong>{windowStart}</strong> and <strong>{windowEnd}</strong>.</p>',
+            '<p>Please use the button below to enter each option: collection date, days to deliver, where you collect, where you deliver, and price.</p>',
+            FREIGHT_SIGNOFF,
+        ].join(''),
+    },
+    {
+        key: FREIGHT_DELIVERY_BOOKING_TEMPLATE_KEY,
+        name: 'UK delivery booking request',
+        category: 'Freight',
+        description: 'Emailed to a UK haulier to ask them to book the collection and delivery they quoted. Its details and a "Confirm the booking" button are appended automatically: the button opens the same page on the supplier portal, where they confirm with their job or booking reference, or decline. Tokens: {forwarder} {sailingDate} (the collection date) {portFrom} {portTo} {service} {containerSize} {price}.',
+        subject: 'Delivery booking request – {containerSize} – collection {sailingDate} {portFrom} to {portTo}',
+        bodyHtml: [
+            FREIGHT_GREETING,
+            '<p>Greetings,</p>',
+            '<p>Thank you for your quote. We would like to book the collection and delivery below. Please confirm it with your reference using the button, or decline it if you can no longer do it.</p>',
+            FREIGHT_SIGNOFF,
+        ].join(''),
+    },
+];
+DEFAULT_EMAIL_TEMPLATES.push(...FREIGHT_DELIVERY_TEMPLATES);
+
 // The container email (src/services/forwarder-container-routes.js,
 // docs/forwarder-containers.md; seeded by
 // 2026-11-23_13_seed_forwarder_container_template.js), category 'Freight' so
@@ -656,6 +693,7 @@ module.exports = {
     FORWARDER_PAYMENT_TEMPLATE_KEY, FORWARDER_PAYMENT_TEMPLATE,
     FREIGHT_TEMPLATES, FREIGHT_QUOTE_REQUEST_TEMPLATE_KEY, FREIGHT_BOOKING_REQUEST_TEMPLATE_KEY,
     FREIGHT_BOOKING_CONTENTS_TEMPLATE_KEY, FREIGHT_MOVEMENT_REQUEST_TEMPLATE_KEY,
+    FREIGHT_DELIVERY_TEMPLATES, FREIGHT_DELIVERY_REQUEST_TEMPLATE_KEY, FREIGHT_DELIVERY_BOOKING_TEMPLATE_KEY,
     FREIGHT_CONTAINER_TEMPLATE_KEY, FREIGHT_CONTAINER_TEMPLATE,
     DEFAULT_EMAIL_TEMPLATES, SUPPLIER_PI_TEMPLATE_KEYS, QC_VISIT_TEMPLATE_KEYS, PO_PORTAL_TEMPLATE_KEY,
     SIGNED_PI_TEMPLATE_KEY,

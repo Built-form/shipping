@@ -124,6 +124,11 @@ that makes its **customs** entry, each a pick of its own, by id:
   nobody (`why: "booking_not_confirmed"`); a pick taken off the list holds
   nothing (`forwarder_removed`); nothing is held on a container that is not real
   yet (`not_real`). One forwarder holding freight and delivery is "end to end".
+- `deliveryBooking: { id, status, bookingRef, forwarderId, forwarder } | null`: the
+  container's live booking for the delivery leg alone (a booking on a delivery
+  request to a UK haulier, `docs/freight-quotes.md`), beside `booking`, which stays
+  the freight booking. It outranks the delivery pick too: show the pick read-only,
+  "from UK delivery booking #N".
 - `duties` is also in the compact entry of `GET /orders`' `shipments` map. It is
   an object: compare it by what it says, not by identity, when deciding whether
   an entry changed between polls.

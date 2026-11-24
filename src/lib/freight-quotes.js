@@ -14,6 +14,14 @@ const crypto = require('crypto');
 const { FONT, INK, MUTED, BORDER, CODE_BG, escapeHtml, button, linkFallback, small, facts } = require('./email-layout');
 const { parseRecipients, normalizeEmail } = require('./po-portal-email');
 const { requestLinesSnapshot, parseRequestLines, requestDrift } = require('./request-to-send-drift');
+const { kindGiven } = require('./forwarder-containers');
+
+// A request is for freight, or (2026-11-24) for DELIVERY: a UK haulier quotes
+// collection at the UK port and delivery to the warehouse. Same tables, read by
+// the request's kind (src/lib/forwarder-containers.js REQUEST_KINDS):
+//   sailing_date  the collection day        loading_date  the same day (not asked)
+//   transit_days  days to deliver, from 0   port_from / port_to  collect from / deliver to
+const isDelivery = thing => Boolean(thing) && thing.kind === 'delivery';
 
 /** 48 lower-case hex characters: unguessable, and the link's whole permission. */
 const TOKEN_RE = /^[a-f0-9]{48}$/;
@@ -382,6 +390,9 @@ function validateRequest(body, today) {
         batchId = body.batchId.toLowerCase();
     }
 
+    const kind = kindGiven(body.kind);
+    if (kind.error) return bad('kind', kind.error);
+
     const { windowStart, windowEnd } = body;
     if (!isYmd(windowStart)) return bad('windowStart', 'windowStart must be a date (YYYY-MM-DD).');
     if (!isYmd(windowEnd)) return bad('windowEnd', 'windowEnd must be a date (YYYY-MM-DD).');
@@ -416,8 +427,11 @@ function validateRequest(body, today) {
 
     return {
         value: {
+            kind: kind.kind,
             forwarderIds, batchId, windowStart, windowEnd,
-            origin: origin.value || 'China', destination: destination.value || 'UK',
+            // Left blank: where a sailing starts and ends, or where a haulier collects and delivers.
+            origin: origin.value || (kind.kind === 'delivery' ? 'UK port' : 'China'),
+            destination: destination.value || (kind.kind === 'delivery' ? 'Our UK warehouse' : 'UK'),
             containerSize, services: services.value, stockMovements: stockMovements.value,
             note: note.value, expiryDays,
         },
@@ -488,17 +502,31 @@ function validateOptions(raw, request) {
         const at = name => `options[${i}].${name}`;
         if (!o || typeof o !== 'object' || Array.isArray(o)) return bad(`options[${i}]`, 'Each option must be an object.');
 
-        if (!isYmd(o.loadingDate)) return bad(at('loadingDate'), 'The loading date must be a date (YYYY-MM-DD).');
-        if (!isYmd(o.sailingDate)) return bad(at('sailingDate'), 'The sailing date must be a date (YYYY-MM-DD).');
-        if (o.loadingDate > o.sailingDate) return bad(at('loadingDate'), 'The loading date must be on or before the sailing date.');
-        if (o.sailingDate < earliest || o.sailingDate > latest) {
-            return bad(at('sailingDate'), `The sailing date must be between ${earliest} and ${latest}.`);
+        // A delivery option has a collection day and no loading date of its own: the
+        // loading date kept with it is that day. It may be delivered the day it is collected.
+        const delivery = isDelivery(request);
+        const loadingDate = delivery ? o.sailingDate : o.loadingDate;
+        if (delivery) {
+            if (!isYmd(o.sailingDate)) return bad(at('sailingDate'), 'The collection date must be a date (YYYY-MM-DD).');
+            if (o.sailingDate < earliest || o.sailingDate > latest) {
+                return bad(at('sailingDate'), `The collection date must be between ${earliest} and ${latest}.`);
+            }
+        } else {
+            if (!isYmd(o.loadingDate)) return bad(at('loadingDate'), 'The loading date must be a date (YYYY-MM-DD).');
+            if (!isYmd(o.sailingDate)) return bad(at('sailingDate'), 'The sailing date must be a date (YYYY-MM-DD).');
+            if (o.loadingDate > o.sailingDate) return bad(at('loadingDate'), 'The loading date must be on or before the sailing date.');
+            if (o.sailingDate < earliest || o.sailingDate > latest) {
+                return bad(at('sailingDate'), `The sailing date must be between ${earliest} and ${latest}.`);
+            }
         }
 
         const transitDays = Number(o.transitDays);
-        if (typeof o.transitDays === 'boolean' || o.transitDays === null || o.transitDays === ''
-            || !Number.isInteger(transitDays) || transitDays < 1 || transitDays > TRANSIT_MAX_DAYS) {
-            return bad(at('transitDays'), `The transit time must be a whole number of days from 1 to ${TRANSIT_MAX_DAYS}.`);
+        const fewest = delivery ? 0 : 1;
+        if (typeof o.transitDays === 'boolean' || o.transitDays === null || o.transitDays === '' || o.transitDays === undefined
+            || !Number.isInteger(transitDays) || transitDays < fewest || transitDays > TRANSIT_MAX_DAYS) {
+            return bad(at('transitDays'), delivery
+                ? `The days to deliver must be a whole number from 0 to ${TRANSIT_MAX_DAYS}.`
+                : `The transit time must be a whole number of days from 1 to ${TRANSIT_MAX_DAYS}.`);
         }
 
         const portFrom = requiredLine(o.portFrom, at('portFrom'), PORT_MAX);
@@ -531,7 +559,7 @@ function validateOptions(raw, request) {
         if (note.code) return note;
 
         options.push({
-            loadingDate: o.loadingDate, sailingDate: o.sailingDate, transitDays,
+            loadingDate, sailingDate: o.sailingDate, transitDays,
             portFrom: portFrom.value, portTo: portTo.value, service: o.service, containerSize,
             price: Number(priceText).toFixed(2), currency: o.currency,
             carrier: carrier.value, validUntil, note: note.value,
@@ -583,10 +611,11 @@ const foot = html => `<p style="margin:0 0 10px;font-family:${FONT};font-size:12
 
 /** What a request asks for, as the two-column list both link emails carry. */
 function requestFacts(request) {
+    const delivery = isDelivery(request);
     const rows = [
-        ['Sailing between / 开船日期', `${escapeHtml(request.windowStart)} – ${escapeHtml(request.windowEnd)}`],
-        ['From / 起运地', escapeHtml(request.origin || '')],
-        ['To / 目的地', escapeHtml(request.destination || '')],
+        [delivery ? 'Collection between / 提货日期' : 'Sailing between / 开船日期', `${escapeHtml(request.windowStart)} – ${escapeHtml(request.windowEnd)}`],
+        [delivery ? 'Collect from / 提货地点' : 'From / 起运地', escapeHtml(request.origin || '')],
+        [delivery ? 'Deliver to / 送货地点' : 'To / 目的地', escapeHtml(request.destination || '')],
         ['Container / 柜型', escapeHtml(request.containerSize)],
         ['Delivery / 交货方式', (request.services || []).map(s => escapeHtml(serviceLabel(s))).join('<br>')],
     ];
@@ -655,15 +684,22 @@ function quoteBlockHtml({ request, url, expiresOn, registerUrl }) {
     const reg = escapeHtml(registerUrl || '');
     const regLink = reg ? `<a href="${reg}" style="color:#1f5fbf;word-break:break-all;">${reg}</a>` : '';
     const until = escapeHtml(expiresOn || '');
+    const delivery = isDelivery(request);
     return [
         boxOpen,
-        lead('<strong>Freight quote request</strong> / <strong>海运报价请求</strong>'),
+        lead(delivery
+            ? '<strong>UK delivery quote request</strong> / <strong>英国境内送货报价请求</strong>'
+            : '<strong>Freight quote request</strong> / <strong>海运报价请求</strong>'),
         requestFacts(request),
         movementsHtml(request.stockMovements),
         button(url, 'Enter your quote / 填写报价'),
         linkFallback(url),
-        small('Open the page and add one line per sailing you can offer: loading date, sailing date, transit time, ports, service and price. No sign-in is needed. You can come back and change your answer until we book.'),
-        small('打开页面后，请为每个可提供的船期添加一行：装柜日期、开船日期、航程天数、港口、服务方式和价格。无需登录。在我们订舱之前，您可以随时回来修改。'),
+        small(delivery
+            ? 'Open the page and add one line per collection you can offer: collection date, days to deliver, where you collect, where you deliver, and price. No sign-in is needed. You can come back and change your answer until we book.'
+            : 'Open the page and add one line per sailing you can offer: loading date, sailing date, transit time, ports, service and price. No sign-in is needed. You can come back and change your answer until we book.'),
+        small(delivery
+            ? '打开页面后，请为每个可提供的提货安排添加一行：提货日期、送达所需天数、提货地点、送货地点和价格。无需登录。在我们预订之前，您可以随时回来修改。'
+            : '打开页面后，请为每个可提供的船期添加一行：装柜日期、开船日期、航程天数、港口、服务方式和价格。无需登录。在我们订舱之前，您可以随时回来修改。'),
         (request.stockMovements || []).length
             ? small('Please also enter a price for each stock movement on the same page. Those prices are separate from the price of the sailing. / 请在同一页面为每一项提货安排单独报价，该价格不含在船期价格内。')
             : '',
@@ -673,9 +709,22 @@ function quoteBlockHtml({ request, url, expiresOn, registerUrl }) {
     ].join('');
 }
 
-/** One option as a two-column list: [[label, valueHtml], …]. */
-function optionFacts(option) {
+/** One option as a two-column list: [[label, valueHtml], …]. `kind`: its request's (a delivery option has other words). */
+function optionFacts(option, kind) {
     const arrives = arrivalDate(option.sailingDate, option.transitDays);
+    if (kind === 'delivery') {
+        const rows = [
+            ['Collection / 提货日期', escapeHtml(option.sailingDate)],
+            ['Delivered / 送达日期', escapeHtml(arrives || '')],
+            ['Collect from / 提货地点', escapeHtml(option.portFrom)],
+            ['Deliver to / 送货地点', escapeHtml(option.portTo)],
+            ['Service / 服务', escapeHtml(serviceLabel(option.service))],
+            ['Container / 柜型', escapeHtml(option.containerSize)],
+            ['Price / 价格', `<strong>${escapeHtml(money(option.price, option.currency))}</strong>`],
+        ];
+        if (option.carrier) rows.push(['Haulier / 承运车队', escapeHtml(option.carrier)]);
+        return rows;
+    }
     const rows = [
         ['Loading / 装柜日期', escapeHtml(option.loadingDate)],
         ['Sailing / 开船日期', escapeHtml(option.sailingDate)],
@@ -690,16 +739,24 @@ function optionFacts(option) {
     return rows;
 }
 
-/** The fixed block under the booking request's body: the sailing, the note, the button. */
-function bookingBlockHtml({ option, url, note }) {
+/** The fixed block under the booking request's body: the sailing (or, for a delivery request, the collection), the note, the button. */
+function bookingBlockHtml({ option, url, note, kind }) {
+    const delivery = kind === 'delivery';
+    const rows = optionFacts(option, kind);
     return [
         boxOpen,
-        lead('<strong>Please book this sailing</strong> / <strong>请预订此船期</strong>'),
-        facts(note ? [...optionFacts(option), ['Note / 备注', escapeHtml(note).replace(/\r?\n/g, '<br>')]] : optionFacts(option)),
-        button(url, 'Confirm or decline the booking / 确认或拒绝订舱'),
+        lead(delivery
+            ? '<strong>Please book this delivery</strong> / <strong>请预订此次送货</strong>'
+            : '<strong>Please book this sailing</strong> / <strong>请预订此船期</strong>'),
+        facts(note ? [...rows, ['Note / 备注', escapeHtml(note).replace(/\r?\n/g, '<br>')]] : rows),
+        button(url, delivery ? 'Confirm or decline the booking / 确认或拒绝预订' : 'Confirm or decline the booking / 确认或拒绝订舱'),
         linkFallback(url),
-        small('Open the page, enter your booking reference and press Confirm; or decline if the space is no longer available. No sign-in is needed.'),
-        small('打开页面后，请填写订舱号并点击“确认”；如舱位已无法提供，请选择拒绝。无需登录。'),
+        small(delivery
+            ? 'Open the page, enter your job or booking reference and press Confirm; or decline if you can no longer do it. No sign-in is needed.'
+            : 'Open the page, enter your booking reference and press Confirm; or decline if the space is no longer available. No sign-in is needed.'),
+        small(delivery
+            ? '打开页面后，请填写您的任务号或预订号并点击“确认”；如无法安排，请选择拒绝。无需登录。'
+            : '打开页面后，请填写订舱号并点击“确认”；如舱位已无法提供，请选择拒绝。无需登录。'),
         boxClose,
     ].join('');
 }
@@ -715,7 +772,8 @@ const CONTAINER_ASK_LABELS = Object.freeze({
     invoice: 'Your invoice / 贵司发票',
     photos: 'Photos of the loading / 装柜照片',
     billOfLading: 'Bill of lading / 提单',
-    customsDraft: 'Draft customs entry, for us to check / 报关单草稿（供我方核对）',
+    customsDraft: 'Draft customs entry, for us to check, if you send one / 报关单草稿（如有，供我方核对）',
+    customsEntry: 'Customs entry, with its MRN / 报关单及其MRN号',
 });
 
 /**

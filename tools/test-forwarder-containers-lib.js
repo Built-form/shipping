@@ -255,8 +255,9 @@ test('dutiesOfFlags: the duties a row of the portal\'s view says its forwarder h
 
 test('what each duty is asked for: the fields and the kinds of file', () => {
     assert.deepEqual(FC.DUTIES, ['freight', 'delivery', 'customs']);
-    assert.deepEqual(FC.BOOKING_SCOPES, ['port_to_port', 'end_to_end']);
-    assert.deepEqual(FC.SCOPE_DUTIES, { port_to_port: ['freight'], end_to_end: ['freight', 'delivery'] });
+    // 'delivery' is a booking on a delivery request (2026-11-24): never one a freight booking can be given.
+    assert.deepEqual(FC.BOOKING_SCOPES, ['port_to_port', 'end_to_end', 'delivery']);
+    assert.deepEqual(FC.SCOPE_DUTIES, { port_to_port: ['freight'], end_to_end: ['freight', 'delivery'], delivery: ['delivery'] });
     assert.equal(FC.FIELD_DUTY.ecn, 'freight');
     assert.equal(FC.FIELD_DUTY.loadingDate, 'freight');
     assert.equal(FC.FIELD_DUTY.etd, 'freight');
@@ -414,9 +415,9 @@ test('containerAsks: each company is asked only for its own duties\' things', ()
     assert.deepEqual(FC.containerAsks(none, ['freight']), ['ecn', 'loadingDate', 'etd', 'invoice', 'photos', 'billOfLading']);
     assert.deepEqual(FC.containerAsks(none, ['delivery']), ['deliveryDate', 'invoice'], 'never the number, the loading date, photos or the bill of lading');
     assert.deepEqual(FC.containerAsks({ ...none, deliveryDate: '2026-12-20' }, ['delivery']), ['invoice'], 'a delivery date we hold is not asked for');
-    assert.deepEqual(FC.containerAsks(none, ['customs']), ['invoice', 'customsDraft']);
+    assert.deepEqual(FC.containerAsks(none, ['customs']), ['invoice', 'customsDraft', 'customsEntry']);
     assert.deepEqual(FC.containerAsks(none, ['freight', 'delivery']), ['ecn', 'loadingDate', 'etd', 'deliveryDate', 'invoice', 'photos', 'billOfLading']);
-    assert.deepEqual(FC.containerAsks(none, ['delivery', 'customs']), ['deliveryDate', 'invoice', 'customsDraft']);
+    assert.deepEqual(FC.containerAsks(none, ['delivery', 'customs']), ['deliveryDate', 'invoice', 'customsDraft', 'customsEntry']);
     assert.deepEqual(FC.containerAsks(none, []), []);
 });
 
@@ -466,7 +467,7 @@ test('containerBlockHtml: every ask the rules can make has a label', () => {
     for (const ask of FC.containerAsks({})) assert.equal(typeof F.CONTAINER_ASK_LABELS[ask], 'string', ask);
     // ... whichever duties the company holds.
     for (const ask of FC.containerAsks({}, FC.DUTIES)) assert.equal(typeof F.CONTAINER_ASK_LABELS[ask], 'string', ask);
-    assert.deepEqual(FC.containerAsks({}, FC.DUTIES), ['ecn', 'loadingDate', 'etd', 'deliveryDate', 'invoice', 'photos', 'billOfLading', 'customsDraft']);
+    assert.deepEqual(FC.containerAsks({}, FC.DUTIES), ['ecn', 'loadingDate', 'etd', 'deliveryDate', 'invoice', 'photos', 'billOfLading', 'customsDraft', 'customsEntry']);
 });
 
 test('the container email template: a Freight template of its own, in the defaults, outside the four the old seeds loop over', () => {
@@ -773,7 +774,7 @@ const upload = (over = {}) => ({
 });
 
 test('uploads: the draft customs entry is the customs duty\'s, the fourth kind, and kept with the forwarder documents', () => {
-    assert.deepEqual(FC.UPLOAD_KINDS, ['invoice', 'loading_photo', 'bill_of_lading', 'customs_draft']);
+    assert.deepEqual(FC.UPLOAD_KINDS, ['invoice', 'loading_photo', 'bill_of_lading', 'customs_draft', 'customs_entry']);
     assert.deepEqual(FC.ORIGINAL_KINDS, ['invoice', 'loading_photo', 'bill_of_lading']);
     assert.equal(FC.KIND_DUTY.customs_draft, 'customs');
     assert.deepEqual(FC.UPLOAD_RULES.customs_draft, { types: ['application/pdf', 'image/png', 'image/jpeg'], maxBytes: 15 * MB });
@@ -897,4 +898,116 @@ test('uploads: where one stands for our team', () => {
     assert.equal(FC.uploadReviewState(upload({ review_status: 'rejected' })), 'rejected');
     assert.equal(FC.uploadReviewState(upload({ upload_status: 'withdrawn' })), 'withdrawn');
     assert.equal(FC.uploadReviewState(upload({ upload_status: 'draft' })), 'not_sent');
+});
+
+// ── the customs entry itself (2026-11-24): the final one, with its MRN ────
+//
+// Beside the draft (which some forwarders never send): the entry as customs
+// took it. It carries its MRN, typed with the file. The portal keeps that in
+// the upload's note (the one text column its login may write), so for this
+// kind the note IS the MRN and nothing else.
+
+test('uploads: the customs entry is the customs duty\'s, a fifth kind, kept with the forwarder documents', () => {
+    assert.equal(FC.KIND_DUTY.customs_entry, 'customs');
+    assert.deepEqual(FC.UPLOAD_RULES.customs_entry, { types: ['application/pdf', 'image/png', 'image/jpeg'], maxBytes: 15 * MB });
+    assert.equal('customs_entry'.length <= 16, true, 'it fits the portal\'s kind column');
+    assert.equal(FC.kindAllowed('customs_entry', ['customs']), true);
+    assert.equal(FC.kindAllowed('customs_entry', ['freight', 'delivery']), false);
+    assert.match(FC.filedKeyFor({ kind: 'customs_entry', random: '3f2c9a40-1b7d-4c1e-9f51-0a2b3c4d5e6f', filename: 'entry.pdf', contentType: 'application/pdf' }), /^forwarder-documents\/3f2c9a40-1b7d-4c1e-9f51-0a2b3c4d5e6f\/entry\.pdf$/);
+    // Like the draft, it is decided only by a ShipLine that names it.
+    assert.equal(FC.clientKnowsKind('customs_entry', undefined), false);
+    assert.equal(FC.clientKnowsKind('customs_entry', 'customs_draft'), false);
+    assert.equal(FC.clientKnowsKind('customs_entry', 'customs_entry'), true);
+    // It needs no draft before it: the gate asks only who handles customs.
+    const duties = dutiesOf(ship({ forwarder_id: 4, customs_forwarder_id: 5 }));
+    const row = { id: 71, forwarder_id: 5, kind: 'customs_entry', upload_status: 'sent', review_status: 'open', final_key: 'k', note: '26GB1A2B3C4D5E6F7G' };
+    assert.equal(FC.uploadGate({ row, duties, action: 'accept' }), null);
+    assert.deepEqual(FC.uploadGate({ row: { ...row, forwarder_id: 4 }, duties, action: 'accept' }), { status: 409, code: 'NOT_THEIR_DUTY', allowedNext: ['reject'], kind: 'customs_entry' });
+});
+
+test('the MRN: 18 characters, two digits, two letters, fourteen letters or digits; read whatever the spacing or case', () => {
+    assert.equal(FC.normMrn(' 26gb 1a2b3c4d-5e6f7g '), '26GB1A2B3C4D5E6F7G');
+    assert.equal(FC.mrnProblem('26GB1A2B3C4D5E6F7G'), null);
+    assert.equal(FC.mrnProblem('26gb1a2b3c4d5e6f7g'), null);
+    assert.equal(FC.mrnProblem('26 GB 1A2B3C4D5E6F7G'), null);
+    for (const none of ['', '   ', null, undefined]) assert.equal(FC.mrnProblem(none), 'missing', String(none));
+    for (const bad of ['26GB1A2B3C4D5E6F7', '26GB1A2B3C4D5E6F7G8', 'GB261A2B3C4D5E6F7G', '2GB01A2B3C4D5E6F7G', '26G11A2B3C4D5E6F7G', '26GB1A2B3C4D5E6F7_', 'see the file']) {
+        assert.equal(FC.mrnProblem(bad), 'shape', bad);
+    }
+});
+
+test('the reference a file carries: the MRN of a customs entry, from its note; no other kind has one', () => {
+    assert.deepEqual(FC.uploadReference({ kind: 'customs_entry', note: ' 26gb1a2b3c4d5e6f7g ' }), { reference: '26GB1A2B3C4D5E6F7G' });
+    assert.deepEqual(FC.uploadReference({ kind: 'customs_entry', note: null }), { problem: 'missing' });
+    assert.deepEqual(FC.uploadReference({ kind: 'customs_entry', note: 'attached' }), { problem: 'shape' });
+    // A note on any other kind is a note.
+    for (const kind of ['invoice', 'loading_photo', 'bill_of_lading', 'customs_draft']) assert.equal(FC.uploadReference({ kind, note: '26GB1A2B3C4D5E6F7G' }), null, kind);
+});
+
+// ── the delivery leg through Freight quotes (2026-11-24) ─────────────────
+//
+// A quote request has a kind: freight, or delivery (a UK haulier, port to
+// warehouse). A booking's scope follows its request's kind, so a container can
+// hold two live bookings, one per leg: a freight one and a delivery one.
+
+test('a booking\'s scope follows its request\'s kind: a delivery request books the delivery alone', () => {
+    assert.deepEqual(FC.BOOKING_SCOPES, ['port_to_port', 'end_to_end', 'delivery']);
+    assert.deepEqual(FC.SCOPE_DUTIES.delivery, ['delivery']);
+    assert.deepEqual(FC.REQUEST_KINDS, ['freight', 'delivery']);
+    assert.equal(FC.DEFAULT_KIND, 'freight');
+    // A request made with no kind is a freight request, as every request was.
+    assert.deepEqual(FC.kindGiven(undefined), { kind: 'freight' });
+    assert.deepEqual(FC.kindGiven('freight'), { kind: 'freight' });
+    assert.deepEqual(FC.kindGiven('delivery'), { kind: 'delivery' });
+    for (const bad of [null, '', 'air', 7, 'Delivery']) assert.match(FC.kindGiven(bad).error, /kind must be one of: freight, delivery/, String(bad));
+    // Freight: port to port unless told end to end. Never delivery.
+    assert.deepEqual(FC.scopeFor('freight', undefined), { scope: 'port_to_port' });
+    assert.deepEqual(FC.scopeFor('freight', 'port_to_port'), { scope: 'port_to_port' });
+    assert.deepEqual(FC.scopeFor('freight', 'end_to_end'), { scope: 'end_to_end' });
+    assert.match(FC.scopeFor('freight', 'delivery').error, /scope must be one of: port_to_port, end_to_end/);
+    assert.match(FC.scopeFor('freight', null).error, /scope must be one of/);
+    // Delivery: always delivery; a body that names a freight scope is refused, not obeyed.
+    assert.deepEqual(FC.scopeFor('delivery', undefined), { scope: 'delivery' });
+    assert.deepEqual(FC.scopeFor('delivery', 'delivery'), { scope: 'delivery' });
+    for (const freight of ['port_to_port', 'end_to_end']) assert.match(FC.scopeFor('delivery', freight).error, /a delivery request books delivery only/, freight);
+    // A request row from before kinds has none: freight.
+    assert.deepEqual(FC.scopeFor(undefined, undefined), { scope: 'port_to_port' });
+    assert.deepEqual(FC.scopeFor(null, 'end_to_end'), { scope: 'end_to_end' });
+});
+
+test('two bookings can share a container only when they cover different legs', () => {
+    assert.equal(FC.scopesOverlap('port_to_port', 'delivery'), false);
+    assert.equal(FC.scopesOverlap('delivery', 'port_to_port'), false);
+    assert.equal(FC.scopesOverlap('end_to_end', 'delivery'), true, 'end to end already covers the delivery');
+    assert.equal(FC.scopesOverlap('port_to_port', 'end_to_end'), true);
+    assert.equal(FC.scopesOverlap('port_to_port', 'port_to_port'), true);
+    assert.equal(FC.scopesOverlap('delivery', 'delivery'), true);
+    // A booking row from before scopes is port to port.
+    assert.equal(FC.scopesOverlap(undefined, 'port_to_port'), true);
+    assert.equal(FC.scopesOverlap(null, 'delivery'), false);
+});
+
+test('dutiesOf: a freight booking and a delivery booking on one container each give their forwarder their own leg', () => {
+    const s = ship({ forwarder_id: 3, delivery_forwarder_id: 3, customs_forwarder_id: 5 });
+    const freight = bk({ id: 41, forwarder_id: 4 });
+    const delivery = bk({ id: 55, scope: 'delivery', forwarder_id: 6 });
+    assert.deepEqual(dutiesOf(s, [freight, delivery]), {
+        freight: { forwarderId: 4, source: 'booking', bookingId: 41 },
+        delivery: { forwarderId: 6, source: 'booking', bookingId: 55 },
+        customs: { forwarderId: 5, source: 'container' },
+    });
+    // Whatever order they come in.
+    assert.deepEqual(dutiesOf(s, [delivery, freight]).delivery, { forwarderId: 6, source: 'booking', bookingId: 55 });
+    // A delivery booking still requested leaves the DELIVERY with nobody (its pick included); the freight is not its to hold up.
+    const waiting = dutiesOf(s, [freight, { ...delivery, status: 'requested' }]);
+    assert.deepEqual(waiting.delivery, nobody('booking_not_confirmed'));
+    assert.deepEqual(waiting.freight, { forwarderId: 4, source: 'booking', bookingId: 41 });
+    // A delivery booking alone: the freight is the pick's.
+    assert.deepEqual(dutiesOf(s, [delivery]).freight, { forwarderId: 3, source: 'container' });
+    // Cancelled, it is no booking: the delivery pick again.
+    assert.deepEqual(dutiesOf(s, [freight, { ...delivery, status: 'cancelled' }]).delivery, { forwarderId: 3, source: 'container' });
+    // Its forwarder, attached for delivery alone, has a 'duty' row: never one an older portal build writes for.
+    const d = dutiesOf(s, [freight, delivery]);
+    assert.equal(FC.linkSourceOf(d, 6), 'duty');
+    assert.equal(FC.linkSourceOf(d, 4), 'booking');
 });

@@ -10,8 +10,11 @@
 --
 --   freight    the live booking that covers freight (scope port_to_port or
 --              end_to_end), else shipments.forwarder_id
---   delivery   the live booking that covers delivery (scope end_to_end), else
---              shipments.delivery_forwarder_id
+--   delivery   the live booking that covers delivery (scope end_to_end, or
+--              delivery: a booking for the UK leg alone, on a delivery request),
+--              else shipments.delivery_forwarder_id. At most one such booking
+--              per container (uq_freight_bookings_live_delivery), as at most one
+--              covers the freight (uq_freight_bookings_live_freight)
 --   customs    shipments.customs_forwarder_id (picked by hand only)
 --   For each: a covering booking must be CONFIRMED (one still requested leaves
 --   THAT duty with nobody, the pick included), the holder must be on the list
@@ -85,7 +88,7 @@ SELECT
   bk.id
 FROM shipments s
 LEFT JOIN freight_bookings bk ON bk.shipment_id = s.id AND bk.status IN ('requested', 'confirmed')
-                             AND bk.scope = 'end_to_end'
+                             AND bk.scope IN ('end_to_end', 'delivery')
 LEFT JOIN freight_quote_requests fr ON fr.id = bk.request_id
 JOIN forwarders f ON f.id = IF(bk.id IS NULL, s.delivery_forwarder_id, fr.forwarder_id) AND f.deleted_at IS NULL
 WHERE s.deleted_at IS NULL AND s.merged_into_id IS NULL

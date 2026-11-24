@@ -490,8 +490,12 @@ test('mergeShipments: the loser releases its keys before the survivor takes the 
 // freight booking follows its container into the survivor — unless the
 // survivor holds one already (one live booking per container; then it stays
 // on the merged loser, which tools/verify-shipments.js reports).
-function mergeConn(rows, { survivorBooked = 0 } = {}) {
+// `live`: the live freight bookings on each shipment, by shipment id: [{ id, scope }].
+function mergeConn(rows, { survivorBooked = 0, live = null, moveFails = null } = {}) {
+    const onShipment = live || { 5: Array.from({ length: survivorBooked }, (_, i) => ({ id: 100 + i, scope: 'port_to_port' })), 9: [{ id: 41, scope: 'port_to_port' }] };
     return fakeConn((sql, params) => {
+        if (sql.includes("SELECT id, scope FROM freight_bookings WHERE shipment_id = ? AND status IN ('requested', 'confirmed')")) return [onShipment[params[0]] || []];
+        if (moveFails && sql.startsWith('UPDATE freight_bookings SET shipment_id = ? WHERE id = ?')) throw moveFails;
         if (sql.includes('FROM shipments WHERE id = ? FOR UPDATE')) return [[rows[params[0]]]];
         if (sql.includes('FROM orders WHERE shipment_id = ? ORDER BY id FOR UPDATE')) return [[]];
         if (sql.includes('FOR SHARE')) return [[]];
@@ -526,11 +530,11 @@ test('mergeShipments: a live freight booking follows its container into a surviv
     };
     const free = mergeConn(rows, { survivorBooked: 0 });
     await sync.mergeShipments(free, 5, 9);
-    assert.deepEqual(has(free.calls, "UPDATE freight_bookings SET shipment_id = ? WHERE shipment_id = ? AND status IN ('requested', 'confirmed')").map(c => c.params), [[5, 9]]);
+    assert.deepEqual(has(free.calls, 'UPDATE freight_bookings SET shipment_id = ? WHERE id = ?').map(c => c.params), [[5, 41]]);
     assert.deepEqual(has(free.calls, "UPDATE freight_bookings SET shipment_id = ? WHERE shipment_id = ? AND status NOT IN ('requested', 'confirmed')").map(c => c.params), [[5, 9]]);
     const held = mergeConn(rows, { survivorBooked: 1 });
     await sync.mergeShipments(held, 5, 9);
-    assert.equal(has(held.calls, "AND status IN ('requested', 'confirmed')").filter(c => c.sql.startsWith('UPDATE freight_bookings')).length, 0, 'the survivor already has one: the loser keeps its own');
+    assert.equal(has(held.calls, 'UPDATE freight_bookings SET shipment_id = ? WHERE id = ?').length, 0, 'the survivor already has one: the loser keeps its own');
     assert.equal(has(held.calls, "AND status NOT IN ('requested', 'confirmed')").length, 1, 'history follows regardless');
 });
 
@@ -657,4 +661,85 @@ test('shipmentSummary: the compact entry carries the expected loading date, whic
     assert.equal(S.shipmentSummary(S.rowToShipment({ ...base, loading_date: '2026-12-15' })).loadingDate, '2026-12-15');
     assert.equal(S.shipmentSummary(S.rowToShipment({ ...base, loading_date: null })).loadingDate, null);
     assert.equal(S.shipmentSummary(S.rowToShipment(base)).loadingDate, null);
+});
+
+// ── one live booking per LEG (2026-11-24) ─────────────────────────────────
+
+test('shipmentSelect reads the freight booking and the delivery booking apart: two bookings never blend into one', () => {
+    const sql = sync.shipmentSelect({});
+    // The booking the container shows (its forwarder, its reference) is the one that covers the freight.
+    assert.match(sql, /WHERE fb\.status IN \('requested', 'confirmed'\) AND fb\.shipment_id IS NOT NULL AND fb\.scope IN \('port_to_port', 'end_to_end'\)/);
+    // The live booking for the delivery alone is read by a join of its own.
+    assert.match(sql, /MAX\(fb\.id\) AS dbk_id, MAX\(fb\.status\) AS dbk_status, MAX\(fb\.booking_ref\) AS dbk_ref/);
+    assert.match(sql, /AND fb\.shipment_id IS NOT NULL AND fb\.scope = 'delivery'/);
+    assert.match(sql, /\) dbk ON dbk\.shipment_id = s\.id/);
+    assert.match(sql, /LEFT JOIN forwarders dbf ON dbf\.id = dbk\.dbk_forwarder_id/);
+    assert.match(sql, /dbk\.dbk_id, dbk\.dbk_status, dbk\.dbk_ref, dbk\.dbk_forwarder_id, dbk\.dbk_forwarder_name/);
+    // Read for some shipments only, both joins are narrowed to them.
+    const some = sync.shipmentSelect({ idFilter: '5,9' });
+    assert.equal((some.match(/AND fb\.shipment_id IN \(5,9\)/g) || []).length, 2);
+});
+
+test('rowToShipment: a delivery booking is told beside the freight booking, and holds the delivery duty', () => {
+    const base = {
+        id: 61, reference: '339', stage: 'BOOKED', mode: 'SEA', deleted_at: null, merged_into_id: null,
+        forwarder: null, forwarder_id: null, delivery_forwarder_id: 5, customs_forwarder_id: null,
+        pf_name: null, pf_live: null, df_name: 'Haul UK', df_live: 1, cf_name: null, cf_live: null,
+        bk_count: 1, bk_id: 41, bk_status: 'confirmed', bk_scope: 'port_to_port', bk_ref: 'BK-1', bk_forwarder_id: 3, bk_forwarder_name: 'DCG', bf_name: 'DCG Global', bf_live: 1,
+        dbk_id: 55, dbk_status: 'confirmed', dbk_ref: 'JOB-9', dbk_forwarder_id: 6, dbk_forwarder_name: 'Trucks Ltd', dbf_name: 'Trucks Limited', dbf_live: 1,
+    };
+    const s = S.rowToShipment(base);
+    assert.deepEqual([s.forwarder, s.forwarderId, s.forwarderSource, s.booking.id], ['DCG', 3, 'booking', 41], 'the container still shows its freight booking');
+    assert.deepEqual(s.deliveryBooking, { id: 55, status: 'confirmed', bookingRef: 'JOB-9', forwarderId: 6, forwarder: 'Trucks Ltd' });
+    assert.deepEqual(s.duties.freight, { forwarderId: 3, source: 'booking', bookingId: 41, name: 'DCG Global' });
+    assert.deepEqual(s.duties.delivery, { forwarderId: 6, source: 'booking', bookingId: 55, name: 'Trucks Limited' }, 'the booking outranks the delivery pick');
+    // Still requested: nobody delivers yet, the pick included.
+    assert.deepEqual(S.rowToShipment({ ...base, dbk_status: 'requested' }).duties.delivery, { forwarderId: null, why: 'booking_not_confirmed' });
+    // No delivery booking: null, and the pick holds the delivery.
+    const none = S.rowToShipment({ ...base, dbk_id: null, dbk_status: null, dbk_ref: null, dbk_forwarder_id: null, dbk_forwarder_name: null, dbf_name: null, dbf_live: null });
+    assert.equal(none.deliveryBooking, null);
+    assert.deepEqual(none.duties.delivery, { forwarderId: 5, source: 'container', name: 'Haul UK' });
+    // A row read without the joins says nothing of a delivery booking.
+    assert.equal('deliveryBooking' in S.rowToShipment({ id: 61, reference: '339', stage: 'BOOKED', mode: 'SEA' }), false);
+});
+
+test('mergeShipments: a live booking follows its container only into a leg the survivor has free', async () => {
+    const rows = {
+        5: { id: 5, stage: 'BOOKED', reference: '330', mode: 'SEA' },
+        9: { id: 9, stage: 'DRAFT', name: 'D', mode: 'SEA' },
+    };
+    const moved = conn => has(conn.calls, 'UPDATE freight_bookings SET shipment_id = ? WHERE id = ?').map(c => c.params);
+    // The survivor has a freight booking; the loser a delivery booking: it moves, they are different legs.
+    let c = mergeConn(rows, { live: { 5: [{ id: 30, scope: 'port_to_port' }], 9: [{ id: 41, scope: 'delivery' }] } });
+    await sync.mergeShipments(c, 5, 9);
+    assert.deepEqual(moved(c), [[5, 41]]);
+    // The survivor's booking is end to end: it already covers the delivery, so the loser keeps its delivery booking.
+    c = mergeConn(rows, { live: { 5: [{ id: 30, scope: 'end_to_end' }], 9: [{ id: 41, scope: 'delivery' }] } });
+    await sync.mergeShipments(c, 5, 9);
+    assert.deepEqual(moved(c), []);
+    // The loser has both legs, the survivor a delivery booking: only the freight booking moves.
+    c = mergeConn(rows, { live: { 5: [{ id: 30, scope: 'delivery' }], 9: [{ id: 41, scope: 'port_to_port' }, { id: 42, scope: 'delivery' }] } });
+    await sync.mergeShipments(c, 5, 9);
+    assert.deepEqual(moved(c), [[5, 41]]);
+    // The loser has both, the survivor none: both move.
+    c = mergeConn(rows, { live: { 5: [], 9: [{ id: 41, scope: 'port_to_port' }, { id: 42, scope: 'delivery' }] } });
+    await sync.mergeShipments(c, 5, 9);
+    assert.deepEqual(moved(c), [[5, 41], [5, 42]]);
+    // Two bookings of the loser that overlap each other never both move (a state the keys forbid, met defensively).
+    c = mergeConn(rows, { live: { 5: [], 9: [{ id: 41, scope: 'end_to_end' }, { id: 42, scope: 'delivery' }] } });
+    await sync.mergeShipments(c, 5, 9);
+    assert.deepEqual(moved(c), [[5, 41]]);
+});
+
+test('mergeShipments: a booking attached to the survivor at the same moment fails the whole merge, to be tried again', async () => {
+    const rows = {
+        5: { id: 5, stage: 'BOOKED', reference: '330', mode: 'SEA' },
+        9: { id: 9, stage: 'DRAFT', name: 'D', mode: 'SEA' },
+    };
+    const dup = Object.assign(new Error("Duplicate entry '5' for key 'freight_bookings.uq_freight_bookings_live_delivery'"), { errno: 1062, code: 'ER_DUP_ENTRY' });
+    const c = mergeConn(rows, { live: { 5: [], 9: [{ id: 41, scope: 'delivery' }] }, moveFails: dup });
+    await assert.rejects(sync.mergeShipments(c, 5, 9), e => e instanceof S.ShipmentError && e.status === 409 && e.code === 'RETRY');
+    // Any other failure is not dressed up as one.
+    const other = mergeConn(rows, { live: { 5: [], 9: [{ id: 41, scope: 'delivery' }] }, moveFails: Object.assign(new Error('gone away'), { errno: 2006 }) });
+    await assert.rejects(sync.mergeShipments(other, 5, 9), /gone away/);
 });

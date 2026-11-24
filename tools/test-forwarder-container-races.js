@@ -726,6 +726,76 @@ const check = (name, ok, detail = '') => {
         const back9 = await outcome(R.rejectDetails(conn, { id: q9, note: 'Race test: before it leaves', fields: ['deliveryDate'], actor }, { recordAudit }));
         check('and it is sent back by a page that names the delivery date', Boolean(back9.result) && (await rowOf(q9)).status === 'rejected', codeOf(back9));
 
+        // ── one live booking per LEG (the delivery leg through Freight quotes) ──
+        // The keys themselves, on two connections: uq_freight_bookings_live_freight and
+        // uq_freight_bookings_live_delivery are what settle two attaches at once.
+        console.log('\nOne live booking per leg: the two keys, on two connections');
+        const dupKey = o => (o.error && o.error.errno === 1062 ? (/uq_freight_bookings_live_(freight|delivery)/.exec(o.error.message) || [])[0] || 'another key' : null);
+        const leg = await shipment();
+        await booking(leg, C, 'confirmed');
+        const hauls1 = await booking(null, G, 'requested', { scope: 'delivery' });
+        const hauls2 = await booking(null, H, 'requested', { scope: 'delivery' });
+        // Both attach at once: the first holds its row until it commits, the second waits on the key and is then refused.
+        await other.query('START TRANSACTION');
+        await other.query('UPDATE freight_bookings SET shipment_id = ? WHERE id = ?', [leg, hauls1]);
+        let secondSettled = false;
+        const second = outcome(conn.query('UPDATE freight_bookings SET shipment_id = ? WHERE id = ?', [leg, hauls2])).finally(() => { secondSettled = true; });
+        await wait(1200);
+        const secondWaited = !secondSettled;
+        await other.query('COMMIT');
+        const secondOut = await second;
+        check('two delivery bookings attached to one container at once: the second WAITS for the first', secondWaited);
+        check('and is then refused by the delivery key: exactly one of them is on the container', dupKey(secondOut) === 'uq_freight_bookings_live_delivery'
+            && (await q('SELECT COUNT(*) AS n FROM freight_bookings WHERE shipment_id = ? AND scope = \'delivery\' AND status IN (\'requested\', \'confirmed\')', [leg]))[0].n === 1, `${dupKey(secondOut)} ${codeOf(secondOut)}`);
+        const grow = await outcome(conn.query('UPDATE freight_bookings SET scope = \'end_to_end\' WHERE shipment_id = ? AND scope = \'port_to_port\'', [leg]));
+        check('the freight booking cannot grow to end to end beside it: the same key', dupKey(grow) === 'uq_freight_bookings_live_delivery', `${dupKey(grow)} ${codeOf(grow)}`);
+        const twoFreight = await booking(null, D, 'requested');
+        const again2 = await outcome(conn.query('UPDATE freight_bookings SET shipment_id = ? WHERE id = ?', [leg, twoFreight]));
+        check('and a second freight booking is refused by the freight key, as one live booking per container was before', dupKey(again2) === 'uq_freight_bookings_live_freight', `${dupKey(again2)} ${codeOf(again2)}`);
+        await q('UPDATE freight_bookings SET status = \'cancelled\' WHERE id = ?', [hauls1]);
+        const freed = await outcome(conn.query('UPDATE freight_bookings SET scope = \'end_to_end\' WHERE shipment_id = ? AND scope = \'port_to_port\'', [leg]));
+        check('once the delivery booking is cancelled, the freight booking can cover the delivery too', !freed.error, codeOf(freed));
+
+        // A delivery date of the delivery booking's forwarder, against that booking being cancelled.
+        const legD = await shipment({ forwarder_id: C, forwarder: `${TAG} C` });
+        const haulsD = await booking(legD, G, 'confirmed', { scope: 'delivery' });
+        check('a confirmed delivery booking: its forwarder writes the delivery date', await portalWrite({ email: emailG, shipmentId: legD, forwarderId: G, requested: DELIVERY }) === 1);
+        r = await portalWriteDuring({
+            shipmentId: legD, email: emailG, forwarderId: G, requested: DELIVERY,
+            change: () => other.query('UPDATE freight_bookings SET status = \'cancelled\' WHERE id = ?', [haulsD]), release: 'COMMIT',
+        });
+        check('that booking being cancelled: a delivery date WAITS, then writes nothing', r.waited && r.rows === 0, JSON.stringify(r));
+        const legE = await shipment({ forwarder_id: C, forwarder: `${TAG} C` });
+        const haulsE = await booking(legE, G, 'confirmed', { scope: 'delivery' });
+        await order(legE, { estimated_departure_date: '2026-12-20' });
+        const qE = await propose(legE, DELIVERY, G);
+        r = await decideDuring({
+            decide: async () => claim(qE, await heldAll(legE)),
+            change: () => other.query('UPDATE freight_bookings SET status = \'cancelled\' WHERE id = ?', [haulsE]), release: 'COMMIT',
+        });
+        check('a claim of its delivery date WAITS for that cancellation, and is then refused: it delivers nothing here any more', r.waited && codeOf(r) === 'NOT_THEIR_CONTAINER', codeOf(r));
+
+        // A merge against an attach on the survivor at the same moment: never two live bookings covering one leg.
+        const survivor = await shipment();
+        const loser = await shipment({ stage: 'DRAFT', reference: null, open_key: `D:${TAG} merge` });
+        await booking(loser, G, 'requested', { scope: 'delivery' });
+        const lateBooking = await booking(null, H, 'requested', { scope: 'delivery' });
+        await other.query('START TRANSACTION');
+        await other.query('UPDATE freight_bookings SET shipment_id = ? WHERE id = ?', [survivor, lateBooking]);
+        let mergeSettled = false;
+        const merging = outcome((async () => {
+            await conn.beginTransaction();
+            try { const out = await sync.mergeShipments(conn, survivor, loser); await conn.commit(); return out; } catch (e) { await conn.rollback(); throw e; }
+        })()).finally(() => { mergeSettled = true; });
+        await wait(1500);
+        const mergeWaited = !mergeSettled;
+        await other.query('COMMIT');
+        const merged = await merging;
+        const onSurvivor = (await q('SELECT COUNT(*) AS n FROM freight_bookings WHERE shipment_id = ? AND scope = \'delivery\' AND status IN (\'requested\', \'confirmed\')', [survivor]))[0].n;
+        check('a merge that meets an attach on the survivor never leaves two live delivery bookings there', onSurvivor === 1, `live delivery bookings on the survivor: ${onSurvivor}`);
+        check('it either left the loser\'s booking where it was, or failed whole with a retryable refusal', !merged.error || (merged.error.status === 409 && merged.error.code === 'RETRY'),
+            `${mergeWaited ? 'waited' : 'did not wait'}; ${merged.error ? `${merged.error.status} ${merged.error.code || merged.error.message}` : 'went through'}`);
+
         // ── a forwarder's files: accept against a withdrawal, and two accepts at once ──
         // The accept route itself (src/services/forwarder-upload-routes.js), run on
         // these two connections, with a stand-in for both buckets: no file goes
