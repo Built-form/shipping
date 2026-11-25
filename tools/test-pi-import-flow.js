@@ -10,7 +10,7 @@
 //   PI_NOTIFY_REDIRECT_TO=<a mailbox you can read> node tools/test-pi-import-flow.js
 //
 // Needs: the TEST database in .env, AWS credentials for the test bucket,
-// GEMINI_API_KEY, FRONT_API_TOKEN + FRONT_CHANNEL_ID, a fixture login
+// GEMINI_API_KEY, SES_FROM_ARN, a fixture login
 // (tools/pi-test-helpers.js), and PI_NOTIFY_REDIRECT_TO — it refuses to run
 // without one, so no supplier is ever emailed. Check that mailbox afterwards.
 // The submission, the invoice and its rows are removed again unless --keep.

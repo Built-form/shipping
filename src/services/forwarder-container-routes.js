@@ -56,13 +56,14 @@
 
 const crypto = require('crypto');
 const FC = require('../lib/forwarder-containers');
+const CI = require('../lib/clearance-instructions');
 const F = require('../lib/freight-quotes');
 const N = require('../lib/payment-notices');
 const S = require('../lib/shipments');
 const poPortalEmail = require('../lib/po-portal-email');
 const { jportalSchema } = require('../lib/jportal');
 const { escapeHtml, wrapEmail } = require('../lib/email-layout');
-const { FREIGHT_CONTAINER_TEMPLATE_KEY } = require('../lib/email-template-defaults');
+const { FREIGHT_CONTAINER_TEMPLATE_KEY, FREIGHT_CLEARANCE_TEMPLATE_KEY } = require('../lib/email-template-defaults');
 const sync = require('./shipment-sync');
 const { readUploads, readDocuments, listUploads } = require('./forwarder-upload-routes');
 const { sendEmail: defaultSend } = require('./email-send');
@@ -77,6 +78,11 @@ const ER_LOCK_DEADLOCK = 1213;
 const ISO = "'%Y-%m-%dT%H:%i:%sZ'";
 const EMAIL_TYPE = 'freight_container_details';
 const NOTICE_TABLE = 'freight_container_notices';
+// Clearance instructions (docs/clearance-instructions.md): the sheet sent to whoever
+// handles a container's customs. One kept row per email that carried one.
+const CLEARANCE_EMAIL_TYPE = 'freight_clearance_instructions';
+const CLEARANCE_TABLE = 'shipment_clearance_instructions';
+const DUTY_TABLE = 'clearance_duty_rates';
 const NOT_MIGRATED = { error: 'The forwarder container page is not set up on this server yet: its tables have not been migrated.', code: 'NOT_MIGRATED' };
 const LIST_LIMIT = 200;
 
@@ -219,6 +225,34 @@ const whyNot = (duties, needed) => {
  *   last three are the freight duty's (the freight booking, ownerOf's answer
  *   and the freight holder's row), as before 2026-11-24.
  */
+/**
+ * Keeps the sheet an email carries, under that email's own row: written in the
+ * transaction that claims the send, so what was sent is on record before Front
+ * is called. One row per email: a key Front refused sends again over the row
+ * its first attempt kept (the sheet may have been corrected since). The version
+ * is the container's next; the caller holds the shipment row's lock.
+ */
+async function keepClearance(conn, { retry, shipmentId, forwarderId, noticeId, title, filename, csv, totalCbm, sheet, userEmail }) {
+    const rowsJson = JSON.stringify(sheet.rows);
+    if (retry) {
+        const [upd] = await conn.query(
+            `UPDATE ${CLEARANCE_TABLE} SET title = ?, filename = ?, container_cost_usd = ?, total_cbm = ?, rows_json = ?, csv = ?, created_by_email = ? WHERE notice_id = ?`,
+            [title, filename, sheet.containerCostUsd, totalCbm, rowsJson, csv, userEmail, noticeId]
+        );
+        if (upd.affectedRows) {
+            const [rows] = await conn.query(`SELECT id, version FROM ${CLEARANCE_TABLE} WHERE notice_id = ?`, [noticeId]);
+            if (rows[0]) return { id: Number(rows[0].id), version: Number(rows[0].version), filename, csv, rows: sheet.rows.length };
+        }
+    }
+    const [[{ next }]] = await conn.query(`SELECT COALESCE(MAX(version), 0) + 1 AS next FROM ${CLEARANCE_TABLE} WHERE shipment_id = ?`, [shipmentId]);
+    const [ins] = await conn.query(
+        `INSERT INTO ${CLEARANCE_TABLE} (shipment_id, forwarder_id, notice_id, version, title, filename, container_cost_usd, total_cbm, rows_json, csv, created_by_email)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [shipmentId, forwarderId, noticeId, Number(next), title, filename, sheet.containerCostUsd, totalCbm, rowsJson, csv, userEmail]
+    );
+    return { id: Number(ins.insertId), version: Number(next), filename, csv, rows: sheet.rows.length };
+}
+
 async function lockOwnership(conn, shipmentId) {
     const [ships] = await conn.query(
         `SELECT id, reference, mode, stage, deleted_at, merged_into_id, forwarder_id, forwarder, delivery_forwarder_id, customs_forwarder_id
@@ -901,8 +935,17 @@ function registerForwarderContainerRoutes(app, deps) {
         const id = Number(req.params.id);
         const { sendKey, to, subject, body, forwarderId: wanted } = req.body || {};
         if (!FC.isSendKey(sendKey)) throw new Fail(400, 'BAD_FIELD', 'sendKey must be the key the dialog made.', { field: 'sendKey' });
+        // Clearance instructions (docs/clearance-instructions.md): with `clearance`
+        // { containerCostUsd, rows } this email carries the container's sheet to
+        // whoever handles its customs, attached and kept. Checked before anything
+        // is read: it is sent only complete.
+        const sheet = req.body && req.body.clearance !== undefined && req.body.clearance !== null ? CI.check(req.body.clearance) : null;
+        if (sheet && sheet.problems.length) {
+            throw new Fail(422, 'CLEARANCE_INCOMPLETE', `The clearance instructions are not complete: ${sheet.problems.length} thing${sheet.problems.length === 1 ? '' : 's'} to fill in.`, { problems: sheet.problems, allowedNext: ['fill'] });
+        }
         // Which of the container's forwarders to email (2026-11-24). Left out: the
-        // only one it has, else the one that carries the freight.
+        // only one it has, else the one that carries the freight; for clearance
+        // instructions, the one that handles its customs.
         const wantedId = wanted === undefined || wanted === null ? null : Number(wanted);
         if (wantedId !== null && !(Number.isSafeInteger(wantedId) && wantedId > 0)) {
             throw new Fail(400, 'BAD_FIELD', 'forwarderId must be a forwarder id.', { field: 'forwarderId' });
@@ -922,7 +965,15 @@ function registerForwarderContainerRoutes(app, deps) {
                 const attached = FC.attachedOf(duties);
                 const target = wantedId !== null
                     ? attached.find(a => a.forwarderId === wantedId) || null
-                    : (attached.length === 1 ? attached[0] : attached.find(a => a.duties.includes('freight')) || null);
+                    : sheet
+                        ? attached.find(a => a.duties.includes('customs')) || null
+                        : (attached.length === 1 ? attached[0] : attached.find(a => a.duties.includes('freight')) || null);
+                if (sheet && !target && wantedId === null) {
+                    throw new Fail(409, 'NO_CUSTOMS_HOLDER', 'Nobody handles this container’s customs yet. Pick who does, then send.', { allowedNext: ['pick'] });
+                }
+                if (sheet && target && !target.duties.includes('customs')) {
+                    throw new Fail(409, 'NOT_THEIR_DUTY', 'That forwarder does not handle this container’s customs.', { kind: 'clearance', allowedNext: ['reload'] });
+                }
                 if (!target) {
                     if (wantedId !== null && attached.length) {
                         throw new Fail(409, 'NOT_VISIBLE', 'That forwarder does nothing on this container, so it has no page to link to.', { why: null });
@@ -965,8 +1016,19 @@ function registerForwarderContainerRoutes(app, deps) {
                     );
                     noticeId = Number(ins.insertId);
                 }
+                // The sheet this email carries, kept under its row before Front is called.
+                let kept = null;
+                if (sheet) {
+                    const title = CI.titleOf({ trackingRef: heldOf(row).ecn, reference: shipment.reference });
+                    kept = await keepClearance(conn, {
+                        retry: state === 'retry', shipmentId: id, forwarderId: target.forwarderId, noticeId, title, filename: CI.filenameOf(title),
+                        csv: CI.toCsv({ title, rows: sheet.rows, containerCostUsd: sheet.containerCostUsd }),
+                        totalCbm: CI.totalsOf(sheet.rows, sheet.containerCostUsd).totalCbm, sheet, userEmail: req.userEmail || null,
+                    });
+                }
                 const carriesFreight = target.duties.includes('freight');
                 return {
+                    kept,
                     noticeId, addresses, forwarderId: target.forwarderId,
                     forwarderName: (forwarder && forwarder.name) || '',
                     reference: shipment.reference || '',
@@ -981,23 +1043,29 @@ function registerForwarderContainerRoutes(app, deps) {
             await preapprove(conn, { emails: claimed.addresses, actorEmail: req.userEmail || null, note: `Forwarder container ${claimed.reference}` });
 
             const held = heldOf(row);
-            const tpl = await getEmailTemplate(conn, FREIGHT_CONTAINER_TEMPLATE_KEY);
+            const kept = claimed.kept;
+            const tpl = await getEmailTemplate(conn, kept ? FREIGHT_CLEARANCE_TEMPLATE_KEY : FREIGHT_CONTAINER_TEMPLATE_KEY);
             const vars = { forwarder: claimed.forwarderName, containerName: claimed.reference, bookingRef: claimed.bookingRef || '' };
             const finalSubject = ((typeof subject === 'string' && subject.trim())
                 ? renderTemplate(subject.trim(), vars)
-                : (renderTemplate(tpl.subject, vars) || `Container ${claimed.reference} – details needed`))
+                : (renderTemplate(tpl.subject, vars) || `Container ${claimed.reference} – ${kept ? 'clearance instructions' : 'details needed'}`))
                 .replace(/[\r\n]+/g, ' ').slice(0, 500);
             const escaped = Object.fromEntries(Object.entries(vars).map(([k, val]) => [k, escapeHtml(val)]));
             const inner = renderTemplate((typeof body === 'string' && body.trim()) ? body : tpl.bodyHtml, escaped);
             const html = wrapEmail({
                 title: finalSubject,
-                bodyHtml: inner + F.containerBlockHtml({
-                    containerName: claimed.reference, bookingRef: claimed.bookingRef, asks: FC.containerAsks(held, claimed.duties),
-                    url: FC.containerUrl(portalBase, id), registerUrl: poPortalEmail.registerUrl(portalBase),
-                }),
+                bodyHtml: inner + (kept
+                    ? F.clearanceBlockHtml({ containerName: claimed.reference, filename: kept.filename, url: FC.containerUrl(portalBase, id), registerUrl: poPortalEmail.registerUrl(portalBase) })
+                    : F.containerBlockHtml({
+                        containerName: claimed.reference, bookingRef: claimed.bookingRef, asks: FC.containerAsks(held, claimed.duties),
+                        url: FC.containerUrl(portalBase, id), registerUrl: poPortalEmail.registerUrl(portalBase),
+                    })),
             });
 
-            const sent = await sendEmail({ to: claimed.addresses, subject: finalSubject, html });
+            const sent = await sendEmail({
+                to: claimed.addresses, subject: finalSubject, html,
+                ...(kept ? { attachments: [{ bytes: Buffer.from(kept.csv, 'utf8'), filename: kept.filename, contentType: 'text/csv' }] } : {}),
+            });
             if (!sent.ok) {
                 await conn.query(`UPDATE ${NOTICE_TABLE} SET status = 'failed' WHERE id = ? AND status = 'sending'`, [claimed.noticeId]);
                 if (sent.reason === 'ses_not_configured') {
@@ -1010,9 +1078,10 @@ function registerForwarderContainerRoutes(app, deps) {
                   WHERE id = ?`,
                 [sent.messageId || null, null, JSON.stringify(claimed.addresses), finalSubject, claimed.noticeId]
             );
+            // A sheet asks the forwarder for nothing, so there is nothing for it to confirm by.
             await logSentEmail(conn, {
-                emailType: EMAIL_TYPE, sentTo: claimed.addresses, subject: finalSubject,
-                confirmVia: 'portal', sendTable: NOTICE_TABLE, sendId: claimed.noticeId,
+                emailType: kept ? CLEARANCE_EMAIL_TYPE : EMAIL_TYPE, sentTo: claimed.addresses, subject: finalSubject,
+                confirmVia: kept ? 'none' : 'portal', sendTable: NOTICE_TABLE, sendId: claimed.noticeId,
             });
             await recordAudit(conn, {
                 entityType: 'freight_container_notice', entityId: claimed.noticeId, action: 'sent',
@@ -1021,12 +1090,78 @@ function registerForwarderContainerRoutes(app, deps) {
                     shipmentId: id, reference: claimed.reference, forwarderId: claimed.forwarderId, forwarder: claimed.forwarderName,
                     to: claimed.addresses, subject: finalSubject,
                     frontMessageUid: sent.messageId || null, frontConversationId: null,
+                    ...(kept ? { clearance: { id: kept.id, version: kept.version, filename: kept.filename, rows: kept.rows } } : {}),
                 },
                 userEmail: req.userEmail,
             });
-            return { ok: true, outcome: 'sent', noticeId: claimed.noticeId };
+            if (!kept) return { ok: true, outcome: 'sent', noticeId: claimed.noticeId };
+            // What each commodity code went with, to be offered the next time: only once it has gone.
+            for (const [code, percent] of CI.dutyRatesOf(sheet.rows)) {
+                await conn.query(
+                    `INSERT INTO ${DUTY_TABLE} (commodity_code, duty_percent, updated_by_email) VALUES (?, ?, ?)
+                     ON DUPLICATE KEY UPDATE duty_percent = VALUES(duty_percent), updated_by_email = VALUES(updated_by_email)`,
+                    [code, percent, req.userEmail || null]
+                );
+            }
+            return { ok: true, outcome: 'sent', noticeId: claimed.noticeId, clearanceId: kept.id, version: kept.version };
         });
         res.json(out);
+    }));
+
+    // ── GET /api/v1/shipments/:id/clearance-instructions ────────────────────
+    // What has been sent for the container, newest first (each with its rows and
+    // its file, so it can be looked at and downloaded again), who handles its
+    // customs now, what its file will be called, and the duty each commodity code
+    // last went with. Read by any staff user; `canSend` says whether this one may send.
+    app.get('/api/v1/shipments/:id(\\d+)/clearance-instructions', route('GET /shipments/:id/clearance-instructions', async (req, res) => {
+        const id = Number(req.params.id);
+        res.json(await withConnection(async (conn) => {
+            const row = await getShipment(conn, id);
+            if (!row) throw new Fail(404, 'NO_SUCH_SHIPMENT', `Shipment ${id} not found.`);
+            const bookings = bookingsOfRow(row);
+            const forwarders = await forwardersById(conn, namedForwarders(row, bookings));
+            const customs = FC.dutiesOf({ shipment: row, bookings, forwarderLive: liveIn(forwarders) }).customs;
+            const holder = customs && customs.forwarderId != null ? forwarders.get(Number(customs.forwarderId)) : null;
+            const [sent] = await conn.query(
+                `SELECT c.id, c.forwarder_id, f.name AS forwarder_name, c.version, c.title, c.filename, c.container_cost_usd, c.total_cbm,
+                        c.rows_json, c.csv, c.created_by_email, n.status, n.sent_to, DATE_FORMAT(n.sent_at, ${ISO}) AS sent_at
+                   FROM ${CLEARANCE_TABLE} c JOIN ${NOTICE_TABLE} n ON n.id = c.notice_id LEFT JOIN forwarders f ON f.id = c.forwarder_id
+                  WHERE c.shipment_id = ? ORDER BY c.id DESC`,
+                [id]
+            );
+            const [rates] = await conn.query(`SELECT commodity_code, duty_percent FROM ${DUTY_TABLE}`);
+            const title = CI.titleOf({ trackingRef: heldOf(row).ecn, reference: row.reference });
+            return {
+                shipmentId: id, title, filename: CI.filenameOf(title), canSend: FC.mayDecide(req.userType),
+                customs: holder ? { forwarderId: Number(holder.id), name: holder.name || null } : null,
+                dutyRates: Object.fromEntries(rates.map(r => [String(r.commodity_code), Number(r.duty_percent)])),
+                sent: sent.map(s => ({
+                    id: Number(s.id), version: Number(s.version), forwarderId: Number(s.forwarder_id), forwarderName: s.forwarder_name || null,
+                    title: s.title, filename: s.filename, containerCostUsd: Number(s.container_cost_usd), totalCbm: Number(s.total_cbm),
+                    rows: jsonList(s.rows_json), csv: s.csv,
+                    // sending = Front never answered (it may or may not have gone); failed = Front refused it.
+                    status: s.status, sentAt: s.sent_at || null, sentByEmail: s.created_by_email || null, sentTo: jsonList(s.sent_to),
+                })),
+            };
+        }));
+    }));
+
+    // ── POST /api/v1/shipments/:id/clearance-instructions/preview ───────────
+    // Body { containerCostUsd, rows }. The file as it would be sent, blanks and
+    // all, with what still stops it going. Writes nothing: looking and
+    // downloading are always allowed, to any staff user.
+    app.post('/api/v1/shipments/:id(\\d+)/clearance-instructions/preview', route('POST /shipments/:id/clearance-instructions/preview', async (req, res) => {
+        const id = Number(req.params.id);
+        const sheet = CI.check(req.body);
+        res.json(await withConnection(async (conn) => {
+            const row = await getShipment(conn, id);
+            if (!row) throw new Fail(404, 'NO_SUCH_SHIPMENT', `Shipment ${id} not found.`);
+            const title = CI.titleOf({ trackingRef: heldOf(row).ecn, reference: row.reference });
+            return {
+                title, filename: CI.filenameOf(title), problems: sheet.problems,
+                csv: CI.toCsv({ title, rows: sheet.rows, containerCostUsd: sheet.containerCostUsd }),
+            };
+        }));
     }));
 }
 

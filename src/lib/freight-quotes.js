@@ -804,6 +804,25 @@ function containerBlockHtml({ containerName, bookingRef, asks, url, registerUrl 
     ].join('');
 }
 
+// Under the email that sends a container's clearance instructions
+// (docs/clearance-instructions.md): the container, the file that is attached, and the
+// button to its page on the portal, where the same file is. It asks for nothing.
+function clearanceBlockHtml({ containerName, filename, url, registerUrl }) {
+    const reg = escapeHtml(registerUrl || '');
+    const regLink = reg ? `<a href="${reg}" style="color:#1f5fbf;word-break:break-all;">${reg}</a>` : '';
+    return [
+        boxOpen,
+        lead('<strong>Clearance instructions</strong> / <strong>清关资料</strong>'),
+        facts([['Container / 集装箱', escapeHtml(containerName || '')], ['Attached / 附件', escapeHtml(filename || '')]]),
+        button(url, 'Open the container / 打开集装箱页面'),
+        linkFallback(url),
+        small('The file is attached, and can be downloaded again from the container’s page once you sign in.'),
+        small('文件已随函附上，登录后也可在集装箱页面再次下载。'),
+        regLink ? small(`No account yet? Register at ${regLink} with the email address this message was sent to. No approval is needed. / 尚无账号？请使用接收本邮件的邮箱地址在 ${regLink} 注册，无需审核。`) : '',
+        boxClose,
+    ].join('');
+}
+
 // ── a container's contents by supplier ──────────────────────────────────────
 
 const round = (n, places) => Number(Number(n || 0).toFixed(places));
@@ -938,6 +957,6 @@ module.exports = {
     bookingFinished, requestState, isEditable, validateOptions, validateStaffAnswer,
     validateBookingRef, optionalText,
     money, serviceLabel, requestFacts, movementsHtml, movementBlockHtml, quoteBlockHtml, optionFacts, bookingBlockHtml,
-    CONTAINER_ASK_LABELS, containerBlockHtml,
+    CONTAINER_ASK_LABELS, containerBlockHtml, clearanceBlockHtml,
     groupContentsBySupplier, contentsHtml, contentsSnapshot, contentsDrift,
 };
