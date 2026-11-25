@@ -97,6 +97,16 @@ const GRANTED_OUTCOMES = new Set(['invited', 'approved', 'already_active']);
 
 const { FONT, INK, MUTED, BORDER, CODE_BG, escapeHtml, button, linkFallback, small } = require('./email-layout');
 
+// `purchase_orders.kind` of a sample order (src/lib/sample-orders.js KIND_SAMPLE).
+const SAMPLE_KIND = 'sample';
+
+/**
+ * The stored template a PO's send starts from: a sample order has its own
+ * (`sample_order_portal`), every other PO `purchase_order_portal`. Both are in
+ * src/lib/email-template-defaults.js and editable in ShipLine.
+ */
+const sendTemplateKey = kind => (kind === SAMPLE_KIND ? 'sample_order_portal' : 'purchase_order_portal');
+
 /**
  * The fixed portal block under the template body: the button to the PO, and
  * how to get an account. English and Chinese, as the portal is. `preapproved`
@@ -104,10 +114,21 @@ const { FONT, INK, MUTED, BORDER, CODE_BG, escapeHtml, button, linkFallback, sma
  * email may say there is no approval to wait for; otherwise it says our team
  * will approve them.
  */
-function portalBlockHtml({ poNumber, version, poUrl, registerUrl: regUrl, preapproved }) {
+function portalBlockHtml({ poNumber, version, poUrl, registerUrl: regUrl, preapproved, kind }) {
     const po = escapeHtml(poNumber);
     const v = version != null ? ` v${escapeHtml(version)}` : '';
     const vZh = version != null ? `（第 ${escapeHtml(version)} 版）` : '';
+    // A sample order: named as one, and the one thing asked of the supplier on
+    // its page is "Mark as sent" (docs/sample-orders.md).
+    if (kind === SAMPLE_KIND) {
+        return blockHtml({
+            leadHtml: `<strong>Sample order ${po}${v}</strong> is on the supplier portal. Sign in, download the PDF from the order's page, and mark the samples as sent there once they have left.<br>样品订单 <strong>${po}</strong>${vZh}已发布在供应商门户。请登录门户，在该订单页面下载 PDF，并在样品寄出后在该页面标记为已寄出。`,
+            url: poUrl,
+            regUrl,
+            preapproved,
+            footHtml: 'No PDF is attached to this email: the sample order is kept on the portal, so you always download the current version. / 本邮件不附带 PDF：样品订单保存在门户中，您下载的始终是最新版本。',
+        });
+    }
     return blockHtml({
         leadHtml: `<strong>PO ${po}${v}</strong> is on the supplier portal. Sign in, and download the PDF from the order's page.<br>采购订单 <strong>${po}</strong>${vZh}已发布在供应商门户。请登录门户，在该订单页面下载 PDF。`,
         url: poUrl,
@@ -180,6 +201,7 @@ module.exports = {
     provisionList,
     outcomeFor,
     GRANTED_OUTCOMES,
+    sendTemplateKey,
     portalBlockHtml,
     signedPiPortalBlockHtml,
     blockHtml,

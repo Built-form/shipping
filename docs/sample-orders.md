@@ -76,6 +76,15 @@ The guard does two things to a stock line and nothing else: it cannot be put on 
 | `GET /orders`, `GET /purchase-orders` | Sample rows only with `?samples=1`. Any other caller gets stock rows and stock POs only. With the flag, the answer carries `capabilities.sampleOrders`. |
 | `POST /po-change-requests/:id/apply` | Applies a supplier's "mark as sent" (below). |
 
+## Sending it
+
+A sample order is sent like any PO: GEN PDF, then SEND (`POST /api/v1/purchase-order-documents/:id/email`, docs/po-portal-send.md). Nothing is attached; the email links to the order's page on the portal.
+
+- **What the send does.** It emails the recipients, gives each of them access to that supplier on the portal (so a new contact can register and see the order with no approval), lists the PDF on the order's Emailed PDFs tab, and commits the PO (section "Edits that change the bill").
+- **What it does not do.** It does not put the order on the portal. A sample order is listed there from the moment it is made, for the supplier's contacts who already have access, exactly as a stock PO's lines are: the portal lists by lines and access, not by the email. So a sample order made and never sent can still be seen, and marked as sent, by a supplier who is already signed up. Holding it back until the send would be a change to the portal's list rule, and it is not built.
+- **Its own words.** The send starts from template `sample_order_portal` (category `PO`, seeded by `2026-11-25_30_seed_sample_order_portal_template.js`, editable in ShipLine's templates; tokens `{poNumber}` `{version}`), not `purchase_order_portal`, which asks for a PI back and says artwork is coming. It asks the supplier to post the samples with the order number on the parcel, to choose **Mark as sent** on the order's page, and to upload an invoice there if there is one. It says nothing about the price. The appended portal block names a sample order too (`portalBlockHtml({ kind: 'sample' })`). The choice is `sendTemplateKey(kind)` in `src/lib/po-portal-email.js`; a body edited in ShipLine's send dialog overrides the template, as for any PO.
+- With no row in `email_templates` (the seed not run yet) the send uses the in-code default, so the email is right either way; the row is what lists the template in ShipLine.
+
 ## "Mark as sent" from the portal
 
 The supplier's one action on a sample order. The portal stages `requested_json = { markSent: { sentOn, courier?, tracking? } }` in its own `po_change_requests`, with `base_json = { status, jfCode, quantity, seenAt }`: what the supplier was looking at. Staff apply it in ShipLine; it moves the line from `PO_SENT` to `ON_AIR` with the date and the courier.

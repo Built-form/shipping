@@ -6976,7 +6976,9 @@ app.get('/api/v1/suppliers/:id/emails', async (req, res) => {
 // written here is also what lists the version on the portal. Otherwise still a
 // delivery primitive: doesn't touch order status, doesn't fire the legacy Make
 // webhook. Subject and body come from the stored `purchase_order_portal`
-// template (editable via /email-templates) and can be overridden per send;
+// template, or `sample_order_portal` for a sample order
+// (poPortalEmail.sendTemplateKey; both editable via /email-templates), and can
+// be overridden per send;
 // {poNumber} and {version} are filled in either way, and the fixed portal
 // block (button to the PO, how to register) is appended under the body.
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -6992,7 +6994,8 @@ app.post('/api/v1/purchase-order-documents/:id/email', async (req, res) => {
         // `subject`/`body` are optional per-send overrides. When the caller
         // supplies a body (typically the template fetched via
         // GET /email-templates, then edited in the UI), it's used as the
-        // message; otherwise the stored `purchase_order_portal` template is.
+        // message; otherwise the stored template is (`purchase_order_portal`,
+        // or `sample_order_portal` for a sample order).
         const { to, subject, body } = req.body || {};
 
         // `to` accepts either a single string or an array of strings, each
@@ -7062,7 +7065,10 @@ app.post('/api/v1/purchase-order-documents/:id/email', async (req, res) => {
                 && portalAccess.poSupplierMatched
                 && portalAccess.users.every(u => poPortalEmail.GRANTED_OUTCOMES.has(u.outcome));
 
-            const tpl = await getEmailTemplate(conn, 'purchase_order_portal');
+            // A sample order's email has its own words. loadPo reads the kind
+            // where the column exists and answers 'stock' where it does not.
+            const poKind = (await sampleOrders.loadPo(conn, doc.purchase_order_id))?.kind;
+            const tpl = await getEmailTemplate(conn, poPortalEmail.sendTemplateKey(poKind));
             const vars = { poNumber: doc.po_number, version: doc.version };
             const finalSubject = (typeof subject === 'string' && subject.trim())
                 ? renderTemplate(subject.trim(), vars)
@@ -7076,6 +7082,7 @@ app.post('/api/v1/purchase-order-documents/:id/email', async (req, res) => {
                 poUrl,
                 registerUrl: poPortalEmail.registerUrl(portalBase),
                 preapproved,
+                kind: poKind,
             });
 
             // The template (or the staff member's edit of it) and the portal
