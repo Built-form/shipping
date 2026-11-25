@@ -56,7 +56,7 @@ async function sendReminderForReceipt(receipt, baseUrl) {
         ? appendPortalLink(renderReminderEmailHtml(receipt.subject, reminderNumber, { portal: true }), receipt.action_url)
         : appendReceiptLink(renderReminderEmailHtml(receipt.subject, reminderNumber), receipt.token, baseUrl);
 
-    const sent = await emailSend.sendEmail({ to: recipients, subject, html: body });
+    const sent = await emailSend.sendEmail({ kind: 'receipt.reminder', to: recipients, subject, html: body });
     if (!sent.ok) {
         return { ok: false, reason: sent.reason, status: sent.status ?? null, detail: sent.detail ?? null };
     }

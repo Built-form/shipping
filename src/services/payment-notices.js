@@ -295,7 +295,7 @@ async function sendNotice(ctx, { paymentId, kind, actor, body }) {
     }
     let front;
     try {
-        front = await sendEmail({ to: addresses, subject, html });
+        front = await sendEmail({ kind: `payment.${kind}`, to: addresses, subject, html });
     } catch (e) {
         front = { ok: false, reason: 'network_error', detail: e && e.message };
     }

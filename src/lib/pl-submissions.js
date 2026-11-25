@@ -26,6 +26,7 @@
 // the 10 MiB limit, the result states and the line cap.
 
 const PI = require('./pi-submissions');
+const { parseScanEvent } = require('./portal-scan');
 
 const {
     STALE_CHECK_SECONDS, MAX_CHECK_ATTEMPTS, RETRYABLE_CODES, MAX_FILE_BYTES, ALLOWED_TYPES,
@@ -110,6 +111,13 @@ function destKey({ submissionId, filename, contentType, token }) {
  */
 function parseTrigger(event, { bucket = null } = {}) {
     const e = isObj(event) ? event : {};
+    // The portal bucket's virus scan result (as pi-submissions.js parseTrigger).
+    const scanned = parseScanEvent(e, { bucket });
+    if (scanned) {
+        if (scanned.otherBucket) return { ignore: 'other_bucket' };
+        if (!isPlKey(scanned.key)) return { ignore: 'not_a_pl_key' };
+        return { source: 'event', key: scanned.key, scan: scanned.result };
+    }
     if (e.source === 'aws.s3' || e['detail-type'] === 'Object Created') {
         const d = isObj(e.detail) ? e.detail : {};
         const name = isObj(d.bucket) ? d.bucket.name : null;

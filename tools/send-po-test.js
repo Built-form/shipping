@@ -90,7 +90,7 @@ const PO_EMAIL_BODY_HTML = [
         const htmlBody = PO_EMAIL_BODY_HTML;
 
         console.log(`Sending through SES (from=${process.env.SES_FROM_ARN}, to=${recipients.join(', ')})…`);
-        const sent = await sendEmail({
+        const sent = await sendEmail({ kind: 'test.po',
             to: recipients, subject, html: htmlBody,
             attachments: [{ bytes: pdfBytes, filename, contentType: 'application/pdf' }],
         });

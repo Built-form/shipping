@@ -789,7 +789,7 @@ function registerQcVisitCommsRoutes(app, deps) {
                     ? htmlBody
                     : appendReceiptLink(htmlBody, receiptToken, apiBaseUrlFromReq(req));
 
-                const sent = await emailSend.sendEmail({
+                const sent = await emailSend.sendEmail({ kind: 'qc_visit.email',
                     to: toAddresses, subject: finalSubject, html: bodyWithReceipt,
                     attachments: attachments.map(a => ({ bytes: a.bytes, filename: a.filename, contentType: a.type })),
                 });

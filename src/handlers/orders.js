@@ -3351,7 +3351,7 @@ app.post('/api/v1/draft-container-documents/:id/email', async (req, res) => {
                 files.push({ bytes: a.pdf.bytes, filename: a.pdf.filename, contentType: 'application/pdf' });
                 if (a.csv) files.push({ bytes: a.csv.bytes, filename: a.csv.filename, contentType: 'text/csv' });
             }
-            const sent = await emailSend.sendEmail({ to: toAddresses, subject: finalSubject, html: emailBody, attachments: files });
+            const sent = await emailSend.sendEmail({ kind: 'request_to_send.documents', to: toAddresses, subject: finalSubject, html: emailBody, attachments: files });
             if (!sent.ok) {
                 log.error('[draft-container-documents/email] SES error', { reason: sent.reason, status: sent.status, detail: sent.detail });
                 // Not sent: its receipt must not be listed, or chased.
@@ -3931,7 +3931,7 @@ app.post('/api/v1/quality-assurance-documents/:id/email', async (req, res) => {
 
             const files = [{ bytes: pdfBytes, filename, contentType: 'application/pdf' }];
             if (csvAttachment) files.push({ bytes: csvAttachment.bytes, filename: csvAttachment.filename, contentType: 'text/csv' });
-            const sent = await emailSend.sendEmail({ to: toAddresses, subject: finalSubject, html: bodyWithReceipt, attachments: files });
+            const sent = await emailSend.sendEmail({ kind: 'qa.documents', to: toAddresses, subject: finalSubject, html: bodyWithReceipt, attachments: files });
             if (!sent.ok) {
                 log.error('[quality-assurance-documents/email] SES error', { reason: sent.reason, status: sent.status, detail: sent.detail });
                 // Not sent: its receipt must not be listed, or chased.
@@ -6732,7 +6732,7 @@ app.post('/api/v1/purchase-order-documents/:id/email', async (req, res) => {
 
             // Through SES (src/services/email-send.js). No attachment: the PDF
             // is on the portal.
-            const sent = await emailSend.sendEmail({ to: toAddresses, subject: finalSubject, html: emailHtml });
+            const sent = await emailSend.sendEmail({ kind: 'po.documents', to: toAddresses, subject: finalSubject, html: emailHtml });
             if (!sent.ok) {
                 log.error('[purchase-order-documents/email] SES error', { reason: sent.reason, status: sent.status, detail: sent.detail });
                 return { frontError: { status: sent.status ?? 502, body: sent.detail || sent.reason } };
@@ -7560,7 +7560,7 @@ app.post('/api/v1/purchase-order-signed-pis/:id/email', async (req, res) => {
             const emailHtml = wrapEmail({ title: finalSubject, bodyHtml: bodyWithPortal });
 
             // No attachment: the file is on the portal.
-            const sent = await emailSend.sendEmail({ to: toAddresses, subject: finalSubject, html: emailHtml });
+            const sent = await emailSend.sendEmail({ kind: 'po.signed_pi', to: toAddresses, subject: finalSubject, html: emailHtml });
             if (!sent.ok) {
                 log.error('[purchase-order-signed-pis/email] SES error', { reason: sent.reason, status: sent.status, detail: sent.detail });
                 return { frontError: { status: sent.status ?? 502, body: sent.detail || sent.reason } };
