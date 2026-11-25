@@ -716,6 +716,44 @@ Writing a migration:
   so an `ALTER` on a busy table fails fast (and the deploy with it; just re-run)
   instead of queueing every query behind its metadata lock.
 
+#### Views and the proxy's collation
+
+**A view that works on TEST can fail on production.** It happened twice
+(2026-11-23 and 2026-11-24): the forwarder screens answered `Illegal mix of
+collations (utf8mb4_0900_ai_ci,COERCIBLE) and (utf8mb4_unicode_ci,COERCIBLE)`
+on production from their first release, and never on TEST.
+
+- A view keeps the collation of the session that **created** it. Every string
+  literal in it has that collation for good. The runner connects direct, where
+  the driver asks for `utf8mb4_unicode_ci`.
+- The live Lambdas connect through the RDS Proxy, which drops what the driver
+  asks for. Their sessions run under the server default, `utf8mb4_0900_ai_ci`.
+  TEST and a local server connect direct, so they never see the difference.
+- MySQL refuses to compare two strings of different collations when neither is
+  a column.
+
+So, in a view:
+
+| Do not write | Why it fails through the proxy | Write |
+|---|---|---|
+| `DATE_FORMAT(d, '%H:%i') = '00:00'` (any function's text against a literal) | the function answers in the session's collation, the literal has the view's. **Every** read of the view fails | compare numbers, dates or columns: `HOUR(d) = 0 AND MINUTE(d) = 0` |
+| `'container' AS link_source` (a column that is text made only of literals: also `IF(…, 'a', 'b')`, `CASE … THEN 'a'`, `ELT(n, 'a', 'b')`) | a caller's `link_source IN ('container')` compares its own literal with the view's | `CONVERT('container' USING utf8mb4) AS link_source`: the same in every session, and a caller's literal yields to it. In a `UNION`, wrap **every** branch |
+
+The runner checks this for you. After every `--apply`, and in `--status`, it
+reads every view under both collations and compares each text column with a
+literal ([src/lib/view-collations.js](src/lib/view-collations.js)). A view of
+this repository that fails makes `--apply` exit 1, so `deploy.sh` stops before
+the code ships; the fix is a new migration that re-creates the view. On its own,
+read-only:
+
+```bash
+node tools/migrate.js --stage test --check-views
+```
+
+Run it on TEST after writing a view, before production sees the file. To see a
+production-only SQL error on TEST, start the session with
+`SET NAMES utf8mb4 COLLATE utf8mb4_0900_ai_ci`.
+
 The first file, `2026-09-21_00_baseline.sql`, is the app's tables as they stood
 when this was introduced, generated from production with `--dump-baseline`. It
 runs only on an empty database. A populated database with no ledger (production

@@ -11,6 +11,7 @@
 //   node tools/migrate.js --stage test                   dry run: list pending files
 //   node tools/migrate.js --stage test --apply           apply pending files
 //   node tools/migrate.js --stage dev --status           ledger vs files, changed files, missing views
+//   node tools/migrate.js --stage test --check-views     read-only: can every view be read under both session collations
 //   node tools/migrate.js --stage dev --verify-baseline  diff this database against the baseline file
 //   node tools/migrate.js --stage dev --adopt            existing database: record the baseline as applied
 //                                                        (--apply does this itself when the check is clean)
@@ -22,6 +23,13 @@
 // endpoint that is not reachable from here. The AWS CLI reads the secret, so
 // whoever runs this needs secretsmanager:GetSecretValue, as for a deploy.
 // Without --stage it uses .env, and then writing needs --confirm-host <DB_HOST>.
+//
+// After --apply (and in --status) every view is checked under the two
+// collations our sessions run with: this runner and TEST connect direct
+// (utf8mb4_unicode_ci), the live Lambdas through the RDS Proxy
+// (utf8mb4_0900_ai_ci), and a view that mixes the two fails on production only
+// (src/lib/view-collations.js). A view of ours that fails makes --apply exit 1,
+// so deploy.sh stops before the code that reads it ships.
 //
 // Other options:
 //   --database <name>   override the database name (e.g. a scratch schema)
@@ -50,6 +58,7 @@ const { splitSql } = require('../src/lib/sql-split');
 const {
     MIGRATIONS_DIR, LEDGER_TABLE, BASELINE_FILE, listMigrationFiles,
 } = require('../src/lib/schema-migrations');
+const { viewsCreatedBy, checkViewCollations, describe: describeViewCheck } = require('../src/lib/view-collations');
 
 const BASELINE_TABLES_FILE = path.join(MIGRATIONS_DIR, 'baseline-tables.json');
 // serverless.yml custom.envNames: the production stack is stage "dev".
@@ -87,6 +96,7 @@ const opts = {
     status: flag('--status'),
     adopt: flag('--adopt'),
     verify: flag('--verify-baseline'),
+    checkViews: flag('--check-views'),
     dump: flag('--dump-baseline'),
     out: arg('--out'),
     force: flag('--force'),
@@ -333,6 +343,22 @@ async function verifyBaseline(conn, file = path.join(MIGRATIONS_DIR, BASELINE_FI
     return behind;
 }
 
+// ── view collations ─────────────────────────────────────────────────────────
+
+// The views this repository's migrations create: the ones a failed check is
+// ours to fix. Any other view in the database is reported, and fails nothing.
+function ownedViews(dir = MIGRATIONS_DIR) {
+    return viewsCreatedBy(listMigrationFiles(dir).map(f => fs.readFileSync(path.join(dir, f), 'utf8')));
+}
+
+// Can every view be read under both session collations (src/lib/view-collations.js)?
+// Read-only. 1 when a view of ours cannot, else 0.
+async function viewCheck(conn, { dir = MIGRATIONS_DIR, print = console.log } = {}) {
+    const report = describeViewCheck(await checkViewCollations(conn), ownedViews(dir));
+    for (const line of report.lines) print(line);
+    return report.failed ? 1 : 0;
+}
+
 // ── modes ───────────────────────────────────────────────────────────────────
 
 async function status(conn) {
@@ -355,6 +381,8 @@ async function status(conn) {
     for (const [view, file] of Object.entries(REQUIRED_VIEWS)) {
         if (!have.has(view)) console.log(`view missing: ${view} (create it as admin from ${file})`);
     }
+    console.log('');
+    await viewCheck(conn);
     return 0;
 }
 
@@ -389,7 +417,9 @@ async function migrate(conn, target) {
     const pending = files.filter(f => !ledger.has(f));
     if (!pending.length) {
         console.log('Up to date: nothing pending.');
-        return 0;
+        // Checked on every --apply, pending or not: a view can also be broken
+        // by hand, or by a migration applied before this check existed.
+        return opts.apply ? viewCheck(conn) : 0;
     }
     console.log(`Pending (${pending.length}):\n  ${pending.join('\n  ')}`);
     if (!opts.apply) {
@@ -398,8 +428,10 @@ async function migrate(conn, target) {
     }
     await ensureLedger(conn);
     for (const f of pending) await applyFile(conn, f, target);
-    console.log(`\nApplied ${pending.length} migration(s).`);
-    return 0;
+    console.log(`\nApplied ${pending.length} migration(s).\n`);
+    // The files are applied and recorded whatever this says. A failure here
+    // stops deploy.sh, and is fixed with a new migration.
+    return viewCheck(conn);
 }
 
 async function adopt(conn, dir = MIGRATIONS_DIR) {
@@ -423,15 +455,16 @@ async function adopt(conn, dir = MIGRATIONS_DIR) {
 }
 
 async function main() {
-    const modes = ['apply', 'status', 'adopt', 'verify', 'dump'].filter(m => opts[m]);
+    const modes = ['apply', 'status', 'adopt', 'verify', 'dump', 'checkViews'].filter(m => opts[m]);
     if (flag('--help') || flag('-h') || modes.length > 1) {
-        console.log(fs.readFileSync(__filename, 'utf8').split('\n').slice(2, 36).map(l => l.replace(/^\/\/ ?/, '')).join('\n'));
+        console.log(fs.readFileSync(__filename, 'utf8').split('\n').slice(2, 44).map(l => l.replace(/^\/\/ ?/, '')).join('\n'));
         return modes.length > 1 ? 2 : 0;
     }
     const target = resolveTarget();
     checkTarget(target, { stage: opts.stage, writes, confirmHost: opts.confirmHost });
     const mode = opts.apply ? 'APPLY' : opts.adopt ? 'ADOPT' : opts.status ? 'status'
-        : opts.verify ? 'verify baseline' : opts.dump ? 'dump baseline' : 'dry run';
+        : opts.verify ? 'verify baseline' : opts.dump ? 'dump baseline'
+            : opts.checkViews ? 'check views' : 'dry run';
     console.log(`Database: ${target.user || '?'}@${target.host}/${target.database}  (${target.source}${opts.stage ? `, stage ${opts.stage}` : ''})`);
     console.log(`Mode: ${mode}\n`);
 
@@ -448,6 +481,7 @@ async function main() {
         }
         if (opts.status) return await status(conn);
         if (opts.verify) return (await verifyBaseline(conn)) ? 1 : 0;
+        if (opts.checkViews) return await viewCheck(conn);
         if (opts.dump) return await dumpBaseline(conn, target);
         if (opts.adopt) return await adopt(conn);
         return await migrate(conn, target);
@@ -474,5 +508,5 @@ if (require.main === module) {
 // For tools/test-migrate-lib.js.
 module.exports = {
     Refusal, checkTarget, alreadyApplied, applyFile, adopt, verifyBaseline,
-    normaliseCreate, definitionLines, checksum,
+    normaliseCreate, definitionLines, checksum, ownedViews, viewCheck,
 };
