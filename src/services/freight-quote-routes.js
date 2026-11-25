@@ -927,7 +927,7 @@ function registerFreightQuoteRoutes(app, deps) {
                     }),
                 });
 
-                const sent = await sendEmail({ to: addresses, subject: finalSubject, html });
+                const sent = await sendEmail({ kind: 'freight_quote.request', to: addresses, subject: finalSubject, html });
                 if (!sent.ok) {
                     await conn.query(
                         `UPDATE freight_quote_requests
@@ -1128,7 +1128,7 @@ function registerFreightQuoteRoutes(app, deps) {
                 return { kind, request, addresses, finalSubject, html: wrapEmail({ title: finalSubject, bodyHtml: inner + block }) };
             });
 
-            const sent = await sendEmail({ to: made.addresses, subject: made.finalSubject, html: made.html });
+            const sent = await sendEmail({ kind: 'freight_quote.reminder', to: made.addresses, subject: made.finalSubject, html: made.html });
             if (!sent.ok) {
                 await conn.query('UPDATE freight_quote_requests SET reminder_count = reminder_count - 1 WHERE id = ? AND reminder_count > 0', [id]);
                 throw frontFailure(sent);
@@ -1384,7 +1384,7 @@ function registerFreightQuoteRoutes(app, deps) {
                 return { bookingId, requestId: Number(request.id), batchId: request.batch_id, addresses, finalSubject, html, option: o, forwarder: request.forwarder_name };
             });
 
-            const sent = await sendEmail({ to: made.addresses, subject: made.finalSubject, html: made.html });
+            const sent = await sendEmail({ kind: 'freight_quote.booking', to: made.addresses, subject: made.finalSubject, html: made.html });
             if (!sent.ok) {
                 await conn.query(
                     `UPDATE freight_bookings
@@ -1687,7 +1687,7 @@ function registerFreightQuoteRoutes(app, deps) {
                 bodyHtml: inner + F.contentsHtml(contents, { containerName: source.label, option: o, bookingRef: b.booking_ref || null }),
             });
 
-            const sent = await sendEmail({ to: addresses, subject: finalSubject, html, attachments });
+            const sent = await sendEmail({ kind: 'freight_booking.contents', to: addresses, subject: finalSubject, html, attachments });
             if (!sent.ok) throw frontFailure(sent);
 
             // contents_document_ids: the documents attached, in the order attached
@@ -1814,7 +1814,7 @@ function registerFreightQuoteRoutes(app, deps) {
 
             let sent = null;
             if (wantEmail) {
-                sent = await sendEmail({ to: made.addresses, subject: made.finalSubject, html: made.html });
+                sent = await sendEmail({ kind: 'freight_quote.stock_movements', to: made.addresses, subject: made.finalSubject, html: made.html });
                 if (!sent.ok) {
                     await conn.query('DELETE FROM freight_stock_movements WHERE request_id = ? AND add_key = ?', [id, addKey]);
                     throw frontFailure(sent);

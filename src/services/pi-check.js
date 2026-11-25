@@ -42,6 +42,7 @@ const { bestBankComparison } = require('../lib/bank-verification');
 const { loadBankReference } = require('./bank-reference');
 const poCheck = require('./po-invoice-check');
 const log = require('../lib/logger');
+const { SCAN_CLEAN, isAccessDenied, scanFailedMessage } = require('../lib/portal-scan');
 
 const REGION = process.env.AWS_REGION || 'eu-north-1';
 const DEFAULT_RUN_MS = 300 * 1000;
@@ -119,8 +120,10 @@ function createPiChecker({
             try {
                 await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: row.s3_key }));
             } catch (e) {
-                if (!isMissing(e)) log.warn('[pi-check] head failed', { submissionId: row.id, error: e.message });
-                return { outcome: 'skipped', submissionId: Number(row.id), reason: isMissing(e) ? 'file_missing' : 'head_failed' };
+                // 403: the portal's virus scan has not cleared the file yet; the scan's result
+                // event starts the check instead.
+                if (!isMissing(e) && !isAccessDenied(e)) log.warn('[pi-check] head failed', { submissionId: row.id, error: e.message });
+                return { outcome: 'skipped', submissionId: Number(row.id), reason: isMissing(e) ? 'file_missing' : isAccessDenied(e) ? 'not_scanned_yet' : 'head_failed' };
             }
         }
 
@@ -149,6 +152,12 @@ function createPiChecker({
 
         let poSnapshot = null;
         try {
+            // 3b. The portal's virus scan (jportal README section 27): a file that did not
+            // come back clean is never read; the supplier is asked for a different one.
+            if (trigger.scan && trigger.scan !== SCAN_CLEAN) {
+                return await fail(row, attempt, 'FILE_SCAN_FAILED', scanFailedMessage(trigger.scan));
+            }
+
             // 4. The file.
             let bytes = null;
             let etag;

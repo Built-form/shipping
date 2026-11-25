@@ -39,9 +39,10 @@
 // authed through the greedy /api/v1/{proxy+} route.
 
 const { v4: uuidv4 } = require('uuid');
-const { GetObjectCommand, PutObjectCommand } = require('@aws-sdk/client-s3');
+const { GetObjectCommand, PutObjectCommand, HeadObjectCommand } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const T = require('../lib/telex-releases');
+const { isAccessDenied, explainRefusal } = require('../lib/portal-scan');
 const { jportalSchema, isSourceMissing } = require('../lib/jportal');
 
 const ER_NO_SUCH_TABLE = 1146;
@@ -331,6 +332,17 @@ function registerTelexReleaseRoutes(app, deps) {
         let row;
         try { row = await withConnection(conn => readSubmission(conn, id)); } catch (e) { if (isSourceMissing(e)) return portalMissing(); throw e; }
         if (!row || !fileSent(row)) return answer(404, { error: 'Telex upload not found.', code: 'NOT_FOUND' });
+        // The portal's virus scan (src/lib/portal-scan.js): a file it has not cleared is refused
+        // by the bucket, so say why rather than hand out a link that answers 403. Any other
+        // error here is left to the link itself, as before.
+        try {
+            await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: row.final_s3_key }));
+        } catch (e) {
+            if (isAccessDenied(e)) {
+                const scan = await explainRefusal(s3, bucket, row.final_s3_key);
+                return answer(scan.status, scan.body);
+            }
+        }
         const url = await getSignedUrl(s3, new GetObjectCommand({
             Bucket: bucket, Key: row.final_s3_key,
             ResponseContentType: row.content_type || 'application/octet-stream',
@@ -367,6 +379,10 @@ function registerTelexReleaseRoutes(app, deps) {
             }
             bytes = Buffer.from(await obj.Body.transformToByteArray());
         } catch (e) {
+            if (isAccessDenied(e)) {
+                const scan = await explainRefusal(s3, bucket, row.final_s3_key);
+                return answer(scan.status, { ...scan.body, allowedNext: ['reload'] });
+            }
             log.warn('[POST /telex-submissions/:id/accept] the file could not be read', { id, error: e.message });
             return answer(409, { error: 'The supplier\'s file could not be read from the portal. Send it back and ask for it again.', code: 'FILE_UNAVAILABLE', allowedNext: ['reject'] });
         }

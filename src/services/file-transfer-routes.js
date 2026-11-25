@@ -38,6 +38,7 @@ const { HeadObjectCommand, GetObjectCommand, PutObjectCommand } = require('@aws-
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const { v4: uuidv4 } = require('uuid');
 const L = require('../lib/file-transfers');
+const { isAccessDenied, explainRefusal } = require('../lib/portal-scan');
 const { jportalSchema, isSourceMissing } = require('../lib/jportal');
 const { sendEmail } = require('./email-send');
 const { wrapEmail } = require('../lib/email-layout');
@@ -133,6 +134,8 @@ function registerFileTransferRoutes(app, deps) {
             return { url, expiresAt: new Date(Date.now() + FILE_URL_SECONDS * 1000).toISOString(), state };
         } catch (e) {
             if (isMissing(e)) state.gone = true;
+            // The portal's virus scan refused the read: say why (src/lib/portal-scan.js).
+            else if (isAccessDenied(e)) return { url: null, expiresAt: null, state, scan: (await explainRefusal(s3, b, readable.key)).body };
             else log.warn('[file-transfers] file lookup failed', { id: row.id, error: e.message });
             return { url: null, expiresAt: null, state };
         }
@@ -189,7 +192,7 @@ function registerFileTransferRoutes(app, deps) {
             if (redirect) subject = `[for ${original.join(', ') || 'nobody'}] ${subject}`;
             // The template is the inside of the card (src/lib/email-layout.js).
             const html = wrapEmail({ title, bodyHtml: renderTemplate(tpl.bodyHtml, vars.body) });
-            const sent = await sendEmail({ to, subject, html });
+            const sent = await sendEmail({ kind: 'file_transfer.notice', to, subject, html });
             if (sent.ok) {
                 await conn.query(`UPDATE ${jp()}.file_transfers SET notified_at = UTC_TIMESTAMP(), notify_error = NULL WHERE id = ?`, [id]);
                 // On the Email Receipts page: confirmed when a supplier's user
@@ -319,6 +322,7 @@ function registerFileTransferRoutes(app, deps) {
             transfer: toJson(out.row, { views: out.views }),
             file: link.url ? { url: link.url, expiresAt: link.expiresAt } : null,
             fileState: link.state,
+            fileScan: link.scan || null,
         });
     }));
 
@@ -350,6 +354,7 @@ function registerFileTransferRoutes(app, deps) {
             transfer: toJson(out.row, { views: out.views }),
             file: link.url ? { url: link.url, expiresAt: link.expiresAt } : null,
             fileState: link.state,
+            fileScan: link.scan || null,
         });
     }));
 

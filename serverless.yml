@@ -94,6 +94,10 @@ provider:
     DB_PASSWORD: ${self:custom.secrets.DB_PASSWORD}
     DB_NAME: ${self:custom.secrets.DB_NAME}
     DB_PORT: ${self:custom.secrets.DB_PORT}
+    # The portal's email log (src/services/email-send.js, portal README
+    # section 26): every email sent is recorded in jportal.email_log with this
+    # stage. (EMAIL_LOG=off in a function's environment turns the log off.)
+    EMAIL_LOG_STAGE: ${sls:stage}
     MINTSOFT_API_KEY: ${self:custom.secrets.MINTSOFT_API_KEY}
     MINTSOFT_CLIENT_ID: ${self:custom.secrets.MINTSOFT_CLIENT_ID}
     ASANA_PAT: ${self:custom.secrets.ASANA_PAT}
@@ -247,6 +251,19 @@ provider:
           Action:
             - s3:GetObject
           Resource:
+            - arn:aws:s3:::jportal-pi-uploads-${self:custom.envName}/files/fwd/*
+        # The portal's virus scan (jportal README section 27): its bucket policy
+        # refuses GetObject on a supplier's file until GuardDuty tags it clean.
+        # Reading the tags tells staff why (src/lib/portal-scan.js
+        # explainRefusal): still scanning, or blocked.
+        - Effect: Allow
+          Action:
+            - s3:GetObjectTagging
+          Resource:
+            - arn:aws:s3:::jportal-pi-uploads-${self:custom.envName}/pi/*
+            - arn:aws:s3:::jportal-pi-uploads-${self:custom.envName}/pl/*
+            - arn:aws:s3:::jportal-pi-uploads-${self:custom.envName}/ci/*
+            - arn:aws:s3:::jportal-pi-uploads-${self:custom.envName}/files/sup/*
             - arn:aws:s3:::jportal-pi-uploads-${self:custom.envName}/files/fwd/*
         - Effect: Allow
           Action:
@@ -633,7 +650,8 @@ functions:
   # Checks a proforma invoice a supplier uploaded through the supplier portal
   # (jportal) against its PO, with the staff check's prompt and schema, and
   # writes the result to jportal.pi_submissions (src/services/pi-check.js).
-  # Triggered by the portal bucket's EventBridge "Object Created" events — this
+  # Triggered by GuardDuty's scan-result events for the portal bucket (until
+  # the portal's virus scan, README section 27: "Object Created") — this
   # stack owns the rule and matches the bucket by NAME, so nothing crosses
   # between the two stacks — and invoked directly (async, { submissionId }) by
   # the portal, which grants itself lambda:InvokeFunction on this explicit name.
@@ -653,17 +671,20 @@ functions:
     maximumRetryAttempts: 1
     events:
       - eventBridge:
+          # The portal's virus scan result for the file (jportal README section 27),
+          # every result: a clean one starts the check, any other fails the row
+          # FILE_SCAN_FAILED unread. Replaces S3's "Object Created": with the
+          # portal's gate on, a file cannot be read before it is scanned clean.
           pattern:
             source:
-              - aws.s3
+              - aws.guardduty
             detail-type:
-              - Object Created
+              - GuardDuty Malware Protection Object Scan Result
             detail:
-              bucket:
-                name:
+              s3ObjectDetails:
+                bucketName:
                   - jportal-pi-uploads-${self:custom.envName}
-              object:
-                key:
+                objectKey:
                   - prefix: 'pi/'
 
   # ── Supplier-portal packing-list check ──
@@ -685,17 +706,20 @@ functions:
     maximumRetryAttempts: 1
     events:
       - eventBridge:
+          # The portal's virus scan result for the file (jportal README section 27),
+          # every result: a clean one starts the check, any other fails the row
+          # FILE_SCAN_FAILED unread. Replaces S3's "Object Created": with the
+          # portal's gate on, a file cannot be read before it is scanned clean.
           pattern:
             source:
-              - aws.s3
+              - aws.guardduty
             detail-type:
-              - Object Created
+              - GuardDuty Malware Protection Object Scan Result
             detail:
-              bucket:
-                name:
+              s3ObjectDetails:
+                bucketName:
                   - jportal-pi-uploads-${self:custom.envName}
-              object:
-                key:
+                objectKey:
                   - prefix: 'pl/'
 
   # ── Supplier-portal packing-list refresh ──
@@ -735,17 +759,20 @@ functions:
     maximumRetryAttempts: 1
     events:
       - eventBridge:
+          # The portal's virus scan result for the file (jportal README section 27),
+          # every result: a clean one starts the check, any other fails the row
+          # FILE_SCAN_FAILED unread. Replaces S3's "Object Created": with the
+          # portal's gate on, a file cannot be read before it is scanned clean.
           pattern:
             source:
-              - aws.s3
+              - aws.guardduty
             detail-type:
-              - Object Created
+              - GuardDuty Malware Protection Object Scan Result
             detail:
-              bucket:
-                name:
+              s3ObjectDetails:
+                bucketName:
                   - jportal-pi-uploads-${self:custom.envName}
-              object:
-                key:
+                objectKey:
                   - prefix: 'ci/'
 
   # ── Supplier confirmed a deposit arrived (supplier portal) ──

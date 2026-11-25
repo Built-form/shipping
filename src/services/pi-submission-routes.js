@@ -42,6 +42,7 @@ const { HeadObjectCommand, GetObjectCommand, PutObjectCommand } = require('@aws-
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const { v4: uuidv4 } = require('uuid');
 const L = require('../lib/pi-submissions');
+const { isAccessDenied, explainRefusal } = require('../lib/portal-scan');
 const bank = require('../lib/bank-verification');
 const { loadBankReference } = require('./bank-reference');
 const { jportalSchema, PO_SUPPLIER_IS } = require('../lib/jportal');
@@ -247,7 +248,7 @@ function registerPiSubmissionRoutes(app, deps) {
             if (redirect) subject = `[for ${original}] ${subject}`;
             // The template is the inside of the card (src/lib/email-layout.js).
             const html = wrapEmail({ title, bodyHtml: renderTemplate(tpl.bodyHtml, vars.body) });
-            const sent = await sendEmail({ to, subject, html });
+            const sent = await sendEmail({ kind: 'pi_submission.decision', to, subject, html });
             if (sent.ok) {
                 await conn.query(`UPDATE ${jp}.pi_submissions SET notified_at = UTC_TIMESTAMP(), notify_error = NULL WHERE id = ?`, [id]);
                 // On the Email Receipts page, as a notice: nothing to confirm.
@@ -427,6 +428,9 @@ function registerPiSubmissionRoutes(app, deps) {
             // The file: is it still there and unchanged, and a link to it. No
             // connection is held for these.
             let file = null;
+            // Why there is no link, when the portal's virus scan refused the read
+            // (src/lib/portal-scan.js): { code, error }.
+            let fileScan = null;
             const fileState = { gone: false, changed: false };
             const bucket = piBucket();
             if (bucket && L.isPiKey(row.s3_key)) {
@@ -441,6 +445,7 @@ function registerPiSubmissionRoutes(app, deps) {
                     file = { url, expiresAt: new Date(Date.now() + FILE_URL_SECONDS * 1000).toISOString() };
                 } catch (e) {
                     if (isMissing(e)) fileState.gone = true;
+                    else if (isAccessDenied(e)) fileScan = (await explainRefusal(s3, bucket, row.s3_key)).body;
                     else log.warn('[GET /pi-submissions/:id] file lookup failed', { id, error: e.message });
                 }
             }
@@ -453,6 +458,7 @@ function registerPiSubmissionRoutes(app, deps) {
                 poCurrent: poCurrent ? JSON.parse(JSON.stringify(poCurrent)) : null,
                 poDiff,
                 file,
+                fileScan,
                 poInvoices: out.invRows.map(r => ({
                     id: Number(r.id), filename: r.filename, uploadedAt: iso(r.uploaded_at),
                     verdict: r.verdict || null, piSubmissionId: r.pi_submission_id != null ? Number(r.pi_submission_id) : null,
@@ -538,6 +544,10 @@ function registerPiSubmissionRoutes(app, deps) {
             } catch (e) {
                 if (isMissing(e)) return refuse(res, NOT_IMPORTABLE(['file_gone']));
                 if (isPreconditionFailed(e)) return refuse(res, NOT_IMPORTABLE(['file_changed']));
+                if (isAccessDenied(e)) {
+                    const scan = await explainRefusal(s3, bucket, row.s3_key);
+                    return res.status(scan.status).json(scan.body);
+                }
                 log.warn('[POST /pi-submissions/:id/import] get failed', { id, error: e.message });
                 return refuse(res, FILE_UNAVAILABLE);
             }
