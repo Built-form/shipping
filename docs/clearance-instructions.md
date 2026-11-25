@@ -19,10 +19,11 @@ Built on the forwarder container page (`docs/forwarder-containers.md`): the cust
 | Supplier, JFA / HW | the container's order lines |
 | Commercial invoice number | read off the supplier's invoice on the INVOICES tab (the newest balance invoice with a number); else the number its packing list prints; else typed |
 | Description of goods | the product's JFPRO **category** and the JF codes in the row ("Gauze Swabs JF1477 JF1475"); the product's name where it has no category. A product's category is the first of its set, as JFPRO itself shows one. Not the subcategory (the user, 2026-11-24). Editable |
-| Country of origin, commodity code | JFPRO product |
+| Country of origin | since 2026-11-25 (ShipLine): the **order's supplier's** country as JFPRO reads it (`GET /api/duty-rates` `suppliers[].countryCode`); only when JFPRO does not know that supplier, the product's main supplier's country, said on the row |
+| Commodity code | JFPRO product |
 | Cartons, net and gross weight | **the supplier's packing list when one was read for that product**, else ours: cartons from the order's units per carton, gross from the order's carton weight, net from JFPRO's net carton weight. The row says when the list's figures differ from ours |
 | Volume | the order's carton spec (as the container card derives it) |
-| Duty percentage | what was last SENT for that commodity code (`clearance_duty_rates`); nothing here knows a tariff. A whole-number percent, as JFPRO holds duty |
+| Duty percentage | since 2026-11-25 (ShipLine): JFPRO's **Duty rates, Import (UK)** for the commodity code AND the origin (`GET /api/duty-rates?market=GB`); no rate there = blank, to be filled. A whole-number percent. `clearance_duty_rates` (last sent, by code only) is still written on a send but no longer read to fill the sheet: one code pays different duty from different countries |
 | Value of goods | units × the order's unit price |
 | Container cost | the freight booking's price when it is in dollars, else typed |
 | Cost of shipping | the cost shared by volume: cost ÷ total CBM (to two places) is a rate to four places; a row's share is the rate × its CBM, to the dollar. The same sum in ShipLine and here, with the same figures in both test files |
