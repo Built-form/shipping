@@ -6,9 +6,14 @@
 //
 // A SAMPLE order (po.kind 'sample', docs/sample-orders.md) prints the same
 // page with three differences: it is headed SAMPLE ORDER; each line names the
-// sample code the supplier should write on the parcel; and a free sample is
-// never printed as a price of 0 (its cells read "Free", and an order with
-// nothing to pay prints no totals at all).
+// sample code the supplier should write on the parcel; and a sample with no
+// price is not priced on the paper at all (the user, 2026-11-25: "exclude the
+// price column dont say free"):
+//   - no line has a price: the table has no Unit Price and Line Price columns
+//     (the item takes their room), and with no shipping charge either there is
+//     no totals box. Nothing says "free", and nothing prints a 0;
+//   - some lines have a price: the columns stay, and an unpriced line's two
+//     cells are left empty.
 //
 // Pagination: long line-items split across pages. The table header is
 // re-drawn on every page; totals + comments always land together on the
@@ -51,6 +56,13 @@ const COLS = [
 // many lines as the Item column needs, and grow the row height to fit so the
 // text stays inside its box instead of bleeding into the row below.
 const ITEM_COL = COLS[1];
+// The table of a sample order none of whose lines has a price: the same width,
+// with the two price columns' room given to the item.
+const COLS_NO_PRICE = [
+    { header: 'Ref',      x: 50,  w: 70,  align: 'center' },
+    { header: 'Item',     x: 120, w: 340, align: 'center' },
+    { header: 'Quantity', x: 460, w: 80,  align: 'center' },
+];
 const MAX_NAME_LEN = 75;
 const ROW_PAD_Y = 8; // vertical padding above/below the wrapped item text
 
@@ -71,16 +83,25 @@ function itemText(line) {
 }
 
 const isSamplePo = po => Boolean(po) && po.kind === 'sample';
-// A free sample: a line of a sample order with no price.
-const isFreeLine = (po, line) => isSamplePo(po) && Number(line.unitPrice || 0) === 0;
+const hasPrice = line => Number(line.unitPrice || 0) > 0;
+// A line of a sample order with no price: nothing is printed in its price cells.
+const isUnpricedLine = (po, line) => isSamplePo(po) && !hasPrice(line);
+
+// The columns this order's table has. Every order has all five, except a
+// sample order with no priced line, which has no price columns.
+function tableFor(po, lines) {
+    const priced = !isSamplePo(po) || lines.some(hasPrice);
+    const cols = priced ? COLS : COLS_NO_PRICE;
+    return { priced, cols, item: cols[1], qty: cols[2] };
+}
 
 // Height a row needs so its (possibly multi-line) item name fits with padding.
 // Never shorter than ROW_H, so short names keep the original single-line look.
-function rowHeight(doc, line) {
+function rowHeight(doc, line, itemCol = ITEM_COL) {
     doc.font('Helvetica').fontSize(10);
     const nameH = doc.heightOfString(itemText(line) || ' ', {
-        width: ITEM_COL.w,
-        align: ITEM_COL.align,
+        width: itemCol.w,
+        align: itemCol.align,
     });
     return Math.max(ROW_H, Math.ceil(nameH) + ROW_PAD_Y * 2);
 }
@@ -149,16 +170,18 @@ function drawHeaderBlock(doc, po) {
     }
 }
 
-function drawTableHeader(doc, y) {
+function drawTableHeader(doc, y, cols = COLS) {
     doc.lineWidth(0.5).rect(TABLE_LEFT, y, TABLE_WIDTH, ROW_H).fillAndStroke('#e6e6e6', '#000');
     doc.fillColor('#000').font('Helvetica-Bold').fontSize(10);
-    for (const col of COLS) {
+    for (const col of cols) {
         doc.text(col.header, col.x, y + 9, { width: col.w, align: col.align });
     }
     return y + ROW_H;
 }
 
-function drawRow(doc, y, line, rowH, free = false) {
+// `table`: tableFor(...). `unpriced`: a sample line with no price, whose price
+// cells stay empty where the table has them.
+function drawRow(doc, y, line, rowH, table = { priced: true, item: ITEM_COL, qty: COLS[2] }, unpriced = false) {
     doc.lineWidth(0.5).rect(TABLE_LEFT, y, TABLE_WIDTH, rowH).stroke('#000');
     const qty = Number(line.quantity || 0);
     const unit = Number(line.unitPrice || 0);
@@ -169,16 +192,19 @@ function drawRow(doc, y, line, rowH, free = false) {
     // Vertically centre single-line cells, and the wrapped name block, within
     // the (possibly grown) row height.
     const lineH = doc.heightOfString('X');
-    const nameH = doc.heightOfString(name || ' ', { width: ITEM_COL.w, align: ITEM_COL.align });
+    const nameH = doc.heightOfString(name || ' ', { width: table.item.w, align: table.item.align });
     const singleY = y + (rowH - lineH) / 2;
     const nameY = y + (rowH - nameH) / 2;
 
     doc.text(line.sku || '',          50,  singleY, { width: 70,  align: 'center' });
-    doc.text(name,                    120, nameY,   { width: 200, align: 'center' });
-    doc.text(String(qty),             320, singleY, { width: 60,  align: 'center' });
-    // A free sample is said in words: a price of 0 is never printed for it.
-    doc.text(free ? 'Free' : fmtMoney(unit, 5),      380, singleY, { width: 70,  align: 'center' });
-    doc.text(free ? 'Free' : fmtMoney(lineTotal, 2), 450, singleY, { width: 70,  align: 'center' });
+    doc.text(name,                    table.item.x, nameY,   { width: table.item.w, align: 'center' });
+    doc.text(String(qty),             table.qty.x,  singleY, { width: table.qty.w,  align: 'center' });
+    // No price columns, or a sample line with no price: nothing is printed
+    // there. Not a 0, and not a word.
+    if (table.priced && !unpriced) {
+        doc.text(fmtMoney(unit, 5),       380, singleY, { width: 70,  align: 'center' });
+        doc.text(fmtMoney(lineTotal, 2),  450, singleY, { width: 70,  align: 'center' });
+    }
     return { yNext: y + rowH, lineTotal };
 }
 
@@ -210,13 +236,6 @@ function drawCommentsBox(doc, y, comments) {
     return y + 90;
 }
 
-// A sample order with nothing to pay says so, where the totals would be.
-function drawNothingToPay(doc, y) {
-    doc.font('Helvetica-Bold').fontSize(10).fillColor('#000')
-        .text('Free of charge: nothing to pay.', 50, y + 9, { width: TABLE_WIDTH, align: 'right' });
-    return y + ROW_H;
-}
-
 // po: { poNumber, orderDate, supplier, supplierAddress[], currency, shippingTotal, comments, kind? }
 // lines: [{ sku, name, quantity, unitPrice, sampleCode? }]
 async function buildPoPdf(po, lines) {
@@ -227,40 +246,43 @@ async function buildPoPdf(po, lines) {
 
     // Page 1: header block + table starts at y=320.
     drawHeaderBlock(doc, po);
-    let y = drawTableHeader(doc, 320);
+    const table = tableFor(po, lines);
+    let y = drawTableHeader(doc, 320, table.cols);
     let subtotal = 0;
 
     const startNewPage = () => {
         doc.addPage();
-        y = drawTableHeader(doc, PAGE_TOP);
+        y = drawTableHeader(doc, PAGE_TOP, table.cols);
     };
 
     for (const line of lines) {
-        const rowH = rowHeight(doc, line);
+        const rowH = rowHeight(doc, line, table.item);
         // If this row (which may be taller than ROW_H for a long name) would
         // overflow the page, paginate before drawing it.
         if (y + rowH > PAGE_BOTTOM) startNewPage();
-        const { yNext, lineTotal } = drawRow(doc, y, line, rowH, isFreeLine(po, line));
+        const { yNext, lineTotal } = drawRow(doc, y, line, rowH, table, isUnpricedLine(po, line));
         subtotal += lineTotal;
         y = yNext;
     }
 
     // Totals + comments must stay together on the last page. If they don't fit
     // alongside the last row, push them to a new page.
+    // A sample order with nothing to pay (no priced line, no shipping charge)
+    // has no totals box, and nothing in its place.
     const shipping = Number(po.shippingTotal || 0);
     const nothingToPay = isSamplePo(po) && subtotal + shipping === 0;
-    const totalsHeight = nothingToPay ? ROW_H : ROW_H * 3;
+    const totalsHeight = nothingToPay ? 0 : ROW_H * 3;
     const commentsHeight = 90;
     const blockGap = 30;
-    const requiredSpace = blockGap + totalsHeight + blockGap + commentsHeight;
+    const requiredSpace = (nothingToPay ? 0 : blockGap + totalsHeight) + blockGap + commentsHeight;
     if (y + requiredSpace > PAGE_BOTTOM) {
         doc.addPage();
         y = PAGE_TOP;
-    } else {
+    } else if (!nothingToPay) {
         y += blockGap;
     }
 
-    y = nothingToPay ? drawNothingToPay(doc, y) : drawTotalsBox(doc, y, po.currency, shipping, subtotal);
+    if (!nothingToPay) y = drawTotalsBox(doc, y, po.currency, shipping, subtotal);
     y = drawCommentsBox(doc, y + blockGap, po.comments);
 
     doc.end();

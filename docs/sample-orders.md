@@ -95,7 +95,7 @@ Courier details staff entered first are kept unless the apply sends `useSupplier
 | Deposit-received and artwork-confirmed Lambdas | a sample PO's lines are not moved; the supplier's tick is still recorded |
 | Artwork confirmation email | refused (409 `SAMPLE_NO_ARTWORK`) |
 | QC visit candidates, ShipsGo sync, shipment shadow | cannot meet a sample: it is never `IN_PRODUCTION` or `READY_FOR_QC` and holds no AWB, container or shipment (the validator, and the activation check, hold that) |
-| PO PDF | headed SAMPLE ORDER; one line per sample code; a free line prints "Free", never a price of 0; nothing to pay prints no totals |
+| PO PDF | headed SAMPLE ORDER; one line per sample code. A sample with no price is not priced on the paper (the user, 2026-11-25: "exclude the price column dont say free"): when no line has a price the table has no Unit Price and Line Price columns, and with no shipping charge either there is no totals box; when some lines have a price the columns stay and an unpriced line's two cells are empty. Nothing prints "free", and nothing prints a 0 for a sample's price |
 | Portal payment views | included: a sample's payment shows like any PO payment |
 
 ## Switching it on
