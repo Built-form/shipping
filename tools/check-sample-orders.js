@@ -24,13 +24,21 @@
 //                   JFlow's sign-in: put a signed-in Google ID token in the
 //                   JFLOW_TOKEN environment variable (never on the command
 //                   line; it is sent, not printed).
+//   --jflow-function  instead of --jflow-health: the name of JFlow's Lambda for
+//                   this stage (jflow-test-jflowApi). The same health route,
+//                   asked of the function directly with `aws lambda invoke`:
+//                   no token, only the rights a deploy already needs.
 // Without them the report still runs; those two lines read "unchecked".
 //
 // Read-only except --arm and --disarm, each of which writes one row.
 
 const mysql = require('mysql2/promise');
 const { resolveTarget, checkTarget, Refusal } = require('./migrate');
-const { runChecks, summarise, askJflowHealth } = require('../src/services/sample-orders-check');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { execFileSync } = require('child_process');
+const { runChecks, summarise, askJflowHealth, askJflowLambda } = require('../src/services/sample-orders-check');
 const S = require('../src/lib/sample-orders');
 
 function arg(name) {
@@ -42,10 +50,33 @@ const flag = name => process.argv.includes(name);
 // Does the deployed JFlow say its payments model knows the sample rule?
 // true / false, or null when no URL was given. Anything short of a clear yes
 // is a no, and says why (src/services/sample-orders-check.js askJflowHealth).
-async function askJflow(url) {
-    const { answer, detail } = await askJflowHealth(url, { token: process.env.JFLOW_TOKEN || null });
+async function askJflow(url, functionName) {
+    const { answer, detail } = functionName
+        ? await askJflowLambda(functionName, { invoke: invokeLambda })
+        : await askJflowHealth(url, { token: process.env.JFLOW_TOKEN || null });
     if (detail) console.log(`  (${detail})`);
     return answer;
+}
+
+// Run a Lambda with one event and give back what it returned. Read-only for the
+// health route. The event and the answer pass through two files in a folder of
+// their own under the system's temp folder, removed afterwards.
+async function invokeLambda(functionName, event) {
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(functionName)) throw new Error('not a function name');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sample-check-'));
+    try {
+        const eventFile = path.join(dir, 'event.json');
+        const outFile = path.join(dir, 'out.json');
+        fs.writeFileSync(eventFile, JSON.stringify(event));
+        execFileSync('aws', [
+            'lambda', 'invoke', '--region', process.env.AWS_REGION || 'eu-north-1',
+            '--function-name', functionName, '--cli-binary-format', 'raw-in-base64-out',
+            '--payload', `file://${eventFile}`, outFile,
+        ], { stdio: ['ignore', 'ignore', 'pipe'], shell: process.platform === 'win32' });
+        return JSON.parse(fs.readFileSync(outFile, 'utf8'));
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
 }
 
 async function main() {
@@ -78,7 +109,7 @@ async function main() {
         const results = await runChecks(conn, {
             portalUser: arg('--portal-user') || 'jportal_app',
             jflowUser: arg('--jflow-user'),
-            jflowReportsSamples: await askJflow(arg('--jflow-health')),
+            jflowReportsSamples: await askJflow(arg('--jflow-health'), arg('--jflow-function')),
         });
         const mark = { ok: 'ok  ', fail: 'FAIL', unchecked: '??  ' };
         for (const r of results) {

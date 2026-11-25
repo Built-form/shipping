@@ -32,6 +32,11 @@ function conn(w) {
                 return [[]];
             }
             if (/FROM mysql\.user/.test(text)) return [w.users.includes(params[0]) ? [{ ok: 1 }] : []];
+            // The roles a login holds and has active when it signs in.
+            if (/FROM mysql\.role_edges/.test(text)) {
+                if (w.noRoleTables) throw Object.assign(new Error("Table 'mysql.role_edges' doesn't exist"), { errno: 1146 });
+                return [((w.roles || {})[params[0]] || []).map(role => ({ role }))];
+            }
             if (/PRIVILEGES/.test(text)) {
                 // One statement over the four privilege tables: global or schema
                 // ('*'), the table ('t.*'), or the column ('t.c').
@@ -168,4 +173,59 @@ test('JFlow health: a route that cannot be reached, or does not answer JSON, is 
     assert.equal(error.answer, false);
     assert.match(error.detail, /answered 503/);
     assert.doesNotMatch(error.detail, /JFLOW_TOKEN/);
+});
+
+// The same question asked of JFlow's Lambda directly (aws lambda invoke): the
+// route an operator with deploy rights always has, with no browser token.
+const lambdaAnswer = (statusCode, body, seen = []) => async (name, event) => {
+    seen.push({ name, event });
+    return { statusCode, body: typeof body === 'string' ? body : JSON.stringify(body) };
+};
+
+test('JFlow function: asked for GET /api/v1/health, a yes is a yes', async () => {
+    assert.deepEqual(await C.askJflowLambda(null, { invoke: lambdaAnswer(200, {}) }), { answer: null, detail: null });
+    const seen = [];
+    const got = await C.askJflowLambda('jflow-test-jflowApi', { invoke: lambdaAnswer(200, { status: 'ok', paymentsFlow: { sampleOrders: true } }, seen) });
+    assert.deepEqual(got, { answer: true, detail: null });
+    assert.equal(seen[0].name, 'jflow-test-jflowApi');
+    assert.equal(seen[0].event.rawPath, '/api/v1/health');
+    assert.equal(seen[0].event.requestContext.http.method, 'GET');
+    assert.equal(seen[0].event.version, '2.0');
+});
+
+test('JFlow function: an older build, an error answer, a body that is not JSON or a failed invoke is a no, with the reason', async () => {
+    const old = await C.askJflowLambda('f', { invoke: lambdaAnswer(200, { status: 'ok' }) });
+    assert.equal(old.answer, false);
+    assert.match(old.detail, /does not report the sample rule/);
+    assert.equal((await C.askJflowLambda('f', { invoke: lambdaAnswer(200, { paymentsFlow: { sampleOrders: 'true' } }) })).answer, false);
+    const failed = await C.askJflowLambda('f', { invoke: lambdaAnswer(500, { error: 'x' }) });
+    assert.equal(failed.answer, false);
+    assert.match(failed.detail, /answered 500/);
+    const garbled = await C.askJflowLambda('f', { invoke: lambdaAnswer(200, '<html>') });
+    assert.equal(garbled.answer, false);
+    const crashed = await C.askJflowLambda('f', { invoke: async () => ({ errorType: 'Runtime.ImportModuleError', errorMessage: 'boom' }) });
+    assert.equal(crashed.answer, false);
+    assert.match(crashed.detail, /Runtime\.ImportModuleError/);
+    const denied = await C.askJflowLambda('f', { invoke: async () => { throw new Error('AccessDeniedException'); } });
+    assert.equal(denied.answer, false);
+    assert.match(denied.detail, /AccessDeniedException/);
+});
+
+// Found on TEST, 2026-11-25: RDS gives its master login everything through a
+// role and nothing directly, and JFlow's stack signs in as that login. A check
+// that reads only the login's own rows says it can read nothing.
+test('a login whose rights come from a role is read through the role', async () => {
+    const viaRole = world({ grants: { jportal_app: ['purchase_orders.kind'], rds_superuser_role: ['*'] }, roles: { jflow_app: ['rds_superuser_role'] } });
+    assert.equal(byName(await run(viaRole), 'JFlow login can read the kind columns').status, 'ok');
+    assert.equal(await C.canSelect(conn(viaRole), 'jflow_app', 'orders', 'order_kind'), true);
+    // A role that gives only one of the two columns is still a no for the pair.
+    const half = world({ grants: { jportal_app: ['purchase_orders.kind'], reader: ['purchase_orders.kind'] }, roles: { jflow_app: ['reader'] } });
+    assert.equal(byName(await run(half), 'JFlow login can read the kind columns').status, 'fail');
+    // Someone else's role is not this login's.
+    const other = world({ grants: { jportal_app: ['purchase_orders.kind'], rds_superuser_role: ['*'] }, roles: { somebody: ['rds_superuser_role'] } });
+    assert.equal(byName(await run(other), 'JFlow login can read the kind columns').status, 'fail');
+    // A server with no role tables has no roles: the login's own rights decide, as before.
+    const old = world({ noRoleTables: true });
+    assert.equal(byName(await run(old), 'JFlow login can read the kind columns').status, 'ok');
+    assert.equal(await C.canSelect(conn(world({ noRoleTables: true, grants: {} })), 'jflow_app', 'orders', 'order_kind'), false);
 });

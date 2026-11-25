@@ -37,7 +37,37 @@ async function userExists(conn, user) {
 
 // Can `user` SELECT `table`.`column` of this schema? By a privilege on
 // everything, on the schema, on the table, or on the column. Any host.
+// A login and the roles it has active when it signs in. A login's rights can be
+// a role's and not its own: RDS gives its master login everything through
+// rds_superuser_role, and the privilege tables then hold nothing under the
+// login's name. A role counts only when it is one of the login's default roles,
+// or the server activates every granted role at login. A server with no role
+// tables has no roles.
+async function granteesOf(conn, user) {
+    try {
+        const [rows] = await conn.query(
+            `SELECT e.FROM_USER AS role FROM mysql.role_edges e
+              WHERE e.TO_USER = ?
+                AND (@@global.activate_all_roles_on_login = 1
+                     OR EXISTS (SELECT 1 FROM mysql.default_roles d
+                                 WHERE d.USER = e.TO_USER AND d.DEFAULT_ROLE_USER = e.FROM_USER))`,
+            [user]
+        );
+        return [user, ...rows.map(r => r.role)];
+    } catch (err) {
+        return [user];
+    }
+}
+
+// Can `user` SELECT this column: by its own rights, or by a role's?
 async function canSelect(conn, user, table, column) {
+    for (const grantee of await granteesOf(conn, user)) {
+        if (await holdsSelect(conn, grantee, table, column)) return true;
+    }
+    return false;
+}
+
+async function holdsSelect(conn, user, table, column) {
     // information_schema spells a grantee 'user'@'host'.
     const [rows] = await conn.query(
         `SELECT 1 AS ok FROM information_schema.USER_PRIVILEGES
@@ -225,4 +255,41 @@ async function askJflowHealth(url, { fetchImpl = fetch, token = null } = {}) {
     }
 }
 
-module.exports = { runChecks, summarise, canSelect, DATA_CHECKS, askJflowHealth };
+const reportsSampleRule = body =>
+    Boolean(body && (body.sampleOrders === true || (body.paymentsFlow && body.paymentsFlow.sampleOrders === true)));
+
+// The same question, asked of JFlow's Lambda directly instead of through its
+// gateway: the route an operator with deploy rights always has, and it needs no
+// browser token. `invoke(functionName, event)` runs the function and gives back
+// what it returned (the tool does it with `aws lambda invoke`). The event is a
+// plain GET of the health route, which answers without a signed-in user.
+//   → { answer: true | false | null, detail }, as askJflowHealth.
+const HEALTH_EVENT = Object.freeze({
+    version: '2.0',
+    routeKey: 'ANY /{proxy+}',
+    rawPath: '/api/v1/health',
+    rawQueryString: '',
+    headers: { accept: 'application/json', host: 'direct-invoke' },
+    requestContext: { http: { method: 'GET', path: '/api/v1/health', sourceIp: '127.0.0.1', protocol: 'HTTP/1.1' }, stage: '$default' },
+    isBase64Encoded: false,
+});
+
+async function askJflowLambda(functionName, { invoke } = {}) {
+    if (!functionName) return { answer: null, detail: null };
+    try {
+        const res = await invoke(functionName, JSON.parse(JSON.stringify(HEALTH_EVENT)));
+        if (res && res.errorType) {
+            return { answer: false, detail: `JFlow's function failed: ${res.errorType}${res.errorMessage ? ` (${res.errorMessage})` : ''}` };
+        }
+        const status = res ? Number(res.statusCode) : NaN;
+        if (status !== 200) return { answer: false, detail: `JFlow's health route answered ${Number.isFinite(status) ? status : 'nothing'}` };
+        const body = JSON.parse(res.body);
+        return reportsSampleRule(body)
+            ? { answer: true, detail: null }
+            : { answer: false, detail: "JFlow's health route does not report the sample rule: its payments model is not re-pinned yet" };
+    } catch (err) {
+        return { answer: false, detail: `JFlow's function could not be asked: ${err.message}` };
+    }
+}
+
+module.exports = { runChecks, summarise, canSelect, DATA_CHECKS, askJflowHealth, askJflowLambda };
