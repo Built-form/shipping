@@ -507,6 +507,8 @@ if (require.main === module) {
 
 // For tools/test-migrate-lib.js.
 module.exports = {
+    // resolveTarget: also for tools/check-sample-orders.js, which reads --stage the same way.
+    resolveTarget,
     Refusal, checkTarget, alreadyApplied, applyFile, adopt, verifyBaseline,
     normaliseCreate, definitionLines, checksum, ownedViews, viewCheck,
 };

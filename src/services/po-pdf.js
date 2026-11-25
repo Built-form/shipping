@@ -4,6 +4,12 @@
 // POs: header block (PO Ref, Order Date), three-column address block, line-
 // items table, totals box, comments box.
 //
+// A SAMPLE order (po.kind 'sample', docs/sample-orders.md) prints the same
+// page with three differences: it is headed SAMPLE ORDER; each line names the
+// sample code the supplier should write on the parcel; and a free sample is
+// never printed as a price of 0 (its cells read "Free", and an order with
+// nothing to pay prints no totals at all).
+//
 // Pagination: long line-items split across pages. The table header is
 // re-drawn on every page; totals + comments always land together on the
 // last page, on a new page if they wouldn't fit alongside the last row.
@@ -58,11 +64,21 @@ function truncateName(name) {
     return s.slice(0, MAX_NAME_LEN - 1).trimEnd() + '…';
 }
 
+// What the Item cell holds: the name, and under it the sample code of a sample line.
+function itemText(line) {
+    const name = truncateName(line.name);
+    return line.sampleCode ? `${name}\nSample code: ${line.sampleCode}` : name;
+}
+
+const isSamplePo = po => Boolean(po) && po.kind === 'sample';
+// A free sample: a line of a sample order with no price.
+const isFreeLine = (po, line) => isSamplePo(po) && Number(line.unitPrice || 0) === 0;
+
 // Height a row needs so its (possibly multi-line) item name fits with padding.
 // Never shorter than ROW_H, so short names keep the original single-line look.
 function rowHeight(doc, line) {
     doc.font('Helvetica').fontSize(10);
-    const nameH = doc.heightOfString(truncateName(line.name) || ' ', {
+    const nameH = doc.heightOfString(itemText(line) || ' ', {
         width: ITEM_COL.w,
         align: ITEM_COL.align,
     });
@@ -86,7 +102,7 @@ function fmtDate(d) {
 
 function drawHeaderBlock(doc, po) {
     // Title
-    doc.fontSize(22).font('Helvetica-Bold').text('PURCHASE ORDER', 50, 60);
+    doc.fontSize(22).font('Helvetica-Bold').text(isSamplePo(po) ? 'SAMPLE ORDER' : 'PURCHASE ORDER', 50, 60);
 
     // PO Ref / Order Date
     doc.fontSize(10).font('Helvetica-Bold');
@@ -142,12 +158,12 @@ function drawTableHeader(doc, y) {
     return y + ROW_H;
 }
 
-function drawRow(doc, y, line, rowH) {
+function drawRow(doc, y, line, rowH, free = false) {
     doc.lineWidth(0.5).rect(TABLE_LEFT, y, TABLE_WIDTH, rowH).stroke('#000');
     const qty = Number(line.quantity || 0);
     const unit = Number(line.unitPrice || 0);
     const lineTotal = qty * unit;
-    const name = truncateName(line.name);
+    const name = itemText(line);
 
     doc.font('Helvetica').fontSize(10).fillColor('#000');
     // Vertically centre single-line cells, and the wrapped name block, within
@@ -160,8 +176,9 @@ function drawRow(doc, y, line, rowH) {
     doc.text(line.sku || '',          50,  singleY, { width: 70,  align: 'center' });
     doc.text(name,                    120, nameY,   { width: 200, align: 'center' });
     doc.text(String(qty),             320, singleY, { width: 60,  align: 'center' });
-    doc.text(fmtMoney(unit, 5),       380, singleY, { width: 70,  align: 'center' });
-    doc.text(fmtMoney(lineTotal, 2),  450, singleY, { width: 70,  align: 'center' });
+    // A free sample is said in words: a price of 0 is never printed for it.
+    doc.text(free ? 'Free' : fmtMoney(unit, 5),      380, singleY, { width: 70,  align: 'center' });
+    doc.text(free ? 'Free' : fmtMoney(lineTotal, 2), 450, singleY, { width: 70,  align: 'center' });
     return { yNext: y + rowH, lineTotal };
 }
 
@@ -193,8 +210,15 @@ function drawCommentsBox(doc, y, comments) {
     return y + 90;
 }
 
-// po: { poNumber, orderDate, supplier, supplierAddress[], currency, shippingTotal, comments }
-// lines: [{ sku, name, quantity, unitPrice }]
+// A sample order with nothing to pay says so, where the totals would be.
+function drawNothingToPay(doc, y) {
+    doc.font('Helvetica-Bold').fontSize(10).fillColor('#000')
+        .text('Free of charge: nothing to pay.', 50, y + 9, { width: TABLE_WIDTH, align: 'right' });
+    return y + ROW_H;
+}
+
+// po: { poNumber, orderDate, supplier, supplierAddress[], currency, shippingTotal, comments, kind? }
+// lines: [{ sku, name, quantity, unitPrice, sampleCode? }]
 async function buildPoPdf(po, lines) {
     const doc = new PDFDocument({ size: 'A4', margin: 50 });
     const chunks = [];
@@ -216,14 +240,16 @@ async function buildPoPdf(po, lines) {
         // If this row (which may be taller than ROW_H for a long name) would
         // overflow the page, paginate before drawing it.
         if (y + rowH > PAGE_BOTTOM) startNewPage();
-        const { yNext, lineTotal } = drawRow(doc, y, line, rowH);
+        const { yNext, lineTotal } = drawRow(doc, y, line, rowH, isFreeLine(po, line));
         subtotal += lineTotal;
         y = yNext;
     }
 
     // Totals + comments must stay together on the last page. If they don't fit
     // alongside the last row, push them to a new page.
-    const totalsHeight = ROW_H * 3;
+    const shipping = Number(po.shippingTotal || 0);
+    const nothingToPay = isSamplePo(po) && subtotal + shipping === 0;
+    const totalsHeight = nothingToPay ? ROW_H : ROW_H * 3;
     const commentsHeight = 90;
     const blockGap = 30;
     const requiredSpace = blockGap + totalsHeight + blockGap + commentsHeight;
@@ -234,7 +260,7 @@ async function buildPoPdf(po, lines) {
         y += blockGap;
     }
 
-    y = drawTotalsBox(doc, y, po.currency, Number(po.shippingTotal || 0), subtotal);
+    y = nothingToPay ? drawNothingToPay(doc, y) : drawTotalsBox(doc, y, po.currency, shipping, subtotal);
     y = drawCommentsBox(doc, y + blockGap, po.comments);
 
     doc.end();

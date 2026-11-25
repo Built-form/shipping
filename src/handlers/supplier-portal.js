@@ -34,6 +34,9 @@ const express = require('express');
 const cors = require('cors');
 const { getPool } = require('../db');
 const log = require('../lib/logger');
+// This older, public page asks for ready dates. A sample order has none: its
+// lines are neither listed nor writable here (docs/sample-orders.md).
+const sampleOrders = require('../services/sample-orders');
 const { ensureSupplierPortalCodes, safeCompareCode, normalizeCode } = require('../lib/portal-code');
 const {
     normSupplier, chinaToday, isYmd, isHm, confirmationTimestamps, applyTransition,
@@ -169,7 +172,7 @@ async function fetchLineItems(conn, poId) {
         `SELECT id, jf_code, product_name, quantity, status,
                 estimated_ready_date, actual_ready_date
            FROM orders
-          WHERE purchase_order_id = ? AND deleted_at IS NULL
+          WHERE purchase_order_id = ? AND deleted_at IS NULL${await sampleOrders.stockOnlySql(conn)}
           ORDER BY jf_code ASC, id ASC`,
         [poId]
     );
@@ -278,7 +281,7 @@ app.post('/api/v1/portal/po-ready-date', async (req, res) => {
             // auditing.
             const [ownRows] = await conn.query(
                 `SELECT id, status, estimated_ready_date, actual_ready_date, dates FROM orders
-                  WHERE purchase_order_id = ? AND deleted_at IS NULL`,
+                  WHERE purchase_order_id = ? AND deleted_at IS NULL${await sampleOrders.stockOnlySql(conn)}`,
                 [auth.po.id]
             );
             const byId = new Map(ownRows.map(r => [r.id, r]));

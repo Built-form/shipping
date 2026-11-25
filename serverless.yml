@@ -108,6 +108,11 @@ provider:
     SHIPSGO_API_KEY: ${self:custom.secrets.SHIPSGO_API_KEY}
     MAKE_PO_SENT_WEBHOOK_URL: ${self:custom.secrets.MAKE_PO_SENT_WEBHOOK_URL, ''}
     PO_DOCS_BUCKET: shipping-purchase-orders-${sls:stage}
+    # The stage this code runs as ('dev' is production, 'test' is TEST). Sample
+    # orders are armed by a row in app_migrations named for ONE stage
+    # (sample_orders_on:<stage>, src/lib/sample-orders.js), so the row a TEST
+    # rebuild copies from production never arms TEST. Unset = never armed.
+    APP_STAGE: ${sls:stage}
     # JFPRO's documents bucket (owned by the JFPRO stack, same region): the QC
     # inspection kit documents (src/services/qc-kit-routes.js presigns links,
     # qc-visit-comms-routes.js attaches them to the inspector email). Read only.

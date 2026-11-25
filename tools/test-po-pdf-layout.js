@@ -63,3 +63,67 @@ test('a purchase order with no supplier still prints a dash in the supplier colu
     const dash = calls.find(c => c.text === '-' && c.x === 50);
     assert.equal(dash.y, 180);
 });
+
+// ── A sample order (docs/sample-orders.md) ───────────────────────────────────
+// Its own heading, the sample code on each line, and a free sample never
+// printed as a price of 0.
+
+async function textsOf(po, lines) {
+    const texts = [];
+    const original = PDFDocument.prototype.text;
+    PDFDocument.prototype.text = function (text) {
+        texts.push(String(text));
+        return original.apply(this, arguments);
+    };
+    try {
+        await buildPoPdf({ poNumber: 'PO_00431J', orderDate: '2026-11-25', supplier: SHORT_NAME, currency: 'USD', ...po }, lines);
+    } finally {
+        PDFDocument.prototype.text = original;
+    }
+    return texts;
+}
+
+const FREE = { sku: 'JF1016', name: 'Wrist Brace', quantity: 2, unitPrice: 0, sampleCode: 'SA0031-S01-V03-CN0011' };
+const PRICED = { sku: 'JF1017', name: 'Knee Brace', quantity: 3, unitPrice: 4.5, sampleCode: 'SA0032-S01-V01-CN0011' };
+
+test('a stock PO is headed PURCHASE ORDER and prints a price of 0 as it always has', async () => {
+    const texts = await textsOf({}, [{ sku: 'JF1001', name: 'Nitrile Gloves', quantity: 100, unitPrice: 0 }]);
+    assert.equal(texts[0], 'PURCHASE ORDER');
+    assert.ok(texts.includes('0.00000'));
+    assert.ok(texts.includes('Total Cost'));
+    assert.equal(texts.some(t => /Sample code/.test(t)), false);
+});
+
+test('a sample order is headed SAMPLE ORDER and names the sample code on each line', async () => {
+    const texts = await textsOf({ kind: 'sample' }, [PRICED]);
+    assert.equal(texts[0], 'SAMPLE ORDER');
+    assert.equal(texts.includes('PURCHASE ORDER'), false);
+    assert.ok(texts.includes('Knee Brace\nSample code: SA0032-S01-V01-CN0011'));
+    assert.ok(texts.includes('4.50000'));
+    assert.ok(texts.includes('13.50'));
+    assert.ok(texts.includes('Total Cost'));
+});
+
+test('a free sample never prints a price of 0: its cells read Free, and nothing to pay prints no totals', async () => {
+    const texts = await textsOf({ kind: 'sample', shippingTotal: 0 }, [FREE]);
+    assert.equal(texts.some(t => /^0\.0+$/.test(t)), false);
+    assert.equal(texts.filter(t => t === 'Free').length, 2);
+    assert.equal(texts.includes('Total Cost'), false);
+    assert.equal(texts.includes('Shipping Total'), false);
+    assert.ok(texts.includes('Free of charge: nothing to pay.'));
+    assert.ok(texts.includes('Comments:'));
+});
+
+test('a free line beside a priced one, or with a shipping charge, still totals what is owed', async () => {
+    const mixed = await textsOf({ kind: 'sample' }, [FREE, PRICED]);
+    assert.equal(mixed.filter(t => t === 'Free').length, 2);
+    assert.ok(mixed.includes('Total Cost'));
+    assert.ok(mixed.includes('13.50'));
+    assert.equal(mixed.includes('Free of charge: nothing to pay.'), false);
+
+    const shipped = await textsOf({ kind: 'sample', shippingTotal: 25 }, [FREE]);
+    assert.equal(shipped.filter(t => t === 'Free').length, 2);
+    assert.ok(shipped.includes('Shipping Total'));
+    assert.ok(shipped.includes('25.00'));
+    assert.equal(shipped.includes('Free of charge: nothing to pay.'), false);
+});

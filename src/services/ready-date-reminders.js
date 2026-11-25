@@ -35,6 +35,9 @@ const { DEFAULT_EMAIL_TEMPLATES, READY_DATE_REMINDER_TEMPLATE_KEY } = require('.
 const { createEmailReceipt, recordReminderSend } = require('../lib/email-receipt');
 const { jportalSchema, isSourceMissing } = require('../lib/jportal');
 const { sendEmail: defaultSend } = require('./email-send');
+// A sample order has no ready date to chase: its supplier's one action on the
+// portal is "Mark as sent" (docs/sample-orders.md).
+const sampleOrders = require('./sample-orders');
 const { loadDepositGate: defaultLoadGate } = require('./deposit-gate');
 const { londonToday } = require('./daily-alerts');
 
@@ -264,7 +267,7 @@ async function runReadyDateReminders(pool, opts = {}) {
                     po.po_number, po.supplier AS po_supplier
                FROM orders o
                JOIN purchase_orders po ON po.id = o.purchase_order_id AND po.deleted_at IS NULL
-              WHERE ${R.waitingSql('o', '?')}
+              WHERE ${R.waitingSql('o', '?')}${await sampleOrders.stockOnlySql(conn, 'o')}
               ORDER BY o.purchase_order_id ASC, o.jf_code ASC, o.id ASC`,
             Array(R.WAITING_TODAYS).fill(today)
         );
