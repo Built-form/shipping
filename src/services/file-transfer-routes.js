@@ -39,7 +39,7 @@ const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const { v4: uuidv4 } = require('uuid');
 const L = require('../lib/file-transfers');
 const { jportalSchema, isSourceMissing } = require('../lib/jportal');
-const { sendFrontMessage } = require('./front-send');
+const { sendEmail } = require('./email-send');
 const { wrapEmail } = require('../lib/email-layout');
 const { logSentEmail } = require('../lib/email-receipt');
 
@@ -189,7 +189,7 @@ function registerFileTransferRoutes(app, deps) {
             if (redirect) subject = `[for ${original.join(', ') || 'nobody'}] ${subject}`;
             // The template is the inside of the card (src/lib/email-layout.js).
             const html = wrapEmail({ title, bodyHtml: renderTemplate(tpl.bodyHtml, vars.body) });
-            const sent = await sendFrontMessage({ to, subject, html });
+            const sent = await sendEmail({ to, subject, html });
             if (sent.ok) {
                 await conn.query(`UPDATE ${jp()}.file_transfers SET notified_at = UTC_TIMESTAMP(), notify_error = NULL WHERE id = ?`, [id]);
                 // On the Email Receipts page: confirmed when a supplier's user
@@ -206,7 +206,7 @@ function registerFileTransferRoutes(app, deps) {
                 entityType: 'file_transfer', entityId: id, action: sent.ok ? 'notified' : 'notify_failed', before: null,
                 after: {
                     template: L.TEMPLATE_KEY, to, ...(redirect ? { redirectedFrom: original } : {}),
-                    ...(sent.ok ? { frontMessageUid: sent.frontMessageUid || null } : { reason: sent.reason, frontStatus: sent.status ?? null }),
+                    ...(sent.ok ? { frontMessageUid: sent.messageId || null } : { reason: sent.reason, frontStatus: sent.status ?? null }),
                 },
                 userEmail,
             });

@@ -2,16 +2,19 @@
 
 // One-off smoke test for the /purchase-order-documents/:id/email endpoint.
 // Picks the most-recent purchase_order_documents row, fetches the PDF from
-// S3, and posts it to Front exactly the way the handler does. Run with:
+// S3, and sends it through SES exactly the way the handler does
+// (src/services/email-send.js). Run with:
 //
 //   node tools/send-po-test.js <recipient1,recipient2,...> [documentId]
 //
 // Recipients are comma-separated. Document id is optional — defaults to
-// the latest row.
+// the latest row. Needs SES_FROM_ARN (and AWS credentials that may
+// ses:SendEmail from it) in the environment.
 
 require('dotenv').config();
 const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
 const { getPool, closePool } = require('../src/db');
+const { sendEmail, isConfigured } = require('../src/services/email-send');
 
 const recipientArg = process.argv[2];
 const explicitDocId = process.argv[3] ? Number(process.argv[3]) : null;
@@ -21,8 +24,8 @@ if (!recipientArg) {
     process.exit(1);
 }
 const recipients = recipientArg.split(',').map(s => s.trim()).filter(Boolean);
-if (!process.env.FRONT_API_TOKEN || !process.env.FRONT_CHANNEL_ID) {
-    console.error('Missing FRONT_API_TOKEN or FRONT_CHANNEL_ID in env.');
+if (!isConfigured()) {
+    console.error('Missing or malformed SES_FROM_ARN in env (an email-address identity ARN).');
     process.exit(1);
 }
 if (!process.env.PO_DOCS_BUCKET) {
@@ -86,27 +89,13 @@ const PO_EMAIL_BODY_HTML = [
         const subject = String(doc.po_number);
         const htmlBody = PO_EMAIL_BODY_HTML;
 
-        const form = new FormData();
-        for (const addr of recipients) form.append('to[]', addr);
-        form.append('subject', subject);
-        form.append('body', htmlBody);
-        form.append('body_format', 'html');
-        form.append('options[archive]', 'false');
-        form.append('attachments[]', new Blob([pdfBytes], { type: 'application/pdf' }), filename);
-
-        const url = `https://api2.frontapp.com/channels/${encodeURIComponent(process.env.FRONT_CHANNEL_ID)}/messages`;
-        console.log(`POSTing to Front (channel=${process.env.FRONT_CHANNEL_ID}, to=${recipients.join(', ')})…`);
-        const resp = await fetch(url, {
-            method: 'POST',
-            headers: {
-                Authorization: `Bearer ${process.env.FRONT_API_TOKEN}`,
-                Accept: 'application/json',
-            },
-            body: form,
+        console.log(`Sending through SES (from=${process.env.SES_FROM_ARN}, to=${recipients.join(', ')})…`);
+        const sent = await sendEmail({
+            to: recipients, subject, html: htmlBody,
+            attachments: [{ bytes: pdfBytes, filename, contentType: 'application/pdf' }],
         });
-        const respText = await resp.text();
-        console.log('Front response:', resp.status, resp.statusText);
-        console.log(respText.slice(0, 1000));
+        console.log('SES result:', JSON.stringify(sent));
+        if (!sent.ok) process.exitCode = 1;
     } catch (err) {
         console.error('Fatal:', err.message);
         process.exitCode = 1;

@@ -4,13 +4,13 @@
 // (docs/freight-quotes.md): the token and link, what a forwarder, a request and
 // an answer may say, a request's state, the emails' fixed blocks, a container's
 // contents by supplier and whether they changed since they were sent — plus
-// sendFrontMessage's attachments (src/services/front-send.js). No database.
+// sendEmail's SES message and attachments (src/services/email-send.js). No database.
 //   node --test tools/test-freight-quotes-lib.js
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const F = require('../src/lib/freight-quotes');
-const { sendFrontMessage } = require('../src/services/front-send');
+const { sendEmail } = require('../src/services/email-send');
 const {
     DEFAULT_EMAIL_TEMPLATES, FREIGHT_TEMPLATES, FREIGHT_QUOTE_REQUEST_TEMPLATE_KEY,
     FREIGHT_BOOKING_REQUEST_TEMPLATE_KEY, FREIGHT_BOOKING_CONTENTS_TEMPLATE_KEY,
@@ -361,25 +361,38 @@ test('contentsDrift: nothing sent → null; then only what the forwarder acts on
     assert.equal(F.contentsDrift(snapshot, LINES.slice(0, 3)).changes[0].kind, 'removed');
 });
 
-test('sendFrontMessage: attachments ride along as files; none by default', async () => {
+test('sendEmail: attachments ride along on the SES message; none by default', async () => {
     const calls = [];
-    const fetchImpl = async (url, init) => {
-        calls.push(init.body);
-        return { ok: true, text: async () => JSON.stringify({ message_uid: 'm1', _links: { related: { conversation: 'https://x/cnv_9' } } }) };
-    };
-    const env = { FRONT_CHANNEL_ID: 'c', FRONT_API_TOKEN: 't' };
-    const plain = await sendFrontMessage({ to: 'a@b.com', subject: 's', html: '<p>x</p>' }, { fetchImpl, env });
-    assert.deepEqual(plain, { ok: true, frontMessageUid: 'm1', frontConversationId: 'cnv_9' });
-    assert.equal(calls[0].getAll('attachments[]').length, 0);
+    const sendImpl = async (region, input) => { calls.push(input); return { MessageId: 'm1' }; };
+    const env = { SES_FROM_ARN: 'arn:aws:ses:eu-north-1:123456789012:identity/portal@example.com' };
+    const plain = await sendEmail({ to: 'a@b.com', subject: 's', html: '<p>x</p>' }, { sendImpl, env });
+    assert.deepEqual(plain, { ok: true, messageId: 'm1' });
+    assert.equal(calls[0].Content.Simple.Attachments, undefined);
+    assert.equal(calls[0].ReplyToAddresses, undefined, 'no EMAIL_REPLY_TO, no Reply-To');
 
-    await sendFrontMessage({
+    await sendEmail({
         to: 'a@b.com', subject: 's', html: '<p>x</p>',
         attachments: [{ bytes: Buffer.from('%PDF'), filename: 'q.pdf', contentType: 'application/pdf' }, null, { filename: 'no-bytes.csv' }],
-    }, { fetchImpl, env });
-    const files = calls[1].getAll('attachments[]');
+    }, { sendImpl, env });
+    const files = calls[1].Content.Simple.Attachments;
     assert.equal(files.length, 1);
-    assert.equal(files[0].name, 'q.pdf');
-    assert.equal(files[0].type, 'application/pdf');
+    assert.equal(files[0].FileName, 'q.pdf');
+    assert.equal(files[0].ContentType, 'application/pdf');
+    assert.equal(files[0].ContentDisposition, 'ATTACHMENT');
+});
+
+test('sendEmail: not configured, a refusal and no answer are reported, never thrown', async () => {
+    const env = { SES_FROM_ARN: 'arn:aws:ses:eu-north-1:123456789012:identity/portal@example.com' };
+    assert.deepEqual(await sendEmail({ to: 'a@b.com', subject: 's', html: 'x' }, { env: {} }), { ok: false, reason: 'ses_not_configured' });
+    assert.deepEqual(await sendEmail({ to: 'a@b.com', subject: 's', html: 'x' }, { env: { SES_FROM_ARN: 'arn:aws:ses:eu-north-1:123456789012:identity/example.com' } }), { ok: false, reason: 'ses_not_configured' }, 'a domain identity has no address');
+    assert.deepEqual(await sendEmail({ to: [], subject: 's', html: 'x' }, { env }), { ok: false, reason: 'no_recipients' });
+    const sesError = (name, status, message = name) => Object.assign(new Error(message), { name, $metadata: { httpStatusCode: status } });
+    const refused = await sendEmail({ to: 'a@b.com', subject: 's', html: 'x' }, { env, sendImpl: async () => { throw sesError('MessageRejected', 400, 'not verified'); } });
+    assert.deepEqual(refused, { ok: false, reason: 'ses_error', status: 400, retryable: false, detail: 'MessageRejected: not verified' });
+    const busy = await sendEmail({ to: 'a@b.com', subject: 's', html: 'x' }, { env, sendImpl: async () => { throw sesError('TooManyRequestsException', 429); } });
+    assert.equal(busy.retryable, true);
+    const dead = await sendEmail({ to: 'a@b.com', subject: 's', html: 'x' }, { env, sendImpl: async () => { throw Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }); } });
+    assert.deepEqual(dead, { ok: false, reason: 'network_error', detail: 'socket hang up' });
 });
 
 // ── a delivery request: a UK haulier, port to warehouse (2026-11-24) ──────

@@ -32,6 +32,7 @@ const {
     confirmViaOf, canRemind, syncPortalReceipts, selectEmailReceipts, remindersStoppedOf,
 } = require('../lib/email-receipt');
 const { sendReminderForReceipt } = require('../services/receipt-reminders');
+const emailSend = require('../services/email-send');
 const { receiveOrderStock, ReceiveError } = require('../services/order-receive');
 // The PO send links to the PDF on the supplier portal and pre-approves its
 // recipients there; the portal records who opened it (docs/po-portal-send.md).
@@ -3209,8 +3210,8 @@ app.post('/api/v1/draft-container-documents/:id/email', async (req, res) => {
         if (toAddresses.length === 0 || toAddresses.some(a => !EMAIL_RE.test(a))) {
             return res.status(400).json({ error: 'A valid `to` email address (or array of addresses) is required.' });
         }
-        if (!process.env.FRONT_API_TOKEN || !process.env.FRONT_CHANNEL_ID) {
-            return res.status(500).json({ error: 'Front is not configured (FRONT_API_TOKEN, FRONT_CHANNEL_ID).' });
+        if (!emailSend.isConfigured()) {
+            return res.status(500).json({ error: 'Email sending is not configured (SES_FROM_ARN).' });
         }
         if (!PO_BUCKET) {
             return res.status(500).json({ error: 'PO_DOCS_BUCKET env var not configured.' });
@@ -3345,43 +3346,21 @@ app.post('/api/v1/draft-container-documents/:id/email', async (req, res) => {
                 emailBody = appendReceiptLink(`${htmlBody}${updateBlock}`, receiptToken, apiBaseUrlFromReq(req));
             }
 
-            const form = new FormData();
-            for (const addr of toAddresses) form.append('to[]', addr);
-            form.append('subject', finalSubject);
-            form.append('body', emailBody);
-            form.append('body_format', 'html');
-            form.append('options[archive]', 'false');
+            const files = [];
             for (const a of attachments) {
-                form.append('attachments[]', new Blob([a.pdf.bytes], { type: 'application/pdf' }), a.pdf.filename);
-                if (a.csv) {
-                    form.append('attachments[]', new Blob([a.csv.bytes], { type: 'text/csv' }), a.csv.filename);
-                }
+                files.push({ bytes: a.pdf.bytes, filename: a.pdf.filename, contentType: 'application/pdf' });
+                if (a.csv) files.push({ bytes: a.csv.bytes, filename: a.csv.filename, contentType: 'text/csv' });
             }
-
-            const frontUrl = `https://api2.frontapp.com/channels/${encodeURIComponent(process.env.FRONT_CHANNEL_ID)}/messages`;
-            const resp = await fetch(frontUrl, {
-                method: 'POST',
-                headers: {
-                    Authorization: `Bearer ${process.env.FRONT_API_TOKEN}`,
-                    Accept: 'application/json',
-                },
-                body: form,
-            });
-            const respText = await resp.text();
-            if (!resp.ok) {
-                log.error('[draft-container-documents/email] Front API error', {
-                    status: resp.status, body: respText.slice(0, 500),
-                });
+            const sent = await emailSend.sendEmail({ to: toAddresses, subject: finalSubject, html: emailBody, attachments: files });
+            if (!sent.ok) {
+                log.error('[draft-container-documents/email] SES error', { reason: sent.reason, status: sent.status, detail: sent.detail });
                 // Not sent: its receipt must not be listed, or chased.
                 await discardEmailReceipt(conn, receiptToken);
-                return { frontError: { status: resp.status, body: respText.slice(0, 500) } };
+                return { frontError: { status: sent.status ?? 502, body: sent.detail || sent.reason } };
             }
-            let parsed = null;
-            try { parsed = JSON.parse(respText); } catch { /* 202 with empty body is fine */ }
-
-            const conversationUrl = parsed?._links?.related?.conversation || '';
-            const frontConversationId = conversationUrl ? conversationUrl.split('/').pop() : null;
-            const frontMessageUid = parsed?.message_uid || parsed?.id || null;
+            // The SES message id goes where Front's uid went; no conversation any more.
+            const frontMessageUid = sent.messageId;
+            const frontConversationId = null;
 
             // One send row per document the email is about (all share the Front
             // message), so each PDF shows this email in its own sends history:
@@ -3499,7 +3478,7 @@ app.post('/api/v1/draft-container-documents/:id/email', async (req, res) => {
         if (result.conflict) return res.status(409).json(result.conflict);
         if (result.frontError) {
             return res.status(502).json({
-                error: 'Front rejected the message.',
+                error: 'The email service (SES) rejected the message.',
                 frontStatus: result.frontError.status,
                 frontBody: result.frontError.body,
             });
@@ -3886,8 +3865,8 @@ app.post('/api/v1/quality-assurance-documents/:id/email', async (req, res) => {
         if (toAddresses.length === 0 || toAddresses.some(a => !EMAIL_RE.test(a))) {
             return res.status(400).json({ error: 'A valid `to` email address (or array of addresses) is required.' });
         }
-        if (!process.env.FRONT_API_TOKEN || !process.env.FRONT_CHANNEL_ID) {
-            return res.status(500).json({ error: 'Front is not configured (FRONT_API_TOKEN, FRONT_CHANNEL_ID).' });
+        if (!emailSend.isConfigured()) {
+            return res.status(500).json({ error: 'Email sending is not configured (SES_FROM_ARN).' });
         }
         if (!PO_BUCKET) {
             return res.status(500).json({ error: 'PO_DOCS_BUCKET env var not configured.' });
@@ -3950,41 +3929,17 @@ app.post('/api/v1/quality-assurance-documents/:id/email', async (req, res) => {
             });
             const bodyWithReceipt = appendReceiptLink(htmlBody, receiptToken, apiBaseUrlFromReq(req));
 
-            const form = new FormData();
-            for (const addr of toAddresses) form.append('to[]', addr);
-            form.append('subject', finalSubject);
-            form.append('body', bodyWithReceipt);
-            form.append('body_format', 'html');
-            form.append('options[archive]', 'false');
-            form.append('attachments[]', new Blob([pdfBytes], { type: 'application/pdf' }), filename);
-            if (csvAttachment) {
-                form.append('attachments[]', new Blob([csvAttachment.bytes], { type: 'text/csv' }), csvAttachment.filename);
-            }
-
-            const frontUrl = `https://api2.frontapp.com/channels/${encodeURIComponent(process.env.FRONT_CHANNEL_ID)}/messages`;
-            const resp = await fetch(frontUrl, {
-                method: 'POST',
-                headers: {
-                    Authorization: `Bearer ${process.env.FRONT_API_TOKEN}`,
-                    Accept: 'application/json',
-                },
-                body: form,
-            });
-            const respText = await resp.text();
-            if (!resp.ok) {
-                log.error('[quality-assurance-documents/email] Front API error', {
-                    status: resp.status, body: respText.slice(0, 500),
-                });
+            const files = [{ bytes: pdfBytes, filename, contentType: 'application/pdf' }];
+            if (csvAttachment) files.push({ bytes: csvAttachment.bytes, filename: csvAttachment.filename, contentType: 'text/csv' });
+            const sent = await emailSend.sendEmail({ to: toAddresses, subject: finalSubject, html: bodyWithReceipt, attachments: files });
+            if (!sent.ok) {
+                log.error('[quality-assurance-documents/email] SES error', { reason: sent.reason, status: sent.status, detail: sent.detail });
                 // Not sent: its receipt must not be listed, or chased.
                 await discardEmailReceipt(conn, receiptToken);
-                return { frontError: { status: resp.status, body: respText.slice(0, 500) } };
+                return { frontError: { status: sent.status ?? 502, body: sent.detail || sent.reason } };
             }
-            let parsed = null;
-            try { parsed = JSON.parse(respText); } catch { /* 202 with empty body is fine */ }
-
-            const conversationUrl = parsed?._links?.related?.conversation || '';
-            const frontConversationId = conversationUrl ? conversationUrl.split('/').pop() : null;
-            const frontMessageUid = parsed?.message_uid || parsed?.id || null;
+            const frontMessageUid = sent.messageId;
+            const frontConversationId = null;
 
             const [sendInsert] = await conn.query(
                 `INSERT INTO quality_assurance_document_sends
@@ -4031,7 +3986,7 @@ app.post('/api/v1/quality-assurance-documents/:id/email', async (req, res) => {
         if (result.notFound) return res.status(404).json({ error: `Quality assurance document ${id} not found.` });
         if (result.frontError) {
             return res.status(502).json({
-                error: 'Front rejected the message.',
+                error: 'The email service (SES) rejected the message.',
                 frontStatus: result.frontError.status,
                 frontBody: result.frontError.body,
             });
@@ -6698,8 +6653,8 @@ app.post('/api/v1/purchase-order-documents/:id/email', async (req, res) => {
         if (toAddresses.length === 0) {
             return res.status(400).json({ error: 'A valid `to` email address (or array of addresses) is required.' });
         }
-        if (!process.env.FRONT_API_TOKEN || !process.env.FRONT_CHANNEL_ID) {
-            return res.status(500).json({ error: 'Front is not configured (FRONT_API_TOKEN, FRONT_CHANNEL_ID).' });
+        if (!emailSend.isConfigured()) {
+            return res.status(500).json({ error: 'Email sending is not configured (SES_FROM_ARN).' });
         }
         const portalBase = poPortalEmail.portalBaseOf();
         if (!portalBase) {
@@ -6775,43 +6730,15 @@ app.post('/api/v1/purchase-order-documents/:id/email', async (req, res) => {
             // this email confirmed (syncPortalReceipts, src/lib/email-receipt.js).
             const emailHtml = wrapEmail({ title: finalSubject, bodyHtml: bodyWithPortal });
 
-            // Front /channels/{id}/messages. `to[]` notation makes Front treat
-            // the field as an array; we append once per recipient.
-            // body_format=html so our HTML styling renders instead of being
-            // shown as source. No attachment: the PDF is on the portal.
-            const form = new FormData();
-            for (const addr of toAddresses) form.append('to[]', addr);
-            form.append('subject', finalSubject);
-            form.append('body', emailHtml);
-            form.append('body_format', 'html');
-            form.append('options[archive]', 'false');
-
-            const frontUrl = `https://api2.frontapp.com/channels/${encodeURIComponent(process.env.FRONT_CHANNEL_ID)}/messages`;
-            const resp = await fetch(frontUrl, {
-                method: 'POST',
-                headers: {
-                    Authorization: `Bearer ${process.env.FRONT_API_TOKEN}`,
-                    Accept: 'application/json',
-                },
-                body: form,
-            });
-            const respText = await resp.text();
-            if (!resp.ok) {
-                log.error('[purchase-order-documents/email] Front API error', {
-                    status: resp.status, body: respText.slice(0, 500),
-                });
-                return { frontError: { status: resp.status, body: respText.slice(0, 500) } };
+            // Through SES (src/services/email-send.js). No attachment: the PDF
+            // is on the portal.
+            const sent = await emailSend.sendEmail({ to: toAddresses, subject: finalSubject, html: emailHtml });
+            if (!sent.ok) {
+                log.error('[purchase-order-documents/email] SES error', { reason: sent.reason, status: sent.status, detail: sent.detail });
+                return { frontError: { status: sent.status ?? 502, body: sent.detail || sent.reason } };
             }
-            let parsed = null;
-            try { parsed = JSON.parse(respText); } catch { /* 202 accepted with empty body is fine */ }
-
-            // Pull the Front conversation id out of `_links.related.conversation`,
-            // which is a URL like `.../conversations/cnv_xxx`.
-            const conversationUrl = parsed?._links?.related?.conversation || '';
-            const frontConversationId = conversationUrl
-                ? conversationUrl.split('/').pop()
-                : null;
-            const frontMessageUid = parsed?.message_uid || parsed?.id || null;
+            const frontMessageUid = sent.messageId;
+            const frontConversationId = null;
 
             const [sendInsert] = await conn.query(
                 `INSERT INTO purchase_order_document_sends
@@ -6878,7 +6805,7 @@ app.post('/api/v1/purchase-order-documents/:id/email', async (req, res) => {
         if (result.notFound) return res.status(404).json({ error: `Purchase order document ${id} not found.` });
         if (result.frontError) {
             return res.status(502).json({
-                error: 'Front rejected the message.',
+                error: 'The email service (SES) rejected the message.',
                 frontStatus: result.frontError.status,
                 frontBody: result.frontError.body,
             });
@@ -7562,8 +7489,8 @@ app.post('/api/v1/purchase-order-signed-pis/:id/email', async (req, res) => {
         if (toAddresses.length === 0) {
             return res.status(400).json({ error: 'A valid `to` email address (or array of addresses) is required.' });
         }
-        if (!process.env.FRONT_API_TOKEN || !process.env.FRONT_CHANNEL_ID) {
-            return res.status(500).json({ error: 'Front is not configured (FRONT_API_TOKEN, FRONT_CHANNEL_ID).' });
+        if (!emailSend.isConfigured()) {
+            return res.status(500).json({ error: 'Email sending is not configured (SES_FROM_ARN).' });
         }
         const portalBase = poPortalEmail.portalBaseOf();
         if (!portalBase) {
@@ -7633,35 +7560,13 @@ app.post('/api/v1/purchase-order-signed-pis/:id/email', async (req, res) => {
             const emailHtml = wrapEmail({ title: finalSubject, bodyHtml: bodyWithPortal });
 
             // No attachment: the file is on the portal.
-            const form = new FormData();
-            for (const addr of toAddresses) form.append('to[]', addr);
-            form.append('subject', finalSubject);
-            form.append('body', emailHtml);
-            form.append('body_format', 'html');
-            form.append('options[archive]', 'false');
-
-            const frontUrl = `https://api2.frontapp.com/channels/${encodeURIComponent(process.env.FRONT_CHANNEL_ID)}/messages`;
-            const resp = await fetch(frontUrl, {
-                method: 'POST',
-                headers: {
-                    Authorization: `Bearer ${process.env.FRONT_API_TOKEN}`,
-                    Accept: 'application/json',
-                },
-                body: form,
-            });
-            const respText = await resp.text();
-            if (!resp.ok) {
-                log.error('[purchase-order-signed-pis/email] Front API error', {
-                    status: resp.status, body: respText.slice(0, 500),
-                });
-                return { frontError: { status: resp.status, body: respText.slice(0, 500) } };
+            const sent = await emailSend.sendEmail({ to: toAddresses, subject: finalSubject, html: emailHtml });
+            if (!sent.ok) {
+                log.error('[purchase-order-signed-pis/email] SES error', { reason: sent.reason, status: sent.status, detail: sent.detail });
+                return { frontError: { status: sent.status ?? 502, body: sent.detail || sent.reason } };
             }
-            let parsed = null;
-            try { parsed = JSON.parse(respText); } catch { /* 202 with empty body is fine */ }
-
-            const conversationUrl = parsed?._links?.related?.conversation || '';
-            const frontConversationId = conversationUrl ? conversationUrl.split('/').pop() : null;
-            const frontMessageUid = parsed?.message_uid || parsed?.id || null;
+            const frontMessageUid = sent.messageId;
+            const frontConversationId = null;
 
             const [sendInsert] = await conn.query(
                 `INSERT INTO purchase_order_signed_pi_sends
@@ -7719,7 +7624,7 @@ app.post('/api/v1/purchase-order-signed-pis/:id/email', async (req, res) => {
         if (result.notFound) return res.status(404).json({ error: `Signed PI ${id} not found.` });
         if (result.frontError) {
             return res.status(502).json({
-                error: 'Front rejected the message.',
+                error: 'The email service (SES) rejected the message.',
                 frontStatus: result.frontError.status,
                 frontBody: result.frontError.body,
             });
@@ -8635,13 +8540,13 @@ app.post('/api/v1/email-receipts/:id/resend', async (req, res) => {
             if (result.reason === 'no_reminder') {
                 return res.status(422).json({ error: 'There is no reminder for this email: it asks for nothing by email.' });
             }
-            if (result.reason === 'front_not_configured') {
-                return res.status(503).json({ error: 'Front is not configured.' });
+            if (result.reason === 'ses_not_configured') {
+                return res.status(503).json({ error: 'Email sending is not configured (SES_FROM_ARN).' });
             }
-            log.error('[email-receipts/resend] Front API error', {
+            log.error('[email-receipts/resend] SES error', {
                 status: result.status, body: result.detail,
             });
-            return res.status(502).json({ error: 'Failed to send reminder via Front.' });
+            return res.status(502).json({ error: 'Failed to send the reminder through SES.' });
         }
 
         const updated = await withConnection(async (conn) => {

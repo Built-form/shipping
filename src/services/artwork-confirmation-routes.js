@@ -24,7 +24,7 @@ const QV = require('../lib/qc-visits');
 const poPortalEmail = require('../lib/po-portal-email');
 const { escapeHtml, wrapEmail } = require('../lib/email-layout');
 const { ARTWORK_CONFIRMATION_TEMPLATE_KEY } = require('../lib/email-template-defaults');
-const { sendFrontMessage: defaultSend } = require('./front-send');
+const { sendEmail: defaultSend } = require('./email-send');
 const { logSentEmail } = require('../lib/email-receipt');
 const { loadDepositGate } = require('./deposit-gate');
 const { londonToday: defaultLondonToday } = require('./daily-alerts');
@@ -57,7 +57,7 @@ function registerArtworkConfirmationRoutes(app, deps) {
     const {
         withConnection, recordAudit, getEmailTemplate, renderTemplate,
         ready = async () => {},
-        sendFrontMessage = defaultSend,
+        sendEmail = defaultSend,
         londonToday = defaultLondonToday,
         log = defaultLog,
     } = deps;
@@ -281,7 +281,7 @@ function registerArtworkConfirmationRoutes(app, deps) {
                 bodyHtml: inner + A.artworkBlockHtml({ poNumber: po.po_number, url, lines: chosenLines, expiresOn }),
             });
 
-            const sent = await sendFrontMessage({ to: addresses, subject: finalSubject, html });
+            const sent = await sendEmail({ to: addresses, subject: finalSubject, html });
             if (!sent.ok) {
                 await conn.query(
                     `UPDATE artwork_confirmation_requests
@@ -289,15 +289,15 @@ function registerArtworkConfirmationRoutes(app, deps) {
                       WHERE id = ?`,
                     [requestId]
                 );
-                if (sent.reason === 'front_not_configured') {
-                    throw new Fail(500, 'FRONT_NOT_CONFIGURED', 'Front is not configured (FRONT_API_TOKEN, FRONT_CHANNEL_ID).');
+                if (sent.reason === 'ses_not_configured') {
+                    throw new Fail(500, 'FRONT_NOT_CONFIGURED', 'Email sending is not configured (SES_FROM_ARN).');
                 }
-                throw new Fail(502, 'FRONT_ERROR', 'Front rejected the message.', { frontStatus: sent.status ?? null, frontBody: sent.detail ?? null });
+                throw new Fail(502, 'FRONT_ERROR', 'The email service (SES) rejected the message.', { frontStatus: sent.status ?? null, frontBody: sent.detail ?? null });
             }
 
             await conn.query(
                 'UPDATE artwork_confirmation_requests SET front_message_uid = ?, front_conversation_id = ? WHERE id = ?',
-                [sent.frontMessageUid, sent.frontConversationId, requestId]
+                [sent.messageId, null, requestId]
             );
             // On ShipLine's Email Receipts page as a portal email: the link is
             // the one thing asked (no "Confirm receipt" button), and a tick on
@@ -345,7 +345,7 @@ function registerArtworkConfirmationRoutes(app, deps) {
                 before: null,
                 after: {
                     requestId, orderIds: chosen.orderIds, to: addresses, subject: finalSubject,
-                    frontMessageUid: sent.frontMessageUid, frontConversationId: sent.frontConversationId, expiresOn,
+                    frontMessageUid: sent.messageId, frontConversationId: null, expiresOn,
                     artworkConfirmedDate: datedOrderIds.length ? artworkDate : null, datedOrderIds,
                 },
                 userEmail: req.userEmail,

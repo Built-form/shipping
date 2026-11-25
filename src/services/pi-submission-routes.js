@@ -46,7 +46,7 @@ const bank = require('../lib/bank-verification');
 const { loadBankReference } = require('./bank-reference');
 const { jportalSchema, PO_SUPPLIER_IS } = require('../lib/jportal');
 const { recordAuditStrict } = require('../lib/audit');
-const { sendFrontMessage } = require('./front-send');
+const { sendEmail } = require('./email-send');
 const { wrapEmail } = require('../lib/email-layout');
 const { logSentEmail } = require('../lib/email-receipt');
 
@@ -247,7 +247,7 @@ function registerPiSubmissionRoutes(app, deps) {
             if (redirect) subject = `[for ${original}] ${subject}`;
             // The template is the inside of the card (src/lib/email-layout.js).
             const html = wrapEmail({ title, bodyHtml: renderTemplate(tpl.bodyHtml, vars.body) });
-            const sent = await sendFrontMessage({ to, subject, html });
+            const sent = await sendEmail({ to, subject, html });
             if (sent.ok) {
                 await conn.query(`UPDATE ${jp}.pi_submissions SET notified_at = UTC_TIMESTAMP(), notify_error = NULL WHERE id = ?`, [id]);
                 // On the Email Receipts page, as a notice: nothing to confirm.
@@ -263,7 +263,7 @@ function registerPiSubmissionRoutes(app, deps) {
                 entityType: 'pi_submission', entityId: id, action: sent.ok ? 'notified' : 'notify_failed', before: null,
                 after: {
                     status, template: key, to, ...(redirect ? { redirectedFrom: original } : {}),
-                    ...(sent.ok ? { frontMessageUid: sent.frontMessageUid || null } : { reason: sent.reason, frontStatus: sent.status ?? null }),
+                    ...(sent.ok ? { frontMessageUid: sent.messageId || null } : { reason: sent.reason, frontStatus: sent.status ?? null }),
                 },
                 userEmail,
             });

@@ -66,7 +66,7 @@ function runner(pool, extra = {}) {
     const opts = {
         today: WEDNESDAY, env: ENV, log: quiet,
         loadDepositGate: async () => ({ clear: true }),
-        sendFrontMessage: async (msg) => { sent.push(msg); return { ok: true, frontMessageUid: 'msg_1', frontConversationId: 'cnv_1' }; },
+        sendEmail: async (msg) => { sent.push(msg); return { ok: true, messageId: 'msg_1' }; },
         ...extra,
     };
     return { sent, run: () => runReadyDateReminders(pool, opts) };
@@ -245,7 +245,7 @@ test('sweep: a later day is a reminder under the same receipt; a supplier alread
 
 test('sweep: a failed send gives the supplier back; nobody to email is counted', async () => {
     const pool = fakePool({ lines: [line(1, 7, 'PO_7', 'Acme', 'JF1'), line(2, 8, 'PO_8', 'Nobody Ltd', 'JF2')], sends: { 7: ['a@acme.example'] } });
-    const { run } = runner(pool, { sendFrontMessage: async () => ({ ok: false, reason: 'front_error', status: 500 }) });
+    const { run } = runner(pool, { sendEmail: async () => ({ ok: false, reason: 'ses_error', status: 500 }) });
     const summary = await run();
     assert.equal(summary.failed, 1);
     assert.equal(summary.sent, 0);

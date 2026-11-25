@@ -139,18 +139,18 @@ function replay(row, now) {
         case 'sending': return refused(N.refusal('SEND_IN_PROGRESS', { send }));
         case 'unknown': return refused(N.refusal('SEND_OUTCOME_UNKNOWN', { send }));
         default:
-            return refused(N.refusal(String(row.sendError || '').startsWith('front') ? 'FRONT_REFUSED' : 'SEND_FAILED', { send, reason: row.sendError || null }));
+            return refused(N.refusal(/^(front|ses)_error/.test(String(row.sendError || '')) ? 'FRONT_REFUSED' : 'SEND_FAILED', { send, reason: row.sendError || null }));
     }
 }
 
 /**
- * Sends one notice of a transfer. ctx: { store, sendFront, now, apiBaseUrl }.
+ * Sends one notice of a transfer. ctx: { store, sendEmail, now, apiBaseUrl }.
  * input: { paymentId, kind, actor: { email, userType }, body: { sendKey, to,
  * subject, body, delivery, previewToken } }. → { status, body }, never throws
  * for anything the sender can act on.
  */
 async function sendNotice(ctx, { paymentId, kind, actor, body }) {
-    const { store, sendFront } = ctx;
+    const { store, sendEmail } = ctx;
     const now = ctx.now || (() => new Date());
     const b = body || {};
 
@@ -291,16 +291,16 @@ async function sendNotice(ctx, { paymentId, kind, actor, body }) {
     // 4. Front, once, and only while the deadline leaves room for the call to
     //    end inside it: past the deadline a person may say what happened.
     if (!N.mayCallFront(send.deadlineAt, now())) {
-        return giveUp('deadline: too little time left to call Front', refused(N.refusal('SEND_FAILED', { send: sendJson({ ...send, status: 'failed' }, now()) })));
+        return giveUp('deadline: too little time left to call SES', refused(N.refusal('SEND_FAILED', { send: sendJson({ ...send, status: 'failed' }, now()) })));
     }
     let front;
     try {
-        front = await sendFront({ to: addresses, subject, html });
+        front = await sendEmail({ to: addresses, subject, html });
     } catch (e) {
         front = { ok: false, reason: 'network_error', detail: e && e.message };
     }
 
-    // 5. What Front said.
+    // 5. What SES said.
     const current = async fallback => sendJson((await store.getSend(send.id).catch(() => null)) || fallback, now());
     if (!front || !front.ok) {
         const reason = (front && front.reason) || 'network_error';
@@ -831,7 +831,7 @@ function createStore(deps) {
                             SET status = 'sent', sent_at = COALESCE(sent_at, UTC_TIMESTAMP()), front_message_uid = ?, front_conversation_id = ?,
                                 send_error = NULL, resolved_at = NULL, resolved_by_email = NULL
                           WHERE id = ? AND (status IN ('sending', 'unknown') OR (? = 1 AND status = 'failed' AND resolved_at IS NOT NULL))`,
-                        [(front && front.frontMessageUid) || null, (front && front.frontConversationId) || null, id, 1]
+                        [(front && front.messageId) || null, null, id, 1]
                     )
                     : await conn.query(
                         `UPDATE supplier_payment_sends

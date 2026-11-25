@@ -50,7 +50,7 @@ const legsOf = req => (req && req.query && req.query.legs === 'all' ? 'all' : 'f
 /** The template of a request's emails, by its kind. */
 const requestTemplateKey = kind => (kind === 'delivery' ? FREIGHT_DELIVERY_REQUEST_TEMPLATE_KEY : FREIGHT_QUOTE_REQUEST_TEMPLATE_KEY);
 const bookingTemplateKey = kind => (kind === 'delivery' ? FREIGHT_DELIVERY_BOOKING_TEMPLATE_KEY : FREIGHT_BOOKING_REQUEST_TEMPLATE_KEY);
-const { sendFrontMessage: defaultSend } = require('./front-send');
+const { sendEmail: defaultSend } = require('./email-send');
 const { preapprovePortalAddresses: defaultPreapprove } = require('./portal-access');
 const { logSentEmail, recordReminderSend } = require('../lib/email-receipt');
 const { londonToday: defaultLondonToday } = require('./daily-alerts');
@@ -150,7 +150,7 @@ function registerFreightQuoteRoutes(app, deps) {
         loadForwarderQuoteForPdf, generateDraftDocumentSet, s3,
         poBucket = () => null,
         ready = async () => {},
-        sendFrontMessage = defaultSend,
+        sendEmail = defaultSend,
         preapprove = defaultPreapprove,
         londonToday = defaultLondonToday,
         log = defaultLog,
@@ -927,7 +927,7 @@ function registerFreightQuoteRoutes(app, deps) {
                     }),
                 });
 
-                const sent = await sendFrontMessage({ to: addresses, subject: finalSubject, html });
+                const sent = await sendEmail({ to: addresses, subject: finalSubject, html });
                 if (!sent.ok) {
                     await conn.query(
                         `UPDATE freight_quote_requests
@@ -937,9 +937,9 @@ function registerFreightQuoteRoutes(app, deps) {
                     );
                     results.push({
                         ...base, requestId, outcome: 'failed',
-                        error: sent.reason === 'front_not_configured'
-                            ? 'Front is not configured (FRONT_API_TOKEN, FRONT_CHANNEL_ID).'
-                            : 'Front rejected the message.',
+                        error: sent.reason === 'ses_not_configured'
+                            ? 'Email sending is not configured (SES_FROM_ARN).'
+                            : 'The email service (SES) rejected the message.',
                         frontStatus: sent.status ?? null, frontBody: sent.detail ?? null,
                     });
                     continue;
@@ -948,7 +948,7 @@ function registerFreightQuoteRoutes(app, deps) {
                     `UPDATE freight_quote_requests
                         SET sent_at = UTC_TIMESTAMP(), front_message_uid = ?, front_conversation_id = ?
                       WHERE id = ?`,
-                    [sent.frontMessageUid, sent.frontConversationId, requestId]
+                    [sent.messageId, null, requestId]
                 );
                 // On ShipLine's Email Receipts page as a portal email: the link
                 // is the one thing asked, and an answer confirms it
@@ -965,7 +965,7 @@ function registerFreightQuoteRoutes(app, deps) {
                         batchId, forwarderId: fw.id, forwarder: fw.name, to: addresses, subject: finalSubject,
                         windowStart: want.windowStart, windowEnd: want.windowEnd, origin: want.origin,
                         destination: want.destination, containerSize: want.containerSize, services: want.services,
-                        stockMovements: want.stockMovements, expiresOn, frontMessageUid: sent.frontMessageUid, frontConversationId: sent.frontConversationId,
+                        stockMovements: want.stockMovements, expiresOn, frontMessageUid: sent.messageId, frontConversationId: null,
                     },
                     userEmail: req.userEmail,
                 });
@@ -1128,7 +1128,7 @@ function registerFreightQuoteRoutes(app, deps) {
                 return { kind, request, addresses, finalSubject, html: wrapEmail({ title: finalSubject, bodyHtml: inner + block }) };
             });
 
-            const sent = await sendFrontMessage({ to: made.addresses, subject: made.finalSubject, html: made.html });
+            const sent = await sendEmail({ to: made.addresses, subject: made.finalSubject, html: made.html });
             if (!sent.ok) {
                 await conn.query('UPDATE freight_quote_requests SET reminder_count = reminder_count - 1 WHERE id = ? AND reminder_count > 0', [id]);
                 throw frontFailure(sent);
@@ -1150,7 +1150,7 @@ function registerFreightQuoteRoutes(app, deps) {
                 if (receipt) {
                     await recordReminderSend(conn, receipt.id, {
                         reminderNumber: Number(receipt.reminder_count || 0) + 1, sentTo: made.addresses, subject: made.finalSubject,
-                        frontMessageUid: sent.frontMessageUid, frontConversationId: sent.frontConversationId, sentByEmail: req.userEmail || null,
+                        frontMessageUid: sent.messageId, frontConversationId: null, sentByEmail: req.userEmail || null,
                     });
                 } else {
                     await logSentEmail(conn, {
@@ -1167,7 +1167,7 @@ function registerFreightQuoteRoutes(app, deps) {
                 after: {
                     kind: made.kind, forwarder: made.request.forwarder_name || null, to: made.addresses, subject: made.finalSubject,
                     reminderNumber: reminderCount + 1,
-                    frontMessageUid: sent.frontMessageUid, frontConversationId: sent.frontConversationId,
+                    frontMessageUid: sent.messageId, frontConversationId: null,
                 },
                 userEmail: req.userEmail,
             });
@@ -1288,10 +1288,10 @@ function registerFreightQuoteRoutes(app, deps) {
     }
 
     function frontFailure(sent) {
-        if (sent.reason === 'front_not_configured') {
-            return new Fail(500, 'FRONT_NOT_CONFIGURED', 'Front is not configured (FRONT_API_TOKEN, FRONT_CHANNEL_ID).');
+        if (sent.reason === 'ses_not_configured') {
+            return new Fail(500, 'FRONT_NOT_CONFIGURED', 'Email sending is not configured (SES_FROM_ARN).');
         }
-        return new Fail(502, 'FRONT_ERROR', 'Front rejected the message.', { frontStatus: sent.status ?? null, frontBody: sent.detail ?? null });
+        return new Fail(502, 'FRONT_ERROR', 'The email service (SES) rejected the message.', { frontStatus: sent.status ?? null, frontBody: sent.detail ?? null });
     }
 
     // ── POST /api/v1/freight-quotes/options/:optionId/book ──────────────────
@@ -1384,7 +1384,7 @@ function registerFreightQuoteRoutes(app, deps) {
                 return { bookingId, requestId: Number(request.id), batchId: request.batch_id, addresses, finalSubject, html, option: o, forwarder: request.forwarder_name };
             });
 
-            const sent = await sendFrontMessage({ to: made.addresses, subject: made.finalSubject, html: made.html });
+            const sent = await sendEmail({ to: made.addresses, subject: made.finalSubject, html: made.html });
             if (!sent.ok) {
                 await conn.query(
                     `UPDATE freight_bookings
@@ -1397,7 +1397,7 @@ function registerFreightQuoteRoutes(app, deps) {
             }
             await conn.query(
                 'UPDATE freight_bookings SET front_message_uid = ?, front_conversation_id = ? WHERE id = ?',
-                [sent.frontMessageUid, sent.frontConversationId, made.bookingId]
+                [sent.messageId, null, made.bookingId]
             );
             await logSentEmail(conn, {
                 emailType: 'freight_booking_request', sentTo: made.addresses, subject: made.finalSubject,
@@ -1411,7 +1411,7 @@ function registerFreightQuoteRoutes(app, deps) {
                     subject: made.finalSubject, sailingDate: made.option.sailingDate, portFrom: made.option.portFrom,
                     portTo: made.option.portTo, price: made.option.price, currency: made.option.currency,
                     shipmentId: shipmentId != null && shipmentId !== '' ? Number(shipmentId) : null,
-                    frontMessageUid: sent.frontMessageUid, frontConversationId: sent.frontConversationId,
+                    frontMessageUid: sent.messageId, frontConversationId: null,
                 },
                 userEmail: req.userEmail,
             });
@@ -1687,7 +1687,7 @@ function registerFreightQuoteRoutes(app, deps) {
                 bodyHtml: inner + F.contentsHtml(contents, { containerName: source.label, option: o, bookingRef: b.booking_ref || null }),
             });
 
-            const sent = await sendFrontMessage({ to: addresses, subject: finalSubject, html, attachments });
+            const sent = await sendEmail({ to: addresses, subject: finalSubject, html, attachments });
             if (!sent.ok) throw frontFailure(sent);
 
             // contents_document_ids: the documents attached, in the order attached
@@ -1710,7 +1710,7 @@ function registerFreightQuoteRoutes(app, deps) {
                     `INSERT INTO draft_container_document_sends
                         (draft_container_document_id, sent_to, subject, front_message_uid, front_conversation_id, sent_by_email, delivery)
                      VALUES (?, ?, ?, ?, ?, ?, 'attached')`,
-                    [d.id, JSON.stringify(addresses), finalSubject, sent.frontMessageUid, sent.frontConversationId, req.userEmail || null]
+                    [d.id, JSON.stringify(addresses), finalSubject, sent.messageId, null, req.userEmail || null]
                 );
             }
             await logSentEmail(conn, {
@@ -1724,7 +1724,7 @@ function registerFreightQuoteRoutes(app, deps) {
                     to: addresses, subject: finalSubject, container: source.label, shipmentId: Number(ship.id),
                     suppliers: contents.groups.length, lines: contents.totals.lines, cartons: contents.totals.cartons,
                     attachments: attachments.map(a => a.filename),
-                    frontMessageUid: sent.frontMessageUid, frontConversationId: sent.frontConversationId,
+                    frontMessageUid: sent.messageId, frontConversationId: null,
                 },
                 userEmail: req.userEmail,
             });
@@ -1814,7 +1814,7 @@ function registerFreightQuoteRoutes(app, deps) {
 
             let sent = null;
             if (wantEmail) {
-                sent = await sendFrontMessage({ to: made.addresses, subject: made.finalSubject, html: made.html });
+                sent = await sendEmail({ to: made.addresses, subject: made.finalSubject, html: made.html });
                 if (!sent.ok) {
                     await conn.query('DELETE FROM freight_stock_movements WHERE request_id = ? AND add_key = ?', [id, addKey]);
                     throw frontFailure(sent);
@@ -1830,7 +1830,7 @@ function registerFreightQuoteRoutes(app, deps) {
                 after: {
                     forwarder: made.request.forwarder_name || null, stockMovements: added,
                     to: made.addresses, subject: made.finalSubject,
-                    frontMessageUid: sent ? sent.frontMessageUid : null, frontConversationId: sent ? sent.frontConversationId : null,
+                    frontMessageUid: sent ? sent.messageId : null, frontConversationId: null,
                 },
                 userEmail: req.userEmail,
             });

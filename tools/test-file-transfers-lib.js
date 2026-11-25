@@ -149,7 +149,7 @@ test('the email: escaped tokens and a link to the portal\'s Files page', () => {
 // ── Routes, against fakes ──────────────────────────────────────────────────
 
 const { registerFileTransferRoutes } = require('../src/services/file-transfer-routes');
-const frontSend = require('../src/services/front-send');
+const emailSend = require('../src/services/email-send');
 
 function s3Error(name, status) {
     return Object.assign(new Error(name), { name, $metadata: { httpStatusCode: status } });
@@ -377,18 +377,15 @@ test('routes: sending a file — create, uploaded (checked, pinned, emailed), no
     process.env.SUPPLIER_PORTAL_URL = 'https://portal.example.com';
     delete process.env.PI_NOTIFY_REDIRECT_TO;
     const sent = [];
-    const original = frontSend.sendFrontMessage;
-    // The routes module captured sendFrontMessage at require time; swap the
-    // module's export AND the captured one through the global fetch instead.
+    // The routes module captured sendEmail at require time; the SES call under
+    // it is swapped through the module's test seam.
     const fetchCalls = [];
-    const realFetch = globalThis.fetch;
-    globalThis.fetch = async (url, init) => {
-        fetchCalls.push({ url, init });
-        sent.push(Object.fromEntries([...init.body.entries()].filter(([k]) => k !== 'body')));
-        return { ok: true, status: 202, text: async () => JSON.stringify({ message_uid: 'msg-1' }) };
-    };
-    process.env.FRONT_CHANNEL_ID = 'cha_1';
-    process.env.FRONT_API_TOKEN = 'tok';
+    emailSend._setSendImplForTests(async (region, input) => {
+        fetchCalls.push({ region, input });
+        sent.push({ 'to[]': input.Destination.ToAddresses.join(','), subject: input.Content.Simple.Subject.Data });
+        return { MessageId: 'msg-1' };
+    });
+    process.env.SES_FROM_ARN = 'arn:aws:ses:eu-north-1:123456789012:identity/portal@example.com';
     try {
         let r = await h.call('POST', '/api/v1/file-transfers', { supplierId: 11, filename: 'Artwork.pdf', contentType: 'application/pdf', fileSize: 16, note: 'Check the colours' });
         assert.equal(r.status, 201, JSON.stringify(r.body));
@@ -427,7 +424,7 @@ test('routes: sending a file — create, uploaded (checked, pinned, emailed), no
         assert.equal(sent.length, 1);
         assert.equal(sent[0]['to[]'], 'li@acme.test', 'the active portal user, never the disabled one');
         assert.equal(sent[0].subject, 'A file – Artwork.pdf');
-        assert.match(fetchCalls[0].url, /channels\/cha_1\/messages/);
+        assert.equal(fetchCalls[0].region, 'eu-north-1');
         assert.ok(h.db.audits.some(a => a.action === 'sent') && h.db.audits.some(a => a.action === 'notified'));
         // Listed on the Email Receipts page as a portal email: no confirm
         // button, no reminder (no action_url); opening the file confirms it.
@@ -435,7 +432,7 @@ test('routes: sending a file — create, uploaded (checked, pinned, emailed), no
             email_type: 'file_transfer', send_table: 'file_transfers', send_id: transfer.id,
             sent_to: '["li@acme.test"]', subject: 'A file – Artwork.pdf', confirm_via: 'portal', action_url: null,
         }]);
-        assert.doesNotMatch(String(fetchCalls[0].init.body.get('body')), /confirm-receipt/);
+        assert.doesNotMatch(String(fetchCalls[0].input.Content.Simple.Body.Html.Data), /confirm-receipt/);
 
         // Again: idempotent, no second email.
         r = await h.call('POST', `/api/v1/file-transfers/${transfer.id}/uploaded`, {});
@@ -468,8 +465,8 @@ test('routes: sending a file — create, uploaded (checked, pinned, emailed), no
         assert.equal(r.body.transfer.status, 'withdrawn');
         assert.equal(r.body.transfer.withdrawnBy, 'me@jfa.test');
     } finally {
-        globalThis.fetch = realFetch;
-        frontSend.sendFrontMessage = original;
+        emailSend._setSendImplForTests(null);
+        delete process.env.SES_FROM_ARN;
     }
 });
 

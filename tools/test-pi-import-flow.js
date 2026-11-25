@@ -42,7 +42,7 @@ const check = (label, ok, detail) => {
         console.error('Refusing to run: set PI_NOTIFY_REDIRECT_TO to a mailbox you can read.');
         process.exit(2);
     }
-    for (const k of ['GEMINI_API_KEY', 'FRONT_API_TOKEN', 'FRONT_CHANNEL_ID']) {
+    for (const k of ['GEMINI_API_KEY', 'SES_FROM_ARN']) {
         if (!process.env[k]) { console.error(`Refusing to run: ${k} is not set.`); process.exit(2); }
     }
     const pool = getPool();

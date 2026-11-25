@@ -76,7 +76,7 @@ function memoryStore(over = {}) {
         const r = byId(id);
         const may = ['sending', 'unknown'].includes(r.status) || (byExecutor && r.status === 'failed' && r.resolvedAt);
         if (!may) return { ok: false, send: r };
-        Object.assign(r, { status: 'sent', sentAt: r.sentAt || NOW.toISOString(), sendError: null, frontMessageUid: front ? front.frontMessageUid : r.frontMessageUid || null, resolvedByEmail: resolvedBy, resolvedAt: resolvedBy ? NOW.toISOString() : null });
+        Object.assign(r, { status: 'sent', sentAt: r.sentAt || NOW.toISOString(), sendError: null, frontMessageUid: front ? front.messageId : r.frontMessageUid || null, resolvedByEmail: resolvedBy, resolvedAt: resolvedBy ? NOW.toISOString() : null });
         s.audits.push({ id, action: resolvedBy ? 'notice_resolved' : 'notice_sent' });
         return { ok: true, send: r };
     };
@@ -97,8 +97,8 @@ async function requestFor(store, kind = 'deposit', over = {}) {
     const p = await S.previewOf(store.source, store.delivery, [], NOW);
     return { sendKey: 'key-0001-aaaa', to: ['li@acme.example'], subject: 'Deposit paid – {currency} {amount}', body: '<p>We paid {amount} for {paidFor}.</p>', delivery: 'portal', previewToken: p.previewToken, ...over };
 }
-const frontOk = calls => async msg => { calls.push(msg); return { ok: true, frontMessageUid: 'msg-1', frontConversationId: 'cnv-1' }; };
-const ctx = (store, sendFront, over = {}) => ({ store, sendFront, now: () => NOW, apiBaseUrl: 'https://api.example', ...over });
+const frontOk = calls => async msg => { calls.push(msg); return { ok: true, messageId: 'msg-1' }; };
+const ctx = (store, sendFront, over = {}) => ({ store, sendEmail: sendFront, now: () => NOW, apiBaseUrl: 'https://api.example', ...over });
 const ACTOR = { email: 'ops@jfa.example', userType: 'standard' };
 const send = (store, sendFront, body, kind = 'deposit', over = {}) => S.sendNotice(ctx(store, sendFront, over.ctx), { paymentId: 45, kind, actor: over.actor || ACTOR, body });
 
@@ -339,9 +339,9 @@ test('too little of the deadline left: Front is not called at all', async () => 
 
 test('Front refuses: failed, 502, and nothing more is done', async () => {
     const store = memoryStore();
-    const r = await send(store, async () => ({ ok: false, reason: 'front_error', status: 422, detail: 'bad' }), await requestFor(store));
+    const r = await send(store, async () => ({ ok: false, reason: 'ses_error', status: 422, detail: 'bad' }), await requestFor(store));
     assert.deepEqual([r.status, r.body.code, r.body.frontStatus], [502, 'FRONT_REFUSED', 422]);
-    assert.deepEqual(store.rows.map(x => [x.status, x.sendError]), [['failed', 'front_error: 422']]);
+    assert.deepEqual(store.rows.map(x => [x.status, x.sendError]), [['failed', 'ses_error: 422']]);
     assert.equal(store.calls.includes('finalise'), false);
     assert.equal(store.calls.includes('logReceipt'), false);
     // Front not configured here is a definite "not sent" too.
@@ -426,7 +426,7 @@ test('a retried key whose send failed or is unknown is answered as that, not sen
     assert.equal(calls, 1);
     const failed = memoryStore();
     const fb = await requestFor(failed);
-    const refuse = async () => { calls += 1; return { ok: false, reason: 'front_error', status: 500 }; };
+    const refuse = async () => { calls += 1; return { ok: false, reason: 'ses_error', status: 500 }; };
     await send(failed, refuse, fb);
     const f2 = await send(failed, refuse, fb);
     assert.deepEqual([f2.status, f2.body.code], [502, 'FRONT_REFUSED']);
@@ -610,7 +610,7 @@ const sqlOf = conn => conn.log.map(x => x.sql);
 test('the store finalises with one guarded UPDATE, the receipt link and the audit in one transaction', async () => {
     const row = { id: 7, supplier_payment_id: 45, notice_kind: 'deposit', delivery: 'attached', supplier_name: SUPPLIER, status: 'sent', sent_to: '["li@acme.example"]', receipt_token: 'tok-1', deadline_at_iso: '2026-11-16T12:01:00Z', sent_at_iso: '2026-11-16T12:00:05Z' };
     const conn = scripted([[/^UPDATE supplier_payment_sends SET status = 'sent'/, [{ affectedRows: 1 }]], [/FROM supplier_payment_sends s WHERE s\.id = \?/, [[row]]]]);
-    const r = await storeOn(conn).finalise(7, { front: { frontMessageUid: 'm', frontConversationId: 'c' }, byExecutor: true });
+    const r = await storeOn(conn).finalise(7, { front: { messageId: 'm' }, byExecutor: true });
     assert.equal(r.ok, true);
     assert.equal(r.send.status, 'sent');
     const u = conn.log.find(x => x.sql.startsWith('UPDATE supplier_payment_sends SET status = \'sent\''));
@@ -641,12 +641,12 @@ test('the store: a send that is no longer "sending" or "unknown" is not finalise
 test('the store: failing, marking unknown and "it did not go" are each guarded on the state they may leave', async () => {
     const conn = scripted([[/^UPDATE supplier_payment_sends/, [{ affectedRows: 1 }]], [/FROM supplier_payment_sends s WHERE s\.id = \?/, [[{ id: 7, status: 'failed', sent_to: '[]' }]]]]);
     const store = storeOn(conn);
-    await store.fail(7, 'front_error: 422');
+    await store.fail(7, 'ses_error: 422');
     await store.unknown(7, 'network_error');
     await store.resolveNotSent(7, { resolvedBy: 'ops@jfa.example' });
     const [fail, unknown, not] = conn.log.filter(x => x.sql.startsWith('UPDATE supplier_payment_sends'));
     assert.match(fail.sql, /SET status = 'failed', send_error = \? WHERE id = \? AND status = 'sending'$/);
-    assert.deepEqual(fail.params, ['front_error: 422', 7]);
+    assert.deepEqual(fail.params, ['ses_error: 422', 7]);
     assert.match(unknown.sql, /SET status = 'unknown', send_error = \? WHERE id = \? AND status = 'sending'$/);
     assert.match(not.sql, /SET status = 'failed', send_error = 'resolved: not sent', resolved_at = UTC_TIMESTAMP\(\), resolved_by_email = \? WHERE id = \? AND \(status = 'unknown' OR \(status = 'sending' AND deadline_at < UTC_TIMESTAMP\(\)\)\)$/);
 });
@@ -917,26 +917,26 @@ test('a reminder of a payment email is refused once the payment is deleted or be
     assert.equal(other.log.length, 0);
 });
 
-test('Front: attachments ride as files on the request; without any, the request is as it always was', async () => {
-    const { sendFrontMessage } = require('../src/services/front-send');
+test('SES: attachments ride on the message; without any, the message carries none', async () => {
+    const { sendEmail } = require('../src/services/email-send');
     const seen = [];
-    const fetchImpl = async (url, init) => {
-        seen.push({ url, init });
-        return { ok: true, status: 202, text: async () => JSON.stringify({ message_uid: 'm1', _links: { related: { conversation: 'https://api2.frontapp.com/conversations/cnv_9' } } }) };
-    };
-    const env = { FRONT_CHANNEL_ID: 'cha_1', FRONT_API_TOKEN: 't' };
-    const r = await sendFrontMessage({
+    const sendImpl = async (region, input) => { seen.push({ region, input }); return { MessageId: 'm1' }; };
+    const env = { SES_FROM_ARN: 'arn:aws:ses:eu-north-1:123456789012:identity/portal@example.com', EMAIL_REPLY_TO: 'team@example.com' };
+    const r = await sendEmail({
         to: ['a@x.com'], subject: 'S', html: '<p>h</p>',
         attachments: [{ filename: 'proof.pdf', contentType: 'application/pdf', bytes: Buffer.from('PDF-1') }, { filename: 'scan.png', contentType: 'image/png', bytes: Buffer.from('PNG') }],
-    }, { fetchImpl, env });
-    assert.deepEqual(r, { ok: true, frontMessageUid: 'm1', frontConversationId: 'cnv_9' });
-    const files = seen[0].init.body.getAll('attachments[]');
-    assert.deepEqual(files.map(f => [f.name, f.type]), [['proof.pdf', 'application/pdf'], ['scan.png', 'image/png']]);
-    assert.equal(await files[0].text(), 'PDF-1');
-    assert.deepEqual(seen[0].init.body.getAll('to[]'), ['a@x.com']);
-    await sendFrontMessage({ to: ['a@x.com'], subject: 'S', html: 'h' }, { fetchImpl, env });
-    assert.equal(seen[1].init.body.getAll('attachments[]').length, 0);
-    assert.deepEqual([...seen[1].init.body.keys()].sort(), ['body', 'body_format', 'options[archive]', 'subject', 'to[]']);
+    }, { sendImpl, env });
+    assert.deepEqual(r, { ok: true, messageId: 'm1' });
+    assert.equal(seen[0].region, 'eu-north-1');
+    const files = seen[0].input.Content.Simple.Attachments;
+    assert.deepEqual(files.map(f => [f.FileName, f.ContentType]), [['proof.pdf', 'application/pdf'], ['scan.png', 'image/png']]);
+    assert.equal(Buffer.from(files[0].RawContent).toString(), 'PDF-1');
+    assert.deepEqual(seen[0].input.Destination.ToAddresses, ['a@x.com']);
+    assert.deepEqual(seen[0].input.ReplyToAddresses, ['team@example.com']);
+    assert.equal(seen[0].input.FromEmailAddress, 'JFA Medical <portal@example.com>');
+    await sendEmail({ to: ['a@x.com'], subject: 'S', html: 'h' }, { sendImpl, env });
+    assert.equal('Attachments' in seen[1].input.Content.Simple, false);
+    assert.deepEqual(Object.keys(seen[1].input.Content.Simple).sort(), ['Body', 'Subject']);
 });
 
 test('the store reads who opened a payment on the portal, and answers a server without the portal as nobody', async () => {

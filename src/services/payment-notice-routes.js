@@ -23,7 +23,7 @@
 
 const N = require('../lib/payment-notices');
 const S = require('./payment-notices');
-const { sendFrontMessage } = require('./front-send');
+const { sendEmail: defaultSendEmail } = require('./email-send');
 const { apiBaseUrlFromReq } = require('../lib/email-receipt');
 
 const ER_NO_SUCH_TABLE = 1146;
@@ -34,7 +34,7 @@ const NOT_MIGRATED = {
 
 function registerPaymentNoticeRoutes(app, deps) {
     const { withConnection, ready, lockSupplierPaymentTargets, getEmailTemplate, recordAudit, log } = deps;
-    const sendFront = deps.sendFront || sendFrontMessage;
+    const sendEmail = deps.sendEmail || defaultSendEmail;
 
     // No file is read here: a payment goes out as a link to the portal, never with its
     // proof attached (the user, 2026-11-17).
@@ -76,7 +76,7 @@ function registerPaymentNoticeRoutes(app, deps) {
 
     app.post('/api/v1/supplier-payments/:id(\\d+)/notices/:kind/email', handle('POST /supplier-payments/:id/notices/:kind/email', req =>
         S.sendNotice(
-            { store, sendFront, apiBaseUrl: apiBaseUrlFromReq(req) },
+            { store, sendEmail, apiBaseUrl: apiBaseUrlFromReq(req) },
             { paymentId: Number(req.params.id), kind: req.params.kind, actor: actorOf(req), body: req.body || {} }
         )));
 

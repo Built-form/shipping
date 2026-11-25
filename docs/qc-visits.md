@@ -54,7 +54,7 @@ Unlike the older cross-database views (`src/db/migrations/README.md`), the kit v
 - **Env vars used:**
   - `PO_DOCS_BUCKET` (`shipping-purchase-orders-<stage>`): visit attachments and the QA document attachment. Routes return 500 `NO_BUCKET` if it is unset.
   - `JFPRO_DOCS_BUCKET` (**new**, `jfpro-documents-<stage>`, set in `serverless.yml`): JFPRO's documents bucket, where the kit documents live. `GET /qc-kits` and an inspector email with kit documents return 500 `NO_BUCKET` if it is unset. The bucket name comes from this variable, never from `document_versions.s3_bucket` (the test database is a nightly copy of production; `jfpro-documents-test` is a mirror of `jfpro-documents-dev`).
-  - `FRONT_API_TOKEN` and `FRONT_CHANNEL_ID`: needed only by `POST /qc-visits/:id/email`, which returns 500 `FRONT_NOT_CONFIGURED` if either is empty. **[unverified]** whether the `shipping/test` secret has them.
+  - `SES_FROM_ARN` (since 2026-11-25; was `FRONT_API_TOKEN` + `FRONT_CHANNEL_ID`): needed only by `POST /qc-visits/:id/email`, which returns 500 `FRONT_NOT_CONFIGURED` if it is empty. The `shipping/test` secret has it.
   - `PUBLIC_API_BASE_URL`: optional. `email-receipt.js` reads it for the confirm-receipt link; without it the link base comes from the request.
   - **Gemini is not used** by any QC visit code. Email bodies come from templates.
 - **Bucket policy:** `PurchaseOrderDocsBucketPolicy` gains a `Deny` of anonymous `s3:GetObject` on `qc-visits/*` (§4.3).

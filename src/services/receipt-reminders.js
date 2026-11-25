@@ -17,6 +17,7 @@
 //     original send) is ≥ REMINDER_INTERVAL_HOURS old, up to REMINDER_MAX times.
 //   • the manual "resend" button — POST /api/v1/email-receipts/:id/resend (orders.js).
 const log = require('../lib/logger');
+const emailSend = require('./email-send');
 const {
     appendReceiptLink, appendPortalLink, confirmViaOf, canRemind, syncPortalReceipts, CHASED_PORTAL_STEPS, NEVER_SWEPT_TYPES,
     renderReminderEmailHtml, recordReminderSend, parseRecipients, queryWithRemindersStopped,
@@ -27,19 +28,20 @@ const {
 const REMINDER_INTERVAL_HOURS = Math.max(1, Number(process.env.RECEIPT_REMINDER_INTERVAL_HOURS) || 48);
 const REMINDER_MAX = Math.max(0, Number(process.env.RECEIPT_REMINDER_MAX ?? 5));
 
-// Send a single reminder for a receipt row via Front. Pure send — the caller
-// owns the DB bump so the sweep and the endpoint can each control their own
-// transaction/response. Reuses receipt.token (the original capability) and
-// shows reminder #(reminder_count + 1). Returns a discriminated result:
+// Send a single reminder for a receipt row through SES (src/services/email-send.js).
+// Pure send — the caller owns the DB bump so the sweep and the endpoint can each
+// control their own transaction/response. Reuses receipt.token (the original
+// capability) and shows reminder #(reminder_count + 1). Returns a discriminated result:
 //   { ok: true, recipients, subject, reminderNumber, frontMessageUid, frontConversationId }
-//   { ok: false, reason: 'no_reminder' | 'no_recipients' | 'front_not_configured' | 'front_error', status?, detail? }
+//     (frontMessageUid is the SES message id; frontConversationId is always null now)
+//   { ok: false, reason: 'no_reminder' | 'no_recipients' | 'ses_not_configured' | 'ses_error' | 'network_error', status?, detail? }
 async function sendReminderForReceipt(receipt, baseUrl) {
     if (!canRemind(receipt)) return { ok: false, reason: 'no_reminder' };
     const portal = confirmViaOf(receipt) === 'portal';
     const recipients = parseRecipients(receipt.sent_to);
     if (!recipients.length) return { ok: false, reason: 'no_recipients' };
-    if (!process.env.FRONT_CHANNEL_ID || !process.env.FRONT_API_TOKEN) {
-        return { ok: false, reason: 'front_not_configured' };
+    if (!emailSend.isConfigured()) {
+        return { ok: false, reason: 'ses_not_configured' };
     }
 
     const reminderNumber = Number(receipt.reminder_count || 0) + 1;
@@ -54,35 +56,12 @@ async function sendReminderForReceipt(receipt, baseUrl) {
         ? appendPortalLink(renderReminderEmailHtml(receipt.subject, reminderNumber, { portal: true }), receipt.action_url)
         : appendReceiptLink(renderReminderEmailHtml(receipt.subject, reminderNumber), receipt.token, baseUrl);
 
-    const form = new FormData();
-    for (const addr of recipients) form.append('to[]', addr);
-    form.append('subject', subject);
-    form.append('body', body);
-    form.append('body_format', 'html');
-    form.append('options[archive]', 'false');
-
-    const frontUrl = `https://api2.frontapp.com/channels/${encodeURIComponent(process.env.FRONT_CHANNEL_ID)}/messages`;
-    const resp = await fetch(frontUrl, {
-        method: 'POST',
-        headers: {
-            Authorization: `Bearer ${process.env.FRONT_API_TOKEN}`,
-            Accept: 'application/json',
-        },
-        body: form,
-    });
-    const respText = await resp.text();
-    if (!resp.ok) {
-        return { ok: false, reason: 'front_error', status: resp.status, detail: respText.slice(0, 500) };
+    const sent = await emailSend.sendEmail({ to: recipients, subject, html: body });
+    if (!sent.ok) {
+        return { ok: false, reason: sent.reason, status: sent.status ?? null, detail: sent.detail ?? null };
     }
-    // Capture Front provenance (same shape the document-send handlers store) so
-    // the reminder ledger can link back to the conversation.
-    let parsed = null;
-    try { parsed = JSON.parse(respText); } catch { /* 202 with empty body is fine */ }
-    const conversationUrl = parsed?._links?.related?.conversation || '';
-    const frontConversationId = conversationUrl ? conversationUrl.split('/').pop() : null;
-    const frontMessageUid = parsed?.message_uid || parsed?.id || null;
-
-    return { ok: true, recipients, subject, reminderNumber, frontMessageUid, frontConversationId };
+    // The SES message id in the same shape the document-send handlers store.
+    return { ok: true, recipients, subject, reminderNumber, frontMessageUid: sent.messageId, frontConversationId: null };
 }
 
 // Scheduled sweep. Finds unconfirmed receipts due for a reminder and sends one
@@ -169,7 +148,7 @@ async function runReceiptReminders(pool, opts = {}) {
                     id: receipt.id, reason: result.reason, status: result.status,
                 });
                 // Config problem affects every row — stop rather than hammer Front.
-                if (result.reason === 'front_not_configured') break;
+                if (result.reason === 'ses_not_configured') break;
             }
         }
         log.info('[receipt-reminders] sweep complete', summary);

@@ -12,6 +12,13 @@ const assert = require('node:assert/strict');
 
 const R = require('../src/lib/email-receipt');
 const { sendReminderForReceipt, runReceiptReminders } = require('../src/services/receipt-reminders');
+const emailSend = require('../src/services/email-send');
+
+const SES_ARN = 'arn:aws:ses:eu-north-1:123456789012:identity/portal@example.com';
+/** What a test looks at of one SES SendEmail input: who, the subject, the HTML. */
+const sentOf = (input) => ({
+    to: input.Destination.ToAddresses, subject: input.Content.Simple.Subject.Data, body: input.Content.Simple.Body.Html.Data,
+});
 
 /** A connection that records every query and answers from `answer(sql, params)`. */
 function fakeConn(answer = () => [[]]) {
@@ -104,15 +111,13 @@ test('reminder body: a portal reminder asks to open the portal and never to conf
 });
 
 test('sendReminderForReceipt: the confirm button for an email receipt, the portal address for a portal one, nothing otherwise', async () => {
-    const realFetch = globalThis.fetch;
-    const saved = { c: process.env.FRONT_CHANNEL_ID, t: process.env.FRONT_API_TOKEN };
-    process.env.FRONT_CHANNEL_ID = 'cha_1';
-    process.env.FRONT_API_TOKEN = 'tok';
+    const saved = { a: process.env.SES_FROM_ARN };
+    process.env.SES_FROM_ARN = SES_ARN;
     const sent = [];
-    globalThis.fetch = async (url, init) => {
-        sent.push(Object.fromEntries(init.body.entries()));
-        return { ok: true, status: 202, text: async () => JSON.stringify({ message_uid: 'm1' }) };
-    };
+    emailSend._setSendImplForTests(async (region, input) => {
+        sent.push(sentOf(input));
+        return { MessageId: 'm1' };
+    });
     try {
         let r = await sendReminderForReceipt({ token: 'b'.repeat(48), sent_to: '["a@x.com"]', subject: 'QA sheet', reminder_count: 0 }, 'https://api.example.com');
         assert.equal(r.ok, true);
@@ -136,9 +141,8 @@ test('sendReminderForReceipt: the confirm button for an email receipt, the porta
         assert.deepEqual(r, { ok: false, reason: 'no_reminder' });
         assert.equal(sent.length, 2);
     } finally {
-        globalThis.fetch = realFetch;
-        if (saved.c === undefined) delete process.env.FRONT_CHANNEL_ID; else process.env.FRONT_CHANNEL_ID = saved.c;
-        if (saved.t === undefined) delete process.env.FRONT_API_TOKEN; else process.env.FRONT_API_TOKEN = saved.t;
+        emailSend._setSendImplForTests(null);
+        if (saved.a === undefined) delete process.env.SES_FROM_ARN; else process.env.SES_FROM_ARN = saved.a;
     }
 });
 
@@ -327,23 +331,20 @@ const flat = sql => String(sql).replace(/\s+/g, ' ').trim();
 const isPick = sql => /^\s*SELECT id, token, email_type/.test(sql);
 const DUE = { id: 5, token: 'f'.repeat(48), email_type: 'request_to_send', sent_to: '["a@x.com"]', subject: 'Request to send – 333', reminder_count: 0, confirm_via: 'email', action_url: null };
 
-/** Runs `fn` with Front configured and every call to it recorded. */
+/** Runs `fn` with SES configured and every email handed to it recorded. */
 async function withFront(fn) {
-    const realFetch = globalThis.fetch;
-    const saved = { c: process.env.FRONT_CHANNEL_ID, t: process.env.FRONT_API_TOKEN };
-    process.env.FRONT_CHANNEL_ID = 'cha_1';
-    process.env.FRONT_API_TOKEN = 'tok';
+    const saved = { a: process.env.SES_FROM_ARN };
+    process.env.SES_FROM_ARN = SES_ARN;
     const sent = [];
-    globalThis.fetch = async (url, init) => {
-        sent.push(Object.fromEntries(init.body.entries()));
-        return { ok: true, status: 202, text: async () => JSON.stringify({ message_uid: 'm1' }) };
-    };
+    emailSend._setSendImplForTests(async (region, input) => {
+        sent.push(sentOf(input));
+        return { MessageId: 'm1' };
+    });
     try {
         return await fn(sent);
     } finally {
-        globalThis.fetch = realFetch;
-        if (saved.c === undefined) delete process.env.FRONT_CHANNEL_ID; else process.env.FRONT_CHANNEL_ID = saved.c;
-        if (saved.t === undefined) delete process.env.FRONT_API_TOKEN; else process.env.FRONT_API_TOKEN = saved.t;
+        emailSend._setSendImplForTests(null);
+        if (saved.a === undefined) delete process.env.SES_FROM_ARN; else process.env.SES_FROM_ARN = saved.a;
     }
 }
 

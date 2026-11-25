@@ -113,10 +113,10 @@ function build(rules, { shipment = SHIP_ROW(), locked, env = { SUPPLIER_PORTAL_U
         recordAudit: async (conn, entry) => { audits.push(entry); },
         getEmailTemplate: async () => TEMPLATE,
         renderTemplate: (text, vars) => String(text).replace(/\{(\w+)\}/g, (m, k) => (k in vars ? String(vars[k]) : m)),
-        sendFrontMessage: async (msg) => {
+        sendEmail: async (msg) => {
             order.push('front');
             sent.push(msg);
-            return front ? front(msg) : { ok: true, frontMessageUid: 'msg_1', frontConversationId: 'cnv_1' };
+            return front ? front(msg) : { ok: true, messageId: 'msg_1' };
         },
         preapprove: async (conn, args) => { preapproved.push(args); return preapproveResult || { status: 'ok', users: [] }; },
         getShipment: async () => shipment,
@@ -368,7 +368,7 @@ test('email: the row is written as "sending" and committed before Front is calle
     assert.ok(/'sending'/.test(ins.sql));
     assert.deepEqual(ins.params.slice(0, 4), [1214, '339', 4, KEY]);
     const upd = t.db.asked[marked];
-    assert.deepEqual(upd.params, ['msg_1', 'cnv_1', JSON.stringify(['mei@fwd.example', 'ops@fwd.example']), 'Container 339 – details needed', 77]);
+    assert.deepEqual(upd.params, ['msg_1', null, JSON.stringify(['mei@fwd.example', 'ops@fwd.example']), 'Container 339 – details needed', 77]);
 });
 
 test('email: its recipients are pre-approved on the portal, it is on the receipts list as a portal email, and audited', async () => {
@@ -459,7 +459,7 @@ test('email: a key made for another container or forwarder is refused', async ()
     assert.equal(t.sent.length, 0);
 });
 
-test('email: Front refusing marks the row failed, so the same key can try again', async () => {
+test('email: SES refusing marks the row failed, so the same key can try again', async () => {
     const t = build(noticeRules(), { front: () => ({ ok: false, status: 422, detail: 'no' }) });
     const r = await t.call(NOTICE, { body: { sendKey: KEY } });
     assert.equal(r.status, 502);

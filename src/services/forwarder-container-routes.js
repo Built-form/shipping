@@ -65,7 +65,7 @@ const { escapeHtml, wrapEmail } = require('../lib/email-layout');
 const { FREIGHT_CONTAINER_TEMPLATE_KEY } = require('../lib/email-template-defaults');
 const sync = require('./shipment-sync');
 const { readUploads, readDocuments, listUploads } = require('./forwarder-upload-routes');
-const { sendFrontMessage: defaultSend } = require('./front-send');
+const { sendEmail: defaultSend } = require('./email-send');
 const { preapprovePortalAddresses: defaultPreapprove } = require('./portal-access');
 const { readForwarderEvidence: defaultEvidence } = require('./payment-notices');
 const { logSentEmail: defaultLogSentEmail } = require('../lib/email-receipt');
@@ -567,7 +567,7 @@ function registerForwarderContainerRoutes(app, deps) {
     const {
         withConnection, recordAudit, getEmailTemplate, renderTemplate,
         ready = async () => {},
-        sendFrontMessage = defaultSend,
+        sendEmail = defaultSend,
         preapprove = defaultPreapprove,
         getShipment = sync.getShipment,
         patchShipment,
@@ -997,18 +997,18 @@ function registerForwarderContainerRoutes(app, deps) {
                 }),
             });
 
-            const sent = await sendFrontMessage({ to: claimed.addresses, subject: finalSubject, html });
+            const sent = await sendEmail({ to: claimed.addresses, subject: finalSubject, html });
             if (!sent.ok) {
                 await conn.query(`UPDATE ${NOTICE_TABLE} SET status = 'failed' WHERE id = ? AND status = 'sending'`, [claimed.noticeId]);
-                if (sent.reason === 'front_not_configured') {
-                    throw new Fail(500, 'FRONT_NOT_CONFIGURED', 'Front is not configured (FRONT_API_TOKEN, FRONT_CHANNEL_ID).');
+                if (sent.reason === 'ses_not_configured') {
+                    throw new Fail(500, 'FRONT_NOT_CONFIGURED', 'Email sending is not configured (SES_FROM_ARN).');
                 }
-                throw new Fail(502, 'FRONT_ERROR', 'Front rejected the message.', { frontStatus: sent.status ?? null, frontBody: sent.detail ?? null });
+                throw new Fail(502, 'FRONT_ERROR', 'The email service (SES) rejected the message.', { frontStatus: sent.status ?? null, frontBody: sent.detail ?? null });
             }
             await conn.query(
                 `UPDATE ${NOTICE_TABLE} SET status = 'sent', sent_at = UTC_TIMESTAMP(), front_message_uid = ?, front_conversation_id = ?, sent_to = ?, subject = ?
                   WHERE id = ?`,
-                [sent.frontMessageUid || null, sent.frontConversationId || null, JSON.stringify(claimed.addresses), finalSubject, claimed.noticeId]
+                [sent.messageId || null, null, JSON.stringify(claimed.addresses), finalSubject, claimed.noticeId]
             );
             await logSentEmail(conn, {
                 emailType: EMAIL_TYPE, sentTo: claimed.addresses, subject: finalSubject,
@@ -1020,7 +1020,7 @@ function registerForwarderContainerRoutes(app, deps) {
                 after: {
                     shipmentId: id, reference: claimed.reference, forwarderId: claimed.forwarderId, forwarder: claimed.forwarderName,
                     to: claimed.addresses, subject: finalSubject,
-                    frontMessageUid: sent.frontMessageUid || null, frontConversationId: sent.frontConversationId || null,
+                    frontMessageUid: sent.messageId || null, frontConversationId: null,
                 },
                 userEmail: req.userEmail,
             });

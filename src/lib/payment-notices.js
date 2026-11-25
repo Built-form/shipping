@@ -52,7 +52,7 @@ const SEND_ROLES = ['admin', 'standard', 'accountant'];
 // say what happened. The function's own time limit (900 s) is far beyond it,
 // which is why the clock is checked rather than the limit trusted.
 const DEADLINE_SECONDS = 60;
-const FRONT_CALL_SECONDS = 15;   // src/services/front-send.js SEND_TIMEOUT_MS
+const FRONT_CALL_SECONDS = 15;   // src/services/email-send.js SEND_TIMEOUT_MS (the SES call)
 const FRONT_MARGIN_SECONDS = 5;
 
 const toCents = v => Math.round(Number(v) * 100);
@@ -147,7 +147,7 @@ const REFUSALS = {
     SEND_IN_PROGRESS: [409, 'This email is being sent right now.', ['wait']],
     SEND_KEY_REUSED: [409, 'This send was already made with other content. Close the dialog and open it again.', ['reload']],
     NOT_UNKNOWN: [409, 'Only a send whose outcome is unknown can be resolved.', ['reload']],
-    FRONT_REFUSED: [502, 'Front refused the email. Nothing was sent.', ['retry']],
+    FRONT_REFUSED: [502, 'The email service (SES) refused the email. Nothing was sent.', ['retry']],
     SEND_FAILED: [502, 'The email could not be prepared. Nothing was sent.', ['retry']],
     SEND_OUTCOME_UNKNOWN: [502, 'The email may or may not have gone out: Front did not answer. Check Front, then say which. It is not sent again by itself.', ['resolve_sent', 'resolve_not_sent']],
     PAYMENT_NOT_CURRENT: [409, 'This payment has been deleted, or is no longer this supplier\'s. Send it again from the payment instead of reminding.', ['send_again']],

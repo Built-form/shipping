@@ -38,25 +38,21 @@ if (!host.includes('explorer-test')) {
 }
 process.env.IS_OFFLINE = '1';
 process.env.LOCAL_USER_TYPE = 'admin';
-process.env.FRONT_API_TOKEN = 'smoke-not-a-token';
-process.env.FRONT_CHANNEL_ID = 'cha_smoke';
+process.env.SES_FROM_ARN = 'arn:aws:ses:eu-north-1:000000000000:identity/smoke@example.com';
 process.env.SUPPLIER_PORTAL_URL = process.env.SUPPLIER_PORTAL_URL || 'https://jportal-test.built-form.co.uk';
 const JP = '`' + (process.env.JPORTAL_DB_SCHEMA || 'jportal') + '`';
 
-// ── network: Front stubbed, everything else external refused ───────────────
+// ── network: SES stubbed, everything else external refused ─────────────────
 const realFetch = global.fetch;
 const frontCalls = [];
+require('../src/services/email-send')._setSendImplForTests(async (region, input) => {
+    const s = input.Content.Simple;
+    const n = frontCalls.push({ to: input.Destination.ToAddresses, subject: s.Subject.Data, body: String(s.Body.Html.Data) });
+    return { MessageId: `smoke_msg_${n}` };
+});
 global.fetch = async (url, init) => {
     const u = String(url);
     if (u.startsWith('http://127.0.0.1:')) return realFetch(url, init);
-    if (u.startsWith('https://api2.frontapp.com/')) {
-        const f = init.body;
-        const n = frontCalls.push({ to: f.getAll('to[]'), subject: f.get('subject'), body: String(f.get('body')) });
-        return new Response(JSON.stringify({
-            message_uid: `smoke_msg_${n}`,
-            _links: { related: { conversation: `https://api2.frontapp.com/conversations/cnv_smoke_${n}` } },
-        }), { status: 202, headers: { 'content-type': 'application/json' } });
-    }
     throw new Error(`[smoke] blocked outbound fetch to ${u}`);
 };
 

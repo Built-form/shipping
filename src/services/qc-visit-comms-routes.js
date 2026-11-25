@@ -14,8 +14,8 @@
 // Sending mirrors POST /api/v1/quality-assurance-documents/:id/email in
 // orders.js: the subject/body come from an email template (qc_visit_factory,
 // qc_visit_inspector, qc_visit_cancel — src/lib/email-template-defaults.js)
-// and can be overridden per send; the message goes to Front as multipart
-// (channels/${FRONT_CHANNEL_ID}/messages) with a confirm-receipt link
+// and can be overridden per send; the message goes out through SES
+// (src/services/email-send.js) with a confirm-receipt link
 // (email_type 'qc_visit'), and each send is a qc_visit_sends row the receipt
 // is linked to. Attachments: the kit documents of the visit's products
 // (inspector proposals only): each JF code's current China factory QC
@@ -36,6 +36,7 @@ const { emailAvailabilityLink, availabilityEnabled, AvailabilityFail } = require
 const { buildIcs } = require('../lib/ics');
 const S = require('../lib/qc-schedule');
 const { getOrCreateLink, liveLinkOf, sendChanges } = require('./qc-schedule-routes');
+const emailSend = require('./email-send');
 const {
     apiBaseUrlFromReq,
     createEmailReceipt,
@@ -54,7 +55,7 @@ const LINE_KINDS = ['proposal', 'update'];
 const MAX_RECIPIENTS = 20;
 // Total size of everything attached to one email. The QA PDF and the .ics
 // always go; kit documents fill what is left and the rest are skipped (listed
-// in the response's skippedAttachments). Front caps a message at 25 MB.
+// in the response's skippedAttachments). SES caps a message at 40 MB; 25 MB is kept as the budget.
 const MAX_ATTACH_BYTES = 20 * 1024 * 1024;
 const CHINA_OFFSET_HOURS = 8; // Asia/Shanghai is fixed +08:00, no DST
 const ICS_UID_DOMAIN = 'built-form.co.uk';
@@ -623,8 +624,8 @@ function registerQcVisitCommsRoutes(app, deps) {
             const includeAvailability = kind === 'proposal' && b.includeAvailabilityLink === true;
             const attachProductList = lineKind && b.attachProductList === true;
 
-            if (!process.env.FRONT_API_TOKEN || !process.env.FRONT_CHANNEL_ID) {
-                return fail(res, 500, 'Front is not configured (FRONT_API_TOKEN, FRONT_CHANNEL_ID).', 'FRONT_NOT_CONFIGURED');
+            if (!emailSend.isConfigured()) {
+                return fail(res, 500, 'Email sending is not configured (SES_FROM_ARN).', 'FRONT_NOT_CONFIGURED');
             }
             if (!poBucket) return fail(res, 500, 'PO_DOCS_BUCKET env var not configured.', 'NO_BUCKET');
             if (attachKitFiles && !jfproDocsBucket) return fail(res, 500, 'JFPRO_DOCS_BUCKET env var not configured.', 'NO_BUCKET');
@@ -788,40 +789,22 @@ function registerQcVisitCommsRoutes(app, deps) {
                     ? htmlBody
                     : appendReceiptLink(htmlBody, receiptToken, apiBaseUrlFromReq(req));
 
-                const form = new FormData();
-                for (const addr of toAddresses) form.append('to[]', addr);
-                form.append('subject', finalSubject);
-                form.append('body', bodyWithReceipt);
-                form.append('body_format', 'html');
-                form.append('options[archive]', 'false');
-                for (const a of attachments) {
-                    form.append('attachments[]', new Blob([a.bytes], { type: a.type }), a.filename);
-                }
-
-                const frontUrl = `https://api2.frontapp.com/channels/${encodeURIComponent(process.env.FRONT_CHANNEL_ID)}/messages`;
-                const resp = await fetch(frontUrl, {
-                    method: 'POST',
-                    headers: {
-                        Authorization: `Bearer ${process.env.FRONT_API_TOKEN}`,
-                        Accept: 'application/json',
-                    },
-                    body: form,
+                const sent = await emailSend.sendEmail({
+                    to: toAddresses, subject: finalSubject, html: bodyWithReceipt,
+                    attachments: attachments.map(a => ({ bytes: a.bytes, filename: a.filename, contentType: a.type })),
                 });
-                const respText = await resp.text();
-                if (!resp.ok) {
-                    log.error('[qc-visits/email] Front API error', { status: resp.status, body: respText.slice(0, 500) });
+                if (!sent.ok) {
+                    log.error('[qc-visits/email] SES error', { reason: sent.reason, status: sent.status, detail: sent.detail });
                     // Not sent: its receipt must not be listed, or chased.
                     await discardEmailReceipt(conn, receiptToken);
                     return {
-                        status: 502, error: 'Front rejected the message.', code: 'FRONT_FAILED',
-                        payload: { frontStatus: resp.status, frontBody: respText.slice(0, 500) },
+                        status: 502, error: 'The email service (SES) rejected the message.', code: 'FRONT_FAILED',
+                        payload: { frontStatus: sent.status ?? 502, frontBody: sent.detail || sent.reason },
                     };
                 }
-                let parsed = null;
-                try { parsed = JSON.parse(respText); } catch { /* 202 with empty body is fine */ }
-                const conversationUrl = parsed?._links?.related?.conversation || '';
-                const frontConversationId = conversationUrl ? conversationUrl.split('/').pop() : null;
-                const frontMessageUid = parsed?.message_uid || parsed?.id || null;
+                // The SES message id goes where Front's uid went; no conversation any more.
+                const frontMessageUid = sent.messageId;
+                const frontConversationId = null;
 
                 const attachedNames = attachments.map(a => a.filename);
                 // Front has sent the email. From here a database failure must not

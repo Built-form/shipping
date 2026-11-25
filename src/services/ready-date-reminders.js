@@ -34,7 +34,7 @@ const { escapeHtml, wrapEmail } = require('../lib/email-layout');
 const { DEFAULT_EMAIL_TEMPLATES, READY_DATE_REMINDER_TEMPLATE_KEY } = require('../lib/email-template-defaults');
 const { createEmailReceipt, recordReminderSend } = require('../lib/email-receipt');
 const { jportalSchema, isSourceMissing } = require('../lib/jportal');
-const { sendFrontMessage: defaultSend } = require('./front-send');
+const { sendEmail: defaultSend } = require('./email-send');
 const { loadDepositGate: defaultLoadGate } = require('./deposit-gate');
 const { londonToday } = require('./daily-alerts');
 
@@ -197,7 +197,7 @@ async function record(conn, taken, { poIds, orderIds, addresses, subject, sent }
           WHERE id = ?`,
         [
             JSON.stringify(poIds), JSON.stringify([...new Set([...taken.orderIds, ...orderIds])]),
-            JSON.stringify(addresses), subject, sent.frontMessageUid || null, sent.frontConversationId || null, taken.id,
+            JSON.stringify(addresses), subject, sent.messageId || null, null, taken.id,
         ]
     );
     const [[receipt]] = await conn.query(
@@ -209,7 +209,7 @@ async function record(conn, taken, { poIds, orderIds, addresses, subject, sent }
     if (receipt) {
         await recordReminderSend(conn, receipt.id, {
             reminderNumber: Number(receipt.reminder_count || 0) + 1, sentTo: addresses, subject,
-            frontMessageUid: sent.frontMessageUid, frontConversationId: sent.frontConversationId,
+            frontMessageUid: sent.messageId, frontConversationId: null,
             sentByEmail: null, // automatic
         });
     } else {
@@ -234,7 +234,7 @@ async function record(conn, taken, { poIds, orderIds, addresses, subject, sent }
 async function runReadyDateReminders(pool, opts = {}) {
     const {
         today = londonToday(), dryRun = false, force = false,
-        sendFrontMessage = defaultSend, loadDepositGate = defaultLoadGate,
+        sendEmail = defaultSend, loadDepositGate = defaultLoadGate,
         log = defaultLog, env = process.env,
     } = opts;
     const summary = {
@@ -349,13 +349,13 @@ async function runReadyDateReminders(pool, opts = {}) {
                 continue;
             }
 
-            const sent = await sendFrontMessage({ to: addresses, subject, html });
+            const sent = await sendEmail({ to: addresses, subject, html });
             if (!sent.ok) {
                 await release(conn, taken, log);
                 summary.failed++;
                 log.error('[ready-date-reminders] send failed', { supplier: group.supplierName, reason: sent.reason, status: sent.status });
                 // A configuration problem affects every supplier: stop.
-                if (sent.reason === 'front_not_configured') break;
+                if (sent.reason === 'ses_not_configured') break;
                 continue;
             }
             summary.sent++;

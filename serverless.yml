@@ -112,8 +112,20 @@ provider:
     # inspection kit documents (src/services/qc-kit-routes.js presigns links,
     # qc-visit-comms-routes.js attaches them to the inspector email). Read only.
     JFPRO_DOCS_BUCKET: jfpro-documents-${sls:stage}
+    # Front is READ only now: the three importers (qcFrontImport,
+    # frontStatusImport, frontEmailIndex) walk the team's inbox with this token.
+    # No email is sent through Front since 2026-11-25.
     FRONT_API_TOKEN: ${self:custom.secrets.FRONT_API_TOKEN, ''}
-    FRONT_CHANNEL_ID: ${self:custom.secrets.FRONT_CHANNEL_ID, ''}
+    # Every outbound email goes through SES (src/services/email-send.js) from
+    # the verified EMAIL-ADDRESS identity SES_FROM_ARN names (the supplier
+    # portal's sender, portal@built-form.co.uk; its ARN says the region).
+    # Blank = no email: every send route answers "not configured". Replies go
+    # to EMAIL_REPLY_TO (the team's purchasing inbox, the Front channel's own
+    # address, so a supplier's answer still lands in Front). EMAIL_FROM_NAME is
+    # the display name on From (default "JFA Medical").
+    SES_FROM_ARN: ${self:custom.secrets.SES_FROM_ARN, ''}
+    EMAIL_REPLY_TO: ${self:custom.secrets.EMAIL_REPLY_TO, ''}
+    EMAIL_FROM_NAME: ${self:custom.secrets.EMAIL_FROM_NAME, ''}
     GEMINI_API_KEY: ${self:custom.secrets.GEMINI_API_KEY, ''}
     # Schema of the supplier portal (jportal) on the same MySQL server, read and
     # updated by /api/v1/po-change-requests and /api/v1/pi-submissions (and the
@@ -186,6 +198,15 @@ provider:
   iam:
     role:
       statements:
+        # Every outbound email (src/services/email-send.js): send from any SES
+        # identity verified in this account, in whichever region the identity
+        # SES_FROM_ARN names lives.
+        - Effect: Allow
+          Action:
+            - ses:SendEmail
+            - ses:SendRawEmail
+          Resource:
+            - arn:aws:ses:*:${aws:accountId}:identity/*
         - Effect: Allow
           Action:
             - s3:PutObject

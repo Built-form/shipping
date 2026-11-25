@@ -444,9 +444,9 @@ function harness({ userType = 'standard', frontOk = () => true, documentSet = nu
         },
         s3: documentSet ? { send: async (cmd) => ({ Body: { transformToByteArray: async () => Buffer.from(cmd.input.Key) } }) } : null,
         poBucket: () => (documentSet ? 'bucket' : null),
-        sendFrontMessage: async (msg) => {
+        sendEmail: async (msg) => {
             db.sent.push(msg);
-            return frontOk(msg) ? { ok: true, frontMessageUid: `m${db.sent.length}`, frontConversationId: 'c1' } : { ok: false, reason: 'front_error', status: 500 };
+            return frontOk(msg) ? { ok: true, messageId: `m${db.sent.length}` } : { ok: false, reason: 'ses_error', status: 500 };
         },
         preapprove: async (_c, { emails }) => { db.preapproved.push(...emails); return { status: 'ok', users: [] }; },
         londonToday: () => '2026-11-16',
