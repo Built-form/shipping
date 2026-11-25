@@ -1062,7 +1062,7 @@ function registerForwarderContainerRoutes(app, deps) {
                     })),
             });
 
-            const sent = await sendEmail({
+            const sent = await sendEmail({ kind: 'forwarder.container_notice',
                 to: claimed.addresses, subject: finalSubject, html,
                 ...(kept ? { attachments: [{ bytes: Buffer.from(kept.csv, 'utf8'), filename: kept.filename, contentType: 'text/csv' }] } : {}),
             });

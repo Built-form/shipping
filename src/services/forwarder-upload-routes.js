@@ -47,9 +47,10 @@
 // Registered from orders.js; authed through the greedy /api/v1/{proxy+} route.
 
 const { v4: uuidv4 } = require('uuid');
-const { GetObjectCommand, PutObjectCommand } = require('@aws-sdk/client-s3');
+const { GetObjectCommand, PutObjectCommand, HeadObjectCommand } = require('@aws-sdk/client-s3');
 const { getSignedUrl: defaultGetSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const FC = require('../lib/forwarder-containers');
+const { isAccessDenied, explainRefusal } = require('../lib/portal-scan');
 const { supplierKey } = require('../lib/payment-documents');
 const { jportalSchema } = require('../lib/jportal');
 const defaultLog = require('../lib/logger');
@@ -346,6 +347,17 @@ function registerForwarderUploadRoutes(app, deps) {
         if (!bucket) throw new Refusal(500, 'NOT_CONFIGURED', null, 'PI_UPLOADS_BUCKET env var not configured.');
         const row = await withConnection(conn => readOne(conn, id));
         if (!row || row.upload_status !== 'sent' || !row.final_key) throw new Refusal(404, 'NOT_FOUND', null, 'Upload not found.');
+        // The portal's virus scan (src/lib/portal-scan.js): a file it has not cleared is refused
+        // by the bucket, so say why rather than hand out a link that answers 403. Any other
+        // error here is left to the link itself, as before.
+        try {
+            await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: row.final_key }));
+        } catch (e) {
+            if (isAccessDenied(e)) {
+                const scan = await explainRefusal(s3, bucket, row.final_key);
+                throw new Refusal(scan.status, scan.body.code, { allowedNext: ['reload'] }, scan.body.error);
+            }
+        }
         const url = await getSignedUrl(s3, new GetObjectCommand({
             Bucket: bucket, Key: row.final_key,
             ResponseContentType: row.content_type || 'application/octet-stream',
@@ -422,6 +434,10 @@ function registerForwarderUploadRoutes(app, deps) {
             bytes = Buffer.from(await obj.Body.transformToByteArray());
         } catch (e) {
             if (e instanceof Refusal) throw e;
+            if (isAccessDenied(e)) {
+                const scan = await explainRefusal(s3, bucket, row.final_key);
+                throw new Refusal(scan.status, scan.body.code, { allowedNext: ['reload'] }, scan.body.error);
+            }
             log.warn('[POST /forwarder-uploads/:id/accept] the file could not be read', { id, error: e.message });
             throw refuse('FILE_UNAVAILABLE', ['reject']);
         }

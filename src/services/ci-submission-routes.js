@@ -62,6 +62,7 @@ const { HeadObjectCommand, GetObjectCommand, PutObjectCommand } = require('@aws-
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const { v4: uuidv4 } = require('uuid');
 const L = require('../lib/ci-submissions');
+const { isAccessDenied, explainRefusal } = require('../lib/portal-scan');
 const S = require('../lib/shipments');
 const { jportalSchema } = require('../lib/jportal');
 const { recordAuditStrict } = require('../lib/audit');
@@ -315,6 +316,8 @@ function registerCiSubmissionRoutes(app, deps) {
             return { url, expiresAt: new Date(Date.now() + FILE_URL_SECONDS * 1000).toISOString(), state };
         } catch (e) {
             if (isMissing(e)) state.gone = true;
+            // The portal's virus scan refused the read: say why (src/lib/portal-scan.js).
+            else if (isAccessDenied(e)) return { url: null, expiresAt: null, state, scan: (await explainRefusal(s3, bucket, row.s3_key)).body };
             else log.warn('[ci-submissions] file lookup failed', { id: row.id, error: e.message });
             return { url: null, expiresAt: null, state };
         }
@@ -517,6 +520,7 @@ function registerCiSubmissionRoutes(app, deps) {
                 },
                 fileUrl: file.url,
                 fileExpiresAt: file.expiresAt,
+                fileScan: file.scan || null,
                 document: documentJson(document),
                 groupNames: out.groupNames,
                 canImport: row.status === 'submitted' && blockers.length === 0,
@@ -694,6 +698,10 @@ function registerCiSubmissionRoutes(app, deps) {
             } catch (e) {
                 if (isMissing(e)) return refuse(res, NOT_IMPORTABLE(['file_gone']));
                 if (isPreconditionFailed(e)) return refuse(res, NOT_IMPORTABLE(['file_changed']));
+                if (isAccessDenied(e)) {
+                    const scan = await explainRefusal(s3, bucket, row.s3_key);
+                    return res.status(scan.status).json(scan.body);
+                }
                 log.warn('[POST /ci-submissions/:id/import] get failed', { id, error: e.message });
                 return refuse(res, FILE_UNAVAILABLE);
             }

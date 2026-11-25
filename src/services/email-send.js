@@ -23,6 +23,11 @@
 // `attachments` is optional: [{ bytes, filename, contentType }]. SES caps a
 // message at 40 MB after encoding.
 //
+// `kind` is optional: what the email is (e.g. 'po.documents'), for the email
+// log. Every real send is recorded in the portal's jportal.email_log, content
+// included with secret links masked (src/lib/email-log.js, portal README
+// section 26); see logEmail below.
+//
 // → { ok: true, messageId }
 //   { ok: false, reason: 'no_recipients' | 'ses_not_configured' | 'ses_error' | 'network_error', status?, retryable?, detail? }
 // 'ses_error' is SES ANSWERING with a refusal: nothing was sent. `retryable`
@@ -33,6 +38,7 @@
 // for sending, not proof of delivery.
 
 const log = require('../lib/logger');
+const { recordEmail } = require('../lib/email-log');
 
 const SEND_TIMEOUT_MS = 15 * 1000;
 const DEFAULT_FROM_NAME = 'JFA Medical';
@@ -107,15 +113,82 @@ function buildInput({ to, subject, html, text, attachments, replyTo }, sender, e
     };
 }
 
-async function sendEmail({ to, subject, html, text, attachments, replyTo }, { sendImpl = defaultSend, env = process.env } = {}) {
+// ── The email log (portal README section 26) ──
+// After every message SES was asked to take through the REAL SES call (accepted,
+// refused or unanswered; not "no recipients" or "not configured"), one
+// row in jportal.email_log: who to, the content with its secret links masked,
+// attachment names, the outcome. Never on a test's stubbed send (a sendImpl or
+// _setSendImplForTests), so a local test run cannot write rows into the live
+// table that .env points at. EMAIL_LOG=off turns it off. The row goes through
+// its OWN short-lived connection, never the pool: the pool holds one
+// connection, and a caller may still be holding it when it sends.
+const LOG_TIMEOUT_MS = 5 * 1000;
+
+let recordOverride = null;
+/** Test seam: (row input, env) => Promise, called instead of the database for EVERY send. null restores. */
+function _setRecordImplForTests(f) { recordOverride = f || null; }
+
+async function recordToDatabase(input, env) {
+    const mysql = require('mysql2/promise');
+    const { jportalSchema } = require('../lib/jportal');
+    const conn = await mysql.createConnection({
+        host: env.DB_HOST, user: env.DB_USER, password: env.DB_PASSWORD, database: env.DB_NAME,
+        port: env.DB_PORT || 3306, ssl: { rejectUnauthorized: false }, connectTimeout: LOG_TIMEOUT_MS,
+    });
     try {
-        const recipients = (Array.isArray(to) ? to : [to])
-            .filter(x => typeof x === 'string').map(x => x.trim()).filter(Boolean);
-        if (!recipients.length) return { ok: false, reason: 'no_recipients' };
+        await recordEmail((sql, params) => conn.query(sql, params), input, { table: `${jportalSchema(env)}.email_log`, log });
+    } finally {
+        await conn.end().catch(() => conn.destroy());
+    }
+}
+
+async function logEmail(fields, result, { realSes, env }) {
+    const record = recordOverride || (realSes && String(env.EMAIL_LOG || '').toLowerCase() !== 'off' ? recordToDatabase : null);
+    if (!record) return;
+    const input = { app: 'shipping', stage: env.EMAIL_LOG_STAGE || null, ...fields, result };
+    let timer;
+    try {
+        await Promise.race([
+            record(input, env),
+            new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('email log timed out')), LOG_TIMEOUT_MS); }),
+        ]);
+    } catch (e) {
+        log.warn('[email-send] logging the email failed; the email itself is unaffected', { error: String((e && e.message) || e).slice(0, 200) });
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+async function sendEmail(args, opts = {}) {
+    const { sendImpl = defaultSend, env = process.env } = opts;
+    const { result, fields } = await sendOnce(args, { sendImpl, env });
+    if (fields && fields.attempted) {
+        const { attempted, ...row } = fields;
+        await logEmail(row, result, { realSes: sendImpl === defaultSend && !sendOverride, env });
+    }
+    return result;
+}
+
+// One send. → { result, fields }: fields is what the log records, null when
+// there was no one to send to.
+async function sendOnce({ to, subject, html, text, attachments, replyTo, kind = null }, { sendImpl, env }) {
+    const recipients = (Array.isArray(to) ? to : [to])
+        .filter(x => typeof x === 'string').map(x => x.trim()).filter(Boolean);
+    if (!recipients.length) return { result: { ok: false, reason: 'no_recipients' }, fields: null };
+    const fields = { kind, to: recipients, subject, html, text, attachments, from: null, replyTo: null };
+    const result = await sendRaw({ recipients, subject, html, text, attachments, replyTo }, { sendImpl, env }, fields);
+    return { result, fields };
+}
+
+async function sendRaw({ recipients, subject, html, text, attachments, replyTo }, { sendImpl, env }, fields) {
+    try {
         const sender = senderOf(env.SES_FROM_ARN);
         if (!sender) return { ok: false, reason: 'ses_not_configured' };
 
         const input = buildInput({ to: recipients, subject, html, text, attachments, replyTo }, sender, env);
+        fields.from = input.FromEmailAddress;
+        fields.replyTo = input.ReplyToAddresses || null;
+        fields.attempted = true; // only a message SES was asked to take is logged
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), SEND_TIMEOUT_MS);
         let out;
@@ -141,4 +214,4 @@ async function sendEmail({ to, subject, html, text, attachments, replyTo }, { se
     }
 }
 
-module.exports = { sendEmail, buildInput, senderOf, isConfigured, _setSendImplForTests, SEND_TIMEOUT_MS, DEFAULT_FROM_NAME };
+module.exports = { sendEmail, buildInput, senderOf, isConfigured, _setSendImplForTests, _setRecordImplForTests, SEND_TIMEOUT_MS, DEFAULT_FROM_NAME };

@@ -22,6 +22,8 @@
 // buttons to show): STALE_CHECK_SECONDS, MAX_CHECK_ATTEMPTS, RETRYABLE_CODES,
 // the key pattern, the allowed types and the 10 MiB limit.
 
+const { parseScanEvent } = require('./portal-scan');
+
 const STALE_CHECK_SECONDS = 600;
 const MAX_CHECK_ATTEMPTS = 3;
 const RETRYABLE_CODES = ['MODEL_UNAVAILABLE', 'NOT_CONFIGURED', 'MODEL_NO_JSON', 'MODEL_BAD_OUTPUT'];
@@ -154,6 +156,15 @@ function planEvent(source, row, now) {
  */
 function parseTrigger(event, { bucket = null } = {}) {
     const e = isObj(event) ? event : {};
+    // The portal bucket's virus scan result (jportal README section 27): the check's trigger
+    // since staff may only read a file once it is scanned clean. `scan` is the result; a
+    // non-clean one fails the row FILE_SCAN_FAILED without reading the file.
+    const scanned = parseScanEvent(e, { bucket });
+    if (scanned) {
+        if (scanned.otherBucket) return { ignore: 'other_bucket' };
+        if (!isPiKey(scanned.key)) return { ignore: 'not_a_pi_key' };
+        return { source: 'event', key: scanned.key, scan: scanned.result };
+    }
     if (e.source === 'aws.s3' || e['detail-type'] === 'Object Created') {
         const d = isObj(e.detail) ? e.detail : {};
         const name = isObj(d.bucket) ? d.bucket.name : null;

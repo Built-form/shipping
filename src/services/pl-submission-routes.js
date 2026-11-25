@@ -57,6 +57,7 @@ const { HeadObjectCommand, GetObjectCommand, PutObjectCommand } = require('@aws-
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const { v4: uuidv4 } = require('uuid');
 const L = require('../lib/pl-submissions');
+const { isAccessDenied, explainRefusal } = require('../lib/portal-scan');
 const { jportalSchema } = require('../lib/jportal');
 const { recordAuditStrict } = require('../lib/audit');
 const P = require('./packing-list-check');
@@ -326,6 +327,8 @@ function registerPlSubmissionRoutes(app, deps) {
             return { url: await sign(bucket, row.s3_key), expiresAt: expiresAt(), state };
         } catch (e) {
             if (isMissing(e)) state.gone = true;
+            // The portal's virus scan refused the read: say why (src/lib/portal-scan.js).
+            else if (isAccessDenied(e)) return { url: null, expiresAt: null, state, scan: (await explainRefusal(s3, bucket, row.s3_key)).body };
             else log.warn('[pl-submissions] file lookup failed', { id: row.id, error: e.message });
             return { url: null, expiresAt: null, state };
         }
@@ -577,6 +580,7 @@ function registerPlSubmissionRoutes(app, deps) {
                 },
                 fileUrl: file.url,
                 fileExpiresAt: file.expiresAt,
+                fileScan: file.scan || null,
                 packingList: imported ? packingListJson(packingList) : null,
                 previousPackingList: imported ? null : packingListJson(packingList),
                 defaultReplacesId: out.defaultReplacesId,
@@ -718,6 +722,10 @@ function registerPlSubmissionRoutes(app, deps) {
             } catch (e) {
                 if (isMissing(e)) return refuse(res, NOT_IMPORTABLE(['file_gone']));
                 if (isPreconditionFailed(e)) return refuse(res, NOT_IMPORTABLE(['file_changed']));
+                if (isAccessDenied(e)) {
+                    const scan = await explainRefusal(s3, bucket, row.s3_key);
+                    return res.status(scan.status).json(scan.body);
+                }
                 log.warn('[POST /pl-submissions/:id/import] get failed', { id, error: e.message });
                 return refuse(res, FILE_UNAVAILABLE);
             }

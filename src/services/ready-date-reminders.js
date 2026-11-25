@@ -352,7 +352,7 @@ async function runReadyDateReminders(pool, opts = {}) {
                 continue;
             }
 
-            const sent = await sendEmail({ to: addresses, subject, html });
+            const sent = await sendEmail({ kind: 'ready_date.reminder', to: addresses, subject, html });
             if (!sent.ok) {
                 await release(conn, taken, log);
                 summary.failed++;

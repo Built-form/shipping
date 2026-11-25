@@ -291,7 +291,8 @@ test('proofs of any size and number go as a link: none is read, none rides on th
     const front = [];
     assert.equal((await send(store, frontOk(front), await requestFor(store))).status, 200);
     assert.equal(front[0].attachments, undefined);
-    assert.deepEqual(Object.keys(front[0]).sort(), ['html', 'subject', 'to']);
+    assert.deepEqual(Object.keys(front[0]).sort(), ['html', 'kind', 'subject', 'to']);
+    assert.equal(front[0].kind, 'payment.deposit', 'the email log is told what this is');
 });
 
 // ── It fails after the row is written, before Front ───────────────────────

@@ -290,7 +290,7 @@ function registerArtworkConfirmationRoutes(app, deps) {
                 bodyHtml: inner + A.artworkBlockHtml({ poNumber: po.po_number, url, lines: chosenLines, expiresOn }),
             });
 
-            const sent = await sendEmail({ to: addresses, subject: finalSubject, html });
+            const sent = await sendEmail({ kind: 'artwork.request', to: addresses, subject: finalSubject, html });
             if (!sent.ok) {
                 await conn.query(
                     `UPDATE artwork_confirmation_requests
