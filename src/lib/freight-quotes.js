@@ -78,7 +78,8 @@ const MAX_MOVEMENTS = 30;
 const BOOKING_STATUSES = ['requested', 'confirmed', 'declined', 'cancelled'];
 /** A booking that holds its request: no other booking, no new answer. */
 const LIVE_BOOKING_STATUSES = ['requested', 'confirmed'];
-const REVOKE_REASONS = ['staff', 'send_failed', 'filled', 'forwarder_removed'];
+// `copy_closed`: a copy made to book the quote for another container, whose booking no longer stands.
+const REVOKE_REASONS = ['staff', 'send_failed', 'filled', 'forwarder_removed', 'copy_closed'];
 /**
  * A confirmed booking is finished this many days after its sailing was due to
  * arrive: it no longer keeps its link open, is no longer compared with its
@@ -99,6 +100,8 @@ const PRICE_RE = /^\d{1,7}(\.\d{1,2})?$/;
 const CBM_RE = /^\d{1,4}(\.\d{1,3})?$/;
 const WEIGHT_RE = /^\d{1,7}(\.\d{1,2})?$/;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** A key a dialog makes once and sends with every attempt (a batchId, an addKey, a copyKey). */
+const isUuid = v => typeof v === 'string' && UUID_RE.test(v);
 // Control and invisible format characters: never part of a name, a port or a reference.
 const UNPRINTABLE = /[\p{Cc}\p{Cf}]/u;
 
@@ -945,7 +948,7 @@ function contentsDrift(snapshot, lines) {
 }
 
 module.exports = {
-    TOKEN_RE, newToken, isToken, freightUrl,
+    TOKEN_RE, newToken, isToken, freightUrl, isUuid,
     SERVICES, SERVICE_LABELS, SERVICE_LABELS_ZH, DEFAULT_DELIVERY_OPTIONS, CONTAINER_SIZES, CURRENCIES,
     EXPIRY_DAYS, EXPIRY_MIN_DAYS, EXPIRY_MAX_DAYS, WINDOW_MAX_DAYS, SAILING_MARGIN_DAYS, MAX_OPTIONS,
     ANSWER_LIMIT, MAX_FORWARDERS_PER_SEND, MAX_CONTACTS, MAX_SERVICES, MAX_DELIVERY_OPTIONS, MAX_MOVEMENTS,

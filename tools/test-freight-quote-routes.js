@@ -35,6 +35,8 @@ function harness({ userType = 'standard', frontOk = () => true, documentSet = nu
         deliveryOptions: [{ id: 1, label: 'Door to door', deleted_at: null }, { id: 2, label: 'Door to port', deleted_at: null }],
         shipments: [
             { id: 50, name: 'Draft 12', reference: null, stage: 'DRAFT', deleted_at: null, merged_into_id: null },
+            // A second draft, for the same quote booked for another container.
+            { id: 52, name: 'Draft 13', reference: null, stage: 'DRAFT', deleted_at: null, merged_into_id: null },
             // A booked container: a delivery leg is usually booked when it is already on the water.
             { id: 51, name: null, reference: '339', stage: 'IN_TRANSIT', deleted_at: null, merged_into_id: null },
         ],
@@ -175,6 +177,41 @@ function harness({ userType = 'standard', frontOk = () => true, documentSet = nu
                     .map(r => r.batch_id));
                 return [[{ n: batches.size }]];
             }
+            // a copy, made to book the quote for another container (book-another)
+            if (s.startsWith('SELECT id, copied_from_request_id FROM freight_quote_requests WHERE batch_id = ? LIMIT 1')) {
+                return [db.requests.filter(r => r.batch_id === params[0]).slice(0, 1)];
+            }
+            if (s.startsWith('INSERT INTO freight_quote_requests') && s.includes('copied_from_request_id')) {
+                assert.doesNotMatch(s, /stock_movements/);
+                const [token, batch_id, forwarder_id, forwarder_name, window_start_date, window_end_date, origin, destination,
+                    container_size, services, staff_note, sent_to, created_by_email, kind, copied_from_request_id,
+                    answered_by_name, answered_by_email, answer_source, days] = params;
+                if (db.requests.some(r => r.batch_id === batch_id && r.forwarder_id === forwarder_id)) throw Object.assign(new Error('dup'), { errno: 1062 });
+                assert.equal(typeof services, 'string', 'the delivery options are written as the JSON text they are kept as');
+                assert.match(window_start_date, /^\d{4}-\d{2}-\d{2}$/, 'a date is written as a day, never as a Date object');
+                const id = db.requests.length + 1;
+                db.requests.push({
+                    id, token, batch_id, forwarder_id, forwarder_name, window_start_date, window_end_date, origin, destination,
+                    container_size, services, staff_note, sent_to, subject: null, created_by_email, kind, copied_from_request_id,
+                    created_at: NOW(), sent_at: NOW(), expires_at: future(days), revoked_at: null, revoke_reason: null,
+                    answer_count: 1, answered_at: NOW(), answered_by_name, answered_by_email, answer_source, answer_note: null,
+                    declined: 0, row_version: 1, reminded_at: null, reminder_count: 0,
+                });
+                return [{ insertId: id }];
+            }
+            if (s.startsWith("UPDATE freight_quote_requests r SET r.revoked_at = UTC_TIMESTAMP(), r.revoke_reason = 'copy_closed'")) {
+                const rows = db.requests.filter(r => r.copied_from_request_id != null && !r.revoked_at
+                    && !db.bookings.some(b => b.request_id === r.id && params[0].includes(b.status)));
+                rows.forEach(r => Object.assign(r, { revoked_at: NOW(), revoke_reason: 'copy_closed', row_version: r.row_version + 1 }));
+                return ok(rows.length);
+            }
+            if (s.startsWith("UPDATE freight_quote_requests SET revoked_at = UTC_TIMESTAMP(), revoke_reason = 'copy_closed'")) {
+                assert.ok(s.endsWith('WHERE id = ? AND revoked_at IS NULL'), s);
+                const r = db.requests.find(x => x.id === params[0] && !x.revoked_at);
+                if (!r) return ok(0);
+                Object.assign(r, { revoked_at: NOW(), revoke_reason: 'copy_closed', row_version: r.row_version + 1 });
+                return ok(1);
+            }
             if (s.startsWith('INSERT INTO freight_quote_requests')) {
                 assert.match(s, /created_by_email, kind, expires_at\)/, 'the kind is written with the request');
                 const [token, batch_id, forwarder_id, forwarder_name, window_start_date, window_end_date, origin, destination,
@@ -290,6 +327,7 @@ function harness({ userType = 'standard', frontOk = () => true, documentSet = nu
             }
             // options
             if (s.startsWith('INSERT INTO freight_quote_options')) {
+                const firstId = db.options.length + 1;
                 for (let i = 0; i < params.length; i += 15) {
                     const [request_id, answer_no, line_no, loading_date, sailing_date, transit_days, port_from, port_to,
                         service, container_size, price, currency, carrier, valid_until, note] = params.slice(i, i + 15);
@@ -298,7 +336,7 @@ function harness({ userType = 'standard', frontOk = () => true, documentSet = nu
                         port_from, port_to, service, container_size, price, currency, carrier, valid_until, note,
                     });
                 }
-                return ok(params.length / 15);
+                return [{ affectedRows: params.length / 15, insertId: firstId }];
             }
             if (s.startsWith('SELECT * FROM freight_quote_options WHERE id = ?')) {
                 return [db.options.filter(o => o.id === params[0])];
@@ -745,6 +783,192 @@ test('booking: an option from an older answer is refused; a Front failure cancel
     assert.equal(out.status, 502);
     assert.equal(f.db.bookings[0].status, 'cancelled');
     assert.equal(f.db.bookings[0].cancel_reason, 'send_failed');
+});
+
+// ── the same quote for another container (book-another, 2026-11-26) ──────
+const COPY_KEY = 'c0ffee00-0000-4000-8000-000000000002';
+const another = (h, body = {}, optionId = 1) => h.call('POST', `/api/v1/freight-quotes/options/${optionId}/book-another`, { copyKey: COPY_KEY, ...body });
+// Request 1's option booked for Draft 12: the quote a second container is booked on.
+async function bookedOnce(h) {
+    await answered(h);
+    assert.equal((await h.call('POST', '/api/v1/freight-quotes/options/1/book', { shipmentId: 50 })).status, 200);
+}
+
+test('book-another: the quote is copied with a link of its own and booked for the second container; the original is untouched', async () => {
+    const h = harness();
+    await bookedOnce(h);
+    const original = { ...h.db.requests[0] };
+    const sentBefore = h.db.sent.length;
+
+    const out = await another(h, { shipmentId: 52, note: 'Second box, same ship' });
+    assert.equal(out.status, 200);
+    assert.deepEqual([out.body.ok, out.body.bookingId, out.body.requestId, out.body.alreadyBooked], [true, 2, 3, undefined]);
+
+    // The copy: the same forwarder and facts, answered already, a new token, pointing at the original.
+    const copy = h.db.requests[2];
+    assert.deepEqual(
+        [copy.forwarder_id, copy.forwarder_name, copy.window_start_date, copy.window_end_date, copy.container_size, copy.services, copy.kind],
+        [1, 'DCG', '2026-12-01', '2026-12-31', '40HQ', original.services, 'freight']);
+    assert.deepEqual([copy.batch_id, copy.copied_from_request_id, copy.answer_count, copy.answer_source], [COPY_KEY, 1, 1, 'staff']);
+    assert.match(copy.token, /^[a-f0-9]{48}$/);
+    assert.notEqual(copy.token, original.token);
+    // Its one option is the option chosen, as answer 1.
+    const copied = h.db.options.filter(o => o.request_id === 3);
+    assert.equal(copied.length, 1);
+    assert.deepEqual(
+        [copied[0].answer_no, copied[0].line_no, copied[0].sailing_date, copied[0].loading_date, copied[0].transit_days, copied[0].port_from, copied[0].port_to, Number(copied[0].price), copied[0].currency],
+        [1, 1, '2026-12-10', '2026-12-05', 32, 'Ningbo', 'Felixstowe', 1850, 'USD']);
+    // The booking is on the copy, for the second draft.
+    const b = h.db.bookings[1];
+    assert.deepEqual([b.request_id, b.option_id, b.status, b.shipment_id, b.draft_container_name, b.scope], [3, copied[0].id, 'requested', 52, 'Draft 13', 'port_to_port']);
+
+    // One email, with the COPY's link, never the original's.
+    assert.equal(h.db.sent.length, sentBefore + 1);
+    const mail = h.db.sent[h.db.sent.length - 1];
+    assert.deepEqual(mail.to, ['amy@dcg.com']);
+    assert.ok(mail.html.includes(`/freight/${copy.token}`));
+    assert.ok(!mail.html.includes(original.token));
+    assert.match(mail.html, /Second box, same ship/);
+    assert.match(mail.html, /USD 1,850\.00/);
+
+    // The original: its booking, its answer and its version as they were.
+    assert.deepEqual(h.db.requests[0], original);
+    assert.deepEqual([h.db.bookings[0].request_id, h.db.bookings[0].status, h.db.bookings[0].shipment_id], [1, 'requested', 50]);
+
+    // On the board: two requests booked, two bookings, each with its own container.
+    const req1 = out.body.requests.find(r => r.id === 1);
+    const req3 = out.body.requests.find(r => r.id === 3);
+    assert.deepEqual([req1.state, req1.copiedFromRequestId], ['booked', null]);
+    assert.deepEqual([req3.state, req3.copiedFromRequestId, req3.options.length, req3.stockMovements.length], ['booked', 1, 1, 0]);
+    assert.match(req3.url, /\/freight\/[a-f0-9]{48}$/);
+    assert.deepEqual(out.body.bookings.map(x => [x.id, x.requestId, x.containerName]), [[2, 3, 'Draft 13'], [1, 1, 'Draft 12']]);
+
+    // The audit trail says what was copied, and never holds a token.
+    const audit = h.db.audits.find(a => a.entityType === 'freight_quote_request' && a.action === 'copied');
+    assert.deepEqual([audit.entityId, audit.after], [3, { copiedFromRequestId: 1, originalRequestId: 1, optionId: 1, bookingId: 2 }]);
+    assert.equal(h.db.audits.filter(a => a.entityType === 'freight_booking' && a.action === 'requested').pop().after.copiedFromRequestId, 1);
+    assert.doesNotMatch(JSON.stringify(h.db.audits), /[a-f0-9]{48}/);
+    // The email is listed as a booking email of the copy's booking.
+    assert.deepEqual(h.db.receipts[h.db.receipts.length - 1].filter(v => v === 'freight_booking_request' || v === 'freight_bookings'), ['freight_booking_request', 'freight_bookings']);
+
+    // The copy's booking is a booking like any other: confirmed with its own reference.
+    const confirmed = await h.call('PATCH', '/api/v1/freight-bookings/2', { status: 'confirmed', bookingRef: 'BK-2' });
+    assert.deepEqual(confirmed.body.bookings.map(x => [x.id, x.status, x.bookingRef]), [[2, 'confirmed', 'BK-2'], [1, 'requested', null]]);
+    // ... and its confirmation closes nobody: it is a send of its own.
+    assert.equal(confirmed.body.requests.find(r => r.id === 1).state, 'booked');
+    assert.equal(confirmed.body.requests.find(r => r.id === 2).state, 'answered');
+    assert.deepEqual(h.logs, []);
+});
+
+test('book-another: only where a booking stands; plain book still refuses a second booking', async () => {
+    const h = harness();
+    await answered(h);
+    const none = await another(h, { shipmentId: 52 });
+    assert.deepEqual([none.status, none.body.code], [409, 'NOT_BOOKED']);
+    assert.equal(h.db.requests.length, 2);
+
+    await h.call('POST', '/api/v1/freight-quotes/options/1/book', { shipmentId: 50 });
+    assert.equal((await h.call('POST', '/api/v1/freight-quotes/options/1/book', { shipmentId: 52 })).body.code, 'ALREADY_BOOKED');
+    // A key is needed, and it is a UUID.
+    for (const bad of [undefined, '', 'abc', 7]) {
+        const r = await h.call('POST', '/api/v1/freight-quotes/options/1/book-another', { copyKey: bad });
+        assert.deepEqual([r.status, r.body.code, r.body.field], [400, 'BAD_FIELD', 'copyKey'], String(bad));
+    }
+    assert.equal((await h.call('POST', '/api/v1/freight-quotes/options/99/book-another', { copyKey: COPY_KEY })).status, 404);
+    // The same container cannot carry both bookings.
+    const same = await another(h, { shipmentId: 50 });
+    assert.deepEqual([same.status, same.body.code], [409, 'CONTAINER_TAKEN']);
+    assert.equal(h.db.requests.length, 2);
+    assert.equal(h.db.bookings.length, 1);
+
+    // A read-only role books nothing.
+    assert.equal((await another(harness({ userType: 'viewer' }))).status, 403);
+});
+
+test('book-another: the same key again answers the booking it made and emails nobody', async () => {
+    const h = harness();
+    await bookedOnce(h);
+    const first = await another(h, { shipmentId: 52 });
+    const sent = h.db.sent.length;
+    const again = await another(h, { shipmentId: 52 });
+    assert.deepEqual([again.status, again.body.alreadyBooked, again.body.bookingId, again.body.requestId], [200, true, first.body.bookingId, first.body.requestId]);
+    assert.equal(h.db.sent.length, sent);
+    assert.equal(h.db.requests.length, 3);
+    assert.equal(h.db.bookings.length, 2);
+    // A third container is another press, with another key.
+    const third = await h.call('POST', '/api/v1/freight-quotes/options/1/book-another', { copyKey: 'c0ffee00-0000-4000-8000-000000000003' });
+    assert.equal(third.status, 200);
+    assert.deepEqual(h.db.requests.map(r => r.copied_from_request_id ?? null), [null, null, 1, 1]);
+    // A key that belongs to a send is never a copy's.
+    const clash = await h.call('POST', '/api/v1/freight-quotes/options/1/book-another', { copyKey: BATCH });
+    assert.deepEqual([clash.status, clash.body.code], [409, 'COPY_KEY_USED']);
+});
+
+test('book-another: a copy of a copy points at the request the forwarder answered', async () => {
+    const h = harness();
+    await bookedOnce(h);
+    await another(h, { shipmentId: 52 });
+    const copyOption = h.db.options.find(o => o.request_id === 3).id;
+    const out = await h.call('POST', `/api/v1/freight-quotes/options/${copyOption}/book-another`, { copyKey: 'c0ffee00-0000-4000-8000-000000000004' });
+    assert.equal(out.status, 200);
+    assert.equal(h.db.requests[3].copied_from_request_id, 1);
+    assert.deepEqual(h.db.audits.filter(a => a.action === 'copied').pop().after, { copiedFromRequestId: 3, originalRequestId: 1, optionId: copyOption, bookingId: 3 });
+});
+
+test('book-another: an email the service refused cancels the booking and closes the copy, off the board', async () => {
+    let refuse = false;
+    const h = harness({ frontOk: () => !refuse });
+    await bookedOnce(h);
+    refuse = true;
+    const out = await another(h, { shipmentId: 52 });
+    assert.equal(out.status, 502);
+    assert.deepEqual([h.db.bookings[1].status, h.db.bookings[1].cancel_reason], ['cancelled', 'send_failed']);
+    assert.deepEqual([h.db.requests[2].revoke_reason, Boolean(h.db.requests[2].revoked_at)], ['send_failed', true]);
+    refuse = false;
+    // That key is spent; the dialog makes another, and the container is free again.
+    assert.equal((await another(h, { shipmentId: 52 })).body.code, 'COPY_KEY_USED');
+    const retry = await h.call('POST', '/api/v1/freight-quotes/options/1/book-another', { copyKey: 'c0ffee00-0000-4000-8000-000000000005', shipmentId: 52 });
+    assert.equal(retry.status, 200);
+    // The closed copy is not a request to list; its cancelled booking stays in the history.
+    assert.deepEqual(retry.body.requests.map(r => r.id).sort(), [1, 2, 4]);
+    assert.deepEqual(retry.body.bookings.map(b => [b.id, b.status]), [[3, 'requested'], [2, 'cancelled'], [1, 'requested']]);
+});
+
+test('book-another: a copy lives for its booking: declined by the forwarder or cancelled by staff, its link is closed', async () => {
+    const h = harness();
+    await bookedOnce(h);
+    await another(h, { shipmentId: 52 });
+    // The forwarder declines on the copy's page (the portal writes the booking, and cannot revoke).
+    Object.assign(h.db.bookings[1], { status: 'declined', response_source: 'link' });
+    const board = await h.call('GET', '/api/v1/freight-quotes');
+    assert.deepEqual([h.db.requests[2].revoke_reason, Boolean(h.db.requests[2].revoked_at)], ['copy_closed', true]);
+    assert.deepEqual(board.body.requests.map(r => r.id).sort(), [1, 2]);
+    assert.deepEqual(board.body.bookings.map(b => [b.id, b.status]), [[2, 'declined'], [1, 'requested']]);
+    // The badge read closes it too, and never counts it as a quote waiting to be booked.
+    const g = harness();
+    await bookedOnce(g);
+    await another(g, { shipmentId: 52 });
+    Object.assign(g.db.bookings[1], { status: 'declined' });
+    assert.equal((await g.call('GET', '/api/v1/freight-quotes/summary')).body.answered, 0);
+    assert.equal(g.db.requests[2].revoke_reason, 'copy_closed');
+    // The original is never closed by the sweep, booked or not.
+    assert.equal(h.db.requests[0].revoked_at, null);
+
+    // Staff cancel the copy's booking: the copy closes with it, and the quote can be booked again from the original.
+    const c = harness();
+    await bookedOnce(c);
+    await another(c, { shipmentId: 52 });
+    const cancelled = await c.call('PATCH', '/api/v1/freight-bookings/2', { status: 'cancelled' });
+    assert.equal(cancelled.status, 200);
+    assert.equal(c.db.requests[2].revoke_reason, 'copy_closed');
+    assert.equal(c.db.audits.filter(a => a.entityType === 'freight_booking' && a.action === 'cancelled').pop().after.copyClosed, true);
+    assert.deepEqual(cancelled.body.requests.map(r => r.id).sort(), [1, 2]);
+    assert.equal((await c.call('POST', '/api/v1/freight-quotes/options/1/book-another', { copyKey: 'c0ffee00-0000-4000-8000-000000000006', shipmentId: 52 })).status, 200);
+    // Cancelling the ORIGINAL's booking leaves the request open, as before, and the copy's booking standing.
+    const first = await c.call('PATCH', '/api/v1/freight-bookings/1', { status: 'cancelled' });
+    assert.equal(first.body.requests.find(r => r.id === 1).state, 'answered');
+    assert.equal(c.db.requests[0].revoked_at, null);
+    assert.equal(first.body.bookings.find(b => b.id === 3).status, 'requested');
 });
 
 test('booking: what it covers is said by staff; left out, it covers the freight only, whatever the option is called', async () => {
@@ -1321,4 +1545,21 @@ test('a request never changes kind: no statement that updates a request names it
     const updates = source.match(/UPDATE freight_quote_requests[\s\S]*?(?:`|'\s*[,)])/g) || [];
     assert.ok(updates.length >= 8, `found ${updates.length} updates`);
     for (const u of updates) assert.doesNotMatch(u, /\bkind\b/, u.slice(0, 120));
+});
+
+test('book-another on a delivery request: the copy is a delivery request and its booking covers the delivery alone', async () => {
+    const h = harness();
+    await withDelivery(h);
+    assert.equal((await h.call('POST', `/api/v1/freight-quotes/options/3/book${ALL}`, { shipmentId: 51 })).status, 200);
+    // A freight scope is not something a delivery request's copy can be given.
+    const wrong = await h.call('POST', `/api/v1/freight-quotes/options/3/book-another${ALL}`, { copyKey: COPY_KEY, scope: 'end_to_end' });
+    assert.deepEqual([wrong.status, wrong.body.field], [400, 'scope']);
+    assert.equal(h.db.requests.length, 3);
+    const out = await h.call('POST', `/api/v1/freight-quotes/options/3/book-another${ALL}`, { copyKey: COPY_KEY });
+    assert.equal(out.status, 200, JSON.stringify(out.body));
+    assert.deepEqual([h.db.requests[3].kind, h.db.requests[3].copied_from_request_id, h.db.requests[3].forwarder_id], ['delivery', 3, 2]);
+    assert.deepEqual([h.db.bookings[1].request_id, h.db.bookings[1].scope], [4, 'delivery']);
+    assert.match(h.db.sent.at(-1).subject, /^freight_delivery_booking /, 'the delivery booking template');
+    // Kept from a ShipLine that does not ask for both legs, as every delivery request is.
+    assert.deepEqual((await h.call('GET', '/api/v1/freight-quotes')).body.requests.map(r => r.id).sort(), [1, 2]);
 });

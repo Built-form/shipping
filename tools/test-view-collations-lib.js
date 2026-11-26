@@ -248,7 +248,7 @@ test('migrate.js viewCheck: 1 when a view of ours fails, 0 when only another\'s 
 test('migrate.js ownedViews: the views the migration files create', () => {
     const ours = runner.ownedViews();
     for (const v of ['forwarder_duty_holders_v', 'portal_forwarder_containers_v', 'portal_forwarder_clearance_v',
-        'portal_forwarder_payments_v', 'portal_payments_v', 'qc_kit_documents']) {
+        'portal_forwarder_documents_v', 'portal_forwarder_payments_v', 'portal_payments_v', 'qc_kit_documents']) {
         assert.ok(ours.has(v), `${v} is created by a migration`);
     }
     assert.equal(ours.has('orders'), false);
@@ -299,4 +299,39 @@ test('2026-11-25_11: qc_kit_documents of 2026-10-28_20 with nothing changed but 
     q = swap(q, "'product' AS attached_via,", "CONVERT('product' USING utf8mb4) AS attached_via,", 1);
     q = swap(q, "'product_group' AS attached_via,", "CONVERT('product_group' USING utf8mb4) AS attached_via,", 1);
     assert.equal(flat(now), q);
+});
+
+// ── a container's papers for the forwarders working on it (2026-11-26_10) ────
+
+test('2026-11-26_10: portal_forwarder_documents_v names every kind collation-safe, a file by its key only, and nobody', () => {
+    const [view, ...rest] = splitSql(readMigration('2026-11-26_10_portal_forwarder_documents_view.sql'));
+    assert.deepEqual(rest, []);
+    const sql = flat(view);
+    assert.ok(sql.startsWith('CREATE OR REPLACE SQL SECURITY DEFINER VIEW portal_forwarder_documents_v AS SELECT'));
+    const branches = sql.split(' UNION ALL ');
+    assert.equal(branches.length, 5);
+    // Every branch's kind is wrapped: one bare literal makes the whole column a literal again.
+    const kinds = branches.map(b => (b.match(/CONVERT\('([a-z_]+)' USING utf8mb4\)/) || [])[1]);
+    assert.deepEqual(kinds, ['bill_of_lading', 'telex_release', 'packing_list', 'packing_list', 'commercial_invoice']);
+    assert.equal(/,\s*'[a-z_]+'\s*(AS\s+\w+\s*)?,/.test(sql), false);
+    // The columns, in order, from the first branch.
+    assert.deepEqual([...branches[0].matchAll(/ AS ([a-z_0-9]+)/g)].map(m => m[1]),
+        ['shipment_id', 'kind', 'document_id', 'supplier_name', 'filename', 's3_key', 'content_type', 'file_size', 'filed_at']);
+    // A key, never an address that lasts; no forwarder, and nobody's email.
+    for (const word of ['public_url', 'forwarder_id AS', 'forwarder_name', 'uploaded_by_email', 'accepted_by_email', 'extract_json', 'notes']) {
+        assert.equal(sql.includes(word), false, word);
+    }
+    // Only what our team hold, and only a bill of lading of a forwarder's documents.
+    assert.ok(branches[0].includes("d.deleted_at IS NULL AND d.kind = 'bill_of_lading'"));
+    assert.ok(branches[1].includes('t.deleted_at IS NULL'));
+    for (const b of [branches[2], branches[3]]) assert.ok(b.includes('pl.deleted_at IS NULL AND pl.superseded_by_id IS NULL'));
+    // A supplier's invoice on the shipment: not a forwarder's, not a proof, not a QC invoice,
+    // and only under a supplier with goods on board.
+    for (const cond of ["i.doc_kind = 'balance_invoice'", 'i.shipment_id IS NOT NULL', 'i.forwarder_id IS NULL', 'i.deleted_at IS NULL', 'TRIM(o.supplier) = TRIM(i.supplier_name)']) {
+        assert.ok(branches[4].includes(cond), cond);
+    }
+});
+
+test('2026-11-26_11: the grant is of that one view', () => {
+    assert.deepEqual(require(path.join(MIGRATIONS_DIR, '2026-11-26_11_grant_portal_forwarder_documents_to_jportal.js')).VIEWS, ['portal_forwarder_documents_v']);
 });

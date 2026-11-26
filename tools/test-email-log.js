@@ -95,3 +95,45 @@ test('without the test seam, a stubbed send is never written to a real database'
     }
     assert.equal(tried, false);
 });
+
+// ── Delivered, opened, bounced (portal README section 26) ──
+
+test('every email is sent with the configuration set; without one configured, with none', async () => {
+    const seen = [];
+    const sendImpl = async (region, input) => { seen.push(input); return { MessageId: 'm' }; };
+    await sendEmail({ to: 'a@b.com', subject: 's', html: 'x' }, { env: { ...ENV, SES_CONFIGURATION_SET: ' jportal-email-prod ' }, sendImpl });
+    await sendEmail({ to: 'a@b.com', subject: 's', html: 'x' }, { env: ENV, sendImpl });
+    assert.equal(seen[0].ConfigurationSetName, 'jportal-email-prod');
+    assert.equal('ConfigurationSetName' in seen[1], false);
+});
+
+test('a configuration set SES refuses never costs the email: it goes again without the set', async () => {
+    const env = { ...ENV, SES_CONFIGURATION_SET: 'jportal-email-prod' };
+    for (const refusal of [
+        Object.assign(new Error('Configuration set <jportal-email-prod> does not exist.'), { name: 'NotFoundException', $metadata: { httpStatusCode: 404 } }),
+        Object.assign(new Error("User: arn:aws:sts::1:assumed-role/x is not authorized to perform: ses:SendEmail on resource: arn:aws:ses:eu-north-1:1:configuration-set/jportal-email-prod"), { name: 'AccessDeniedException', $metadata: { httpStatusCode: 403 } }),
+    ]) {
+        const seen = [];
+        const rows = [];
+        _setRecordImplForTests(async (input) => { rows.push(input.result); });
+        const sendImpl = async (region, input) => {
+            seen.push(input);
+            if (input.ConfigurationSetName) throw refusal;
+            return { MessageId: 'm-2' };
+        };
+        assert.deepEqual(await sendEmail({ to: 'a@b.com', subject: 's', html: 'x' }, { env, sendImpl }), { ok: true, messageId: 'm-2' });
+        assert.equal(seen.length, 2);
+        assert.equal('ConfigurationSetName' in seen[1], false);
+        assert.equal(seen[1].Destination.ToAddresses[0], 'a@b.com');
+        assert.deepEqual(rows, [{ ok: true, messageId: 'm-2' }], 'logged once, as sent');
+    }
+});
+
+test('any other refusal is not retried', async () => {
+    let calls = 0;
+    const sendImpl = async () => { calls++; throw Object.assign(new Error('Email address is not verified'), { name: 'MessageRejected', $metadata: { httpStatusCode: 400 } }); };
+    const out = await sendEmail({ to: 'a@b.com', subject: 's', html: 'x' }, { env: { ...ENV, SES_CONFIGURATION_SET: 'jportal-email-prod' }, sendImpl });
+    assert.equal(out.ok, false);
+    assert.equal(out.reason, 'ses_error');
+    assert.equal(calls, 1);
+});

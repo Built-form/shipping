@@ -123,7 +123,7 @@ Released together, shipping → portal → ShipLine: ShipLine is the only place 
 
 ### Tests
 
-`npm run test:unit` covers the rules and the routes with scripted statements. **The release gate runs on TEST after its migration**, before anything is deployed: `tools/test-portal-forwarder-container-view.js` (the view against `dutiesOf` on the same fixtures, row for row and flag for flag; the delivery date's form; `finished`) and `tools/test-forwarder-container-races.js` (the portal's own statements and the decisions on two connections: a delivery pick, a booking's scope and a holder's removal against a write and against a claim; a finish after the duty moved, after a delivery date was typed on one order, after an order joined or left; one person who is a contact of two companies; the statement of a portal build from before duties). If the portal's statement does not **wait** on the regrouped view, the release stops there. Not included: more than one holder per duty, a third leg, proof-of-delivery uploads, a forwarder seeing another forwarder's files, and the delivery leg through Freight quotes (a second live booking per container: planned, not built).
+`npm run test:unit` covers the rules and the routes with scripted statements. **The release gate runs on TEST after its migration**, before anything is deployed: `tools/test-portal-forwarder-container-view.js` (the view against `dutiesOf` on the same fixtures, row for row and flag for flag; the delivery date's form; `finished`) and `tools/test-forwarder-container-races.js` (the portal's own statements and the decisions on two connections: a delivery pick, a booking's scope and a holder's removal against a write and against a claim; a finish after the duty moved, after a delivery date was typed on one order, after an order joined or left; one person who is a contact of two companies; the statement of a portal build from before duties). If the portal's statement does not **wait** on the regrouped view, the release stops there. Not included: more than one holder per duty, a third leg, proof-of-delivery uploads, a forwarder seeing another forwarder's files (since 2026-11-26 an accepted bill of lading is the one exception: "A container's documents" below), and the delivery leg through Freight quotes (a second live booking per container: planned, not built).
 
 ## The view
 
@@ -320,6 +320,27 @@ Audit: the filed row's own `create`, and `forwarder_upload` `accept` / `reject`;
 **Older containers (optional).** A container made before this page knows its forwarder only through its payments, so that forwarder sees it for the payment alone. `tools/backfill-container-forwarders.js` gives such a container its forwarder: a real container with no forwarder (linked or typed), no live freight booking, not yet arrived, whose forwarder charges (`payment_extras.rides_with = 'shipment'`) all name one forwarder from the list. A container with an unlinked charge, or charges to two forwarders, is listed and left alone. Dry run by default; `--apply --confirm-host <DB_HOST>` writes `shipments.forwarder_id` and `.forwarder` with one audit row each. The consequence is the one the picker states: that forwarder's portal contacts then see the container in full and can send its number, dates and files.
 
 **Not exercised on a real bucket yet** (2026-11-23): upload, finalise, view and accept need the portal's bucket and its deploy. Covered by scripted-S3 unit tests on both sides; the first real run belongs on the test stage after its deploy (the portal's `tools/smoke-forwarder-uploads.js`).
+
+## A container's documents (2026-11-26)
+
+A forwarder working on a container downloads its papers from the container's page on the portal: the **bill of lading**, the suppliers' **packing lists** and **commercial invoices**, and the **clearance instructions** our team sent (`docs/clearance-instructions.md`). The user's decisions, 2026-11-26: every forwarder **attached** to the container (holding freight, delivery or customs) gets all four, the suppliers' names and our prices included; a payment-only forwarder gets none; the clearance sheet is the one staff sent, never one generated on the portal. Portal side: jportal README section 25, "Documents".
+
+`portal_forwarder_documents_v` (`2026-11-26_10`, `SQL SECURITY DEFINER`; `GRANT SELECT` to the portal's login by `_11`, approved by the user 2026-11-26): one row per file our team **hold**. An upload still waiting on the SUPPLIER PORTAL or FORWARDER tab is not in it.
+
+| `kind` | Rows |
+|---|---|
+| `bill_of_lading` | `shipment_forwarder_documents`, live, `kind = 'bill_of_lading'` (never a customs draft or entry) |
+| `telex_release` | `shipment_telex_releases`, live |
+| `packing_list` | `packing_lists`, live and not superseded, filed on the container's number, or on the draft that was **converted** into it. A draft that was never closed (`draftsBehind` in `src/services/packing-review.js` follows those in code) is not followed |
+| `commercial_invoice` | `shipment_payment_documents`: `balance_invoice`, on a shipment, `forwarder_id IS NULL`, and filed under a supplier **with goods on that shipment** (a live order of the shipment, or of its `shipment_lines`, whose supplier is that name, trimmed, under the tables' own case-insensitive comparison). So a forwarder's invoice, also one uploaded by hand under the forwarder's name, a proof of payment and a QC invoice are never in it |
+
+Columns: `shipment_id, kind, document_id, supplier_name, filename, s3_key, content_type, file_size, filed_at`. **No forwarder**: the view says what a container's papers are, and the portal decides who may have them (a contact of a forwarder with a full row of `portal_forwarder_containers_v` for that shipment). A file is named by its **key** in `PO_DOCS_BUCKET`, never by its public address: the portal's role may read four folders of that bucket (`forwarder-documents/`, `telex-releases/`, `packing-lists/`, `shipment-payments/`) and signs a 300-second download per click.
+
+Checked read-only against the live data on 2026-11-26 (the view's own SELECT, not the view): 105 packing lists on 45 containers, 94 invoices on 44, 24 telex releases on 10, no accepted bill of lading yet. Of 130 live balance invoices on shipments, 36 are left out by the goods-on-board rule: 29 filed under "DCG" (a forwarder) and 7 under a supplier name that no order of that shipment carries. The second kind is worth a look if a forwarder reports a missing invoice: refile it under the supplier's name as the orders spell it.
+
+Tests: `tools/test-view-collations-lib.js` holds the view's shape (every `kind` wrapped for both session collations, a key and never an address, the exclusions) and the grant. **The view has been applied nowhere**: `tools/migrate.js --apply` checks it under both collations when it runs; there is no fixture test on a database for it yet.
+
+Rollback, once no deployed portal reads it: `DROP VIEW portal_forwarder_documents_v`. Nothing else refers to it.
 
 ## Tables (this schema, `2026-11-23_10`)
 

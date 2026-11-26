@@ -130,6 +130,14 @@ provider:
     SES_FROM_ARN: ${self:custom.secrets.SES_FROM_ARN, ''}
     EMAIL_REPLY_TO: ${self:custom.secrets.EMAIL_REPLY_TO, ''}
     EMAIL_FROM_NAME: ${self:custom.secrets.EMAIL_FROM_NAME, ''}
+    # Every email is sent WITH the supplier portal's SES configuration set for
+    # this environment (the jportal stack's EmailConfigurationSet), so SES
+    # reports each delivery, bounce and open to the portal's Emails page and
+    # adds the invisible picture that reports an open (portal README section
+    # 26, "Delivered, opened, bounced"). A key of the same name in the secret
+    # wins. Should SES refuse the set, the email goes without it
+    # (src/services/email-send.js sendTracked).
+    SES_CONFIGURATION_SET: ${self:custom.secrets.SES_CONFIGURATION_SET, 'jportal-email-${self:custom.envName}'}
     GEMINI_API_KEY: ${self:custom.secrets.GEMINI_API_KEY, ''}
     # Schema of the supplier portal (jportal) on the same MySQL server, read and
     # updated by /api/v1/po-change-requests and /api/v1/pi-submissions (and the
@@ -204,13 +212,15 @@ provider:
       statements:
         # Every outbound email (src/services/email-send.js): send from any SES
         # identity verified in this account, in whichever region the identity
-        # SES_FROM_ARN names lives.
+        # SES_FROM_ARN names lives. A send that names a configuration set
+        # (SES_CONFIGURATION_SET) must be allowed on the set as well.
         - Effect: Allow
           Action:
             - ses:SendEmail
             - ses:SendRawEmail
           Resource:
             - arn:aws:ses:*:${aws:accountId}:identity/*
+            - arn:aws:ses:*:${aws:accountId}:configuration-set/jportal-email-*
         - Effect: Allow
           Action:
             - s3:PutObject

@@ -85,7 +85,8 @@ const REQUEST_COLUMNS = `r.id, r.token, r.batch_id, r.forwarder_id, r.forwarder_
         r.window_end_date, r.origin, r.destination, r.container_size, r.services, r.staff_note, r.sent_to,
         r.subject, r.created_by_email, r.created_at, r.sent_at, r.expires_at, r.revoked_at, r.revoke_reason,
         r.answer_count, r.answered_at, r.answered_by_name, r.answered_by_email, r.answer_source, r.answer_note,
-        r.declined, r.row_version, r.reminded_at, r.reminder_count, r.kind, (r.expires_at <= UTC_TIMESTAMP()) AS expired`;
+        r.declined, r.row_version, r.reminded_at, r.reminder_count, r.kind, r.copied_from_request_id,
+        (r.expires_at <= UTC_TIMESTAMP()) AS expired`;
 
 function optionJson(o) {
     return {
@@ -486,6 +487,30 @@ function registerFreightQuoteRoutes(app, deps) {
         }
     }
 
+    // A copy (a request made to book the quote for another container) exists for
+    // its one booking. Once that booking no longer stands (the forwarder declined
+    // it, which the portal writes and cannot follow with a revoke), its link is
+    // closed as `copy_closed`, so the forwarder's page does not turn back into a
+    // quote form and the copy does not read as a quote still to book. Runs where
+    // syncFilled does. A copy is committed with its booking, so one that is seen
+    // without a live booking has lost it. Never fails a read.
+    async function syncCopies(conn) {
+        try {
+            const [upd] = await conn.query(
+                `UPDATE freight_quote_requests r
+                    SET r.revoked_at = UTC_TIMESTAMP(), r.revoke_reason = 'copy_closed', r.row_version = r.row_version + 1
+                  WHERE r.copied_from_request_id IS NOT NULL AND r.revoked_at IS NULL
+                    AND NOT EXISTS (SELECT 1 FROM freight_bookings lb
+                                     WHERE lb.request_id = r.id AND lb.status IN (?))`,
+                [LIVE]
+            );
+            return upd.affectedRows || 0;
+        } catch (e) {
+            if (e.errno !== TABLE_MISSING) log.warn('[freight-quotes] closing finished copies failed', { error: e.message, errno: e.errno });
+            return 0;
+        }
+    }
+
     // A confirmed booking was cancelled: the links that were closed as `filled`
     // because of it open again (unless another booking of the send is confirmed).
     async function reopenFilled(conn, batchId) {
@@ -567,6 +592,9 @@ function registerFreightQuoteRoutes(app, deps) {
             forwarderName: row.forwarder_name || null,
             state,
             revokeReason: row.revoke_reason || null,
+            // A copy made to book the quote for another container: the request it was
+            // copied from. null for a request a forwarder was asked for.
+            copiedFromRequestId: row.copied_from_request_id == null ? null : Number(row.copied_from_request_id),
             // A booking on it is requested or confirmed (finished or not): no
             // other option of it can be booked, whatever `state` says.
             hasLiveBooking: Boolean(liveBooking),
@@ -683,7 +711,9 @@ function registerFreightQuoteRoutes(app, deps) {
         }
         return {
             enabled: portalBase !== '',
-            requests: rows.map((r) => {
+            // A copy whose link is closed has done its job (or never had one): it is
+            // not a request to list. Its booking stays in `bookings`.
+            requests: rows.filter(r => !(r.copied_from_request_id != null && r.revoked_at)).map((r) => {
                 const liveBooking = liveByRequest.get(Number(r.id)) || null;
                 return requestJson(r, {
                     options: options.filter(o => Number(o.request_id) === Number(r.id) && Number(o.is_current) === 1),
@@ -731,6 +761,7 @@ function registerFreightQuoteRoutes(app, deps) {
         const board = await withConnection(async (conn) => {
             try {
                 await syncFilled(conn);
+                await syncCopies(conn);
                 return await readBoard(conn, filter.where, filter.params, { legs: legsOf(req) });
             } catch (e) {
                 if (e.errno !== TABLE_MISSING) throw e;
@@ -756,6 +787,7 @@ function registerFreightQuoteRoutes(app, deps) {
         const counts = await withConnection(async (conn) => {
             try {
                 await syncFilled(conn);
+                await syncCopies(conn);
                 const [[due]] = await conn.query(
                     `SELECT COUNT(*) AS n
                        FROM freight_bookings b
@@ -1176,9 +1208,10 @@ function registerFreightQuoteRoutes(app, deps) {
         res.json(out);
     }));
 
+    // → the id of the first row inserted (the only one, for a single option); null for none.
     async function insertOptions(conn, requestId, answerNo, options) {
-        if (!options.length) return;
-        await conn.query(
+        if (!options.length) return null;
+        const [ins] = await conn.query(
             `INSERT INTO freight_quote_options
                 (request_id, answer_no, line_no, loading_date, sailing_date, transit_days, port_from, port_to,
                  service, container_size, price, currency, carrier, valid_until, note)
@@ -1188,6 +1221,7 @@ function registerFreightQuoteRoutes(app, deps) {
                 o.service, o.containerSize, o.price, o.currency, o.carrier, o.validUntil, o.note,
             ])
         );
+        return ins && ins.insertId != null ? Number(ins.insertId) : null;
     }
 
     // ── POST /api/v1/freight-quotes/:id/options ─────────────────────────────
@@ -1294,12 +1328,103 @@ function registerFreightQuoteRoutes(app, deps) {
         return new Fail(502, 'FRONT_ERROR', 'The email service (SES) rejected the message.', { frontStatus: sent.status ?? null, frontBody: sent.detail ?? null });
     }
 
+    // What both booking routes do once they know which request the booking goes
+    // on (one the caller has locked, or a copy it has just made) and which of
+    // its options: the booking row, and the email with THAT request's link.
+    // Inside the caller's transaction. `onDuplicate`: what a duplicate key that
+    // is not the container's means to the caller.
+    async function makeBooking(conn, { request, option, covers, ship, addresses, noteText, subject, body, userEmail, portalBase, onDuplicate = null }) {
+        const kind = request.kind || FC.DEFAULT_KIND;
+        const o = optionJson(option);
+        const tpl = await getEmailTemplate(conn, bookingTemplateKey(kind));
+        const vars = {
+            forwarder: request.forwarder_name || '', sailingDate: o.sailingDate, loadingDate: o.loadingDate,
+            portFrom: o.portFrom, portTo: o.portTo, service: F.serviceName(o.service),
+            containerSize: o.containerSize, price: F.money(o.price, o.currency),
+        };
+        const finalSubject = ((typeof subject === 'string' && subject.trim())
+            ? renderTemplate(subject.trim(), vars)
+            : (renderTemplate(tpl.subject, vars) || `Booking request – sailing ${o.sailingDate}`))
+            .replace(/[\r\n]+/g, ' ').slice(0, 500);
+
+        let bookingId;
+        try {
+            const [ins] = await conn.query(
+                `INSERT INTO freight_bookings
+                    (request_id, option_id, status, requested_by_email, requested_at, request_note, sent_to,
+                     subject, shipment_id, draft_container_name, scope)
+                 VALUES (?, ?, 'requested', ?, UTC_TIMESTAMP(), ?, ?, ?, ?, ?, ?)`,
+                [
+                    request.id, o.id, userEmail || null, noteText.value, JSON.stringify(addresses),
+                    finalSubject, ship ? ship.id : null, ship ? (ship.name || ship.reference || null) : null, covers.scope,
+                ]
+            );
+            bookingId = Number(ins.insertId);
+        } catch (e) {
+            if (e.errno !== DUPLICATE) throw e;
+            if (isContainerTaken(e)) throw containerTaken();
+            throw onDuplicate ? onDuplicate(e) : e;
+        }
+        const escaped = Object.fromEntries(Object.entries(vars).map(([k, val]) => [k, escapeHtml(val)]));
+        const inner = renderTemplate((typeof body === 'string' && body.trim()) ? body : tpl.bodyHtml, escaped);
+        const html = wrapEmail({
+            title: finalSubject,
+            bodyHtml: inner + F.bookingBlockHtml({ option: o, url: F.freightUrl(portalBase, request.token), note: noteText.value, kind }),
+        });
+        return {
+            bookingId, requestId: Number(request.id), optionId: o.id, batchId: request.batch_id, addresses, finalSubject, html,
+            option: o, forwarder: request.forwarder_name, shipmentId: ship ? Number(ship.id) : null,
+        };
+    }
+
+    // After the commit: the booking's email. Refused, the booking is cancelled as
+    // `send_failed` (and `onRefused` takes back whatever else the caller made for
+    // it). `audit`: what the caller adds to the audit row.
+    async function sendBooking(conn, made, { userEmail, onRefused = null, audit = {} }) {
+        const sent = await sendEmail({ kind: 'freight_quote.booking', to: made.addresses, subject: made.finalSubject, html: made.html });
+        if (!sent.ok) {
+            await conn.query(
+                `UPDATE freight_bookings
+                    SET status = 'cancelled', cancel_reason = 'send_failed', cancelled_at = UTC_TIMESTAMP(),
+                        row_version = row_version + 1
+                  WHERE id = ?`,
+                [made.bookingId]
+            );
+            if (onRefused) await onRefused();
+            throw frontFailure(sent);
+        }
+        await conn.query(
+            'UPDATE freight_bookings SET front_message_uid = ?, front_conversation_id = ? WHERE id = ?',
+            [sent.messageId, null, made.bookingId]
+        );
+        await logSentEmail(conn, {
+            emailType: 'freight_booking_request', sentTo: made.addresses, subject: made.finalSubject,
+            confirmVia: 'portal', sendTable: 'freight_bookings', sendId: made.bookingId,
+        });
+        await recordAudit(conn, {
+            entityType: 'freight_booking', entityId: made.bookingId, action: 'requested',
+            before: null,
+            after: {
+                requestId: made.requestId, optionId: made.optionId, forwarder: made.forwarder, to: made.addresses,
+                subject: made.finalSubject, sailingDate: made.option.sailingDate, portFrom: made.option.portFrom,
+                portTo: made.option.portTo, price: made.option.price, currency: made.option.currency,
+                shipmentId: made.shipmentId,
+                frontMessageUid: sent.messageId, frontConversationId: null,
+                ...audit,
+            },
+            userEmail,
+        });
+    }
+
+    const noShipment = v => v === undefined || v === null || v === '';
+
     // ── POST /api/v1/freight-quotes/options/:optionId/book ──────────────────
     // Body { note?, shipmentId?, to?, subject?, body? }. Asks the forwarder to
     // book one of its current options: the booking row, then an email with the
     // link to the same page, where they confirm with a booking reference or
     // decline. One live booking per request (409 ALREADY_BOOKED), which also
-    // makes a retry harmless. The request's row_version is bumped in the same
+    // makes a retry harmless; the same quote for another container is
+    // …/book-another, below. The request's row_version is bumped in the same
     // transaction, so a forwarder saving a new answer at that moment loses and
     // is shown the booking instead. A Front failure cancels the booking.
     // → { ok, bookingId, …board }
@@ -1318,6 +1443,7 @@ function registerFreightQuoteRoutes(app, deps) {
         if (!portalBase) {
             throw new Fail(409, 'PORTAL_URL_UNSET', 'The supplier portal address (SUPPLIER_PORTAL_URL) is not configured, so the booking link cannot be sent.');
         }
+        const alreadyBooked = () => new Fail(409, 'ALREADY_BOOKED', 'A booking is already in progress on this request.');
 
         const out = await withConnection(async (conn) => {
             const made = await inTransaction(conn, async () => {
@@ -1328,46 +1454,16 @@ function registerFreightQuoteRoutes(app, deps) {
                 if (Number(option.answer_no) !== Number(request.answer_count)) {
                     throw new Fail(409, 'STALE_OPTION', 'The forwarder has changed its answer since this option was shown. Reload and choose again.');
                 }
-                if (await liveBookingOf(conn, Number(request.id))) {
-                    throw new Fail(409, 'ALREADY_BOOKED', 'A booking is already in progress on this request.');
-                }
-                const kind = request.kind || FC.DEFAULT_KIND;
-                const covers = FC.scopeFor(kind, scope);
+                if (await liveBookingOf(conn, Number(request.id))) throw alreadyBooked();
+                const covers = FC.scopeFor(request.kind || FC.DEFAULT_KIND, scope);
                 if (covers.error) throw new Fail(400, 'BAD_FIELD', covers.error, { field: 'scope' });
                 const addresses = await recipientsFor(conn, to, Number(request.forwarder_id));
-                const ship = shipmentId === undefined || shipmentId === null || shipmentId === ''
-                    ? null : await attachableShipment(conn, Number(shipmentId), null, covers.scope);
+                const ship = noShipment(shipmentId) ? null : await attachableShipment(conn, Number(shipmentId), null, covers.scope);
 
-                const o = optionJson(option);
-                const tpl = await getEmailTemplate(conn, bookingTemplateKey(kind));
-                const vars = {
-                    forwarder: request.forwarder_name || '', sailingDate: o.sailingDate, loadingDate: o.loadingDate,
-                    portFrom: o.portFrom, portTo: o.portTo, service: F.serviceName(o.service),
-                    containerSize: o.containerSize, price: F.money(o.price, o.currency),
-                };
-                const finalSubject = ((typeof subject === 'string' && subject.trim())
-                    ? renderTemplate(subject.trim(), vars)
-                    : (renderTemplate(tpl.subject, vars) || `Booking request – sailing ${o.sailingDate}`))
-                    .replace(/[\r\n]+/g, ' ').slice(0, 500);
-
-                let bookingId;
-                try {
-                    const [ins] = await conn.query(
-                        `INSERT INTO freight_bookings
-                            (request_id, option_id, status, requested_by_email, requested_at, request_note, sent_to,
-                             subject, shipment_id, draft_container_name, scope)
-                         VALUES (?, ?, 'requested', ?, UTC_TIMESTAMP(), ?, ?, ?, ?, ?, ?)`,
-                        [
-                            request.id, optionId, req.userEmail || null, noteText.value, JSON.stringify(addresses),
-                            finalSubject, ship ? ship.id : null, ship ? (ship.name || ship.reference || null) : null, covers.scope,
-                        ]
-                    );
-                    bookingId = Number(ins.insertId);
-                } catch (e) {
-                    if (e.errno !== DUPLICATE) throw e;
-                    if (isContainerTaken(e)) throw containerTaken();
-                    throw new Fail(409, 'ALREADY_BOOKED', 'A booking is already in progress on this request.');
-                }
+                const booked = await makeBooking(conn, {
+                    request, option, covers, ship, addresses, noteText, subject, body,
+                    userEmail: req.userEmail, portalBase, onDuplicate: alreadyBooked,
+                });
                 await conn.query(
                     `UPDATE freight_quote_requests
                         SET row_version = row_version + 1,
@@ -1375,47 +1471,142 @@ function registerFreightQuoteRoutes(app, deps) {
                       WHERE id = ?`,
                     [BOOKING_EXTENDS_DAYS, request.id]
                 );
-                const escaped = Object.fromEntries(Object.entries(vars).map(([k, val]) => [k, escapeHtml(val)]));
-                const inner = renderTemplate((typeof body === 'string' && body.trim()) ? body : tpl.bodyHtml, escaped);
-                const html = wrapEmail({
-                    title: finalSubject,
-                    bodyHtml: inner + F.bookingBlockHtml({ option: o, url: F.freightUrl(portalBase, request.token), note: noteText.value, kind }),
-                });
-                return { bookingId, requestId: Number(request.id), batchId: request.batch_id, addresses, finalSubject, html, option: o, forwarder: request.forwarder_name };
+                return booked;
             });
 
-            const sent = await sendEmail({ kind: 'freight_quote.booking', to: made.addresses, subject: made.finalSubject, html: made.html });
-            if (!sent.ok) {
-                await conn.query(
-                    `UPDATE freight_bookings
-                        SET status = 'cancelled', cancel_reason = 'send_failed', cancelled_at = UTC_TIMESTAMP(),
-                            row_version = row_version + 1
-                      WHERE id = ?`,
-                    [made.bookingId]
-                );
-                throw frontFailure(sent);
-            }
-            await conn.query(
-                'UPDATE freight_bookings SET front_message_uid = ?, front_conversation_id = ? WHERE id = ?',
-                [sent.messageId, null, made.bookingId]
-            );
-            await logSentEmail(conn, {
-                emailType: 'freight_booking_request', sentTo: made.addresses, subject: made.finalSubject,
-                confirmVia: 'portal', sendTable: 'freight_bookings', sendId: made.bookingId,
-            });
-            await recordAudit(conn, {
-                entityType: 'freight_booking', entityId: made.bookingId, action: 'requested',
-                before: null,
-                after: {
-                    requestId: made.requestId, optionId, forwarder: made.forwarder, to: made.addresses,
-                    subject: made.finalSubject, sailingDate: made.option.sailingDate, portFrom: made.option.portFrom,
-                    portTo: made.option.portTo, price: made.option.price, currency: made.option.currency,
-                    shipmentId: shipmentId != null && shipmentId !== '' ? Number(shipmentId) : null,
-                    frontMessageUid: sent.messageId, frontConversationId: null,
-                },
-                userEmail: req.userEmail,
-            });
+            await sendBooking(conn, made, { userEmail: req.userEmail });
             return { ok: true, bookingId: made.bookingId, ...(await defaultBoard(conn, legsOf(req))) };
+        });
+        res.json(out);
+    }));
+
+    // ── POST /api/v1/freight-quotes/options/:optionId/book-another ──────────
+    // Body { copyKey, note?, shipmentId?, scope?, to?, subject?, body? }. The same
+    // quote for ANOTHER container (2026-11-26): two containers on one ship, with
+    // the forwarder entering nothing twice. A request holds one live booking, so
+    // this makes a COPY of the request (a link of its own, this option as its one
+    // answer, `copied_from_request_id`) and books the copy, in one transaction.
+    // The forwarder gets a second booking email and confirms it on the copy's
+    // page with its own reference; from there on the copy's booking is a booking
+    // like any other (its own container, contents email and documents). The
+    // request's stock movements are NOT copied: each is priced once, on the
+    // request it was added to.
+    //   - Only where a booking already stands on the request: `409 NOT_BOOKED`
+    //     otherwise (book it as usual).
+    //   - `copyKey` is a UUID the dialog makes once and sends with every attempt;
+    //     it is the copy's batch_id. Sent again, it answers the booking it made
+    //     (`alreadyBooked: true`) and emails nobody; `409 COPY_KEY_USED` when that
+    //     booking no longer stands.
+    //   - A Front failure cancels the booking and closes the copy (`send_failed`).
+    // → { ok, bookingId, requestId, alreadyBooked?, …board }
+    app.post('/api/v1/freight-quotes/options/:optionId(\\d+)/book-another', route('POST /freight-quotes/options/:optionId/book-another', async (req, res) => {
+        refuseReadOnly(req);
+        const optionId = Number(req.params.optionId);
+        const { copyKey, note, shipmentId, to, subject, body, scope } = req.body || {};
+        if (!F.isUuid(copyKey)) throw new Fail(400, 'BAD_FIELD', 'copyKey must be a UUID.', { field: 'copyKey' });
+        const key = copyKey.toLowerCase();
+        const noteText = F.optionalText(note, 'note', F.NOTE_MAX);
+        if (noteText.code) throw invalid(noteText);
+        const portalBase = poPortalEmail.portalBaseOf();
+        if (!portalBase) {
+            throw new Fail(409, 'PORTAL_URL_UNSET', 'The supplier portal address (SUPPLIER_PORTAL_URL) is not configured, so the booking link cannot be sent.');
+        }
+        const keyUsed = () => new Fail(409, 'COPY_KEY_USED', 'That attempt was already made and its booking no longer stands. Open the option again to book it.');
+
+        const out = await withConnection(async (conn) => {
+            const made = await inTransaction(conn, async () => {
+                const [[option]] = await conn.query('SELECT * FROM freight_quote_options WHERE id = ?', [optionId]);
+                if (!option) throw new Fail(404, 'NOT_FOUND', `Option ${optionId} not found.`);
+                const source = await lockRequest(conn, Number(option.request_id));
+                if (source.revoked_at) throw new Fail(409, 'REVOKED', 'This request was closed, so it cannot be booked.');
+                if (Number(option.answer_no) !== Number(source.answer_count)) {
+                    throw new Fail(409, 'STALE_OPTION', 'The forwarder has changed its answer since this option was shown. Reload and choose again.');
+                }
+                if (!(await liveBookingOf(conn, Number(source.id)))) {
+                    throw new Fail(409, 'NOT_BOOKED', 'Nothing is booked on this request, so it needs no copy: book this option as usual.');
+                }
+                // A copy of a copy points at the request the forwarder answered.
+                const originalId = source.copied_from_request_id != null ? Number(source.copied_from_request_id) : Number(source.id);
+
+                // The key was sent before (a retry, a second click): what it made stands, or the key is spent.
+                const [[used]] = await conn.query('SELECT id, copied_from_request_id FROM freight_quote_requests WHERE batch_id = ? LIMIT 1', [key]);
+                if (used) {
+                    const standing = used.copied_from_request_id != null && Number(used.copied_from_request_id) === originalId
+                        ? await liveBookingOf(conn, Number(used.id)) : null;
+                    if (!standing) throw keyUsed();
+                    return { already: true, bookingId: Number(standing.id), requestId: Number(used.id) };
+                }
+
+                const kind = source.kind || FC.DEFAULT_KIND;
+                const covers = FC.scopeFor(kind, scope);
+                if (covers.error) throw new Fail(400, 'BAD_FIELD', covers.error, { field: 'scope' });
+                const addresses = await recipientsFor(conn, to, Number(source.forwarder_id));
+                const ship = noShipment(shipmentId) ? null : await attachableShipment(conn, Number(shipmentId), null, covers.scope);
+
+                // The copy: the same forwarder and the same facts, already answered
+                // (by whoever answered the original), with a link of its own.
+                const token = F.newToken();
+                let copyId;
+                try {
+                    const [ins] = await conn.query(
+                        `INSERT INTO freight_quote_requests
+                            (token, batch_id, forwarder_id, forwarder_name, window_start_date, window_end_date, origin,
+                             destination, container_size, services, staff_note, sent_to, created_by_email, kind,
+                             copied_from_request_id, answer_count, answered_at, answered_by_name, answered_by_email,
+                             answer_source, sent_at, expires_at)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, UTC_TIMESTAMP(), ?, ?, ?, UTC_TIMESTAMP(),
+                                 UTC_TIMESTAMP() + INTERVAL ? DAY)`,
+                        [
+                            token, key, source.forwarder_id, source.forwarder_name,
+                            F.toYmd(source.window_start_date), F.toYmd(source.window_end_date), source.origin, source.destination,
+                            source.container_size,
+                            typeof source.services === 'string' ? source.services : JSON.stringify(source.services ?? []),
+                            source.staff_note, JSON.stringify(addresses), req.userEmail || null, kind, originalId,
+                            source.answered_by_name, source.answered_by_email, source.answer_source, BOOKING_EXTENDS_DAYS,
+                        ]
+                    );
+                    copyId = Number(ins.insertId);
+                } catch (e) {
+                    if (e.errno !== DUPLICATE) throw e;
+                    throw keyUsed();
+                }
+                const copyOptionId = await insertOptions(conn, copyId, 1, [{
+                    loadingDate: F.toYmd(option.loading_date), sailingDate: F.toYmd(option.sailing_date),
+                    transitDays: Number(option.transit_days), portFrom: option.port_from, portTo: option.port_to,
+                    service: option.service, containerSize: option.container_size, price: option.price, currency: option.currency,
+                    carrier: option.carrier || null, validUntil: F.toYmd(option.valid_until), note: option.note || null,
+                }]);
+
+                const booked = await makeBooking(conn, {
+                    request: { id: copyId, token, batch_id: key, forwarder_name: source.forwarder_name, kind },
+                    option: { ...option, id: copyOptionId, request_id: copyId, answer_no: 1, line_no: 1 },
+                    covers, ship, addresses, noteText, subject, body, userEmail: req.userEmail, portalBase,
+                });
+                // The token is never written to the audit log.
+                await recordAudit(conn, {
+                    entityType: 'freight_quote_request', entityId: copyId, action: 'copied',
+                    before: null,
+                    after: { copiedFromRequestId: Number(source.id), originalRequestId: originalId, optionId, bookingId: booked.bookingId },
+                    userEmail: req.userEmail,
+                });
+                return { ...booked, copiedFromRequestId: Number(source.id), copiedFromOptionId: optionId };
+            });
+
+            if (made.already) {
+                return { ok: true, alreadyBooked: true, bookingId: made.bookingId, requestId: made.requestId, ...(await defaultBoard(conn, legsOf(req))) };
+            }
+            await sendBooking(conn, made, {
+                userEmail: req.userEmail,
+                // Nobody was emailed the copy's link: it is closed with its booking.
+                onRefused: () => conn.query(
+                    `UPDATE freight_quote_requests
+                        SET revoked_at = UTC_TIMESTAMP(), revoke_reason = 'send_failed', row_version = row_version + 1
+                      WHERE id = ?`,
+                    [made.requestId]
+                ),
+                audit: { copiedFromRequestId: made.copiedFromRequestId, copiedFromOptionId: made.copiedFromOptionId },
+            });
+            return { ok: true, bookingId: made.bookingId, requestId: made.requestId, ...(await defaultBoard(conn, legsOf(req))) };
         });
         res.json(out);
     }));
@@ -1437,7 +1628,9 @@ function registerFreightQuoteRoutes(app, deps) {
     // token, so marking a booking needs no override: it records
     // response_source = 'staff'. Cancelling reopens the request (its state is
     // derived), keeps its link open another 30 days, and reopens the links a
-    // confirmation had closed as `filled`. → the board.
+    // confirmation had closed as `filled`. Cancelling the booking of a COPY
+    // (book-another) closes the copy's link instead: it existed for that booking.
+    // → the board.
     app.patch('/api/v1/freight-bookings/:id(\\d+)', route('PATCH /freight-bookings/:id', async (req, res) => {
         refuseReadOnly(req);
         const id = Number(req.params.id);
@@ -1535,13 +1728,25 @@ function registerFreightQuoteRoutes(app, deps) {
                 }
                 if (patch.status === 'cancelled') {
                     const request = await lockRequest(conn, Number(b.request_id));
-                    await conn.query(
-                        `UPDATE freight_quote_requests
-                            SET row_version = row_version + 1,
-                                expires_at = GREATEST(expires_at, UTC_TIMESTAMP() + INTERVAL ? DAY)
-                          WHERE id = ?`,
-                        [BOOKING_EXTENDS_DAYS, request.id]
-                    );
+                    if (request.copied_from_request_id != null) {
+                        // A copy (book-another) exists for this one booking: its link
+                        // closes with it, and the original's quote is still there to book.
+                        await conn.query(
+                            `UPDATE freight_quote_requests
+                                SET revoked_at = UTC_TIMESTAMP(), revoke_reason = 'copy_closed', row_version = row_version + 1
+                              WHERE id = ? AND revoked_at IS NULL`,
+                            [request.id]
+                        );
+                        after.copyClosed = true;
+                    } else {
+                        await conn.query(
+                            `UPDATE freight_quote_requests
+                                SET row_version = row_version + 1,
+                                    expires_at = GREATEST(expires_at, UTC_TIMESTAMP() + INTERVAL ? DAY)
+                              WHERE id = ?`,
+                            [BOOKING_EXTENDS_DAYS, request.id]
+                        );
+                    }
                     if (wasConfirmed) after.reopened = await reopenFilled(conn, request.batch_id);
                 }
                 await recordAudit(conn, {

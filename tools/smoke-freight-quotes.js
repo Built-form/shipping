@@ -312,6 +312,48 @@ async function main() {
         check('it opens by id', (await signedIn(claims, 'GET', '/api/supplier/freight-quotes/{id}', R1.id)).data?.booking?.status === 'confirmed');
         check('another forwarder\'s request is 404', (await signedIn(claims, 'GET', '/api/supplier/freight-quotes/{id}', R2.id)).status === 404);
 
+        // ── 6b. the same quote for another container (2026-11-26) ────────────
+        // A copy of the request, booked in its own right. The portal's code is
+        // unchanged: these checks are what say it needs no change.
+        console.log('\n6b. Book the same quote for another container');
+        const copyKey = crypto.randomUUID();
+        const mailsCopy = frontCalls.length;
+        const bookedAgain = await api('POST', `/api/v1/freight-quotes/options/${optionId}/book-another`, { copyKey, note: `second ${TAG}` });
+        board = bookedAgain;
+        const copyId = bookedAgain.body?.requestId;
+        const copyBookingId = bookedAgain.body?.bookingId;
+        const copyReq = () => board.body?.requests?.find(r => r.id === copyId);
+        const [copyRow] = copyId ? await q('SELECT token, batch_id, copied_from_request_id FROM freight_quote_requests WHERE id = ?', [copyId]) : [];
+        check('a copy of the request is made and booked: one option, no stock movements, its own link in one email',
+            bookedAgain.status === 200 && copyReq()?.state === 'booked' && copyReq().copiedFromRequestId === R1.id && copyReq().options.length === 1
+            && copyReq().stockMovements.length === 0 && F.isToken(copyRow?.token) && copyRow.token !== R1.token && copyRow.batch_id === copyKey
+            && frontCalls.length === mailsCopy + 1 && frontCalls[mailsCopy].body.includes(`/freight/${copyRow.token}`)
+            && !frontCalls[mailsCopy].body.includes(R1.token) && /1,850\.00/.test(frontCalls[mailsCopy].body), bookedAgain.body?.error ?? copyReq() ?? bookedAgain.status);
+        check('the original keeps its booking and its stock movements', b1()?.state === 'booked' && b1().stockMovements.length === 3 && booking()?.status === 'confirmed', b1());
+        const sameKey = await api('POST', `/api/v1/freight-quotes/options/${optionId}/book-another`, { copyKey });
+        check('the same key again books and emails nothing', sameKey.status === 200 && sameKey.body?.alreadyBooked === true && sameKey.body.bookingId === copyBookingId && frontCalls.length === mailsCopy + 1, sameKey.body?.error ?? sameKey.status);
+        const copyPage = await link('GET', copyRow?.token);
+        check('the copy\'s page (as jportal_app) shows the booking to confirm, on the copied option',
+            copyPage.status === 200 && copyPage.data?.state === 'booked' && copyPage.data.booking?.status === 'requested'
+            && copyPage.data.booking.option?.id === copyReq()?.options[0].id && copyPage.data.booking.option?.price === '1850.00', copyPage);
+        const copyConfirmed = await link('PUT', copyRow?.token, { rowVersion: copyPage.data?.booking?.rowVersion, decision: 'confirm', bookingRef: `BK2-${TAG}`, name: 'Amy' }, true);
+        check('the forwarder confirms it with its own reference', copyConfirmed.status === 200 && copyConfirmed.data?.booking?.status === 'confirmed' && copyConfirmed.data.booking.bookingRef === `BK2-${TAG}`, copyConfirmed);
+        check('the original\'s page still shows its own reference', (await link('GET', R1.token)).data?.booking?.bookingRef === `BK-${TAG}`);
+        const both = await signedIn(claims, 'GET', '/api/supplier/freight-quotes');
+        check('signed in, the forwarder sees both, each confirmed', both.status === 200 && both.data?.requests?.length === 2
+            && [R1.id, copyId].every(id => both.data.requests.find(r => r.id === id)?.bookingStatus === 'confirmed'), both);
+        check('and the copy opens by id', (await signedIn(claims, 'GET', '/api/supplier/freight-quotes/{id}', copyId)).data?.booking?.bookingRef === `BK2-${TAG}`);
+        board = await api('GET', '/api/v1/freight-quotes');
+        const copyBooking = () => board.body.bookings.find(b => b.id === copyBookingId);
+        check('ShipLine sees two confirmed bookings, one per request', booking()?.bookingRef === `BK-${TAG}` && copyBooking()?.requestId === copyId
+            && copyBooking().status === 'confirmed' && copyBooking().bookingRef === `BK2-${TAG}` && copyBooking().responseSource === 'link', copyBooking());
+        const copyCancelled = await api('PATCH', `/api/v1/freight-bookings/${copyBookingId}`, { status: 'cancelled' });
+        board = copyCancelled;
+        const closedPage = await link('GET', copyRow?.token);
+        check('cancelling the copy\'s booking closes the copy: off the board, its page closed, the original untouched',
+            copyCancelled.status === 200 && copyBooking()?.status === 'cancelled' && !copyReq() && closedPage.data?.state === 'revoked'
+            && b1()?.state === 'booked' && booking()?.status === 'confirmed', closedPage.data?.state ?? copyCancelled);
+
         // ── 7. a container's contents ────────────────────────────────────────
         console.log('\n7. Attach a container and send its contents');
         const [draft] = await q(

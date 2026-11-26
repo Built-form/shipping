@@ -19,6 +19,13 @@
 //                     'ses_not_configured'.
 //   EMAIL_FROM_NAME   the display name on From (default "JFA Medical").
 //   EMAIL_REPLY_TO    optional, comma-separated: where a reply goes.
+//   SES_CONFIGURATION_SET  the SES configuration set every email is sent with
+//                     (the portal stack's jportal-email-<env>): SES then
+//                     reports each delivery, bounce and open to the portal,
+//                     and adds the invisible picture that reports an open
+//                     (portal README section 26, "Delivered, opened,
+//                     bounced"). Should SES refuse the set (not created yet,
+//                     no permission), the email goes again without it.
 //
 // `attachments` is optional: [{ bytes, filename, contentType }]. SES caps a
 // message at 40 MB after encoding.
@@ -83,6 +90,29 @@ let sendOverride = null;
 function _setSendImplForTests(f) { sendOverride = f || null; }
 const defaultSend = (region, input, abortSignal) => (sendOverride || sesSend)(region, input, abortSignal);
 
+/**
+ * True when SES refused a send BECAUSE OF its configuration set (the set is
+ * not there yet, or this role may not send with it): the same message without
+ * the set would go.
+ */
+function isConfigurationSetError(e) {
+    return /configuration[- ]?set/i.test(`${(e && e.name) || ''} ${(e && e.message) || ''}`);
+}
+
+// One SES call. A message with a configuration set that SES refuses on account
+// of the set is sent again WITHOUT it: reports about an email never cost the
+// email itself.
+async function sendTracked(sendImpl, region, input, abortSignal) {
+    try {
+        return await sendImpl(region, input, abortSignal);
+    } catch (e) {
+        if (!input.ConfigurationSetName || !isConfigurationSetError(e)) throw e;
+        log.warn('[email-send] SES refused the configuration set; sent without it (no delivery reports for this email)', { name: e && e.name, set: input.ConfigurationSetName });
+        const { ConfigurationSetName: _dropped, ...bare } = input;
+        return sendImpl(region, bare, abortSignal);
+    }
+}
+
 /** The SendEmail input for one message. Exported for tests. */
 function buildInput({ to, subject, html, text, attachments, replyTo }, sender, env = process.env) {
     const fromName = String(env.EMAIL_FROM_NAME || '').trim() || DEFAULT_FROM_NAME;
@@ -95,10 +125,12 @@ function buildInput({ to, subject, html, text, attachments, replyTo }, sender, e
             ContentType: a.contentType || a.type || 'application/octet-stream',
             ContentDisposition: 'ATTACHMENT',
         }));
+    const configurationSet = String(env.SES_CONFIGURATION_SET || '').trim();
     return {
         FromEmailAddress: `${fromName.replace(/[<>"\r\n]/g, '')} <${sender.address}>`,
         FromEmailAddressIdentityArn: sender.arn,
         Destination: { ToAddresses: to },
+        ...(configurationSet ? { ConfigurationSetName: configurationSet } : {}),
         ...(reply.length ? { ReplyToAddresses: reply } : {}),
         Content: {
             Simple: {
@@ -193,7 +225,7 @@ async function sendRaw({ recipients, subject, html, text, attachments, replyTo }
         const timer = setTimeout(() => controller.abort(), SEND_TIMEOUT_MS);
         let out;
         try {
-            out = await sendImpl(sender.region, input, controller.signal);
+            out = await sendTracked(sendImpl, sender.region, input, controller.signal);
         } finally {
             clearTimeout(timer);
         }
@@ -214,4 +246,4 @@ async function sendRaw({ recipients, subject, html, text, attachments, replyTo }
     }
 }
 
-module.exports = { sendEmail, buildInput, senderOf, isConfigured, _setSendImplForTests, _setRecordImplForTests, SEND_TIMEOUT_MS, DEFAULT_FROM_NAME };
+module.exports = { sendEmail, buildInput, senderOf, isConfigured, isConfigurationSetError, _setSendImplForTests, _setRecordImplForTests, SEND_TIMEOUT_MS, DEFAULT_FROM_NAME };

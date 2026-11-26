@@ -8,7 +8,7 @@ Built on the forwarder container page (`docs/forwarder-containers.md`): the cust
 
 | Where | What |
 |---|---|
-| ShipLine (`src/components/freight/clearanceInstructions.ts`, `ClearanceInstructionsDialog.tsx`) | builds the rows from what it holds, lets every cell be corrected, shows the blanks. Opened from **Clearance instructions** on the container card's FORWARDER tab |
+| ShipLine (`src/components/freight/clearanceInstructions.ts`, `ClearanceInstructionsDialog.tsx`) | builds the rows from what it holds, lets a cell be corrected, shows the blanks. Opened from **Clearance instructions** on the container card's FORWARDER tab. **The commodity code and the duty are JFPRO's and cannot be typed** (the user, 2026-11-26): both cells are read-only; a wrong or missing one is changed in JFPRO (the product, or Duty rates) and the dialog opened again. Correcting a row's origin reads its duty from JFPRO again (`withJfproDuty`), and "USE Vn" takes neither cell from the earlier send (`withJfproCells`) |
 | shipping (`src/lib/clearance-instructions.js`) | checks the rows (the check that decides), writes the file, keeps what was sent, remembers the duty by commodity code |
 | supplier portal | lists what was sent on the container's page, for the company it was sent to, and gives the file again |
 
@@ -20,7 +20,7 @@ Built on the forwarder container page (`docs/forwarder-containers.md`): the cust
 | Commercial invoice number | read off the supplier's invoice on the INVOICES tab (the newest balance invoice with a number); else the number its packing list prints; else typed |
 | Description of goods | the product's JFPRO **category** and the JF codes in the row ("Gauze Swabs JF1477 JF1475"); the product's name where it has no category. A product's category is the first of its set, as JFPRO itself shows one. Not the subcategory (the user, 2026-11-24). Editable |
 | Country of origin | since 2026-11-25 (ShipLine): the **order's supplier's** country as JFPRO reads it (`GET /api/duty-rates` `suppliers[].countryCode`); only when JFPRO does not know that supplier, the product's main supplier's country, said on the row |
-| Commodity code | JFPRO product |
+| Commodity code | JFPRO product. Not editable in ShipLine since 2026-11-26. This server still checks only its shape (8 or 10 digits), not that it is JFPRO's: it cannot read JFPRO's products |
 | Cartons, net and gross weight | **the supplier's packing list when one was read for that product**, else ours: cartons from the order's units per carton, gross from the order's carton weight, net from JFPRO's net carton weight. The row says when the list's figures differ from ours |
 | Volume | the order's carton spec (as the container card derives it) |
 | Duty percentage | since 2026-11-25 (ShipLine): JFPRO's **Duty rates, Import (UK)** for the commodity code AND the origin (`GET /api/duty-rates?market=GB`); no rate there = blank, to be filled. A whole-number percent. `clearance_duty_rates` (last sent, by code only) is still written on a send but no longer read to fill the sheet: one code pays different duty from different countries |
@@ -56,7 +56,7 @@ A row: `{ supplier, invoiceNumber, company: 'JFA' | 'HW', description, origin, c
 
 ## The portal
 
-`portal_forwarder_clearance_v` (definer view, `2026-11-24_21`): the sheets whose email is marked **sent**: `id, shipment_id, forwarder_id, version, filename, csv, sent_at`. Granted to the portal's login by `2026-11-24_22` (SELECT on the view only; approved by the user 2026-11-24). The portal lists a container's sheets on its page and gives a file only to a contact of the company it was sent to, while that company still has a row for the container.
+`portal_forwarder_clearance_v` (definer view, `2026-11-24_21`): the sheets whose email is marked **sent**: `id, shipment_id, forwarder_id, version, filename, csv, sent_at`. Granted to the portal's login by `2026-11-24_22` (SELECT on the view only; approved by the user 2026-11-24). The portal lists a container's sheets on its page. Until 2026-11-26 it gave a file only to a contact of the company it was sent to; since then to a contact of **any** forwarder attached to the container (freight, delivery or customs), with the container's other papers (`docs/forwarder-containers.md`, "A container's documents"). Never to a payment-only forwarder.
 
 ## Rollout
 
@@ -66,7 +66,8 @@ Rollback, once no deployed code reads them: `DROP VIEW portal_forwarder_clearanc
 
 ## Not done
 
-- No tariff lookup: duty is what our team typed last time for that code.
+- No tariff lookup: duty is what JFPRO's Duty rates hold for the code and the origin. A pair JFPRO lacks is filled there, not typed on the sheet.
+- No check here that a sent code or duty is JFPRO's: ShipLine's cells are read-only, and this server checks their shape only.
 - A supplier with two invoices in one container has both numbers on each of its rows; which line is on which invoice is not known.
 - The value is units × our order price, not the invoice's own total.
 - Never run against a database or Front: the routes are unit-tested against a scripted connection; the view and the grant have not been applied anywhere.
