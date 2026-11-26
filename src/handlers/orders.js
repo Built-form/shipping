@@ -17,7 +17,7 @@ const {
 // modules so the public carton-scan Lambda reuses the exact same projection +
 // Mintsoft receiving path (see src/services/order-receive.js).
 const { ORDER_SELECT, parseDates, formatDate, formatDateTime, normalizeExpiry, receiptToJson, rowToOrder } = require('../lib/order-shape');
-const { recordAudit } = require('../lib/audit');
+const { recordAudit, recordAuditStrict } = require('../lib/audit');
 const { pdfLineSnapshot, parseLinesJson } = require('../lib/po-line-snapshot');
 const { quoteLineSource } = require('../lib/quote-line-source');
 const { requestLinesSnapshot } = require('../lib/request-to-send-drift');
@@ -96,6 +96,9 @@ const { correctBalance } = require('../lib/balance-correction');
 const paymentDocumentsLib = require('../lib/payment-documents');
 const { makeSplitOrder } = require('../services/order-split');
 const shipmentsLib = require('../lib/shipments');
+// Sample orders (docs/sample-orders.md): the rules (pure) and their database side.
+const sampleRules = require('../lib/sample-orders');
+const sampleOrders = require('../services/sample-orders');
 const shipmentPaymentsService = require('../services/shipment-payments');
 const { runShipmentPaymentExtraction, sameSupplier: sameSupplierName } = require('../services/shipment-payment-extract');
 
@@ -232,6 +235,9 @@ const PO_SENT_WEBHOOK_URL = process.env.MAKE_PO_SENT_WEBHOOK_URL
 // or when po_number/jf_code is missing.
 async function firePoSentWebhookIfNeeded(conn, order) {
     if (!order || order.status !== 'PO_SENT') return;
+    // A sample order is not production being started: the scenario behind this
+    // hook was built for stock POs, so a sample never fires it.
+    if (order.orderKind === 'sample') return;
     const poNumber = order.poNumber;
     const jfCode = order.jfCode;
     if (!poNumber || !jfCode) return;
@@ -843,9 +849,17 @@ function buildNettedStatusMap(rows, reflectedSettledFor) {
 app.get('/api/v1/orders', async (req, res) => {
     try {
         await purchaseOrdersSchemaReady;
-        const { orders, purchaseOrders, shipments } = await withConnection(async (conn) => {
+        // Sample orders reach only a caller that asks for them (?samples=1, which
+        // a sample-aware ShipLine sends; a query parameter and not a header, so
+        // the gateway's CORS rules are untouched). Any other caller, known or
+        // not, gets stock rows and stock POs only, so nothing that was written
+        // before samples existed can count, draw or price one.
+        const wantsSamples = String((req.query || {}).samples || '') === '1';
+        const { orders, purchaseOrders, shipments, sampleOrdersArmed } = await withConnection(async (conn) => {
             const [rows] = await conn.query(`${ORDER_SELECT} ORDER BY orders.created_at DESC`);
-            const orders = rows.map(rowToOrder);
+            const all = rows.map(rowToOrder);
+            const orders = wantsSamples ? all : all.filter(o => o.orderKind !== 'sample');
+            const sampleOrdersArmed = wantsSamples ? await sampleOrders.armed(conn) : false;
             // Deduplicated side-map: every PO referenced by these orders
             // (via orders.purchase_order_id) with its full document/invoice/
             // signed-PI/payment bundle, keyed by PO id. Many order lines share
@@ -855,14 +869,29 @@ app.get('/api/v1/orders', async (req, res) => {
             // orders.shipment_id). Never fails the list: a missing table or
             // column just yields {}.
             const shipments = await shipmentSync.loadShipmentsForOrders(conn, orders);
-            return { orders, purchaseOrders, shipments };
+            return { orders, purchaseOrders, shipments, sampleOrdersArmed };
         });
-        res.status(200).json({ data: orders, purchaseOrders, shipments });
+        res.status(200).json({
+            data: orders, purchaseOrders, shipments,
+            // Only for a caller that asked: may a sample order be created here now?
+            ...(wantsSamples ? { capabilities: { sampleOrders: sampleOrdersArmed } } : {}),
+        });
     } catch (error) {
         log.error('[GET /orders]', error);
         res.status(500).json({ error: 'An internal error occurred.' });
     }
 });
+
+// The reason an admin gave for a sample edit that needed one (a change to what
+// a committed sample order costs, a write-off), kept beside the change itself.
+async function recordSampleReason(conn, orderId, what, req) {
+    const reason = sampleOrders.reasonOf(req);
+    if (!reason) return;
+    await recordAudit(conn, {
+        entityType: 'order', entityId: Number(orderId), action: 'sample_reason',
+        before: null, after: { what, reason }, userEmail: req.userEmail,
+    });
+}
 
 // ── 2. POST /api/v1/orders ───────────────────────────────────────────────
 app.post('/api/v1/orders', async (req, res) => {
@@ -874,7 +903,22 @@ app.post('/api/v1/orders', async (req, res) => {
         const status = typeof b.status === 'string' ? b.status.trim() : '';
         if (!status) return res.status(400).json({ error: 'status is required.' });
 
-        const order = await withConnection(async (conn) => {
+        const result = await withConnection(async (conn) => {
+            // A line created on a sample PO is a sample line: the server decides
+            // that from the PO, never from the body, and the sample rules then
+            // apply to the whole row (src/lib/sample-orders.js). A sample is
+            // created in one transaction: the lock on its lot in JFPRO's
+            // register, the row, and the unique key on its code go together.
+            const afterRow = { status };
+            for (const [key, col] of Object.entries(UPDATABLE_FIELDS)) afterRow[col] = b[key] ?? (col === 'quantity' ? 0 : null);
+            if (b.courierName !== undefined) afterRow.courier_name = b.courierName;
+            if (b.courierTracking !== undefined) afterRow.courier_tracking = b.courierTracking;
+            const onSamplePo = (await sampleOrders.schemaReady(conn))
+                && (await sampleOrders.loadPo(conn, b.purchaseOrderId))?.kind === sampleRules.KIND_SAMPLE;
+            return sampleOrders.withSampleTx(conn, onSamplePo, async () => {
+            const guard = await sampleOrders.guardWrite(conn, { beforeRow: null, afterRow, via: 'create', req, lockLot: onSamplePo });
+            if (guard.refusal) return { refusal: guard.refusal };
+
             const dates = setDateKey(b.dates && typeof b.dates === 'object' ? { ...b.dates } : {}, status);
 
             // Freeze the carton spec from the catalogue onto this order so its
@@ -885,6 +929,15 @@ app.post('/api/v1/orders', async (req, res) => {
                 `INSERT INTO orders ${ORDER_INSERT_COLS} VALUES ${ORDER_INSERT_PLACEHOLDERS}`,
                 orderInsertValuesFromBody(b, status, dates)
             );
+            if (guard.sample) {
+                // The kind, the normalised values and the courier, on top of the
+                // insert. The unique key on the sample code answers here.
+                const extra = { ...guard, set: { ...guard.set } };
+                if (afterRow.courier_name !== undefined) extra.set.courier_name = afterRow.courier_name || null;
+                if (afterRow.courier_tracking !== undefined) extra.set.courier_tracking = afterRow.courier_tracking || null;
+                const { sets, values } = sampleOrders.sampleSetSql(extra);
+                await conn.query(`UPDATE orders SET ${sets.join(', ')} WHERE id = ?`, [...values, insertResult.insertId]);
+            }
 
             const [rows] = await conn.query(`${ORDER_SELECT} AND orders.id = ?`, [insertResult.insertId]);
             const created = rowToOrder(rows[0]);
@@ -896,14 +949,21 @@ app.post('/api/v1/orders', async (req, res) => {
                 before: null, after: created, userEmail: req.userEmail,
             });
             await firePoSentWebhookIfNeeded(conn, created);
-            const linked = await shipmentSync.shadow(conn, {
+            // A sample is in no shipment, and this hook must not run inside the
+            // sample's transaction.
+            const linked = guard.sample ? null : await shipmentSync.shadow(conn, {
                 site: 'POST /orders', inTx: false, ...membershipKey([created]),
             }, c => shipmentSync.syncOrderMembership(c, [created.id], { userEmail: req.userEmail }));
             patchShipmentIds([created], linked);
-            return created;
+            if (guard.sample) await recordSampleReason(conn, created.id, 'create', req);
+            return { order: created };
+            });
         });
-        res.status(201).json(order);
+        if (result.refusal) return res.status(result.refusal.http).json(sampleOrders.toBody(result.refusal));
+        res.status(201).json(result.order);
     } catch (error) {
+        const clash = sampleOrders.lotClash(error);
+        if (clash) return res.status(clash.http).json(sampleOrders.toBody(clash));
         log.error('[POST /orders]', error);
         res.status(500).json({ error: 'An internal error occurred.' });
     }
@@ -922,6 +982,16 @@ app.put('/api/v1/orders/:id', async (req, res) => {
             const [existing] = await conn.query(`${ORDER_SELECT} AND orders.id = ?`, [id]);
             if (!existing.length) return { notFound: id };
             const beforeOrder = rowToOrder(existing[0]);
+            // A sample line is edited in one transaction, on a locked row
+            // (src/lib/sample-orders.js). A stock line runs as it always did.
+            const sampleLine = sampleRules.isSample(existing[0]);
+            return sampleOrders.withSampleTx(conn, sampleLine, async () => {
+            let beforeRaw = existing[0];
+            if (sampleLine) {
+                const [locked] = await conn.query('SELECT * FROM orders WHERE id = ? AND deleted_at IS NULL FOR UPDATE', [id]);
+                if (!locked.length) return { notFound: id };
+                beforeRaw = locked[0];
+            }
 
             // If quantity is being changed and the order has receipts,
             // refuse to drop below the already-received total. Auto-flip to
@@ -983,7 +1053,39 @@ app.put('/api/v1/orders/:id', async (req, res) => {
                 values.push(nextStatus);
             }
 
-            if (b.dates !== undefined) {
+            // The whole resulting row goes past the sample guard: a sample by
+            // its rules, a stock line only so it cannot take a sample's PO or
+            // code. What the guard returns is written after the caller's own
+            // columns, so it wins where both name one.
+            const changes = {};
+            for (const [key, col] of Object.entries(UPDATABLE_FIELDS)) {
+                if (b[key] !== undefined) changes[col] = b[key];
+            }
+            if (explicitStatus) changes.status = explicitStatus; else if (nextStatus) changes.status = nextStatus;
+            if (sampleLine) {
+                for (const [key, col] of [['courierName', 'courier_name'], ['courierTracking', 'courier_tracking']]) {
+                    if (b[key] === undefined) continue;
+                    changes[col] = typeof b[key] === 'string' && b[key].trim() ? b[key].trim() : null;
+                    fields.push(`${col} = ?`);
+                    values.push(changes[col]);
+                }
+            }
+            const guard = await sampleOrders.guardWrite(conn, {
+                beforeRow: beforeRaw, afterRow: { ...beforeRaw, ...changes }, via: 'update', req, lockLot: sampleLine,
+            });
+            if (guard.refusal) return { refusal: guard.refusal };
+            if (guard.sample) {
+                const extra = sampleOrders.sampleSetSql(guard);
+                fields.push(...extra.sets);
+                values.push(...extra.values);
+                if (guard.clearReceivedStamp) {
+                    delete dates.received;
+                    delete dates.received_by_warehouse;
+                    datesTouched = true;
+                }
+            }
+
+            if (b.dates !== undefined && !guard.clearReceivedStamp) {
                 fields.push('dates = ?');
                 values.push(JSON.stringify(b.dates));
             } else if (datesTouched) {
@@ -1006,18 +1108,29 @@ app.put('/api/v1/orders/:id', async (req, res) => {
                 before: beforeOrder, after: updated, userEmail: req.userEmail,
             });
             await firePoSentWebhookIfNeeded(conn, updated);
-            const linked = await shipmentSync.shadow(conn, {
+            // A sample is in no shipment, and this hook must not run inside the
+            // sample's transaction.
+            const linked = guard.sample ? null : await shipmentSync.shadow(conn, {
                 site: 'PUT /orders/:id', inTx: false, ...membershipKey([updated, beforeOrder]),
             }, c => shipmentSync.syncOrderMembership(c, [updated.id], { userEmail: req.userEmail }));
             patchShipmentIds([updated], linked);
+            if (guard.sample) {
+                // A supplier's "mark as sent" made against the line as it was.
+                if (guard.supersedePending) await sampleOrders.supersedePendingMarkSent(conn, updated.id, req.userEmail);
+                await recordSampleReason(conn, updated.id, 'update', req);
+            }
             return { order: updated };
+            });
         });
 
         if (result.notFound) return res.status(404).json({ error: `Order ${result.notFound} not found.` });
+        if (result.refusal) return res.status(result.refusal.http).json(sampleOrders.toBody(result.refusal));
         if (result.badQuantity) return res.status(400).json({ error: result.badQuantity });
         if (result.noFields) return res.status(400).json({ error: 'No fields to update.' });
         res.json(result.order);
     } catch (error) {
+        const clash = sampleOrders.lotClash(error);
+        if (clash) return res.status(clash.http).json(sampleOrders.toBody(clash));
         log.error('[PUT /orders/:id]', error);
         res.status(500).json({ error: 'An internal error occurred.' });
     }
@@ -1038,13 +1151,32 @@ app.patch('/api/v1/orders/:id/status', async (req, res) => {
             const [existing] = await conn.query(`${ORDER_SELECT} AND orders.id = ?`, [id]);
             if (!existing.length) return { notFound: id };
             const beforeOrder = rowToOrder(existing[0]);
+            // A sample line moves by its own rules, on a locked row, in one
+            // transaction (src/lib/sample-orders.js). Stock: as it always did.
+            const sampleLine = sampleRules.isSample(existing[0]);
+            return sampleOrders.withSampleTx(conn, sampleLine, async () => {
+            let beforeRaw = existing[0];
+            if (sampleLine) {
+                const [locked] = await conn.query('SELECT * FROM orders WHERE id = ? AND deleted_at IS NULL FOR UPDATE', [id]);
+                if (!locked.length) return { notFound: id };
+                beforeRaw = locked[0];
+            }
+            const guard = await sampleOrders.guardWrite(conn, {
+                beforeRow: beforeRaw, afterRow: { ...beforeRaw, status }, via: 'status', req,
+            });
+            if (guard.refusal) return { refusal: guard.refusal };
 
-            const dates = parseDates(existing[0].dates);
+            const dates = parseDates(beforeRaw.dates);
             setDateKey(dates, status);
+            if (guard.clearReceivedStamp) {
+                delete dates.received;
+                delete dates.received_by_warehouse;
+            }
 
+            const extra = guard.sample ? sampleOrders.sampleSetSql(guard) : { sets: [], values: [] };
             await conn.query(
-                'UPDATE orders SET status = ?, dates = ? WHERE id = ?',
-                [status, JSON.stringify(dates), id]
+                `UPDATE orders SET ${['status = ?', 'dates = ?', ...extra.sets].join(', ')} WHERE id = ?`,
+                [status, JSON.stringify(dates), ...extra.values, id]
             );
 
             const [rows] = await conn.query(`${ORDER_SELECT} AND orders.id = ?`, [id]);
@@ -1054,14 +1186,20 @@ app.patch('/api/v1/orders/:id/status', async (req, res) => {
                 before: beforeOrder, after: updated, userEmail: req.userEmail,
             });
             await firePoSentWebhookIfNeeded(conn, updated);
-            const linked = await shipmentSync.shadow(conn, {
+            const linked = guard.sample ? null : await shipmentSync.shadow(conn, {
                 site: 'PATCH /orders/:id/status', inTx: false, ...membershipKey([updated]),
             }, c => shipmentSync.syncOrderMembership(c, [updated.id], { userEmail: req.userEmail }));
             patchShipmentIds([updated], linked);
+            if (guard.sample) {
+                if (guard.supersedePending) await sampleOrders.supersedePendingMarkSent(conn, updated.id, req.userEmail);
+                await recordSampleReason(conn, updated.id, `status ${beforeOrder.status} to ${status}`, req);
+            }
             return { order: updated };
+            });
         });
 
         if (result.notFound) return res.status(404).json({ error: `Order ${result.notFound} not found.` });
+        if (result.refusal) return res.status(result.refusal.http).json(sampleOrders.toBody(result.refusal));
         res.json(result.order);
     } catch (error) {
         log.error('[PATCH /orders/:id/status]', error);
@@ -1089,10 +1227,26 @@ app.delete('/api/v1/orders/:id', async (req, res) => {
             if (Number(sumRows[0].received) > 0) {
                 return { hasReceipts: Number(sumRows[0].received) };
             }
+            // A sample line that was ever sent stays (its code is reserved for
+            // good, and its bill changes by a credit, not by removing the row);
+            // on a committed PO a delete is an admin's edit, with a reason.
+            const sampleLine = sampleRules.isSample(existing[0]);
+            if (sampleLine) {
+                const po = await sampleOrders.loadPo(conn, existing[0].purchase_order_id);
+                const verdict = sampleRules.validateSampleDelete(existing[0], {
+                    isAdmin: sampleOrders.isAdmin(req), reason: sampleOrders.reasonOf(req),
+                    po: po ? { id: po.id, kind: po.kind, committed: await sampleOrders.poCommitted(conn, po.id) } : null,
+                });
+                if (!verdict.ok) return { refusal: verdict };
+            }
             await conn.query(
                 'UPDATE orders SET deleted_at = NOW() WHERE id = ? AND deleted_at IS NULL',
                 [id]
             );
+            if (sampleLine) {
+                await sampleOrders.supersedePendingMarkSent(conn, id, req.userEmail);
+                await recordSampleReason(conn, id, 'delete', req);
+            }
             await recordAudit(conn, {
                 entityType: 'order', entityId: Number(id), action: 'delete',
                 before: shipmentsLib.auditSnapshot(beforeOrder), after: null, userEmail: req.userEmail,
@@ -1109,6 +1263,7 @@ app.delete('/api/v1/orders/:id', async (req, res) => {
             return { ok: true };
         });
         if (result.notFound) return res.status(404).json({ error: `Order ${result.notFound} not found.` });
+        if (result.refusal) return res.status(result.refusal.http).json(sampleOrders.toBody(result.refusal));
         if (result.hasReceipts) {
             return res.status(409).json({
                 error: `Cannot delete order ${id}: it has ${result.hasReceipts} unit(s) already received.`,
@@ -1200,6 +1355,113 @@ app.post('/api/v1/orders/:id/receive', async (req, res) => {
     }
 });
 
+// ── 4b-2. POST /api/v1/orders/:id/sample-received ────────────────────────
+// A sample order's hand-over (docs/sample-orders.md): the parcel is here.
+// Body { quantity, note? }: how many arrived (a whole number, 1 to 50), and a
+// note whenever that differs from what was ordered. Sets RECEIVED and
+// sample_received_qty. The ordered quantity, and so what is owed, is NOT
+// touched. There is NO Mintsoft call: a sample is never stock. Where it sits
+// in the cupboard is recorded on the sample's page in JFPRO.
+//
+// The only way a sample line reaches RECEIVED (PUT and PATCH refuse it), and
+// only from ARRIVED_AT_WAREHOUSE.
+//
+// Idempotency-Key (header, or `idempotencyKey` in the body; required, up to 64
+// characters): kept in the audit row of the receipt. A key seen before returns
+// what it returned the first time and never applies again, even after an
+// admin has corrected the line back to Arrived: a delayed retry cannot undo a
+// correction. A new receipt needs a new key.
+//
+// 200 { order, receipt, replay? } · 400 SAMPLE_QUANTITY | SAMPLE_NOTE_REQUIRED |
+// IDEMPOTENCY_KEY_REQUIRED · 404 · 409 NOT_A_SAMPLE | ALREADY_RECEIVED |
+// SAMPLE_STATUS (with allowedNext)
+app.post('/api/v1/orders/:id/sample-received', async (req, res) => {
+    try {
+        await auditLogSchemaReady;
+        const id = Number(req.params.id);
+        if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'A valid order id is required.' });
+        const body = req.body || {};
+        const key = String(req.get('Idempotency-Key') || body.idempotencyKey || '').trim();
+        if (!key || key.length > 64) {
+            return res.status(400).json({ error: 'An Idempotency-Key of up to 64 characters is required.', code: 'IDEMPOTENCY_KEY_REQUIRED' });
+        }
+
+        const result = await withConnection(conn => sampleOrders.withSampleTx(conn, true, async () => {
+            const [locked] = await conn.query('SELECT * FROM orders WHERE id = ? AND deleted_at IS NULL FOR UPDATE', [id]);
+            if (!locked.length) return { notFound: true };
+            const before = locked[0];
+            if (!sampleRules.isSample(before)) {
+                return { refusal: { ok: false, http: 409, code: 'NOT_A_SAMPLE', message: 'Only a sample order is received this way. Stock is received into Mintsoft.' } };
+            }
+
+            // This key was used before on this line: answer as then, apply nothing.
+            const [seen] = await conn.query(
+                `SELECT after_json FROM audit_log
+                  WHERE entity_type = 'order' AND entity_id = ? AND action = 'sample_received'
+                    AND JSON_UNQUOTE(JSON_EXTRACT(after_json, '$.idempotencyKey')) = ?
+                  ORDER BY id DESC LIMIT 1`,
+                [id, key]
+            );
+            if (seen.length) {
+                const [rows] = await conn.query(`${ORDER_SELECT} AND orders.id = ?`, [id]);
+                const receipt = typeof seen[0].after_json === 'string' ? JSON.parse(seen[0].after_json) : seen[0].after_json;
+                return { order: rowToOrder(rows[0]), receipt, replay: true };
+            }
+
+            if (before.status === 'RECEIVED') {
+                return { refusal: {
+                    ok: false, http: 409, code: 'ALREADY_RECEIVED',
+                    message: 'This sample is already marked received. An admin can move it back to Arrived to record it again.',
+                    allowedNext: sampleRules.allowedNext('RECEIVED', { isAdmin: sampleOrders.isAdmin(req) }),
+                } };
+            }
+            const parsed = sampleRules.parseSampleReceive(body, before);
+            if (!parsed.ok) return { refusal: parsed };
+
+            const guard = await sampleOrders.guardWrite(conn, {
+                beforeRow: before,
+                afterRow: { ...before, status: 'RECEIVED', sample_received_qty: parsed.quantity },
+                via: sampleRules.VIA_RECEIVE, req,
+            });
+            if (guard.refusal) return { refusal: guard.refusal };
+
+            const [beforeRows] = await conn.query(`${ORDER_SELECT} AND orders.id = ?`, [id]);
+            const beforeOrder = rowToOrder(beforeRows[0]);
+            const dates = setDateKey(parseDates(before.dates), 'RECEIVED');
+            const extra = sampleOrders.sampleSetSql(guard);
+            await conn.query(
+                `UPDATE orders SET ${['status = ?', 'sample_received_qty = ?', 'dates = ?', ...extra.sets].join(', ')} WHERE id = ?`,
+                ['RECEIVED', parsed.quantity, JSON.stringify(dates), ...extra.values, id]
+            );
+            const [rows] = await conn.query(`${ORDER_SELECT} AND orders.id = ?`, [id]);
+            const updated = rowToOrder(rows[0]);
+            await recordAuditStrict(conn, {
+                entityType: 'order', entityId: id, action: 'update',
+                before: beforeOrder, after: updated, userEmail: req.userEmail,
+            });
+            // The receipt itself, and the record of the key: strict, so a
+            // receipt is never committed without the row that stops its replay.
+            const receipt = {
+                idempotencyKey: key, quantity: parsed.quantity, ordered: Number(before.quantity),
+                note: parsed.note, receivedBy: req.userEmail || null, receivedAt: dates.received,
+            };
+            await recordAuditStrict(conn, {
+                entityType: 'order', entityId: id, action: 'sample_received',
+                before: null, after: receipt, userEmail: req.userEmail,
+            });
+            if (guard.supersedePending) await sampleOrders.supersedePendingMarkSent(conn, id, req.userEmail);
+            return { order: updated, receipt };
+        }));
+
+        if (result.notFound) return res.status(404).json({ error: `Order ${id} not found.` });
+        if (result.refusal) return res.status(result.refusal.http).json(sampleOrders.toBody(result.refusal));
+        res.json({ order: result.order, receipt: result.receipt, ...(result.replay ? { replay: true } : {}) });
+    } catch (error) {
+        log.error('[POST /orders/:id/sample-received]', error);
+        res.status(500).json({ error: 'An internal error occurred.' });
+    }
+});
+
 // ── 4c. POST /api/v1/orders/:id/not-received ─────────────────────────────
 // Records a shortfall against an order line — the units that didn't physically
 // turn up. No Mintsoft side effect; this is purely a reconciliation marker so
@@ -1266,6 +1528,14 @@ app.post('/api/v1/orders/:id/not-received', async (req, res) => {
                 return res.status(404).json({ error: `Order ${id} not found.` });
             }
             const orderRow = lockRows[0];
+            // A sample has no stock receipts and no "partially received": what
+            // arrived is recorded by POST /orders/:id/sample-received.
+            const sampleRefusal = sampleOrders.refuseSample(orderRow, 'given a shortfall record');
+            if (sampleRefusal) {
+                await conn.rollback();
+                committed = true;
+                return res.status(sampleRefusal.http).json(sampleOrders.toBody(sampleRefusal));
+            }
 
             const [sumRows] = await conn.query(
                 `SELECT
@@ -1561,6 +1831,12 @@ app.post('/api/v1/orders/:id/split', async (req, res) => {
 
                 const original = existing[0];
                 const beforeOriginal = rowToOrder(original);
+                // A sample is never split into a container.
+                const sampleRefusal = sampleOrders.refuseSample(original, 'split into a container');
+                if (sampleRefusal) {
+                    await conn.rollback();
+                    return { refusal: sampleRefusal };
+                }
                 if (splitQuantity >= original.quantity) {
                     await conn.rollback();
                     return { badQuantity: true };
@@ -1620,6 +1896,7 @@ app.post('/api/v1/orders/:id/split', async (req, res) => {
         });
 
         if (result.notFound) return res.status(404).json({ error: `Order ${result.notFound} not found.` });
+        if (result.refusal) return res.status(result.refusal.http).json(sampleOrders.toBody(result.refusal));
         if (result.badQuantity) return res.status(400).json({ error: 'splitQuantity must be less than the original order quantity.' });
         if (result.hasReceipts) {
             return res.status(409).json({
@@ -1668,6 +1945,13 @@ app.post('/api/v1/containers/pack', async (req, res) => {
 
                     const order = existing[0];
                     const beforeOrder = rowToOrder(order);
+                    // A sample travels alone: it is never packed. Nothing of
+                    // this request is written.
+                    const sampleRefusal = sampleOrders.refuseSample(order, 'packed into a container');
+                    if (sampleRefusal) {
+                        await conn.rollback();
+                        return { refusal: sampleRefusal };
+                    }
 
                     if (qty === order.quantity) {
                         // Full pack — update in place
@@ -1739,6 +2023,7 @@ app.post('/api/v1/containers/pack', async (req, res) => {
 
         if (result.badPack) return res.status(400).json({ error: 'Invalid pack entry: orderId and qty > 0 required.' });
         if (result.notFound) return res.status(404).json({ error: `Order ${result.notFound} not found.` });
+        if (result.refusal) return res.status(result.refusal.http).json(sampleOrders.toBody(result.refusal));
         if (result.qtyExceeds) {
             const { qty, orderId, orderQty } = result.qtyExceeds;
             return res.status(400).json({ error: `qty (${qty}) exceeds order ${orderId} quantity (${orderQty}).` });
@@ -4111,6 +4396,10 @@ app.get('/api/v1/stock-snapshots/sum', async (req, res) => {
                          FROM order_receipts GROUP BY order_id
                      ) rcpt ON rcpt.order_id = orders.id`;
         const orderParams = [snapshotFreshness, ...idParams];
+        // Sample orders are not stock: they are in no total and no list here
+        // (docs/sample-orders.md). Cashboard reads these figures, so this one
+        // filter keeps a sample out of every stock number it shows.
+        const stockOnly = await sampleOrders.stockOnlySql(pool);
 
         const [msRows, amzRows, orderRows, onSeaRows, onAirRows, ordersBreakdownRows, msHistoryRows, amzHistoryRows, tagRows, msSkuRows] = await withTimeout(
             Promise.all([
@@ -4163,7 +4452,7 @@ app.get('/api/v1/stock-snapshots/sum', async (req, res) => {
                                      ELSE orders.quantity END
                             ), 0) AS UNSIGNED) as total_quantity
                      FROM orders${receiptsJoin}
-                     WHERE ${idWhere('orders')} AND orders.deleted_at IS NULL GROUP BY orders.status`,
+                     WHERE ${idWhere('orders')} AND orders.deleted_at IS NULL${stockOnly} GROUP BY orders.status`,
                     orderParams
                 ).then(([rows]) => rows),
 
@@ -4175,7 +4464,7 @@ app.get('/api/v1/stock-snapshots/sum', async (req, res) => {
                             orders.actual_ready_date, orders.estimated_departure_date,
                             po.created_at AS po_created_at
                      FROM orders LEFT JOIN purchase_orders po ON po.id = orders.purchase_order_id
-                     WHERE ${idWhere('orders')} AND orders.status = 'ON_SEA' AND orders.deleted_at IS NULL ORDER BY orders.eta ASC`,
+                     WHERE ${idWhere('orders')} AND orders.status = 'ON_SEA' AND orders.deleted_at IS NULL${stockOnly} ORDER BY orders.eta ASC`,
                     idParams
                 ).then(([rows]) => rows),
 
@@ -4186,7 +4475,7 @@ app.get('/api/v1/stock-snapshots/sum', async (req, res) => {
                             orders.actual_ready_date, orders.estimated_departure_date,
                             po.created_at AS po_created_at
                      FROM orders LEFT JOIN purchase_orders po ON po.id = orders.purchase_order_id
-                     WHERE ${idWhere('orders')} AND orders.status = 'ON_AIR' AND orders.deleted_at IS NULL ORDER BY orders.eta ASC`,
+                     WHERE ${idWhere('orders')} AND orders.status = 'ON_AIR' AND orders.deleted_at IS NULL${stockOnly} ORDER BY orders.eta ASC`,
                     idParams
                 ).then(([rows]) => rows),
 
@@ -4197,7 +4486,7 @@ app.get('/api/v1/stock-snapshots/sum', async (req, res) => {
                             orders.shipped_date, orders.estimated_departure_date,
                             po.created_at AS po_created_at
                      FROM orders LEFT JOIN purchase_orders po ON po.id = orders.purchase_order_id
-                     WHERE ${idWhere('orders')} AND orders.status NOT IN ('ON_SEA', 'ON_AIR', 'RECEIVED') AND orders.deleted_at IS NULL ORDER BY orders.created_at DESC`,
+                     WHERE ${idWhere('orders')} AND orders.status NOT IN ('ON_SEA', 'ON_AIR', 'RECEIVED') AND orders.deleted_at IS NULL${stockOnly} ORDER BY orders.created_at DESC`,
                     idParams
                 ).then(([rows]) => rows),
 
@@ -4318,11 +4607,13 @@ app.get('/api/v1/stock-snapshots/sum/all-asins', async (req, res) => {
             return res.status(400).json({ error: 'company query parameter is required.' });
         }
 
+        // Sample orders are not stock (docs/sample-orders.md).
+        const stockOnly = await sampleOrders.stockOnlySql(pool);
         const [
             [asinsFromOrders], [asinsFromMintsoft], [asinsFromAmazon],
         ] = await withTimeout(
             Promise.all([
-                pool.query(`SELECT DISTINCT asin FROM orders WHERE asin IS NOT NULL AND asin != '' AND deleted_at IS NULL`),
+                pool.query(`SELECT DISTINCT asin FROM orders WHERE asin IS NOT NULL AND asin != '' AND deleted_at IS NULL${stockOnly}`),
                 pool.query(`SELECT DISTINCT asin FROM stock_snapshots WHERE asin IS NOT NULL AND asin != ''`),
                 pool.query(`SELECT DISTINCT asin FROM amazon_stock_country_snapshots WHERE asin IS NOT NULL AND asin != '' AND company = ?`, [company]),
             ]),
@@ -4354,7 +4645,7 @@ app.get('/api/v1/stock-snapshots/sum/all-asins', async (req, res) => {
                 // freshness — see buildNettedStatusMap.
                 pool.query(`
                     SELECT id, asin, status, quantity
-                    FROM orders WHERE asin IS NOT NULL AND deleted_at IS NULL
+                    FROM orders WHERE asin IS NOT NULL AND deleted_at IS NULL${stockOnly}
                 `),
                 pool.query(`
                     SELECT orders.asin, orders.id, orders.product_name, orders.quantity, orders.eta, orders.container_number, orders.port, orders.supplier, orders.po_number,
@@ -4364,7 +4655,7 @@ app.get('/api/v1/stock-snapshots/sum/all-asins', async (req, res) => {
                            orders.actual_ready_date, orders.estimated_departure_date,
                            po.created_at AS po_created_at
                     FROM orders LEFT JOIN purchase_orders po ON po.id = orders.purchase_order_id
-                    WHERE orders.status = 'ON_SEA' AND orders.asin IS NOT NULL AND orders.deleted_at IS NULL
+                    WHERE orders.status = 'ON_SEA' AND orders.asin IS NOT NULL AND orders.deleted_at IS NULL${stockOnly}
                     ORDER BY orders.asin, orders.eta ASC
                 `),
                 pool.query(`
@@ -4373,7 +4664,7 @@ app.get('/api/v1/stock-snapshots/sum/all-asins', async (req, res) => {
                            orders.actual_ready_date, orders.estimated_departure_date,
                            po.created_at AS po_created_at
                     FROM orders LEFT JOIN purchase_orders po ON po.id = orders.purchase_order_id
-                    WHERE orders.status = 'ON_AIR' AND orders.asin IS NOT NULL AND orders.deleted_at IS NULL
+                    WHERE orders.status = 'ON_AIR' AND orders.asin IS NOT NULL AND orders.deleted_at IS NULL${stockOnly}
                     ORDER BY orders.asin, orders.eta ASC
                 `),
                 pool.query(`
@@ -4382,7 +4673,7 @@ app.get('/api/v1/stock-snapshots/sum/all-asins', async (req, res) => {
                            orders.shipped_date, orders.estimated_departure_date,
                            po.created_at AS po_created_at
                     FROM orders LEFT JOIN purchase_orders po ON po.id = orders.purchase_order_id
-                    WHERE orders.status NOT IN ('ON_SEA', 'ON_AIR', 'RECEIVED') AND orders.asin IS NOT NULL AND orders.deleted_at IS NULL
+                    WHERE orders.status NOT IN ('ON_SEA', 'ON_AIR', 'RECEIVED') AND orders.asin IS NOT NULL AND orders.deleted_at IS NULL${stockOnly}
                     ORDER BY orders.asin, orders.created_at DESC
                 `),
                 pool.query(`
@@ -5920,6 +6211,9 @@ function rowToPurchaseOrder(row) {
         currency: row.currency || 'USD',
         shippingTotal: row.shipping_total != null ? Number(row.shipping_total) : 0,
         companyId: row.company_id ?? null,
+        // 'stock' or 'sample' (docs/sample-orders.md). A database without the
+        // column reads every PO as stock.
+        kind: row.kind === 'sample' ? 'sample' : 'stock',
         createdAt: row.created_at?.toISOString?.() ?? row.created_at,
         updatedAt: row.updated_at?.toISOString?.() ?? row.updated_at,
     };
@@ -6121,9 +6415,12 @@ app.delete('/api/v1/companies/:id', async (req, res) => {
 app.get('/api/v1/purchase-orders', async (req, res) => {
     try {
         await purchaseOrdersSchemaReady;
+        // As GET /orders: sample POs only for a caller that asks (?samples=1).
+        const wantsSamples = String((req.query || {}).samples || '') === '1';
         const data = await withConnection(async (conn) => {
             const [rows] = await conn.query('SELECT * FROM purchase_orders WHERE deleted_at IS NULL ORDER BY created_at DESC');
-            const pos = await attachSupplierDepositReceipts(conn, rows.map(rowToPurchaseOrder));
+            const all = rows.map(rowToPurchaseOrder);
+            const pos = await attachSupplierDepositReceipts(conn, wantsSamples ? all : all.filter(p => p.kind !== 'sample'));
             return attachCompanies(conn, pos);
         });
         res.json({ data });
@@ -6167,8 +6464,19 @@ app.post('/api/v1/purchase-orders', async (req, res) => {
         if (!Number.isInteger(cid) || cid <= 0) {
             return res.status(400).json({ error: 'companyId must be a positive integer.' });
         }
+        // The kind is set here and never again (docs/sample-orders.md). Nothing
+        // sent is a stock PO, as every caller from before kinds existed sends.
+        const kind = sampleRules.normalizeKind((req.body || {}).kind);
+        if (kind === null) {
+            return res.status(400).json({ error: `kind must be one of ${sampleRules.KINDS.join(', ')}.`, code: 'BAD_KIND' });
+        }
 
         const result = await withConnection(async (conn) => {
+            // A sample PO only where sample orders are armed on this stage,
+            // read fresh: no warm server creates one from a remembered answer.
+            if (kind === sampleRules.KIND_SAMPLE && !await sampleOrders.armed(conn, { fresh: true })) {
+                return { samplesDisabled: true };
+            }
             const [cRows] = await conn.query('SELECT name FROM companies WHERE id = ?', [cid]);
             if (!cRows.length) return { companyNotFound: true };
             const letter = (cRows[0].name || '').trim().charAt(0).toUpperCase();
@@ -6189,6 +6497,11 @@ app.post('/api/v1/purchase-orders', async (req, res) => {
                 const newId = insertResult.insertId;
                 const poNumber = `PO_${String(newId).padStart(5, '0')}${letter}`;
                 await conn.query('UPDATE purchase_orders SET po_number = ? WHERE id = ?', [poNumber, newId]);
+                // Only a sample PO names the column: a stock PO is written
+                // exactly as before, on a database with or without it.
+                if (kind === sampleRules.KIND_SAMPLE) {
+                    await conn.query('UPDATE purchase_orders SET kind = ? WHERE id = ?', [kind, newId]);
+                }
 
                 const [rows] = await conn.query('SELECT * FROM purchase_orders WHERE id = ?', [newId]);
                 const created = rowToPurchaseOrder(rows[0]);
@@ -6205,6 +6518,9 @@ app.post('/api/v1/purchase-orders', async (req, res) => {
             }
         });
 
+        if (result.samplesDisabled) {
+            return res.status(409).json({ error: 'Sample orders are not switched on here.', code: 'SAMPLES_DISABLED' });
+        }
         if (result.companyNotFound) return res.status(400).json({ error: `Company ${cid} not found.` });
         if (result.invalidLetter) return res.status(400).json({ error: 'Cannot derive letter — company name must start with A-Z.' });
         res.status(201).json(result.po);
@@ -6236,6 +6552,23 @@ app.put('/api/v1/purchase-orders/:id', async (req, res) => {
                 if (!existingRows.length) return { notFound: true };
                 const beforePo = rowToPurchaseOrder(existingRows[0]);
 
+                // A sample PO: its kind never changes, its supplier and currency
+                // are fixed once it is committed (emailed, or money on it), and
+                // its shipping total then changes only by an admin, with a
+                // reason. A stock PO is edited as it always was, except that it
+                // cannot be turned into a sample.
+                const body = req.body || {};
+                if (beforePo.kind === sampleRules.KIND_SAMPLE) {
+                    const verdict = sampleRules.validateSamplePoEdit(
+                        { ...beforePo, committed: await sampleOrders.poCommitted(conn, beforePo.id) },
+                        { kind: body.kind, supplier, currency, shippingTotal },
+                        { isAdmin: sampleOrders.isAdmin(req), reason: sampleOrders.reasonOf(req) }
+                    );
+                    if (!verdict.ok) return { refusal: verdict };
+                } else if (body.kind !== undefined && sampleRules.normalizeKind(body.kind) !== sampleRules.KIND_STOCK) {
+                    return { refusal: { ok: false, http: 409, code: 'SAMPLE_KIND_FIXED', message: 'The kind of a purchase order never changes.' } };
+                }
+
                 values.push(id);
                 await conn.query(
                     `UPDATE purchase_orders SET ${fields.join(', ')} WHERE id = ?`,
@@ -6255,6 +6588,7 @@ app.put('/api/v1/purchase-orders/:id', async (req, res) => {
             }
         });
         if (result.notFound) return res.status(404).json({ error: `Purchase order ${id} not found.` });
+        if (result.refusal) return res.status(result.refusal.http).json(sampleOrders.toBody(result.refusal));
         if (result.duplicate) return res.status(409).json({ error: 'poNumber already in use.' });
         res.json(result.po);
     } catch (error) {
@@ -6284,6 +6618,17 @@ app.delete('/api/v1/purchase-orders/:id', async (req, res) => {
             );
             const cascadeOrders = cascadeOrderRows.map(rowToOrder);
 
+            // A sample PO never takes its lines with it: it goes only when it
+            // has no live line and no money on it, and (as every PO) as a soft
+            // delete, so its deleted lines still point at a sample PO.
+            if (beforePo.kind === sampleRules.KIND_SAMPLE) {
+                const verdict = sampleRules.validateSamplePoDelete({
+                    liveLines: cascadeOrders.length,
+                    moneyRecorded: await sampleOrders.poMoneyRecorded(conn, beforePo.id),
+                });
+                if (!verdict.ok) return { refusal: verdict };
+            }
+
             await conn.query('UPDATE purchase_orders SET deleted_at = NOW() WHERE id = ? AND deleted_at IS NULL', [id]);
             await conn.query('UPDATE orders SET deleted_at = NOW() WHERE purchase_order_id = ? AND deleted_at IS NULL', [id]);
             await conn.query('UPDATE purchase_order_documents SET deleted_at = NOW() WHERE purchase_order_id = ? AND deleted_at IS NULL', [id]);
@@ -6311,6 +6656,7 @@ app.delete('/api/v1/purchase-orders/:id', async (req, res) => {
             }
             return { deleted: true };
         });
+        if (result.refusal) return res.status(result.refusal.http).json(sampleOrders.toBody(result.refusal));
         if (!result.deleted) return res.status(404).json({ error: `Purchase order ${id} not found.` });
         res.json({ ok: true, id: Number(id) });
     } catch (error) {
@@ -6353,15 +6699,20 @@ async function loadPoForPdf(conn, po) {
     // whatever name happened to be stamped on the order line at import time.
     // Fall back to the order's own product_name when the jf_code isn't in the
     // master (or is blank).
+    // A sample order prints one line per sample code (its lot): the supplier
+    // writes that code on the parcel, so two samples of one product are two
+    // lines. A stock PO is aggregated exactly as before.
+    const isSamplePo = po.kind === sampleRules.KIND_SAMPLE;
+    const sampleCode = isSamplePo ? ', o.lot_number' : '';
     const [lineRows] = await conn.query(
-        `SELECT o.jf_code, o.asin, o.unit_price,
+        `SELECT o.jf_code, o.asin, o.unit_price${sampleCode},
                 COALESCE(NULLIF(TRIM(p.name), ''), o.product_name) AS product_name,
                 CAST(SUM(o.quantity) AS UNSIGNED) AS quantity,
                 MIN(o.id) AS first_id
            FROM orders o
            LEFT JOIN jfpro_products p ON p.jfcode = o.jf_code
           WHERE o.purchase_order_id = ? AND o.deleted_at IS NULL
-          GROUP BY o.jf_code, o.asin, o.unit_price, COALESCE(NULLIF(TRIM(p.name), ''), o.product_name)
+          GROUP BY o.jf_code, o.asin, o.unit_price${sampleCode}, COALESCE(NULLIF(TRIM(p.name), ''), o.product_name)
           ORDER BY first_id ASC`,
         [po.id]
     );
@@ -6385,12 +6736,16 @@ async function loadPoForPdf(conn, po) {
             shippingTotal: po.shippingTotal ?? 0,
             comments: po.notes || '',
             customer,
+            // 'sample' heads the page SAMPLE ORDER and prints a free line in
+            // words, never as a price of 0 (src/services/po-pdf.js).
+            kind: po.kind,
         },
         lines: lineRows.map(r => ({
             sku: r.jf_code || r.asin || '',
             name: r.product_name || '',
             quantity: Number(r.quantity || 0),
             unitPrice: r.unit_price != null ? Number(r.unit_price) : 0,
+            ...(isSamplePo && r.lot_number ? { sampleCode: String(r.lot_number).trim() } : {}),
         })),
         // What this PDF was printed from, saved with the document so ShipLine
         // can flag lines changed since (src/lib/po-line-snapshot.js).
@@ -6621,7 +6976,9 @@ app.get('/api/v1/suppliers/:id/emails', async (req, res) => {
 // written here is also what lists the version on the portal. Otherwise still a
 // delivery primitive: doesn't touch order status, doesn't fire the legacy Make
 // webhook. Subject and body come from the stored `purchase_order_portal`
-// template (editable via /email-templates) and can be overridden per send;
+// template, or `sample_order_portal` for a sample order
+// (poPortalEmail.sendTemplateKey; both editable via /email-templates), and can
+// be overridden per send;
 // {poNumber} and {version} are filled in either way, and the fixed portal
 // block (button to the PO, how to register) is appended under the body.
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -6637,7 +6994,8 @@ app.post('/api/v1/purchase-order-documents/:id/email', async (req, res) => {
         // `subject`/`body` are optional per-send overrides. When the caller
         // supplies a body (typically the template fetched via
         // GET /email-templates, then edited in the UI), it's used as the
-        // message; otherwise the stored `purchase_order_portal` template is.
+        // message; otherwise the stored template is (`purchase_order_portal`,
+        // or `sample_order_portal` for a sample order).
         const { to, subject, body } = req.body || {};
 
         // `to` accepts either a single string or an array of strings, each
@@ -6707,7 +7065,10 @@ app.post('/api/v1/purchase-order-documents/:id/email', async (req, res) => {
                 && portalAccess.poSupplierMatched
                 && portalAccess.users.every(u => poPortalEmail.GRANTED_OUTCOMES.has(u.outcome));
 
-            const tpl = await getEmailTemplate(conn, 'purchase_order_portal');
+            // A sample order's email has its own words. loadPo reads the kind
+            // where the column exists and answers 'stock' where it does not.
+            const poKind = (await sampleOrders.loadPo(conn, doc.purchase_order_id))?.kind;
+            const tpl = await getEmailTemplate(conn, poPortalEmail.sendTemplateKey(poKind));
             const vars = { poNumber: doc.po_number, version: doc.version };
             const finalSubject = (typeof subject === 'string' && subject.trim())
                 ? renderTemplate(subject.trim(), vars)
@@ -6721,6 +7082,7 @@ app.post('/api/v1/purchase-order-documents/:id/email', async (req, res) => {
                 poUrl,
                 registerUrl: poPortalEmail.registerUrl(portalBase),
                 preapproved,
+                kind: poKind,
             });
 
             // The template (or the staff member's edit of it) and the portal
@@ -9595,6 +9957,11 @@ app.patch('/api/v1/alerts/:id/approve', async (req, res) => {
                 const [existing] = await conn.query(`${ORDER_SELECT} AND orders.id = ?`, [orderId]);
                 if (!existing.length) { await conn.rollback(); return { orderNotFound: orderId }; }
                 const beforeOrder = rowToOrder(existing[0]);
+                // The importer raises no suggestion for a sample; one that
+                // names a sample anyway is never applied (this route writes
+                // with no transition check of its own).
+                const sampleRefusal = sampleOrders.refuseSample(existing[0], 'moved by an email suggestion');
+                if (sampleRefusal) { await conn.rollback(); return { refusal: sampleRefusal }; }
                 if (RECEIVED_TERMINAL_STATUSES.includes(beforeOrder.status)) {
                     await conn.rollback();
                     return { staleTerminal: beforeOrder.status, alert };
@@ -9739,6 +10106,7 @@ app.patch('/api/v1/alerts/:id/approve', async (req, res) => {
         });
 
         if (result.notFound) return res.status(404).json({ error: `Status suggestion ${id} not found.` });
+        if (result.refusal) return res.status(result.refusal.http).json(sampleOrders.toBody(result.refusal));
         if (result.alreadyActioned) return res.status(409).json({ error: 'Suggestion already actioned.', alert: result.alert });
         if (result.badMeta) return res.status(422).json({ error: `Suggestion is missing ${result.badMeta}.` });
         if (result.badStatus) return res.status(400).json({ error: `Invalid status '${result.badStatus}'.` });
@@ -9777,6 +10145,7 @@ app.patch('/api/v1/alerts/:id/deny', async (req, res) => {
         const note = req.body && req.body.note;
         const result = await withConnection(conn => actOnSuggestion(conn, { id, userEmail: req.userEmail, action: 'deny', note }));
         if (result.notFound) return res.status(404).json({ error: `Status suggestion ${id} not found.` });
+        if (result.refusal) return res.status(result.refusal.http).json(sampleOrders.toBody(result.refusal));
         if (result.alreadyActioned) return res.status(409).json({ error: 'Suggestion already actioned.', alert: result.alert });
         res.json(result.alert);
     } catch (error) {
@@ -9800,6 +10169,7 @@ app.patch('/api/v1/alerts/:id/acknowledge', async (req, res) => {
         const note = req.body && req.body.note;
         const result = await withConnection(conn => actOnSuggestion(conn, { id, userEmail: req.userEmail, action: 'acknowledge', note }));
         if (result.notFound) return res.status(404).json({ error: `Status suggestion ${id} not found.` });
+        if (result.refusal) return res.status(result.refusal.http).json(sampleOrders.toBody(result.refusal));
         if (result.alreadyActioned) return res.status(409).json({ error: 'Suggestion already actioned.', alert: result.alert });
         res.json(result.alert);
     } catch (error) {

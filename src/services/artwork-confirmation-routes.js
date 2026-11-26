@@ -28,6 +28,7 @@ const { sendEmail: defaultSend } = require('./email-send');
 const { logSentEmail } = require('../lib/email-receipt');
 const { loadDepositGate } = require('./deposit-gate');
 const { londonToday: defaultLondonToday } = require('./daily-alerts');
+const sampleOrders = require('./sample-orders');
 const defaultLog = require('../lib/logger');
 
 // The tables are not there yet (the migration has not run on this server).
@@ -233,6 +234,14 @@ function registerArtworkConfirmationRoutes(app, deps) {
         const portalBase = poPortalEmail.portalBaseOf();
         if (!portalBase) {
             throw new Fail(409, 'PORTAL_URL_UNSET', 'The supplier portal address (SUPPLIER_PORTAL_URL) is not configured, so the artwork link cannot be sent.');
+        }
+        // A sample order has no artwork to confirm, and its page on the portal
+        // has no Artwork tab (docs/sample-orders.md). With no request ever
+        // made, nothing downstream (the supplier's tick, the Lambda that moves
+        // lines into production) can touch a sample.
+        const samplePo = await withConnection(conn => sampleOrders.loadPo(conn, id));
+        if (samplePo && samplePo.kind === 'sample') {
+            throw new Fail(409, 'SAMPLE_NO_ARTWORK', 'A sample order has no artwork confirmation.');
         }
 
         const out = await withConnection(async (conn) => {

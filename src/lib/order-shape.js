@@ -183,6 +183,14 @@ function rowToOrder(row) {
         artworkConfirmedBySupplier: formatDate(row.artwork_confirmed_by_supplier),
         shipmentId: row.shipment_id ?? null,
         qcVisitIds,
+        // Sample orders (docs/sample-orders.md). A database without the
+        // columns reads every line as stock.
+        orderKind: row.order_kind === 'sample' ? 'sample' : 'stock',
+        courierName: row.courier_name || null,
+        courierTracking: row.courier_tracking || null,
+        sampleReceivedQty: row.sample_received_qty != null ? Number(row.sample_received_qty) : null,
+        sampleEverSent: Number(row.sample_ever_sent || 0) === 1,
+        sampleStatusChangedAt: formatDateTime(row.sample_status_changed_at),
     };
 }
 

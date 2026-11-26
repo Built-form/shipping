@@ -41,7 +41,21 @@ const BLOCKERS = {
     qc_from: 'The line can only be marked ready for QC while it is under production.',
     qc_no_date: 'Marking ready for QC needs an actual ready date.',
     nothing_requested: 'The request holds no change this API knows how to apply.',
+    // A sample order (docs/sample-orders.md): one request, "mark as sent".
+    sample_only: 'Only a sample order is marked as sent this way.',
+    not_for_sample: 'A sample order has no ready dates: its supplier marks it as sent.',
+    sent_from: 'The line is not waiting to be sent any more.',
+    sent_future: 'The sent date is in the future.',
+    sent_before_order: 'The sent date is before the order was placed.',
+    bad_courier: 'The courier and the tracking number are text of at most 64 characters each.',
+    stale: 'The line changed in ShipLine after the supplier opened it. Reject this; they can mark it as sent again.',
 };
+
+// "Mark as sent" moves a sample line from waiting to on its way, and nothing else.
+const SAMPLE_KIND = 'sample';
+const SENT_FROM = 'PO_SENT';
+const SENT_STATUS = 'ON_AIR';
+const COURIER_MAX = 64;
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -84,7 +98,80 @@ function lineFromRow(row) {
         status: row.status || null,
         estimatedReadyDate: toDateOnly(row.estimated_ready_date),
         actualReadyDate: toDateOnly(row.actual_ready_date),
+        // What "mark as sent" needs. A row read without these (a database from
+        // before sample orders) is a stock line.
+        orderKind: row.order_kind === SAMPLE_KIND ? SAMPLE_KIND : 'stock',
+        jfCode: row.jf_code || null,
+        quantity: row.quantity == null ? null : Number(row.quantity),
+        shippedDate: toDateOnly(row.shipped_date),
+        courierName: row.courier_name || null,
+        courierTracking: row.courier_tracking || null,
+        // UTC, as text ('...Z'): compared with the moment the supplier's page was loaded.
+        statusChangedAt: row.sample_status_changed_at_iso || null,
+        poDate: toDateOnly(row.po_date),
     };
+}
+
+// A courier name or tracking number as the supplier typed it: trimmed text, null
+// when empty or absent, undefined when it is not text or too long.
+function courierText(raw) {
+    if (raw === undefined || raw === null) return null;
+    if (typeof raw !== 'string') return undefined;
+    const text = raw.trim();
+    if (text.length > COURIER_MAX) return undefined;
+    return text || null;
+}
+
+// Is the line still what the supplier was looking at? `base` is what the portal
+// stored with the request: the line's status, product and quantity as shown,
+// and when the page was loaded. No record of that is not a pass. The time
+// catches what the three values cannot: a line sent and corrected back in
+// between looks the same and is not.
+function isStale(base, line) {
+    if (!base || typeof base !== 'object') return true;
+    if (base.status !== line.status) return true;
+    if (String(base.jfCode ?? '').trim().toUpperCase() !== String(line.jfCode ?? '').trim().toUpperCase()) return true;
+    if (Number(base.quantity) !== Number(line.quantity)) return true;
+    const seen = Date.parse(base.seenAt);
+    if (!Number.isFinite(seen)) return true;
+    const changed = line.statusChangedAt ? Date.parse(line.statusChangedAt) : NaN;
+    return Number.isFinite(changed) && seen < changed;
+}
+
+// What applying a sample line's "mark as sent" would write.
+//   ms    requested.markSent: { sentOn, courier?, tracking? }
+//   opts  { base, today, useSupplierCourier }: `today` is the latest date it is
+//         anywhere (a supplier ahead of UTC is not "in the future"); courier
+//         details staff entered first are kept unless useSupplierCourier.
+function planMarkSent(ms, line, opts, empty) {
+    if (line.status !== SENT_FROM) return { blockers: ['sent_from'], ...empty };
+    const asked = ms && typeof ms === 'object' && !Array.isArray(ms) ? ms : {};
+    const blockers = [];
+
+    const sentOn = normalizeDate(asked.sentOn);
+    if (!sentOn) {
+        blockers.push('bad_date');
+    } else {
+        if (opts.today && sentOn > opts.today) blockers.push('sent_future');
+        if (line.poDate && sentOn < line.poDate) blockers.push('sent_before_order');
+    }
+    const courier = courierText(asked.courier);
+    const tracking = courierText(asked.tracking);
+    if (courier === undefined || tracking === undefined) blockers.push('bad_courier');
+    if (isStale(opts.base, line)) blockers.push('stale');
+    if (blockers.length) return { blockers: [...new Set(blockers)], ...empty };
+
+    const cols = { shipped_date: sentOn };
+    const before = { status: line.status, shippedDate: line.shippedDate };
+    const after = { status: SENT_STATUS, shippedDate: sentOn };
+    for (const [field, col, value] of [['courierName', 'courier_name', courier], ['courierTracking', 'courier_tracking', tracking]]) {
+        if (value === null || value === line[field]) continue;
+        if (line[field] !== null && !opts.useSupplierCourier) continue;
+        cols[col] = value;
+        before[field] = line[field];
+        after[field] = value;
+    }
+    return { blockers: [], cols, before, after, moveToQc: false, moveToSent: true };
 }
 
 /**
@@ -95,15 +182,30 @@ function lineFromRow(row) {
  *     gone, and so is one when this is missing (fails closed).
  *   poOwned: true only when that purchase order is not deleted and the row's
  *     supplier still owns it (worked out by the caller); anything else blocks.
- * Returns { blockers: string[], cols: { column: value }, before, after, moveToQc }.
+ * Returns { blockers: string[], cols: { column: value }, before, after, moveToQc, moveToSent }.
  * `cols` holds only columns whose value actually changes; with blockers it is empty.
+ *
+ * A SAMPLE line (line.orderKind 'sample') takes one request and no other:
+ * markSent, which moves it from PO_SENT to ON_AIR (moveToSent). `opts` is for
+ * that: { base, today, useSupplierCourier }, see planMarkSent.
  */
-function planApply(requested, line, purchaseOrderId, poOwned) {
-    const empty = { cols: {}, before: {}, after: {}, moveToQc: false };
+function planApply(requested, line, purchaseOrderId, poOwned, opts = {}) {
+    const empty = { cols: {}, before: {}, after: {}, moveToQc: false, moveToSent: false };
     if (!line || purchaseOrderId == null || line.purchaseOrderId !== Number(purchaseOrderId)) {
         return { blockers: ['line_missing'], ...empty };
     }
     if (poOwned !== true) return { blockers: ['po_supplier_changed'], ...empty };
+
+    const asksSent = requested.markSent !== undefined && requested.markSent !== null && requested.markSent !== false;
+    if (line.orderKind === SAMPLE_KIND) {
+        const asksStock = requested.markReadyForQc === true
+            || Object.keys(DATE_FIELDS).some(f => Object.prototype.hasOwnProperty.call(requested, f));
+        if (asksStock) return { blockers: ['not_for_sample'], ...empty };
+        if (!asksSent) return { blockers: ['nothing_requested'], ...empty };
+        return planMarkSent(requested.markSent, line, opts, empty);
+    }
+    if (asksSent) return { blockers: ['sample_only'], ...empty };
+
     if (!EDITABLE_STATUSES.has(line.status)) return { blockers: ['line_locked'], ...empty };
 
     const blockers = [];
@@ -144,7 +246,7 @@ function planApply(requested, line, purchaseOrderId, poOwned) {
         before.status = line.status;
         after.status = READY_FOR_QC_STATUS;
     }
-    return { blockers: [], cols, before, after, moveToQc };
+    return { blockers: [], cols, before, after, moveToQc, moveToSent: false };
 }
 
 /**
@@ -154,7 +256,7 @@ function planApply(requested, line, purchaseOrderId, poOwned) {
  * joined with the live line (live_* columns) and po_owned (1 when its purchase
  * order is live and still the supplier's); see the routes' SELECT.
  */
-function requestToJson(row) {
+function requestToJson(row, opts = {}) {
     const base = parseJsonObject(row.base_json);
     const requested = parseJsonObject(row.requested_json);
     const line = row.live_id == null ? null : lineFromRow({
@@ -163,6 +265,14 @@ function requestToJson(row) {
         status: row.live_status,
         estimated_ready_date: row.live_estimated_ready_date,
         actual_ready_date: row.live_actual_ready_date,
+        order_kind: row.live_order_kind,
+        jf_code: row.live_jf_code,
+        quantity: row.live_quantity,
+        shipped_date: row.live_shipped_date,
+        courier_name: row.live_courier_name,
+        courier_tracking: row.live_courier_tracking,
+        sample_status_changed_at_iso: row.live_sample_status_changed_at_iso,
+        po_date: row.live_po_date,
     });
 
     // Pending: old is the line NOW, which is what applying overwrites. Decided
@@ -192,8 +302,20 @@ function requestToJson(row) {
     if (requested.markReadyForQc === true) {
         changes.push(change('status', base.status ?? null, line ? line.status : null, READY_FOR_QC_STATUS));
     }
+    // A sample's "mark as sent": the move, the date, and the courier where given.
+    if (requested.markSent && typeof requested.markSent === 'object') {
+        const ms = requested.markSent;
+        changes.push(change('status', base.status ?? null, line ? line.status : null, SENT_STATUS));
+        changes.push(change('shippedDate', null, line ? line.shippedDate : null, normalizeDate(ms.sentOn) ?? null));
+        const courier = courierText(ms.courier);
+        if (courier) changes.push(change('courierName', null, line ? line.courierName : null, courier));
+        const tracking = courierText(ms.tracking);
+        if (tracking) changes.push(change('courierTracking', null, line ? line.courierTracking : null, tracking));
+    }
 
-    const plan = pending ? planApply(requested, line, row.purchase_order_id, Number(row.po_owned) === 1) : null;
+    const plan = pending
+        ? planApply(requested, line, row.purchase_order_id, Number(row.po_owned) === 1, { base, today: opts.today || null })
+        : null;
 
     return {
         id: Number(row.id),
@@ -207,6 +329,8 @@ function requestToJson(row) {
         jfCode: row.jf_code || null,
         productName: row.product_name || null,
         lineStatus: line ? line.status : null,
+        // 'sample' for a line of a sample order (its one request is "mark as sent").
+        orderKind: line ? line.orderKind : 'stock',
         changes,
         canApply: pending && plan.blockers.length === 0,
         blockers: plan ? plan.blockers.map(code => ({ code, message: BLOCKERS[code] })) : [],
@@ -238,6 +362,8 @@ function positiveInt(raw) {
 module.exports = {
     EDITABLE_STATUSES,
     READY_FOR_QC_STATUS,
+    SENT_STATUS,
+    courierText,
     DATE_FIELDS,
     REQUEST_STATUSES,
     BLOCKERS,

@@ -27,6 +27,7 @@ const { getPool } = require('../db');
 const { recordAuditStrict } = require('../lib/audit');
 const A = require('../lib/artwork-confirmations');
 const { loadDepositGate: defaultLoadGate } = require('../services/deposit-gate');
+const sampleOrders = require('../services/sample-orders');
 
 const sentToOf = (value) => {
     if (Array.isArray(value)) return value;
@@ -165,6 +166,13 @@ async function handler(event) {
     const pool = getPool();
     const conn = await pool.getConnection();
     try {
+        // A sample order has no artwork step and no production stage: nothing
+        // of it is confirmed or moved here (docs/sample-orders.md).
+        const po = await sampleOrders.loadPo(conn, purchaseOrderId);
+        if (po && po.kind === 'sample') {
+            log.info('[artwork-confirmed] sample order; nothing to do', { purchaseOrderId });
+            return { purchaseOrderId, outcome: 'skipped', reason: 'sample_order' };
+        }
         const result = await applyArtworkConfirmations(conn, purchaseOrderId);
         log.info('[artwork-confirmed] done', { purchaseOrderId, ...result });
         return { purchaseOrderId, ...result };

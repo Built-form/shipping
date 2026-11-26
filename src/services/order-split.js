@@ -35,6 +35,12 @@ class SplitError extends Error {
 function makeSplitOrder({ ORDER_INSERT_COLS, ORDER_INSERT_PLACEHOLDERS, orderInsertValues, setDateKey, parseDates }) {
     // order: the raw orders row (SELECT * / ORDER_SELECT shape, snake_case).
     return async function splitOrder(conn, { order, splitQuantity, overrides = {}, status = 'CONSOLIDATED', receiptsByOrderId = null }) {
+        // A sample order is one line for one sample code (the unique key on
+        // orders.sample_lot_key holds that): it is never split, by any caller.
+        if (order.order_kind === 'sample') {
+            throw new SplitError('SAMPLE_NOT_STOCK', `Order ${order.id} is a sample order and cannot be split.`, 409,
+                { orderId: order.id });
+        }
         const qty = Number(splitQuantity);
         const orderQty = Number(order.quantity);
         if (!Number.isFinite(qty) || qty <= 0 || qty >= orderQty) {

@@ -165,3 +165,152 @@ test('note and ids', () => {
     assert.equal(L.positiveInt(-3), null);
     assert.equal(L.positiveInt(null), null);
 });
+
+// ── A sample order: "mark as sent" (docs/sample-orders.md) ───────────────────
+// The one thing a supplier does on a sample order's page. It carries what they
+// were looking at (base: the line's status, product, quantity, and when the
+// page was loaded), so a request about a line that has since changed is stale.
+
+const sampleLine = (over = {}) => line({
+    status: 'PO_SENT', orderKind: 'sample', jfCode: 'JF1016', quantity: 2,
+    shippedDate: null, courierName: null, courierTracking: null,
+    statusChangedAt: '2026-11-25T10:00:00Z', poDate: '2026-11-25', ...over,
+});
+const seen = (over = {}) => ({ status: 'PO_SENT', jfCode: 'JF1016', quantity: 2, seenAt: '2026-11-26T08:00:00Z', ...over });
+const sent = (over = {}) => ({ markSent: { sentOn: '2026-11-26', courier: 'DHL', tracking: '1234567890', ...over } });
+const when = (over = {}) => ({ base: seen(), today: '2026-11-27', ...over });
+
+test('mark as sent: a sample line goes from PO Sent to On Air with the date and the courier', () => {
+    const plan = L.planApply(sent(), sampleLine(), 7, true, when());
+    assert.deepEqual(plan.blockers, []);
+    assert.deepEqual(plan.cols, { shipped_date: '2026-11-26', courier_name: 'DHL', courier_tracking: '1234567890' });
+    assert.equal(plan.moveToSent, true);
+    assert.equal(plan.moveToQc, false);
+    assert.deepEqual(plan.before, { status: 'PO_SENT', shippedDate: null, courierName: null, courierTracking: null });
+    assert.deepEqual(plan.after, { status: 'ON_AIR', shippedDate: '2026-11-26', courierName: 'DHL', courierTracking: '1234567890' });
+});
+
+test('mark as sent: only for a sample, and a sample takes no ready date and no QC move', () => {
+    assert.deepEqual(L.planApply(sent(), line({ status: 'PO_SENT' }), 7, true, when()).blockers, ['sample_only']);
+    assert.deepEqual(L.planApply({ estimatedReadyDate: '2026-12-01' }, sampleLine(), 7, true, when()).blockers, ['not_for_sample']);
+    assert.deepEqual(L.planApply({ markReadyForQc: true }, sampleLine(), 7, true, when()).blockers, ['not_for_sample']);
+    assert.deepEqual(L.planApply({ ...sent(), actualReadyDate: '2026-11-26' }, sampleLine(), 7, true, when()).blockers, ['not_for_sample']);
+});
+
+test('mark as sent: only while the line is waiting to be sent, and never backward', () => {
+    for (const status of ['SCHEDULED', 'ON_AIR', 'ARRIVED_AT_WAREHOUSE', 'RECEIVED', 'DESTROYED']) {
+        const plan = L.planApply(sent(), sampleLine({ status }), 7, true, when({ base: seen({ status }) }));
+        assert.deepEqual(plan.blockers, ['sent_from'], status);
+        assert.deepEqual(plan.cols, {});
+        assert.equal(plan.moveToSent, false);
+    }
+});
+
+test('mark as sent: the date is a real date, not ahead of today and not before the order', () => {
+    assert.deepEqual(L.planApply(sent({ sentOn: '26/11/2026' }), sampleLine(), 7, true, when()).blockers, ['bad_date']);
+    assert.deepEqual(L.planApply({ markSent: {} }, sampleLine(), 7, true, when()).blockers, ['bad_date']);
+    assert.deepEqual(L.planApply(sent({ sentOn: '2026-11-28' }), sampleLine(), 7, true, when()).blockers, ['sent_future']);
+    assert.deepEqual(L.planApply(sent({ sentOn: '2026-11-27' }), sampleLine(), 7, true, when()).blockers, []);
+    assert.deepEqual(L.planApply(sent({ sentOn: '2026-11-24' }), sampleLine(), 7, true, when()).blockers, ['sent_before_order']);
+    assert.deepEqual(L.planApply(sent({ sentOn: '2026-11-25' }), sampleLine(), 7, true, when()).blockers, []);
+});
+
+test('mark as sent: stale when the line is no longer what the supplier was looking at', () => {
+    const stale = (base) => L.planApply(sent(), sampleLine(), 7, true, when({ base })).blockers;
+    assert.deepEqual(stale(seen({ quantity: 3 })), ['stale']);
+    assert.deepEqual(stale(seen({ jfCode: 'JF1017' })), ['stale']);
+    assert.deepEqual(stale(seen({ status: 'SCHEDULED' })), ['stale']);
+    // The page was loaded before the line last changed status (a dispatch and
+    // its correction in between leave status, product and quantity matching).
+    assert.deepEqual(stale(seen({ seenAt: '2026-11-25T09:59:59Z' })), ['stale']);
+    assert.deepEqual(stale(seen({ seenAt: '2026-11-25T10:00:00Z' })), []);
+    // No record of what they saw is not a pass.
+    assert.deepEqual(stale(seen({ seenAt: undefined })), ['stale']);
+    assert.deepEqual(stale({}), ['stale']);
+    assert.deepEqual(L.planApply(sent(), sampleLine(), 7, true, { today: '2026-11-27' }).blockers, ['stale']);
+    // The case of the product code is not a difference.
+    assert.deepEqual(stale(seen({ jfCode: 'jf1016' })), []);
+});
+
+test('mark as sent: courier details staff entered first are kept unless told otherwise', () => {
+    const staffFirst = sampleLine({ courierName: 'FedEx', courierTracking: '99' });
+    const kept = L.planApply(sent(), staffFirst, 7, true, when());
+    assert.deepEqual(kept.blockers, []);
+    assert.deepEqual(kept.cols, { shipped_date: '2026-11-26' });
+    assert.deepEqual(kept.after, { status: 'ON_AIR', shippedDate: '2026-11-26' });
+    const taken = L.planApply(sent(), staffFirst, 7, true, when({ useSupplierCourier: true }));
+    assert.deepEqual(taken.cols, { shipped_date: '2026-11-26', courier_name: 'DHL', courier_tracking: '1234567890' });
+    // One of the two already there: only the empty one is filled.
+    const half = L.planApply(sent(), sampleLine({ courierName: 'FedEx' }), 7, true, when());
+    assert.deepEqual(half.cols, { shipped_date: '2026-11-26', courier_tracking: '1234567890' });
+});
+
+test('mark as sent: courier and tracking are optional, plain text, 64 characters each', () => {
+    const bare = L.planApply({ markSent: { sentOn: '2026-11-26' } }, sampleLine(), 7, true, when());
+    assert.deepEqual(bare.blockers, []);
+    assert.deepEqual(bare.cols, { shipped_date: '2026-11-26' });
+    assert.deepEqual(L.planApply(sent({ courier: '  DHL  ', tracking: ' ' }), sampleLine(), 7, true, when()).cols,
+        { shipped_date: '2026-11-26', courier_name: 'DHL' });
+    assert.deepEqual(L.planApply(sent({ tracking: 'x'.repeat(65) }), sampleLine(), 7, true, when()).blockers, ['bad_courier']);
+    assert.deepEqual(L.planApply(sent({ courier: 12345 }), sampleLine(), 7, true, when()).blockers, ['bad_courier']);
+});
+
+test('mark as sent: ownership and a missing line block it like any other request', () => {
+    assert.deepEqual(L.planApply(sent(), sampleLine(), 7, false, when()).blockers, ['po_supplier_changed']);
+    assert.deepEqual(L.planApply(sent(), null, 7, true, when()).blockers, ['line_missing']);
+});
+
+test('a stock line applies as it always did when the new options are passed', () => {
+    const plan = L.planApply({ estimatedReadyDate: '2026-11-20' }, line(), 7, true, when());
+    assert.deepEqual(plan.blockers, []);
+    assert.deepEqual(plan.cols, { estimated_ready_date: '2026-11-20' });
+    assert.equal(plan.moveToSent, false);
+});
+
+test('lineFromRow reads the sample fields, and a row without them is a stock line', () => {
+    const l = L.lineFromRow({
+        id: 10, purchase_order_id: 7, status: 'PO_SENT', estimated_ready_date: null, actual_ready_date: null,
+        order_kind: 'sample', jf_code: 'JF1016', quantity: '2', shipped_date: null, courier_name: 'DHL', courier_tracking: null,
+        sample_status_changed_at_iso: '2026-11-25T10:00:00Z', po_date: new Date('2026-11-25T00:00:00Z'),
+    });
+    assert.equal(l.orderKind, 'sample');
+    assert.equal(l.quantity, 2);
+    assert.equal(l.jfCode, 'JF1016');
+    assert.equal(l.courierName, 'DHL');
+    assert.equal(l.statusChangedAt, '2026-11-25T10:00:00Z');
+    assert.equal(l.poDate, '2026-11-25');
+    assert.equal(L.lineFromRow({ id: 1, purchase_order_id: 7, status: 'PO_SENT' }).orderKind, 'stock');
+});
+
+test('requestToJson: a mark-as-sent request shows the move and what it would write', () => {
+    const row = {
+        id: 5, status: 'pending', row_version: 1, supplier_id: 3, supplier_name: 'Acme Co., Ltd.',
+        purchase_order_id: 7, po_number: 'PO_00431J', order_id: 10, jf_code: 'JF1016', product_name: 'Thing',
+        base_json: JSON.stringify(seen()), requested_json: JSON.stringify(sent()),
+        submitted_by_email: 'amy@acme.example', submitted_at_iso: '2026-11-26T08:01:00Z',
+        live_id: 10, live_purchase_order_id: 7, live_status: 'PO_SENT',
+        live_estimated_ready_date: null, live_actual_ready_date: null,
+        live_order_kind: 'sample', live_jf_code: 'JF1016', live_quantity: 2, live_shipped_date: null,
+        live_courier_name: null, live_courier_tracking: null,
+        live_sample_status_changed_at_iso: '2026-11-25T10:00:00Z', live_po_date: '2026-11-25',
+        po_owned: 1,
+    };
+    const json = L.requestToJson(row, { today: '2026-11-27' });
+    assert.equal(json.orderKind, 'sample');
+    assert.equal(json.canApply, true);
+    assert.deepEqual(json.changes.map(c => [c.field, c.oldValue, c.newValue]), [
+        ['status', 'PO_SENT', 'ON_AIR'],
+        ['shippedDate', null, '2026-11-26'],
+        ['courierName', null, 'DHL'],
+        ['courierTracking', null, '1234567890'],
+    ]);
+    // The line moved on in ShipLine: it is shown as blocked, with the reason.
+    const moved = L.requestToJson({ ...row, live_status: 'ON_AIR' }, { today: '2026-11-27' });
+    assert.equal(moved.canApply, false);
+    assert.deepEqual(moved.blockers.map(b => b.code), ['sent_from']);
+    assert.equal(typeof moved.blockers[0].message, 'string');
+    // A stock request is unchanged, and says it is one.
+    const stock = L.requestToJson({ ...row, requested_json: '{"estimatedReadyDate":"2026-12-01"}', live_order_kind: 'stock', live_status: 'IN_PRODUCTION' });
+    assert.equal(stock.orderKind, 'stock');
+    assert.equal(stock.canApply, true);
+});

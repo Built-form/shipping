@@ -222,6 +222,11 @@ function makeBookShipment(deps) {
             if (isFqcOrder(order)) {
                 throw new ShipmentError(409, 'FQC_NOT_SHIPPABLE', `Order ${p.orderId} is an FQC sample; it cannot be shipped.`, { orderId: p.orderId });
             }
+            // A sample order travels alone, by courier: never in a shipment
+            // (src/lib/sample-orders.js).
+            if (order.order_kind === 'sample') {
+                throw new ShipmentError(409, 'SAMPLE_NOT_STOCK', `Order ${p.orderId} is a sample order; it cannot be booked into a container.`, { orderId: p.orderId });
+            }
             const partial = p.qty < orderQty;
             if (partial && (received[p.orderId] || 0) > 0) {
                 throw new ShipmentError(409, 'SPLIT_BLOCKED_BY_RECEIPTS',

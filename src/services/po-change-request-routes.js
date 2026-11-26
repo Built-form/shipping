@@ -44,12 +44,19 @@ const L = require('../lib/po-change-requests');
 // no-op skip, but errors propagate).
 const { SUPPLIER_NAME_MATCH } = require('../lib/jportal');
 const { recordAuditStrict } = require('../lib/audit');
+// A sample order's one request, "mark as sent" (docs/sample-orders.md): the
+// move it asks for goes past the same guard as every other write to a sample.
+const sampleOrders = require('./sample-orders');
 
 const LIST_LIMIT = 500;
 const BULK_LIMIT = 500;
 
 const isDeadlock = err => Boolean(err) && (err.code === 'ER_LOCK_DEADLOCK' || err.errno === 1213);
 const isLockTimeout = err => Boolean(err) && (err.code === 'ER_LOCK_WAIT_TIMEOUT' || err.errno === 1205);
+
+// The latest date it is anywhere: tomorrow, UTC. A supplier ahead of UTC who
+// sent a sample "today" has not sent it in the future.
+const latestToday = () => new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
 const CONFLICT = { status: 409, code: 'CONFLICT', error: 'Someone changed these requests at the same moment; reload and try again.' };
 
 function registerPoChangeRequestRoutes(app, deps) {
@@ -65,8 +72,16 @@ function registerPoChangeRequestRoutes(app, deps) {
     // owns it (0 otherwise, so the list shows po_supplier_changed). Read on
     // every call: an invalid JPORTAL_DB_SCHEMA is a 500 on these routes, not a
     // failed import that would take the whole Lambda down.
-    const selectSql = () => {
+    const selectSql = async (conn) => {
         const jp = L.jportalSchema();
+        // What "mark as sent" is judged against. A database from before sample
+        // orders has none of these columns, and no sample.
+        const sample = (await sampleOrders.schemaReady(conn))
+            ? `o.order_kind AS live_order_kind, o.jf_code AS live_jf_code, o.quantity AS live_quantity,
+                       o.shipped_date AS live_shipped_date, o.courier_name AS live_courier_name,
+                       o.courier_tracking AS live_courier_tracking, o.po_date AS live_po_date,
+                       DATE_FORMAT(o.sample_status_changed_at, '%Y-%m-%dT%H:%i:%sZ') AS live_sample_status_changed_at_iso,`
+            : '';
         return `SELECT r.id, r.supplier_id, r.supplier_name, r.purchase_order_id, r.po_number, r.order_id,
                        r.jf_code, r.product_name, r.base_json, r.requested_json, r.status, r.row_version,
                        r.submitted_by_email, r.decided_by, r.decided_note,
@@ -75,6 +90,7 @@ function registerPoChangeRequestRoutes(app, deps) {
                        DATE_FORMAT(r.applied_at, '%Y-%m-%dT%H:%i:%sZ') AS applied_at_iso,
                        o.id AS live_id, o.purchase_order_id AS live_purchase_order_id, o.status AS live_status,
                        o.estimated_ready_date AS live_estimated_ready_date, o.actual_ready_date AS live_actual_ready_date,
+                       ${sample}
                        (po.id IS NOT NULL AND EXISTS (
                            SELECT 1 FROM suppliers s
                             WHERE s.id = r.supplier_id AND s.deleted_at IS NULL
@@ -83,11 +99,12 @@ function registerPoChangeRequestRoutes(app, deps) {
                   LEFT JOIN orders o ON o.id = r.order_id AND o.deleted_at IS NULL
                   LEFT JOIN purchase_orders po ON po.id = r.purchase_order_id AND po.deleted_at IS NULL`;
     };
+    const toJson = row => L.requestToJson(row, { today: latestToday() });
 
     const readByIds = async (conn, ids) => {
         if (!ids.length) return [];
-        const [rows] = await conn.query(`${selectSql()} WHERE r.id IN (${ids.map(() => '?').join(', ')}) ORDER BY r.order_id, r.id`, ids);
-        return rows.map(L.requestToJson);
+        const [rows] = await conn.query(`${await selectSql(conn)} WHERE r.id IN (${ids.map(() => '?').join(', ')}) ORDER BY r.order_id, r.id`, ids);
+        return rows.map(toJson);
     };
 
     /**
@@ -96,13 +113,17 @@ function registerPoChangeRequestRoutes(app, deps) {
      * longer the row's supplier's) are skipped and reported, nothing written for them.
      * Returns { applied: [{ id, orderId }], skipped: [{ id, orderId, blockers }], orders }.
      */
-    const applyLocked = async (conn, rows, { userEmail, note }) => {
+    const applyLocked = async (conn, rows, { userEmail, note, req = null, useSupplierCourier = false }) => {
         const jp = L.jportalSchema();
         const orderIds = [...new Set(rows.map(r => Number(r.order_id)))].sort((a, b) => a - b);
         const liveById = new Map();
         if (orderIds.length) {
+            // The whole row: a sample's move is validated on the complete line.
+            const stamp = (await sampleOrders.schemaReady(conn))
+                ? ", DATE_FORMAT(sample_status_changed_at, '%Y-%m-%dT%H:%i:%sZ') AS sample_status_changed_at_iso"
+                : '';
             const [live] = await conn.query(
-                `SELECT id, purchase_order_id, status, estimated_ready_date, actual_ready_date, dates
+                `SELECT *${stamp}
                    FROM orders WHERE id IN (${orderIds.map(() => '?').join(', ')}) AND deleted_at IS NULL
                   ORDER BY id FOR UPDATE`,
                 orderIds
@@ -137,13 +158,30 @@ function registerPoChangeRequestRoutes(app, deps) {
             const liveRow = liveById.get(orderId) || null;
             const requested = L.parseJsonObject(row.requested_json);
             const poOwned = owned.has(`${Number(row.purchase_order_id)}:${Number(row.supplier_id)}`);
-            const plan = L.planApply(requested, L.lineFromRow(liveRow), row.purchase_order_id, poOwned);
+            const plan = L.planApply(requested, L.lineFromRow(liveRow), row.purchase_order_id, poOwned, {
+                base: L.parseJsonObject(row.base_json), today: latestToday(), useSupplierCourier,
+            });
             if (plan.blockers.length) {
                 skipped.push({
                     id: Number(row.id), orderId,
                     blockers: plan.blockers.map(code => ({ code, message: L.BLOCKERS[code] })),
                 });
                 continue;
+            }
+            // A sample's "mark as sent": the resulting row goes past the sample
+            // guard, as any other write to a sample does. What it refuses is
+            // reported like a blocker; nothing is written for this request.
+            let sampleExtra = { sets: [], values: [] };
+            if (plan.moveToSent) {
+                const { sample_status_changed_at_iso: _iso, ...beforeRow } = liveRow;
+                const guard = await sampleOrders.guardWrite(conn, {
+                    beforeRow, afterRow: { ...beforeRow, ...plan.cols, status: L.SENT_STATUS }, via: 'change-request', req,
+                });
+                if (guard.refusal) {
+                    skipped.push({ id: Number(row.id), orderId, blockers: [{ code: guard.refusal.code, message: guard.refusal.message }] });
+                    continue;
+                }
+                sampleExtra = sampleOrders.sampleSetSql(guard);
             }
 
             const sets = [];
@@ -158,6 +196,11 @@ function registerPoChangeRequestRoutes(app, deps) {
                 const dates = setDateKey(parseDates(liveRow.dates), L.READY_FOR_QC_STATUS);
                 sets.push('status = ?', 'dates = ?');
                 vals.push(L.READY_FOR_QC_STATUS, JSON.stringify(dates));
+            }
+            if (plan.moveToSent) {
+                const dates = setDateKey(parseDates(liveRow.dates), L.SENT_STATUS);
+                sets.push('status = ?', 'dates = ?', ...sampleExtra.sets);
+                vals.push(L.SENT_STATUS, JSON.stringify(dates), ...sampleExtra.values);
             }
 
             if (sets.length) {
@@ -176,6 +219,7 @@ function registerPoChangeRequestRoutes(app, deps) {
                 // Later rows in this batch see this write.
                 for (const [col, value] of Object.entries(plan.cols)) liveRow[col] = value;
                 if (plan.moveToQc) liveRow.status = L.READY_FOR_QC_STATUS;
+                if (plan.moveToSent) liveRow.status = L.SENT_STATUS;
             }
 
             const [done] = await conn.query(
@@ -266,10 +310,10 @@ function registerPoChangeRequestRoutes(app, deps) {
                 : 'r.updated_at DESC, r.id DESC';
             const data = await withConnection(async (conn) => {
                 const [rows] = await conn.query(
-                    `${selectSql()} ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY ${order} LIMIT ${LIST_LIMIT}`,
+                    `${await selectSql(conn)} ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY ${order} LIMIT ${LIST_LIMIT}`,
                     params
                 );
-                return rows.map(L.requestToJson);
+                return rows.map(toJson);
             });
             res.json({ data });
         } catch (error) {
@@ -283,8 +327,8 @@ function registerPoChangeRequestRoutes(app, deps) {
     app.get('/api/v1/po-change-requests/suppliers', async (req, res) => {
         try {
             const rows = await withConnection(async (conn) => {
-                const [r] = await conn.query(`${selectSql()} WHERE r.status = 'pending' ORDER BY r.supplier_name, r.id`);
-                return r.map(L.requestToJson);
+                const [r] = await conn.query(`${await selectSql(conn)} WHERE r.status = 'pending' ORDER BY r.supplier_name, r.id`);
+                return r.map(toJson);
             });
             const bySupplier = new Map();
             for (const r of rows) {
@@ -336,7 +380,11 @@ function registerPoChangeRequestRoutes(app, deps) {
                 if (rowVersion !== null && Number(row.row_version) !== rowVersion) {
                     return { fail: { status: 409, code: 'STALE', error: 'The supplier changed this request since it was loaded; reload and check it again.' } };
                 }
-                const result = await applyLocked(conn, [row], { userEmail: req.userEmail, note: note.value });
+                // useSupplierCourier: for a sample's "mark as sent", take the
+                // supplier's courier and tracking over ones staff entered first.
+                const result = await applyLocked(conn, [row], {
+                    userEmail: req.userEmail, note: note.value, req, useSupplierCourier: b.useSupplierCourier === true,
+                });
                 if (result.skipped.length) {
                     return { fail: {
                         status: 422, code: 'NOT_APPLICABLE', error: 'This change cannot be applied as it stands.',
@@ -467,7 +515,7 @@ function registerPoChangeRequestRoutes(app, deps) {
                     rows = locked.filter(r => Number(r.supplier_id) === supplierId && r.status === 'pending'
                         && wanted.has(Number(r.id)));
                 }
-                const result = await applyLocked(conn, rows, { userEmail: req.userEmail, note: note.value });
+                const result = await applyLocked(conn, rows, { userEmail: req.userEmail, note: note.value, req });
                 // Asked-for ids that were not pending for this supplier.
                 const found = new Set(rows.map(r => Number(r.id)));
                 for (const id of ids) {

@@ -77,6 +77,29 @@ const DEFAULT_EMAIL_TEMPLATES = [
         ].join(''),
     },
     {
+        // A sample order's send (docs/sample-orders.md, "Sending it"): the same
+        // portal-link email as a PO's, with a sample's asks. Nothing here about
+        // a PI to send back or artwork to come, and nothing about the price: a
+        // sample may or may not be charged for, and the PDF says which.
+        key: 'sample_order_portal',
+        name: 'Sample Order (supplier portal)',
+        category: 'PO',
+        description: 'Emailed to a supplier when a sample order PDF is published: no attachment, the PDF is on the supplier portal. A button to the order and registration instructions are appended automatically. Tokens: {poNumber} {version}.',
+        subject: 'Sample order {poNumber} – on the supplier portal / 样品订单',
+        bodyHtml: [
+            '<div style="font-family:Helvetica,Arial,sans-serif;font-size:14px;color:#222;line-height:1.5;">',
+            '<p>Greetings,</p>',
+            '<p>We have published sample order <strong>{poNumber}</strong> (version {version}). It is not attached to this email: please sign in to our supplier portal and download the PDF from the order\'s page. It lists the samples we are asking for.</p>',
+            '<p>Please send the samples by courier, with the order number {poNumber} written on the parcel. Once they have left, open the order in the portal and choose <strong>Mark as sent</strong>, with the courier and tracking number if you have them. If there is an invoice for the samples or the postage, please upload it on the same page.</p>',
+            '<p>您好，</p>',
+            '<p>我们已发布样品订单 <strong>{poNumber}</strong>（第 {version} 版）。本邮件不附带该文件：请登录我们的供应商门户，在该订单页面下载 PDF，其中列出了我们需要的样品。</p>',
+            '<p>请通过快递寄出样品，并在包裹上注明订单号 {poNumber}。寄出后，请在门户中打开该订单并点击<strong>“标记为已寄出”</strong>，如有快递公司和运单号请一并填写。如样品或运费有发票，请在同一页面上传。</p>',
+            '<p>Thank you. / 谢谢。</p>',
+            '<p>Kind Regards,<br>Operations Team.<br>JFA Medical Ltd.</p>',
+            '</div>',
+        ].join(''),
+    },
+    {
         key: 'draft_container_quote',
         name: 'Delivery Quote Request',
         category: 'Logistics',
@@ -273,6 +296,9 @@ const QC_VISIT_TEMPLATE_KEYS = ['qc_visit_factory', 'qc_visit_inspector', 'qc_vi
 
 // The PO send's portal-link email (seeded by 2026-11-03_20_seed_po_portal_template.js).
 const PO_PORTAL_TEMPLATE_KEY = 'purchase_order_portal';
+
+// The same send for a sample order (seeded by 2026-11-25_30_seed_sample_order_portal_template.js).
+const SAMPLE_ORDER_PORTAL_TEMPLATE_KEY = 'sample_order_portal';
 
 // The signed-PI send's email (reworded by 2026-11-12_30_reword_signed_pi_template.js).
 const SIGNED_PI_TEMPLATE_KEY = 'purchase_order_signed_pi';
@@ -723,6 +749,7 @@ module.exports = {
     FREIGHT_CONTAINER_TEMPLATE_KEY, FREIGHT_CONTAINER_TEMPLATE,
     FREIGHT_CLEARANCE_TEMPLATE_KEY, FREIGHT_CLEARANCE_TEMPLATE,
     DEFAULT_EMAIL_TEMPLATES, SUPPLIER_PI_TEMPLATE_KEYS, QC_VISIT_TEMPLATE_KEYS, PO_PORTAL_TEMPLATE_KEY,
+    SAMPLE_ORDER_PORTAL_TEMPLATE_KEY,
     SIGNED_PI_TEMPLATE_KEY,
     FILE_TRANSFER_TEMPLATE_KEY, FILE_TRANSFER_TEMPLATE,
     ARTWORK_CONFIRMATION_TEMPLATE_KEY, ARTWORK_CONFIRMATION_TEMPLATE,

@@ -159,6 +159,19 @@ async function receiveOrderStock(conn, params) {
         }
         orderRow = lockRows[0];
 
+        // A sample order is never booked into Mintsoft: it would land as
+        // sellable stock under the product's SKU, with the sample's code as its
+        // batch. Refused here, in the one path every receive takes (the authed
+        // route and the public carton-scan Lambda alike). What arrived is
+        // recorded by POST /orders/:id/sample-received (docs/sample-orders.md).
+        if (orderRow.order_kind === 'sample') {
+            await conn.rollback();
+            committed = true;
+            throw new ReceiveError('SAMPLE_NOT_STOCK', 409,
+                'This is a sample order: it is not booked into Mintsoft. Mark the sample received instead.',
+                { code: 'SAMPLE_NOT_STOCK', allowedNext: ['RECEIVED'] });
+        }
+
         // Live sums under the same lock — never trust a cached counter.
         // `received` = physically checked-in (Mintsoft); `settled` adds in
         // not_received shortfalls so remaining capacity is bounded by the

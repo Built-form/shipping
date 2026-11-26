@@ -39,6 +39,9 @@ const { recordAudit } = require('../lib/audit');
 const log = require('./../lib/logger');
 const { buildQcVisitAlerts } = require('../lib/qc-alerts');
 const { OPEN_STATUSES, CANDIDATE_ORDER_STATUSES, chinaToday } = require('../lib/qc-visits');
+// Sample orders (docs/sample-orders.md) are left out of every alert here but
+// one: a sample that has arrived and is not marked received is still chased.
+const sampleOrders = require('./sample-orders');
 
 const ALERT_STATUSES = new Set(['pending', 'snoozed', 'dismissed', 'resolved', 'all']);
 const ACTIONS = new Set(['snooze', 'dismiss', 'restore']);
@@ -165,7 +168,7 @@ async function buildContainerEtaAlerts(conn, today) {
         `SELECT id, jf_code, product_name, supplier, status, quantity, eta,
                 container_number, external_container_number, po_number
            FROM orders
-          WHERE deleted_at IS NULL
+          WHERE deleted_at IS NULL${await sampleOrders.stockOnlySql(conn)}
             AND eta IS NOT NULL
             AND eta <= ?
             AND status NOT IN (${placeholders})
@@ -241,7 +244,7 @@ async function buildMissingDataAlerts(conn, today) {
                 lot_number, mfg_date, exp_date, eta, delivery_date,
                 container_number, external_container_number
            FROM orders
-          WHERE deleted_at IS NULL
+          WHERE deleted_at IS NULL${await sampleOrders.stockOnlySql(conn)}
             AND status IN (${ph})
             AND (lot_number IS NULL OR lot_number = '' OR mfg_date IS NULL OR exp_date IS NULL)
             -- Overdue ETAs still nag (no lower bound); cap the lookahead so a
@@ -334,7 +337,7 @@ async function buildShipmentLateAlerts(conn, today) {
                 DATEDIFF(c.eta, c.eta_initial) AS slip
            FROM orders o
            LEFT JOIN containers c ON c.container_number = TRIM(o.external_container_number)
-          WHERE o.deleted_at IS NULL
+          WHERE o.deleted_at IS NULL${await sampleOrders.stockOnlySql(conn, 'o')}
             AND o.status IN (${ph})
             AND (
                   (o.delivery_date IS NOT NULL AND o.delivery_date < ?)
@@ -413,7 +416,7 @@ async function loadQcVisitAlertInputs(conn) {
         `SELECT id, jf_code, product_name, po_number, purchase_order_id, supplier, status,
                 quantity, deleted_at
            FROM orders
-          WHERE (deleted_at IS NULL AND status IN (${candPh}))${onLines}`,
+          WHERE (deleted_at IS NULL AND status IN (${candPh})${await sampleOrders.stockOnlySql(conn)})${onLines}`,
         params
     );
     return { visits, lines, orders };

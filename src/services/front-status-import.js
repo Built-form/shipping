@@ -40,6 +40,10 @@ const { extractStatusFromEmail, INFERRABLE_MILESTONES } = require('./supplier-em
 const { refineMatchedOrders } = require('./suggestion-refine');
 const { upsertSuggestionAlert, londonToday } = require('./daily-alerts');
 const T = require('../lib/order-transitions');
+// A sample order is never matched to a supplier email and never gets a status
+// suggestion: its path and its gates are not the production ones these rules
+// mirror (docs/sample-orders.md).
+const sampleOrders = require('./sample-orders');
 
 const DEFAULT_SINCE_DAYS = 3;        // first-ever run (no watermark yet)
 const DEFAULT_CONF_MIN = 0.6;
@@ -202,7 +206,7 @@ async function loadOrderForSuggestion(conn, orderId) {
     const placeholders = TERMINAL_STATUSES.map(() => '?').join(', ');
     const [rows] = await conn.query(
         `${ORDER_MATCH_SELECT}
-          WHERE o.id = ? AND o.deleted_at IS NULL
+          WHERE o.id = ? AND o.deleted_at IS NULL${await sampleOrders.stockOnlySql(conn, 'o')}
             AND o.status NOT IN (${placeholders})`,
         [orderId, ...TERMINAL_STATUSES]
     );
@@ -217,7 +221,7 @@ async function matchOrdersByPo(conn, poRaw) {
     const placeholders = TERMINAL_STATUSES.map(() => '?').join(', ');
     const [rows] = await conn.query(
         `${ORDER_MATCH_SELECT}
-          WHERE o.deleted_at IS NULL
+          WHERE o.deleted_at IS NULL${await sampleOrders.stockOnlySql(conn, 'o')}
             AND o.po_number IS NOT NULL AND o.po_number <> ''
             AND o.status NOT IN (${placeholders})
             AND (o.po_number = ? OR UPPER(REGEXP_REPLACE(o.po_number, '[^A-Za-z0-9]', '')) = ?)
@@ -236,7 +240,7 @@ async function matchOrdersByContainer(conn, raw) {
     const placeholders = TERMINAL_STATUSES.map(() => '?').join(', ');
     const [rows] = await conn.query(
         `${ORDER_MATCH_SELECT}
-          WHERE o.deleted_at IS NULL
+          WHERE o.deleted_at IS NULL${await sampleOrders.stockOnlySql(conn, 'o')}
             AND o.status NOT IN (${placeholders})
             AND ( (o.container_number IS NOT NULL AND o.container_number <> ''
                    AND UPPER(REGEXP_REPLACE(o.container_number, '[^A-Za-z0-9]', '')) = ?)
@@ -260,7 +264,7 @@ async function matchOrdersByJfCode(conn, raw) {
     const placeholders = TERMINAL_STATUSES.map(() => '?').join(', ');
     const [rows] = await conn.query(
         `${ORDER_MATCH_SELECT}
-          WHERE o.deleted_at IS NULL
+          WHERE o.deleted_at IS NULL${await sampleOrders.stockOnlySql(conn, 'o')}
             AND o.jf_code IS NOT NULL AND o.jf_code <> ''
             AND o.status NOT IN (${placeholders})
             AND UPPER(REGEXP_REPLACE(o.jf_code, '[^A-Za-z0-9]', '')) = ?

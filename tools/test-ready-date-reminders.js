@@ -12,6 +12,11 @@ const assert = require('node:assert/strict');
 
 const R = require('../src/lib/ready-date-reminders');
 const { runReadyDateReminders } = require('../src/services/ready-date-reminders');
+const sampleOrders = require('../src/services/sample-orders');
+
+// The sweep asks once a minute whether this database has the sample-order
+// columns; each test answers for itself.
+test.beforeEach(() => sampleOrders.resetCaches());
 
 const quiet = { info() {}, warn() {}, error() {} };
 const ENV = { SUPPLIER_PORTAL_URL: 'https://portal.example.com/' };
@@ -38,6 +43,8 @@ function fakePool(data = {}) {
         async query(sql, params = []) {
             const text = String(sql).replace(/\s+/g, ' ').trim();
             queries.push({ sql: text, params });
+            // Does this database know about sample orders? 7 columns = yes (the default).
+            if (/information_schema\.COLUMNS/.test(text)) return [[{ n: data.sampleColumns ?? 7 }]];
             if (/^SELECT o\.id, o\.purchase_order_id/.test(text)) return [data.lines || []];
             if (/po_change_requests/.test(text)) return [data.pending || []];
             if (/FROM email_templates/.test(text)) return [[]];
@@ -152,6 +159,18 @@ test('sweep: nothing at a weekend, and nothing without the portal address', asyn
     const noUrl = await runner(pool, { env: {} }).run();
     assert.equal(noUrl.aborted, 'no_portal_url');
     assert.equal(pool.queries.length, 0);
+});
+
+test('sweep: a sample order is never chased for a ready date', async () => {
+    const waiting = pool => wrote(pool, /^SELECT o\.id, o\.purchase_order_id/)[0].sql;
+    const withSamples = fakePool({ lines: [] });
+    await runner(withSamples).run();
+    assert.match(waiting(withSamples), / AND o\.order_kind = 'stock' ORDER BY /);
+    // A database that has no sample columns holds no sample: nothing is added.
+    sampleOrders.resetCaches();
+    const before = fakePool({ lines: [], sampleColumns: 0 });
+    await runner(before).run();
+    assert.doesNotMatch(waiting(before), /order_kind/);
 });
 
 test('sweep: one email per supplier covers all of their POs, and is logged as a new Email Receipts row', async () => {

@@ -19,6 +19,7 @@ require('dotenv').config();
 const log = require('../lib/logger');
 const { getPool } = require('../db');
 const { recordAudit } = require('../lib/audit');
+const sampleOrders = require('../services/sample-orders');
 
 // The statuses before production (order-transitions levels 0 and 1).
 const BEFORE_PRODUCTION = ['SCHEDULED', 'PO_SENT'];
@@ -43,6 +44,15 @@ async function handler(event) {
             return { outcome: 'skipped', purchaseOrderId, reason: 'no_receipt' };
         }
         const userEmail = receipts[0].confirmed_by_email || null;
+
+        // A sample order has no production stage to move into: the supplier's
+        // "payment received" tick is recorded (it is, above) and its lines stay
+        // where they are until the sample is sent (docs/sample-orders.md).
+        const po = await sampleOrders.loadPo(conn, purchaseOrderId);
+        if (po && po.kind === 'sample') {
+            log.info('[deposit-received] sample order; lines stay where they are', { purchaseOrderId });
+            return { outcome: 'skipped', purchaseOrderId, reason: 'sample_order' };
+        }
 
         await conn.beginTransaction();
         const ph = BEFORE_PRODUCTION.map(() => '?').join(', ');

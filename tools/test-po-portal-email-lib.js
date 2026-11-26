@@ -246,3 +246,60 @@ test('loadSignedPiViews: grouped by signed PI, first viewer first, empty when th
     assert.equal((await loadSignedPiViews(fakeConn({ missing: true }), [12])).size, 0);
     assert.equal((await loadSignedPiViews(fakeConn(), [])).size, 0);
 });
+
+// A sample order goes out by the same send as any PO (docs/sample-orders.md,
+// "Sending it"), with its own words: the supplier is not asked for a PI and told
+// artwork is coming; they are asked to post the samples and mark them sent.
+test('sendTemplateKey: a sample order has its own template, everything else the PO one', () => {
+    assert.equal(P.sendTemplateKey('sample'), 'sample_order_portal');
+    for (const kind of ['stock', undefined, null, '', 'SAMPLE', 'samples']) {
+        assert.equal(P.sendTemplateKey(kind), 'purchase_order_portal', String(kind));
+    }
+});
+
+test('portalBlockHtml: a sample order is named as one and asks for "sent"; a PO block is unchanged', () => {
+    const base = { poNumber: 'PO<1>', version: 3, poUrl: 'https://p.example/orders/1?tab=pdfs', registerUrl: 'https://p.example/register' };
+    const sample = P.portalBlockHtml({ ...base, kind: 'sample', preapproved: true });
+    assert.match(sample, /<strong>Sample order PO&lt;1&gt; v3<\/strong> is on the supplier portal\./);
+    assert.match(sample, /mark the samples as sent there once they have left/);
+    assert.match(sample, /样品订单 <strong>PO&lt;1&gt;<\/strong>（第 3 版）已发布在供应商门户/);
+    assert.match(sample, /标记为已寄出/);
+    assert.match(sample, /the sample order is kept on the portal/);
+    assert.doesNotMatch(sample, /采购订单|the PO is kept/);
+    assert.match(sample, /href="https:\/\/p\.example\/orders\/1\?tab=pdfs"/);
+    assert.match(sample, /already approved/);
+    assert.match(P.portalBlockHtml({ ...base, kind: 'sample', preapproved: false }), /our team will approve/);
+    // No version: none is printed, in either language.
+    const bare = P.portalBlockHtml({ ...base, version: null, kind: 'sample', preapproved: true });
+    assert.match(bare, /<strong>Sample order PO&lt;1&gt;<\/strong> is on/);
+    assert.doesNotMatch(bare, /第/);
+    // A stock PO's block, with the kind said or not, is the one it always was.
+    const stock = P.portalBlockHtml({ ...base, preapproved: true });
+    assert.equal(P.portalBlockHtml({ ...base, kind: 'stock', preapproved: true }), stock);
+    assert.match(stock, /<strong>PO PO&lt;1&gt; v3<\/strong> is on the supplier portal\. Sign in, and download the PDF/);
+    assert.doesNotMatch(stock, /Sample order|样品|mark the samples|已寄出/);
+});
+
+test('the sample order template: in the PO category, both tokens, the portal\'s own words, no PO asks', () => {
+    const D = require('../src/lib/email-template-defaults');
+    assert.equal(D.SAMPLE_ORDER_PORTAL_TEMPLATE_KEY, 'sample_order_portal');
+    assert.equal(P.sendTemplateKey('sample'), D.SAMPLE_ORDER_PORTAL_TEMPLATE_KEY);
+    assert.equal(P.sendTemplateKey('stock'), D.PO_PORTAL_TEMPLATE_KEY);
+    const found = D.DEFAULT_EMAIL_TEMPLATES.filter(t => t.key === 'sample_order_portal');
+    assert.equal(found.length, 1);
+    const t = found[0];
+    assert.equal(t.category, 'PO');
+    assert.equal(t.name, 'Sample Order (supplier portal)');
+    assert.equal(t.subject, 'Sample order {poNumber} – on the supplier portal / 样品订单');
+    assert.match(t.description, /\{poNumber\} \{version\}/);
+    assert.match(t.bodyHtml, /sample order <strong>\{poNumber\}<\/strong> \(version \{version\}\)/);
+    // The button's name on the portal, in both languages (jportal web/src/i18n).
+    assert.match(t.bodyHtml, /<strong>Mark as sent<\/strong>/);
+    assert.match(t.bodyHtml, /标记为已寄出/);
+    // Nothing a production PO asks for, and nothing about the price.
+    assert.doesNotMatch(t.bodyHtml, /artwork|图稿|send back a PI|回传形式发票/i);
+    assert.doesNotMatch(t.subject + t.bodyHtml + t.description, /free|免费/i);
+    // The PO template is as it was.
+    const po = D.DEFAULT_EMAIL_TEMPLATES.find(x => x.key === 'purchase_order_portal');
+    assert.match(po.bodyHtml, /send back a PI/);
+});
