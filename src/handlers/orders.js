@@ -90,6 +90,7 @@ const { registerTelexReleaseRoutes } = require('../services/telex-release-routes
 // A forwarder's container page on the portal (docs/forwarder-containers.md).
 const { registerForwarderContainerRoutes } = require('../services/forwarder-container-routes');
 const { registerForwarderUploadRoutes } = require('../services/forwarder-upload-routes');
+const { registerCustomsEntryRoutes } = require('../services/customs-entry-routes');
 const { registerUiHintRoutes } = require('../services/ui-hint-routes');
 const extrasLib = require('../lib/payment-extras');
 const { correctBalance } = require('../lib/balance-correction');
@@ -13187,6 +13188,22 @@ registerForwarderContainerRoutes(app, {
 // lading): viewing one, accepting it (it is filed with the container: an invoice in
 // the invoice store and read as any other, a photo with the container's photos, a
 // bill of lading in shipment_forwarder_documents) or sending it back.
+// An AI report on each customs document of a container (a forwarder's draft
+// entry, the entry itself, a file our team add): does it match what we have on
+// file (docs/customs-entry-check.md).
+const customsEntryRoutes = registerCustomsEntryRoutes(app, {
+    pool,
+    withConnection,
+    ready: async () => {
+        await shipmentsSchemaReady;
+        await auditLogSchemaReady;
+    },
+    s3,
+    poBucket: PO_BUCKET,
+    recordAudit,
+    log,
+});
+
 registerForwarderUploadRoutes(app, {
     withConnection,
     ready: async () => {
@@ -13199,6 +13216,7 @@ registerForwarderUploadRoutes(app, {
     publicS3Url,
     recordAudit,
     startExtraction: startShipmentPaymentExtraction,
+    startCustomsCheck: customsEntryRoutes.startForUpload,
     documentJson: shipmentPaymentDocumentRowToJson,
     log,
 });

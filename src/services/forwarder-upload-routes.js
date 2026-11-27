@@ -264,6 +264,8 @@ function registerForwarderUploadRoutes(app, deps) {
         ready = async () => {},
         // The usual background read of a filed invoice, after the response.
         startExtraction = () => {},
+        // The AI report on an accepted customs draft or entry (customs-entry-routes.js), after the response.
+        startCustomsCheck = () => {},
         // A shipment payment document as the invoice routes answer it.
         documentJson: invoiceJson = d => ({ id: d.id, filename: d.filename }),
         getSignedUrl = defaultGetSignedUrl,
@@ -568,8 +570,9 @@ function registerForwarderUploadRoutes(app, deps) {
             return { filed: (await filedOf(conn, { ...now, filed_id: out.filed.id })) || out.filed, upload: uploadJson(now) };
         });
         res.json({ ...reply, replayed: false });
-        // 4. An invoice's usual read, after the response.
+        // 4. An invoice's usual read, after the response; a customs document's check against what we hold.
         if (out.filed.as === 'invoice') startExtraction(req, out.filed.id);
+        else if (row.kind === 'customs_draft' || row.kind === 'customs_entry') startCustomsCheck(req, { shipmentId: Number(row.shipment_id), uploadId: id });
     }));
 
     // ── POST /api/v1/forwarder-uploads/:id/reject ───────────────────────────
