@@ -17,12 +17,12 @@ There is no switch to arm. A local order is stock to every reader that does not 
 `validateLocalWrite(before, after, { po })`, run by `guardWrite` on every write:
 
 - It belongs to a local PO and never moves to another. A stock line cannot be put on a local PO (409 `LOCAL_PO_REQUIRED`).
-- Made at `SCHEDULED` or `PO_SENT`. After that it holds only `SCHEDULED`, `PO_SENT`, `ARRIVED_AT_WAREHOUSE`, `PARTIALLY_RECEIVED` or `RECEIVED`. Any other status is 409 `LOCAL_NOT_SHIPPED`, with `allowedNext`.
+- Made at `SCHEDULED` or `PO_SENT`. After that it holds only `SCHEDULED`, `PO_SENT`, `ON_AIR`, `ARRIVED_AT_WAREHOUSE`, `PARTIALLY_RECEIVED` or `RECEIVED`. Any other status is 409 `LOCAL_NOT_SHIPPED`, with `allowedNext`.
 - No `container_number`, `external_container_number`, `awb_number` or `shipment_id` (409 `LOCAL_NOT_SHIPPED`, with `field`).
 - No sample's code as its lot, as for any stock line (409 `SAMPLE_LOT_ON_STOCK`).
 - No port is asked for, and no lot, MFG or expiry date before booking in.
 
-The path is PO Sent, Arrived at Warehouse (when the supplier delivers; staff move it), then Received (by booking into Mintsoft). ShipLine also lets staff move it back from Arrived to PO Sent, if it was marked delivered by mistake. No admin can move a local line to any other stage. The server enforces the set of stages, not the order of the moves, as for stock.
+The path is PO Sent, then On Air/Road if staff want to show it is on its way (optional; the user, 2026-11-27: "allow local orders to go to on road column"), then Arrived at Warehouse (when the supplier delivers), then Received (by booking into Mintsoft). On Air/Road is `ON_AIR`, the same column air freight uses: for a local line it holds no AWB and no container, and ShipLine opens no Pack dialog for it and merges nothing when it comes back off it. ShipLine also lets staff move it one step back (Arrived to On Air/Road or PO Sent, On Air/Road to PO Sent), if it was moved by mistake. No admin can move a local line to any other stage. The server enforces the set of stages, not the order of the moves, as for stock.
 
 ## Booking in
 
@@ -33,8 +33,8 @@ The path is PO Sent, Arrived at Warehouse (when the supplier delivers; staff mov
 | Reader | Policy |
 |---|---|
 | `GET /orders`, `GET /purchase-orders` | included, with `orderKind` / `kind` `'local'` |
-| `stock-snapshots/sum`, `/sum/all-asins` (Cashboard) | included (`sampleOrders.notSampleSql`) |
-| Payments page, JFlow | included as any PO; goods in no container, so the balance falls due once they land, on the supplier's terms |
+| `stock-snapshots/sum`, `/sum/all-asins` (Cashboard) | included (`sampleOrders.notSampleSql`); a local line on the road counts in the on-air figures, as any `ON_AIR` line does |
+| Payments page, JFlow | included as any PO; goods in no container, so a line on the road or landed counts as departed and the balance falls due on the supplier's terms |
 | Ready-date reminders, AI status suggestions from email, old ready-date page | excluded (`stockOnlySql`, `= 'stock'`): they ask a supplier about production |
 | Daily alerts | as stock; a local line never reaches the transit or QC alerts' stages |
 | Make webhook on `PO_SENT` | not fired |

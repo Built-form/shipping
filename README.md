@@ -146,7 +146,7 @@ A purchase order has a kind: stock, or sample. A sample order buys a few units o
 
 ### Local orders
 
-A third kind, `local`: stock a supplier delivers to the warehouse themselves. Booked into Mintsoft (lot and expiry optional), counted in Cashboard and paid like any PO, but with no port, no production or QC stage, no container, and no portal send. Its path is PO Sent, Arrived at Warehouse, Received. Migration `2026-11-27_30` widens the kind checks; nothing to arm. Rules and readers: [`docs/local-orders.md`](docs/local-orders.md).
+A third kind, `local`: stock a supplier delivers to the warehouse themselves. Booked into Mintsoft (lot and expiry optional), counted in Cashboard and paid like any PO, but with no port, no production or QC stage, no container, and no portal send. Its path is PO Sent, On Air/Road (optional, no AWB or container), Arrived at Warehouse, Received. Migration `2026-11-27_30` widens the kind checks; nothing to arm. Rules and readers: [`docs/local-orders.md`](docs/local-orders.md).
 
 ### Freight quotes from forwarders
 

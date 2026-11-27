@@ -16,9 +16,11 @@
 
 const KIND_LOCAL = 'local';
 
-// Every status a local line may hold. PARTIALLY_RECEIVED is written by the
-// Mintsoft receive and the shortfall record, never chosen.
-const LOCAL_STATUSES = ['SCHEDULED', 'PO_SENT', 'ARRIVED_AT_WAREHOUSE', 'PARTIALLY_RECEIVED', 'RECEIVED'];
+// Every status a local line may hold. ON_AIR is ShipLine's On Air/Road column:
+// for a local line, the supplier's van on its way (the user, 2026-11-27), in no
+// container and with no AWB; the step is optional. PARTIALLY_RECEIVED is
+// written by the Mintsoft receive and the shortfall record, never chosen.
+const LOCAL_STATUSES = ['SCHEDULED', 'PO_SENT', 'ON_AIR', 'ARRIVED_AT_WAREHOUSE', 'PARTIALLY_RECEIVED', 'RECEIVED'];
 const CREATE_STATUSES = ['SCHEDULED', 'PO_SENT'];
 
 // What a shipment writes onto a line. A local line holds none of them.
@@ -26,7 +28,8 @@ const SHIPPING_FIELDS = ['container_number', 'external_container_number', 'awb_n
 
 const NEXT = {
     SCHEDULED: ['PO_SENT'],
-    PO_SENT: ['ARRIVED_AT_WAREHOUSE'],
+    PO_SENT: ['ON_AIR', 'ARRIVED_AT_WAREHOUSE'],
+    ON_AIR: ['ARRIVED_AT_WAREHOUSE'],
     // Received is reached by booking the stock into Mintsoft.
     ARRIVED_AT_WAREHOUSE: ['RECEIVED'],
     PARTIALLY_RECEIVED: ['RECEIVED'],
@@ -67,7 +70,7 @@ function validateLocalWrite(before, after, { po } = {}) {
     const allowed = before ? LOCAL_STATUSES : CREATE_STATUSES;
     if (!allowed.includes(after.status)) {
         return refuse('LOCAL_NOT_SHIPPED',
-            `A local order is delivered to the warehouse by the supplier: it goes PO Sent, Arrived at Warehouse, Received, and never ${after.status}.`,
+            `A local order is delivered to the warehouse by the supplier: it goes PO Sent, On Air/Road (optional), Arrived at Warehouse, Received, and never ${after.status}.`,
             { allowedNext: allowedNext(before ? before.status : null) });
     }
     for (const field of SHIPPING_FIELDS) {

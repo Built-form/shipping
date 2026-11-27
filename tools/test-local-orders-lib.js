@@ -51,16 +51,17 @@ test('an existing local line writes nothing extra', () => {
     assert.deepEqual(out.set, {});
 });
 
-test('a local line is made, sent, delivered and booked in: those stages and no other', () => {
-    for (const status of ['SCHEDULED', 'PO_SENT', 'ARRIVED_AT_WAREHOUSE', 'PARTIALLY_RECEIVED', 'RECEIVED']) {
+test('a local line is made, sent, on the road, delivered and booked in: those stages and no other', () => {
+    // On Air/Road: the supplier's van (the user, 2026-11-27), in no container and with no AWB.
+    for (const status of ['SCHEDULED', 'PO_SENT', 'ON_AIR', 'ARRIVED_AT_WAREHOUSE', 'PARTIALLY_RECEIVED', 'RECEIVED']) {
         assert.equal(L.validateLocalWrite(localRow(), localRow({ status }), { po: localPo }).ok, true, status);
     }
-    for (const status of ['IN_PRODUCTION', 'READY_FOR_QC', 'READY', 'CONSOLIDATED', 'ON_SEA', 'ON_AIR', 'IN_WAREHOUSE', 'DESTROYED', 'REPACKAGED']) {
+    for (const status of ['IN_PRODUCTION', 'READY_FOR_QC', 'READY', 'CONSOLIDATED', 'ON_SEA', 'IN_WAREHOUSE', 'DESTROYED', 'REPACKAGED']) {
         const out = L.validateLocalWrite(localRow(), localRow({ status }), { po: localPo });
         assert.equal(out.ok, false, status);
         assert.equal(out.code, 'LOCAL_NOT_SHIPPED');
         assert.equal(out.http, 409);
-        assert.deepEqual(out.allowedNext, ['ARRIVED_AT_WAREHOUSE']);
+        assert.deepEqual(out.allowedNext, ['ON_AIR', 'ARRIVED_AT_WAREHOUSE']);
     }
     const born = L.validateLocalWrite(null, newLine({ status: 'IN_PRODUCTION' }), { po: localPo });
     assert.equal(born.code, 'LOCAL_NOT_SHIPPED');
@@ -69,7 +70,7 @@ test('a local line is made, sent, delivered and booked in: those stages and no o
     for (const status of ['SCHEDULED', 'PO_SENT']) {
         assert.equal(L.validateLocalWrite(null, newLine({ status }), { po: localPo }).ok, true, status);
     }
-    for (const status of ['ARRIVED_AT_WAREHOUSE', 'RECEIVED', 'PARTIALLY_RECEIVED']) {
+    for (const status of ['ON_AIR', 'ARRIVED_AT_WAREHOUSE', 'RECEIVED', 'PARTIALLY_RECEIVED']) {
         assert.equal(L.validateLocalWrite(null, newLine({ status }), { po: localPo }).code, 'LOCAL_NOT_SHIPPED', status);
     }
 });
@@ -98,7 +99,9 @@ test('a local line stays on its own local PO', () => {
 test('the next stage a local line can take', () => {
     assert.deepEqual(L.allowedNext(null), ['SCHEDULED', 'PO_SENT']);
     assert.deepEqual(L.allowedNext('SCHEDULED'), ['PO_SENT']);
-    assert.deepEqual(L.allowedNext('PO_SENT'), ['ARRIVED_AT_WAREHOUSE']);
+    // The road step is optional.
+    assert.deepEqual(L.allowedNext('PO_SENT'), ['ON_AIR', 'ARRIVED_AT_WAREHOUSE']);
+    assert.deepEqual(L.allowedNext('ON_AIR'), ['ARRIVED_AT_WAREHOUSE']);
     // Received is reached by booking the stock into Mintsoft.
     assert.deepEqual(L.allowedNext('ARRIVED_AT_WAREHOUSE'), ['RECEIVED']);
     assert.deepEqual(L.allowedNext('RECEIVED'), []);

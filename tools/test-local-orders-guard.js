@@ -95,7 +95,12 @@ test('a local line is edited and moved with nothing extra to write', async () =>
 test('a local line refuses a shipping stage or a container, by any write', async () => {
     const stage = await G.guardWrite(conn(world()), { beforeRow: localRow(), afterRow: localRow({ status: 'ON_SEA' }), via: 'status', req: standard });
     assert.equal(stage.refusal.code, 'LOCAL_NOT_SHIPPED');
-    assert.deepEqual(stage.refusal.allowedNext, ['ARRIVED_AT_WAREHOUSE']);
+    assert.deepEqual(stage.refusal.allowedNext, ['ON_AIR', 'ARRIVED_AT_WAREHOUSE']);
+    // On the road is allowed, with no AWB; with one it is refused.
+    const road = await G.guardWrite(conn(world()), { beforeRow: localRow(), afterRow: localRow({ status: 'ON_AIR' }), via: 'status', req: standard });
+    assert.equal(road.refusal, undefined);
+    const awb = await G.guardWrite(conn(world()), { beforeRow: localRow({ status: 'ON_AIR' }), afterRow: localRow({ status: 'ON_AIR', awb_number: '176-12345675' }), via: 'update', req: standard });
+    assert.equal(awb.refusal.code, 'LOCAL_NOT_SHIPPED');
     const box = await G.guardWrite(conn(world()), { beforeRow: localRow(), afterRow: localRow({ container_number: 'JF-0042' }), via: 'update', req: standard });
     assert.equal(box.refusal.code, 'LOCAL_NOT_SHIPPED');
 });
