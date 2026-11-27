@@ -1,6 +1,6 @@
 # Clearance instructions
 
-The sheet our team send to the forwarder that handles a container's customs: one row per product type of a supplier, with the commercial invoice, the goods, their origin, cartons, weights, volume, commodity code, duty and value, and the container's freight cost shared between the rows by volume. Until 2026-11-24 it was typed by hand into a spreadsheet and emailed. It is now filled from what we hold, corrected in ShipLine, written here, emailed with the file attached and listed on the container's page on the supplier portal.
+The sheet our team send to the forwarder that handles a container's customs: one row per product type of a supplier, with the commercial invoice, the goods, their origin, cartons, weights, volume, commodity code, duty and value, and the container's freight cost shared between the rows by volume. Until 2026-11-24 it was typed by hand into a spreadsheet and emailed. It is now filled from what we hold, corrected in ShipLine, written here, and listed on the container's page on the supplier portal; the email to the forwarder carries a link to that page, **never the file** (the user, 2026-11-27: "Don't send clearance document via email attachment, just a link to the portal").
 
 Built on the forwarder container page (`docs/forwarder-containers.md`): the customs holder is that page's `customs` duty, and the email is its "Email forwarder" with the sheet on it.
 
@@ -42,7 +42,7 @@ The hand-made sheet, laid out to the character (`tools/test-clearance-instructio
 |---|---|
 | `GET /api/v1/shipments/:id/clearance-instructions` | `{ shipmentId, title, filename, canSend, customs: { forwarderId, name } \| null, dutyRates: { code: percent }, sent: [{ id, version, forwarderId, forwarderName, title, filename, containerCostUsd, totalCbm, rows, csv, status, sentAt, sentByEmail, sentTo }] }`, newest first. Any staff user |
 | `POST /api/v1/shipments/:id/clearance-instructions/preview` | `{ containerCostUsd, rows }` → `{ title, filename, csv, problems }`: the file as it would be sent, blanks and all. Writes nothing. Any staff user |
-| `POST /api/v1/shipments/:id/forwarder-notice` with `clearance: { containerCostUsd, rows }` | sends it: the same email, key and row as "Email forwarder" (`docs/forwarder-containers.md`), to whoever holds the `customs` duty (or `forwarderId`, which must hold it), with the file attached, on the `freight_clearance_instructions` template. → `{ ok, outcome, noticeId, clearanceId, version }`. Admin and standard |
+| `POST /api/v1/shipments/:id/forwarder-notice` with `clearance: { containerCostUsd, rows }` | sends it: the same email, key and row as "Email forwarder" (`docs/forwarder-containers.md`), to whoever holds the `customs` duty (or `forwarderId`, which must hold it), with the container page's link and the file's name, never the file itself (since 2026-11-27), on the `freight_clearance_instructions` template. → `{ ok, outcome, noticeId, clearanceId, version }`. Admin and standard |
 
 Refusals of the send, beside the notice's own: `422 CLEARANCE_INCOMPLETE` (`problems: [{ row, field, message }]`, `allowedNext: ['fill']`; checked before anything is read) · `409 NO_CUSTOMS_HOLDER` (`allowedNext: ['pick']`) · `409 NOT_THEIR_DUTY` (`kind: 'clearance'`).
 
@@ -56,11 +56,13 @@ A row: `{ supplier, invoiceNumber, company: 'JFA' | 'HW', description, origin, c
 
 ## The portal
 
-`portal_forwarder_clearance_v` (definer view, `2026-11-24_21`): the sheets whose email is marked **sent**: `id, shipment_id, forwarder_id, version, filename, csv, sent_at`. Granted to the portal's login by `2026-11-24_22` (SELECT on the view only; approved by the user 2026-11-24). The portal lists a container's sheets on its page. Until 2026-11-26 it gave a file only to a contact of the company it was sent to; since then to a contact of **any** forwarder attached to the container (freight, delivery or customs), with the container's other papers (`docs/forwarder-containers.md`, "A container's documents"). Never to a payment-only forwarder.
+`portal_forwarder_clearance_v` (definer view, `2026-11-24_21`): the sheets whose email is marked **sent**: `id, shipment_id, forwarder_id, version, filename, csv, sent_at`. Granted to the portal's login by `2026-11-24_22` (SELECT on the view only; approved by the user 2026-11-24). The portal lists a container's sheets on its page, and that is the only place the forwarder gets the file: the email links to it. A send whose answer from SES never came stays `sending` and is **not** on the portal, though the email may have gone (before 2026-11-27 the attachment covered that). Until 2026-11-26 it gave a file only to a contact of the company it was sent to; since then to a contact of **any** forwarder attached to the container (freight, delivery or customs), with the container's other papers (`docs/forwarder-containers.md`, "A container's documents"). Never to a payment-only forwarder.
 
 ## Rollout
 
 shipping first (migrations `2026-11-24_20` tables, `_21` view, `_22` grant, `_23` email template, then deploy), then the portal, then ShipLine. Each side stands without the next: a ShipLine without the routes offers nothing (`getClearanceInstructions` answers null on a missing route or `NOT_MIGRATED`); a portal without the view lists nothing and logs it. Until `_23` has run, the send dialog opens on another Freight template: run the migration before the first send.
+
+Link only (2026-11-27): migration `2026-11-27_50_clearance_link_only` rewords the stored template, which said "Please find attached", only where it still holds the seeded words; an edited one is named in the log and left for a person to check. Run it with the deploy that stops attaching, or the email says "attached" with nothing attached. Order: shipping (migrate, deploy), then ShipLine (its dialog's words only). The portal is unchanged.
 
 Rollback, once no deployed code reads them: `DROP VIEW portal_forwarder_clearance_v; DROP TABLE shipment_clearance_instructions, clearance_duty_rates`. Nothing else refers to them.
 

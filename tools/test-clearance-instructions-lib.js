@@ -122,3 +122,70 @@ test('the duty of each commodity code, to be offered next time: the last row to 
         ['3006700000', 0], ['3005909900', 4],
     ]);
 });
+
+// ── Sent as a link to the portal only, never attached (the user, 2026-11-27) ──
+
+const { FREIGHT_CLEARANCE_TEMPLATE } = require('../src/lib/email-template-defaults');
+const { clearanceBlockHtml } = require('../src/lib/freight-quotes');
+const linkOnly = require('../src/db/migrate/2026-11-27_50_clearance_link_only');
+
+// Wording that claims a file is on the email ("is not attached" does not match).
+const SAYS_ATTACHED = /(find|is|are|been) attached|attached \/|附件|附上|随函/i;
+
+test('link only: the template and the block under it say the file is on the portal, never that it is attached', () => {
+    for (const text of [FREIGHT_CLEARANCE_TEMPLATE.bodyHtml, FREIGHT_CLEARANCE_TEMPLATE.description]) {
+        assert.ok(!SAYS_ATTACHED.test(text), text);
+    }
+    assert.ok(FREIGHT_CLEARANCE_TEMPLATE.bodyHtml.includes('{containerName}'));
+    assert.ok(FREIGHT_CLEARANCE_TEMPLATE.bodyHtml.includes('supplier portal'));
+    const html = clearanceBlockHtml({
+        containerName: 'SEKU6400902', filename: 'Clearance Instructions - SEKU6400902.csv',
+        url: 'https://portal.example/freight-containers/1214', registerUrl: 'https://portal.example/register',
+    });
+    assert.ok(!SAYS_ATTACHED.test(html), html);
+    assert.ok(html.includes('Clearance Instructions - SEKU6400902.csv'));
+    assert.ok(html.includes('href="https://portal.example/freight-containers/1214"'));
+    assert.ok(html.includes('https://portal.example/register'));
+    assert.ok(html.includes('not attached to this email'));
+});
+
+// A connection that answers the UPDATE with `affected` and a SELECT with `rows`.
+function linkOnlyConn(affected, rows = []) {
+    const asked = [];
+    return {
+        asked,
+        query: async (sql, params) => {
+            const text = String(sql).replace(/\s+/g, ' ').trim();
+            asked.push({ sql: text, params });
+            return /^UPDATE/.test(text) ? [{ affectedRows: affected }] : [rows];
+        },
+    };
+}
+const runLinkOnly = async (conn) => { const said = []; await linkOnly.up(conn, { log: m => said.push(m) }); return said; };
+
+test('link only: the stored template is reworded only where it still holds what 2026-11-24_23 seeded', async () => {
+    // What it looks for is the wording that said the file was attached, word for word.
+    assert.equal(linkOnly.KEY, 'freight_clearance_instructions');
+    assert.ok(linkOnly.SEEDED.bodyHtml.includes('<p>Please find attached our clearance instructions for container <strong>{containerName}</strong>. The same file is on the container’s page on our supplier portal.</p>'));
+    assert.ok(linkOnly.SEEDED.bodyHtml.includes('<p>随函附上集装箱 <strong>{containerName}</strong> 的清关资料。该文件也可在供应商门户的集装箱页面下载。</p>'));
+    assert.notEqual(linkOnly.SEEDED.bodyHtml, FREIGHT_CLEARANCE_TEMPLATE.bodyHtml);
+
+    const conn = linkOnlyConn(1);
+    assert.deepEqual(await runLinkOnly(conn), ['freight_clearance_instructions reworded']);
+    assert.deepEqual(conn.asked, [{
+        sql: 'UPDATE email_templates SET description = ?, body_html = ? WHERE template_key = ? AND deleted_at IS NULL AND body_html = ?',
+        params: [FREIGHT_CLEARANCE_TEMPLATE.description, FREIGHT_CLEARANCE_TEMPLATE.bodyHtml, 'freight_clearance_instructions', linkOnly.SEEDED.bodyHtml],
+    }]);
+});
+
+test('link only: an edited template is left alone and named; a missing or already reworded one is said', async () => {
+    assert.deepEqual(await runLinkOnly(linkOnlyConn(0, [{ body_html: '<p>Our own words</p>' }])), [
+        'freight_clearance_instructions has been edited since it was seeded and was left as it is: check it does not say the file is attached',
+    ]);
+    assert.deepEqual(await runLinkOnly(linkOnlyConn(0, [])), ['freight_clearance_instructions not found; nothing to reword']);
+    assert.deepEqual(await runLinkOnly(linkOnlyConn(0, [{ body_html: FREIGHT_CLEARANCE_TEMPLATE.bodyHtml }])), ['freight_clearance_instructions already holds the new wording']);
+    // One write asked for, never a second try at an edited template.
+    const edited = linkOnlyConn(0, [{ body_html: '<p>x</p>' }]);
+    await runLinkOnly(edited);
+    assert.equal(edited.asked.filter(a => /^UPDATE/.test(a.sql)).length, 1);
+});

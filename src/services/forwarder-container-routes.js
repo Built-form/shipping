@@ -936,9 +936,9 @@ function registerForwarderContainerRoutes(app, deps) {
         const { sendKey, to, subject, body, forwarderId: wanted } = req.body || {};
         if (!FC.isSendKey(sendKey)) throw new Fail(400, 'BAD_FIELD', 'sendKey must be the key the dialog made.', { field: 'sendKey' });
         // Clearance instructions (docs/clearance-instructions.md): with `clearance`
-        // { containerCostUsd, rows } this email carries the container's sheet to
-        // whoever handles its customs, attached and kept. Checked before anything
-        // is read: it is sent only complete.
+        // { containerCostUsd, rows } this email tells whoever handles the container's
+        // customs that its sheet is on the container's portal page, and keeps it there.
+        // Never attached (2026-11-27). Checked before anything is read: it is sent only complete.
         const sheet = req.body && req.body.clearance !== undefined && req.body.clearance !== null ? CI.check(req.body.clearance) : null;
         if (sheet && sheet.problems.length) {
             throw new Fail(422, 'CLEARANCE_INCOMPLETE', `The clearance instructions are not complete: ${sheet.problems.length} thing${sheet.problems.length === 1 ? '' : 's'} to fill in.`, { problems: sheet.problems, allowedNext: ['fill'] });
@@ -1062,10 +1062,9 @@ function registerForwarderContainerRoutes(app, deps) {
                     })),
             });
 
-            const sent = await sendEmail({ kind: 'forwarder.container_notice',
-                to: claimed.addresses, subject: finalSubject, html,
-                ...(kept ? { attachments: [{ bytes: Buffer.from(kept.csv, 'utf8'), filename: kept.filename, contentType: 'text/csv' }] } : {}),
-            });
+            // No file on the email, a sheet included: it is on the container's portal page
+            // only (the user, 2026-11-27), from the row kept above.
+            const sent = await sendEmail({ kind: 'forwarder.container_notice', to: claimed.addresses, subject: finalSubject, html });
             if (!sent.ok) {
                 await conn.query(`UPDATE ${NOTICE_TABLE} SET status = 'failed' WHERE id = ? AND status = 'sending'`, [claimed.noticeId]);
                 if (sent.reason === 'ses_not_configured') {

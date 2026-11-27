@@ -1595,7 +1595,7 @@ test('tab: a delivery proposal is in the delivery company\'s section, ready to a
 
 // ── clearance instructions: the sheet sent to whoever handles the container's customs ──
 // (docs/clearance-instructions.md). It rides the same email, key and row as
-// "Email forwarder", with the file attached and kept.
+// "Email forwarder": the file is kept and given on the portal, never attached.
 
 const CLEARANCE_LIST = 'GET /api/v1/shipments/:id(\\d+)/clearance-instructions';
 const CLEARANCE_PREVIEW = 'POST /api/v1/shipments/:id(\\d+)/clearance-instructions/preview';
@@ -1631,24 +1631,21 @@ test('clearance: an incomplete sheet is refused before anything is read, with ev
     assert.equal((await t.call(NOTICE, { body: { sendKey: KEY, clearance: SHEET() }, userType: 'accountant' })).status, 403);
 });
 
-test('clearance: goes to whoever handles the container\'s customs, with the file attached, kept as the next version', async () => {
+test('clearance: goes to whoever handles the container\'s customs as a link to its portal page, never attached; kept as the next version', async () => {
     const t = build(clearanceRules(), { shipment: WITH_BROKER({ member_ext: 'seku6400902' }) });
     const r = await t.call(NOTICE, { body: { sendKey: KEY, clearance: SHEET() } });
     assert.equal(r.status, 200);
     assert.deepEqual(r.body, { ok: true, outcome: 'sent', noticeId: 77, clearanceId: 5, version: 3 });
     // Not the freight forwarder: the company picked for customs.
     assert.deepEqual(t.sent[0].to, ['ana@dcg.example']);
-    assert.equal(t.sent[0].attachments.length, 1);
-    const file = t.sent[0].attachments[0];
-    assert.equal(file.filename, 'Clearance Instructions - SEKU6400902.csv');
-    assert.equal(file.contentType, 'text/csv');
-    const csv = file.bytes.toString('utf8');
-    assert.ok(csv.startsWith('SEKU6400902 - Clearance Instructions,'));
-    assert.ok(csv.includes('Roosin,ROOSIN-38,JFA,Burning Dressings JF1010,China,88,Carton,924,994.4,3.232,3005909900,2.50%,3450,3.57,3123,8272.00,'));
-    // The email says what it is and links the container's page; it asks for nothing else.
+    // The file is on the portal only (the user, 2026-11-27): the email carries none.
+    assert.equal(t.sent[0].attachments, undefined);
+    // The email says what it is and links the container's page; it asks for nothing else, and never says "attached".
     assert.ok(t.sent[0].html.includes('Clearance Instructions - SEKU6400902.csv'));
     assert.ok(t.sent[0].html.includes('href="https://portal.example/freight-containers/1214"'));
     assert.ok(!t.sent[0].html.includes('What we need for this container'));
+    assert.ok(!/(find|is|are|been) attached|attached \/|附件|附上|随函/i.test(t.sent[0].html), 'the email never claims a file is attached');
+    assert.ok(t.sent[0].html.includes('not attached to this email'));
     // Kept under the email's own row, in the transaction that claims the send, before Front is called.
     const sqls = t.db.asked.map(a => a.sql);
     const kept = sqls.findIndex(s => /INSERT INTO shipment_clearance_instructions/.test(s));
@@ -1658,7 +1655,10 @@ test('clearance: goes to whoever handles the container\'s customs, with the file
     const ins = t.db.asked[kept].params;
     assert.deepEqual(ins.slice(0, 8), [1214, 3, 77, 3, 'SEKU6400902', 'Clearance Instructions - SEKU6400902.csv', 3450, 3.57]);
     assert.deepEqual(JSON.parse(ins[8]).map(x => x.description), ['Burning Dressings JF1010', 'Foam Dressings JF1051']);
-    assert.equal(ins[9], csv);
+    // The file itself is kept with the row: it is what the portal gives the forwarder.
+    const csv = ins[9];
+    assert.ok(csv.startsWith('SEKU6400902 - Clearance Instructions,'));
+    assert.ok(csv.includes('Roosin,ROOSIN-38,JFA,Burning Dressings JF1010,China,88,Carton,924,994.4,3.232,3005909900,2.50%,3450,3.57,3123,8272.00,'));
     assert.equal(ins[10], 'ops@us.com');
     // What each commodity code was sent with is remembered, once it has gone.
     const rates = t.db.wrote(/INSERT INTO clearance_duty_rates/);
@@ -1672,7 +1672,8 @@ test('clearance: goes to whoever handles the container\'s customs, with the file
 test('clearance: a container with no carrier number yet is named by our own', async () => {
     const t = build(clearanceRules(), { shipment: WITH_BROKER() });
     await t.call(NOTICE, { body: { sendKey: KEY, clearance: SHEET() } });
-    assert.equal(t.sent[0].attachments[0].filename, 'Clearance Instructions - 339.csv');
+    assert.equal(t.db.wrote(/INSERT INTO shipment_clearance_instructions/)[0].params[5], 'Clearance Instructions - 339.csv');
+    assert.ok(t.sent[0].html.includes('Clearance Instructions - 339.csv'));
 });
 
 test('clearance: nobody handles the customs, or the company named does not: refused, nothing kept or sent', async () => {

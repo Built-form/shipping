@@ -181,7 +181,7 @@ What the FORWARDER tab shows.
 
 `{ sendKey, to?, subject?, body? }` → `{ ok, outcome, noticeId }`. Emails the forwarder's contacts the link to the container's page (template `freight_container_details`, category `Freight`; tokens `{forwarder} {containerName} {bookingRef}`). The fixed block under the body lists the container, what we do not hold yet and the papers, the **Open the container** button, and how to register. That page needs a sign-in, so the recipients are pre-approved on the portal first.
 
-With `clearance: { containerCostUsd, rows }` (2026-11-24) the same email carries the container's **clearance instructions** to whoever holds the `customs` duty, attached as a CSV and kept: `docs/clearance-instructions.md`.
+With `clearance: { containerCostUsd, rows }` (2026-11-24) the same email carries the container's **clearance instructions** to whoever holds the `customs` duty, kept, and given as a CSV on the container's portal page only, never attached (2026-11-27): `docs/clearance-instructions.md`.
 
 - **Whose container it is, is decided under a lock** on the shipment row and its live booking, not on the page's read.
 - `to` can only **untick** contacts: `400 NOT_A_CONTACT` (`notContacts`) for any other address. Nobody left: `409 NO_CONTACTS`.

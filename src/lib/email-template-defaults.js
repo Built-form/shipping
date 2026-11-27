@@ -685,9 +685,10 @@ DEFAULT_EMAIL_TEMPLATES.push(FREIGHT_CONTAINER_TEMPLATE);
 // "Here are the clearance instructions for a container" (docs/clearance-instructions.md;
 // seeded by 2026-11-24_23_seed_freight_clearance_template.js). Sent from ShipLine's
 // clearance instructions dialog to the forwarder that handles the container's customs,
-// with the sheet attached. The sender appends a fixed block under this body: the
-// container, the file's name, and the button to the container's page on the supplier
-// portal, where the same file can be downloaded. {forwarder} {containerName} {bookingRef}
+// as a link: the sheet is never attached (the user, 2026-11-27; the stored row is
+// reworded by 2026-11-27_50_clearance_link_only.js). The sender appends a fixed block
+// under this body: the container, the file's name, and the button to the container's
+// page on the supplier portal, where the file is downloaded. {forwarder} {containerName} {bookingRef}
 // are HTML-escaped by the sender ({bookingRef} is always empty here: a booking reference
 // is the freight forwarder's own).
 const FREIGHT_CLEARANCE_TEMPLATE_KEY = 'freight_clearance_instructions';
@@ -695,14 +696,14 @@ const FREIGHT_CLEARANCE_TEMPLATE = {
     key: FREIGHT_CLEARANCE_TEMPLATE_KEY,
     name: 'Freight clearance instructions',
     category: 'Freight',
-    description: 'Emailed to the forwarder that handles a container’s customs, with our clearance instructions attached (the goods by commercial invoice, their commodity codes, weights, volume and value). The container and the button to its page on the supplier portal are added under this text. Tokens: {forwarder}, {containerName}.',
+    description: 'Emailed to the forwarder that handles a container’s customs, with a link to our clearance instructions on the supplier portal (the goods by commercial invoice, their commodity codes, weights, volume and value). No file is sent with the email: the forwarder downloads it from the container’s page. The container, the file’s name and the button to that page are added under this text. Tokens: {forwarder}, {containerName}.',
     subject: 'Container {containerName} – clearance instructions / 集装箱 {containerName} 清关资料',
     bodyHtml: [
         FREIGHT_GREETING,
         '<p>Greetings,</p>',
-        '<p>Please find attached our clearance instructions for container <strong>{containerName}</strong>. The same file is on the container’s page on our supplier portal.</p>',
+        '<p>Our clearance instructions for container <strong>{containerName}</strong> are on the container’s page on our supplier portal. Please sign in there to view and download them.</p>',
         '<p>您好，</p>',
-        '<p>随函附上集装箱 <strong>{containerName}</strong> 的清关资料。该文件也可在供应商门户的集装箱页面下载。</p>',
+        '<p>集装箱 <strong>{containerName}</strong> 的清关资料已发布在我们供应商门户的集装箱页面，请登录查看和下载。</p>',
         FREIGHT_SIGNOFF,
     ].join(''),
 };
