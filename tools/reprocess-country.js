@@ -66,8 +66,10 @@ const ACCOUNT = process.argv[3] || 'JFA';
     }
 
     // Phase B: HTTP (no DB connection held)
-    const tokenManager = getTokenManager(ACCOUNT);
-    const endpoint = require('../src/services/amazon-stock-shared').getEndpoint();
+    // Region-aware, so a US (NA) country gets the NA token + endpoint.
+    const { getRegionForCountry, getEndpointForCountry } = require('../src/services/amazon-stock-shared');
+    const tokenManager = getTokenManager(ACCOUNT, getRegionForCountry(COUNTRY));
+    const endpoint = getEndpointForCountry(COUNTRY);
 
     console.log(`\n[download] active listings...`);
     const listingTsv = await downloadReport(tokenManager, endpoint, active_doc);

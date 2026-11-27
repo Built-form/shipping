@@ -4817,6 +4817,146 @@ app.get('/api/v1/stock-snapshots/sum/all-asins', async (req, res) => {
     }
 });
 
+// ── 9b. GET /api/v1/stock-snapshots/reserved ─────────────────────────────
+// Amazon's reserved units split into their sub-categories — customer orders,
+// FC transfer, FC processing, staging — from the latest snapshot per country.
+// An endpoint of its own: /stock-snapshots/sum and /sum/all-asins keep
+// returning only the `amazon_reserved` total, untouched.
+//
+//   ?asin=B0…  or  ?jfCode=JF0123   [&company=JFA]   one product
+//       → { data: { asins, reserved: {…}, by_country: { UK: {…}, … } } }
+//   ?company=JFA                                      every ASIN of the account
+//       → { data: { B0…: { reserved: {…}, by_country: {…} }, … } }
+//
+// Each {…} is { total, customer_order, fc_transfer, fc_processing, staging,
+// other, breakdown_available } (+ `date` per country). `total` is the same
+// figure as amazon_reserved. Snapshots taken before the split was stored have
+// breakdown_available=false and null sub-categories — never zeros (a snapshot
+// with nothing reserved counts as captured: there is nothing to split).
+// `other` is whatever of the total the four don't account for: 0 unless
+// Amazon's daily report showed more reserved than its live figure did, in
+// which case the excess has no sub-category.
+const RESERVED_PARTS = ['customer_order', 'fc_transfer', 'fc_processing', 'staging'];
+function reservedEntry(row) {
+    const total = Number(row.reserved || 0);
+    const captured = Number(row.uncaptured || 0) === 0;
+    const entry = { total };
+    let sum = 0;
+    for (const part of RESERVED_PARTS) {
+        entry[part] = captured ? Number(row[part] || 0) : null;
+        sum += entry[part] || 0;
+    }
+    entry.other = captured ? Math.max(total - sum, 0) : null;
+    entry.breakdown_available = captured;
+    return entry;
+}
+function buildReservedBreakdown(rows) {
+    const by_country = {};
+    const reserved = { total: 0, breakdown_available: rows.length > 0 };
+    for (const part of [...RESERVED_PARTS, 'other']) reserved[part] = 0;
+    for (const row of rows) {
+        const country = row.country?.trim().toUpperCase();
+        if (!country) continue;
+        const entry = reservedEntry(row);
+        by_country[country] = { date: row.date_ran, ...entry };
+        reserved.total += entry.total;
+        if (!entry.breakdown_available) reserved.breakdown_available = false;
+        for (const part of [...RESERVED_PARTS, 'other']) reserved[part] += entry[part] || 0;
+    }
+    // One country without the split makes the cross-country split partial, so
+    // it is withheld rather than shown short.
+    if (!reserved.breakdown_available) {
+        for (const part of [...RESERVED_PARTS, 'other']) reserved[part] = null;
+    }
+    return { reserved, by_country };
+}
+
+app.get('/api/v1/stock-snapshots/reserved', async (req, res) => {
+    try {
+        await stockSnapshotsSchemaReady;
+        // A repeated parameter arrives as an array: read as absent, not a 500.
+        const text = (v) => (typeof v === 'string' ? v.trim() : '');
+        const cleanAsin = parseAsin(text(req.query.asin));
+        const jfCodeParam = text(req.query.jfCode);
+        const company = text(req.query.company);
+        if (req.query.asin && !cleanAsin) {
+            return res.status(400).json({ error: 'asin must be a valid 10-character ASIN.' });
+        }
+        if (!cleanAsin && !jfCodeParam && !company) {
+            return res.status(400).json({ error: 'Provide an asin or a jfCode (one product), or a company (every ASIN of that account).' });
+        }
+
+        const single = Boolean(cleanAsin || jfCodeParam);
+        let asins = null;
+        if (cleanAsin) {
+            asins = [cleanAsin];
+        } else if (jfCodeParam) {
+            const [rows] = await pool.query(
+                `SELECT DISTINCT asin FROM landed_costs WHERE jf_code = ? AND asin IS NOT NULL AND asin <> ''`,
+                [jfCodeParam]
+            );
+            asins = rows.map(r => r.asin);
+        }
+        if (single && asins.length === 0) {
+            return res.json({ data: { asins: [], ...buildReservedBreakdown([]) } });
+        }
+
+        const where = [`asin IS NOT NULL AND asin != ''`];
+        const params = [];
+        if (asins) { where.push(`asin IN (${asins.map(() => '?').join(',')})`); params.push(...asins); }
+        if (company) { where.push('company = ?'); params.push(company); }
+        const whereSql = where.join(' AND ');
+        const whereSqlA = whereSql.replace(/\b(asin|company)\b/g, 'a.$1');
+
+        // Latest snapshot per country, picked exactly as the endpoint whose
+        // total this mirrors picks it, so `total` always equals its
+        // amazon_reserved: one product → one latest date per country across
+        // its ASINs (/sum); every ASIN → latest per (asin, country)
+        // (/sum/all-asins). Either way a country still on yesterday mid-run
+        // isn't dropped.
+        const grain = single ? ['country'] : ['asin', 'country'];
+        const [rows] = await withTimeout(
+            pool.query(
+                `SELECT ${grain.map(c => `a.${c}`).join(', ')}, MAX(a.date_ran) AS date_ran,
+                        CAST(COALESCE(SUM(a.reserved), 0) AS UNSIGNED)                AS reserved,
+                        CAST(COALESCE(SUM(a.reserved_customer_order), 0) AS UNSIGNED) AS customer_order,
+                        CAST(COALESCE(SUM(a.reserved_fc_transfer), 0) AS UNSIGNED)    AS fc_transfer,
+                        CAST(COALESCE(SUM(a.reserved_fc_processing), 0) AS UNSIGNED)  AS fc_processing,
+                        CAST(COALESCE(SUM(a.reserved_staging), 0) AS UNSIGNED)        AS staging,
+                        CAST(COALESCE(SUM(a.reserved_customer_order IS NULL AND a.reserved <> 0), 0) AS UNSIGNED) AS uncaptured
+                 FROM amazon_stock_country_snapshots a
+                 JOIN (
+                     SELECT ${grain.join(', ')}, MAX(date_ran) AS latest
+                     FROM amazon_stock_country_snapshots
+                     WHERE ${whereSql}
+                     GROUP BY ${grain.join(', ')}
+                 ) ld ON ${grain.map(c => `ld.${c} = a.${c}`).join(' AND ')} AND a.date_ran = ld.latest
+                 WHERE ${whereSqlA}
+                 GROUP BY ${grain.map(c => `a.${c}`).join(', ')}`,
+                [...params, ...params]
+            ),
+            QUERY_TIMEOUT_MS, 'Reserved breakdown'
+        );
+
+        if (single) {
+            return res.json({ data: { asins, ...buildReservedBreakdown(rows) } });
+        }
+
+        const byAsin = new Map();
+        for (const row of rows) {
+            if (!byAsin.has(row.asin)) byAsin.set(row.asin, []);
+            byAsin.get(row.asin).push(row);
+        }
+        const data = {};
+        for (const [asin, asinRows] of byAsin) data[asin] = buildReservedBreakdown(asinRows);
+        res.json({ data });
+    } catch (error) {
+        log.error('[GET /stock-snapshots/reserved]', error);
+        const status = error.message?.includes('timed out') ? 504 : 500;
+        res.status(status).json({ error: 'An internal error occurred.' });
+    }
+});
+
 // ── 10. GET /api/v1/stock-snapshots/fnskus ──────────────────────────────
 app.get('/api/v1/stock-snapshots/fnskus', async (req, res) => {
     try {

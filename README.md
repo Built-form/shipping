@@ -271,6 +271,7 @@ Every draft container has a permanent history (lines, documents, emails, renames
 |---|---|---|
 | `GET` | `/api/v1/stock-snapshots/sum?asin=...&company=...&days=30` | Aggregated stock summary for a single ASIN (Mintsoft + Amazon + orders + history), plus `mintsoft_by_sku`. `history.amazon` is the per-day total across countries; `history.amazon_by_country` is the same daily series split per country (`{ UK: [...], US: [...] }`) — series start on different days, a missing day means no snapshot, not zero |
 | `GET` | `/api/v1/stock-snapshots/sum/all-asins?company=...` | Full summary for every known ASIN, plus `mintsoft_by_sku` per ASIN |
+| `GET` | `/api/v1/stock-snapshots/reserved?asin=...` (or `jfCode=...`, optional `company`) · `?company=...` alone for every ASIN | Amazon reserved units split into `customer_order`, `fc_transfer`, `fc_processing`, `staging` (+ `other`, `total`), latest snapshot per country: `{ reserved: {…}, by_country: { UK: { date, … } } }`, keyed by ASIN in the all-ASIN form. `total` equals `amazon_reserved` from `/sum`. `other` is 0 unless Amazon's daily report showed more reserved than its live figure. `breakdown_available: false` with `null` sub-categories for snapshots taken before the split was stored |
 | `GET` | `/api/v1/stock-snapshots/fnskus?asin=...&company=...` | SKU/FNSKU pairs per country |
 | `GET` | `/api/v1/stock-snapshots/asana-tasks?asin=...` | Replenishment Asana tasks for an ASIN |
 | `GET` | `/api/v1/stock-snapshots/oos-dates?asin=...&company=...` | Historical dates where `fulfillable = 0` per country |
@@ -430,7 +431,11 @@ Deduped Amazon FBA inventory, one row per `(date_ran, country, asin, company)`. 
 | `inbound_working` | INT | Inbound shipment being prepared |
 | `inbound_shipped` | INT | In transit to FBA |
 | `inbound_receiving` | INT | Being received at FBA |
-| `reserved` | INT | Reserved (pending orders, transfers) |
+| `reserved` | INT | Reserved total (pending orders, transfers, processing, staging) |
+| `reserved_customer_order` | INT NULL | Of `reserved`: held for customer orders not yet shipped. `NULL` on all four = split not captured (rows before 2026-11-27) |
+| `reserved_fc_transfer` | INT NULL | Of `reserved`: moving between fulfilment centres |
+| `reserved_fc_processing` | INT NULL | Of `reserved`: held at an FC for processing, excluding staging |
+| `reserved_staging` | INT NULL | Of `reserved`: staged at an FC (Amazon's `Reserved Staging` report column; the live API counts these inside FC processing) |
 
 ### `amazon_stock_raw_snapshots`
 Per-FNSKU rows before dedup/aggregation. Used for OOS date history and for backfill replay.

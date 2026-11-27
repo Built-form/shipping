@@ -270,6 +270,53 @@ async function fetchInventorySummaries(tokenManager, endpoint, marketplaceId, la
     return summaries;
 }
 
+// ── Reserved sub-categories ───────────────────────────────────────────────────
+// One physical pool's reserved units split four ways: customer orders, FC
+// transfer, FC processing, staging. Two sources, and they cut it differently
+// (checked 2026-11-27 on JFA UK + DE, every pool):
+//
+//   health report  `Total Reserved Quantity` = `Reserved Customer Order`
+//                  + `Reserved FC Processing` + `Reserved Staging`. FC transfer
+//                  is a column of its own, `fc-transfer`, OUTSIDE that total
+//                  (it used to be `Reserved FC Transfer`, which is gone).
+//   live API       totalReservedQuantity = pendingCustomerOrderQuantity
+//                  + pendingTransshipmentQuantity (FC transfer)
+//                  + fcProcessingQuantity, and fcProcessingQuantity INCLUDES
+//                  staged units — the API has no staging figure.
+//
+// The live API is real-time and is what the stored `reserved` total follows,
+// so when it knows the pool its three figures are used, and the report's
+// staging is carved out of its FC processing (capped at it: the two are read
+// minutes-to-hours apart). The four then sum to the live total. A pool the
+// API doesn't return falls back to the report's own columns.
+//
+// This only COLLECTS the split. The stored `reserved` total is computed
+// separately in writeSnapshots and is not touched, so the two can disagree:
+// the total is short of the four where it comes from the report alone (which
+// leaves FC transfer out), and above them where the stale report total beat
+// the live one. (The older note in writeSnapshots that staging "overlaps FC
+// transfer" predates this measurement: staged units sit in FC processing.)
+function splitReserved(row, live) {
+    const int = (v) => parseInt(v || '0', 10) || 0;
+    const staging = int(row['Reserved Staging']);
+    if (live && typeof live.totalReservedQuantity === 'number') {
+        const fcProcessing = live.fcProcessingQuantity || 0;
+        const staged = Math.min(staging, fcProcessing);
+        return {
+            customer_order: live.pendingCustomerOrderQuantity || 0,
+            fc_transfer: live.pendingTransshipmentQuantity || 0,
+            fc_processing: fcProcessing - staged,
+            staging: staged,
+        };
+    }
+    return {
+        customer_order: int(row['Reserved Customer Order']),
+        fc_transfer: int(row['fc-transfer'] || row['Reserved FC Transfer']),
+        fc_processing: int(row['Reserved FC Processing']),
+        staging,
+    };
+}
+
 // ── Snapshot writers ──────────────────────────────────────────────────────────
 // Given parsed active listings + health report + API summaries + pan-EU ASIN set,
 // write into amazon_active_listings, amazon_stock_country_snapshots, amazon_stock_raw_snapshots.
@@ -328,11 +375,18 @@ async function writeSnapshots(conn, {
     // authoritative reserved for each physical pool. Key by FNSKU (the pool);
     // multiple SKUs can map to one FNSKU with identical quantities, first wins.
     const apiReservedByFnsku = new Map();
+    // Same pools, the whole reservedQuantity object: feeds the reserved
+    // sub-category columns (see splitReserved).
+    const apiReservedDetailByFnsku = new Map();
     for (const item of apiSummaries) {
         const fnsku = (item.fnSku || '').trim();
         if (!fnsku || apiReservedByFnsku.has(fnsku)) continue;
-        const r = item.inventoryDetails?.reservedQuantity?.totalReservedQuantity;
-        if (typeof r === 'number') apiReservedByFnsku.set(fnsku, r);
+        const rq = item.inventoryDetails?.reservedQuantity;
+        const r = rq?.totalReservedQuantity;
+        if (typeof r === 'number') {
+            apiReservedByFnsku.set(fnsku, r);
+            apiReservedDetailByFnsku.set(fnsku, rq);
+        }
     }
 
     // ── Active Listings ────────────────────────────────────────────────────
@@ -403,6 +457,8 @@ async function writeSnapshots(conn, {
                 condition_type: row['condition'] || 'New',
                 fulfillable: 0, inbound_working: 0,
                 inbound_shipped: 0, inbound_receiving: 0, reserved: 0,
+                reserved_customer_order: 0, reserved_fc_transfer: 0,
+                reserved_fc_processing: 0, reserved_staging: 0,
             };
         }
 
@@ -441,6 +497,16 @@ async function writeSnapshots(conn, {
             // keeps this safe against the same pool being seen twice.
             const liveReserved = fnsku ? apiReservedByFnsku.get(fnsku) : undefined;
             a.reserved          += Math.max(totalReserved, componentReserved, liveReserved || 0);
+
+            // Sub-categories: collected beside the total, which is computed
+            // above exactly as before and never derived from them. The two can
+            // differ (see splitReserved); the endpoint reports any shortfall
+            // as `other`.
+            const split = splitReserved(row, fnsku ? apiReservedDetailByFnsku.get(fnsku) : undefined);
+            a.reserved_customer_order += split.customer_order;
+            a.reserved_fc_transfer    += split.fc_transfer;
+            a.reserved_fc_processing  += split.fc_processing;
+            a.reserved_staging        += split.staging;
         }
 
         if (fnsku && !a.seen_fnskus.has(fnsku)) {
@@ -492,6 +558,8 @@ async function writeSnapshots(conn, {
                 fnsku: '', sku: '',
                 condition_type: item.condition || 'New',
                 fulfillable: 0, reserved: 0,
+                reserved_customer_order: 0, reserved_fc_transfer: 0,
+                reserved_fc_processing: 0, reserved_staging: 0,
                 inbound_working: 0, inbound_shipped: 0, inbound_receiving: 0,
             };
             recoveredCount++;
@@ -505,6 +573,13 @@ async function writeSnapshots(conn, {
             a.inbound_shipped   += details.inboundShippedQuantity     || 0;
             a.inbound_receiving += details.inboundReceivingQuantity   || 0;
             a.reserved          += details.reservedQuantity?.totalReservedQuantity || 0;
+            // No report row for this pool, so no staging figure: the API
+            // counts staged units inside FC processing and they stay there.
+            const split = splitReserved({}, details.reservedQuantity);
+            a.reserved_customer_order += split.customer_order;
+            a.reserved_fc_transfer    += split.fc_transfer;
+            a.reserved_fc_processing  += split.fc_processing;
+            a.reserved_staging        += split.staging;
         }
         if (sku && !a.seen_skus.has(sku)) {
             a.seen_skus.add(sku);
@@ -518,8 +593,9 @@ async function writeSnapshots(conn, {
         await conn.execute(
             `INSERT INTO amazon_stock_country_snapshots
                 (date_ran, country, asin, company, fnsku, sku, condition_type,
-                 fulfillable, inbound_working, inbound_shipped, inbound_receiving, reserved)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 fulfillable, inbound_working, inbound_shipped, inbound_receiving, reserved,
+                 reserved_customer_order, reserved_fc_transfer, reserved_fc_processing, reserved_staging)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON DUPLICATE KEY UPDATE
                  fnsku = VALUES(fnsku), sku = VALUES(sku),
                  condition_type = VALUES(condition_type),
@@ -527,9 +603,14 @@ async function writeSnapshots(conn, {
                  inbound_working = VALUES(inbound_working),
                  inbound_shipped = VALUES(inbound_shipped),
                  inbound_receiving = VALUES(inbound_receiving),
-                 reserved = VALUES(reserved)`,
+                 reserved = VALUES(reserved),
+                 reserved_customer_order = VALUES(reserved_customer_order),
+                 reserved_fc_transfer = VALUES(reserved_fc_transfer),
+                 reserved_fc_processing = VALUES(reserved_fc_processing),
+                 reserved_staging = VALUES(reserved_staging)`,
             [dateRan, countryCode, asin, accountName, a.fnsku, a.sku, a.condition_type,
-             a.fulfillable, a.inbound_working, a.inbound_shipped, a.inbound_receiving, a.reserved]
+             a.fulfillable, a.inbound_working, a.inbound_shipped, a.inbound_receiving, a.reserved,
+             a.reserved_customer_order, a.reserved_fc_transfer, a.reserved_fc_processing, a.reserved_staging]
         );
         upsertCount++;
     }
@@ -637,10 +718,12 @@ async function runBackfill(conn) {
         const [result] = await conn.execute(
             `INSERT INTO amazon_stock_country_snapshots
              (date_ran, country, asin, company, fnsku, sku, condition_type,
-              fulfillable, inbound_working, inbound_shipped, inbound_receiving, reserved)
+              fulfillable, inbound_working, inbound_shipped, inbound_receiving, reserved,
+              reserved_customer_order, reserved_fc_transfer, reserved_fc_processing, reserved_staging)
              SELECT DATE_ADD(s.date_ran, INTERVAL 1 DAY),
                     s.country, s.asin, s.company, s.fnsku, s.sku, s.condition_type,
-                    0, s.inbound_working, s.inbound_shipped, s.inbound_receiving, 0
+                    0, s.inbound_working, s.inbound_shipped, s.inbound_receiving, 0,
+                    0, 0, 0, 0
              FROM amazon_stock_country_snapshots s
              LEFT JOIN amazon_stock_country_snapshots nxt
                  ON nxt.date_ran = DATE_ADD(s.date_ran, INTERVAL 1 DAY)
@@ -653,7 +736,9 @@ async function runBackfill(conn) {
                 inbound_working = VALUES(inbound_working),
                 inbound_shipped = VALUES(inbound_shipped),
                 inbound_receiving = VALUES(inbound_receiving),
-                reserved = 0`,
+                reserved = 0,
+                reserved_customer_order = 0, reserved_fc_transfer = 0,
+                reserved_fc_processing = 0, reserved_staging = 0`,
             [dateRan]
         );
         if (result.affectedRows === 0) break;
@@ -677,9 +762,11 @@ async function copyFailedFromPrevious(conn, countryCode, accountName) {
     await conn.execute(
         `INSERT INTO amazon_stock_country_snapshots
          (date_ran, country, asin, company, fnsku, sku, condition_type,
-          fulfillable, inbound_working, inbound_shipped, inbound_receiving, reserved)
+          fulfillable, inbound_working, inbound_shipped, inbound_receiving, reserved,
+          reserved_customer_order, reserved_fc_transfer, reserved_fc_processing, reserved_staging)
          SELECT ?, country, asin, company, fnsku, sku, condition_type,
-                fulfillable, inbound_working, inbound_shipped, inbound_receiving, reserved
+                fulfillable, inbound_working, inbound_shipped, inbound_receiving, reserved,
+                reserved_customer_order, reserved_fc_transfer, reserved_fc_processing, reserved_staging
          FROM amazon_stock_country_snapshots WHERE date_ran = ? AND country = ? AND company = ?
          ON DUPLICATE KEY UPDATE
             fnsku = VALUES(fnsku), sku = VALUES(sku),
@@ -688,7 +775,11 @@ async function copyFailedFromPrevious(conn, countryCode, accountName) {
             inbound_working = VALUES(inbound_working),
             inbound_shipped = VALUES(inbound_shipped),
             inbound_receiving = VALUES(inbound_receiving),
-            reserved = VALUES(reserved)`,
+            reserved = VALUES(reserved),
+            reserved_customer_order = VALUES(reserved_customer_order),
+            reserved_fc_transfer = VALUES(reserved_fc_transfer),
+            reserved_fc_processing = VALUES(reserved_fc_processing),
+            reserved_staging = VALUES(reserved_staging)`,
         [dateRan, prevDate, countryCode, accountName]
     );
 }
@@ -702,5 +793,5 @@ module.exports = {
     SPTokenManager, withRetry, rateLimitedRequest,
     requestReport, checkReport, downloadReport,
     parseTsvReport, fetchInventorySummaries,
-    writeSnapshots, runBackfill, copyFailedFromPrevious,
+    splitReserved, writeSnapshots, runBackfill, copyFailedFromPrevious,
 };
