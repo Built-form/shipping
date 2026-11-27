@@ -80,7 +80,8 @@ async function localReady(conn) {
               WHERE CONSTRAINT_SCHEMA = DATABASE()
                 AND CONSTRAINT_NAME IN ('chk_purchase_orders_kind', 'chk_orders_order_kind')`
         );
-        const allows = name => rows.some(r => r.CONSTRAINT_NAME === name && /'local'/.test(String(r.CHECK_CLAUSE || '')));
+        // MySQL 8 returns the clause with its quotes escaped: _utf8mb4\'local\'.
+        const allows = name => rows.some(r => r.CONSTRAINT_NAME === name && /\\?'local\\?'/.test(String(r.CHECK_CLAUSE || '')));
         has = allows('chk_purchase_orders_kind') && allows('chk_orders_order_kind');
     }
     localSeen = { has, at: now };

@@ -13,11 +13,16 @@ process.env.APP_STAGE = 'test';
 const G = require('../src/services/sample-orders');
 
 const SAMPLE_LOT = 'SA0031-S01-V03-CN0011';
+// CHECK_CLAUSE exactly as MySQL 8 on TEST returns it (read 2026-11-27): the
+// quotes come back escaped, \'local\'. A fixture without the backslashes hid a
+// localReady that never said yes on a real database.
 const LOCAL_CHECKS = [
-    { CONSTRAINT_NAME: 'chk_purchase_orders_kind', CHECK_CLAUSE: "(`kind` in (_utf8mb4'stock',_utf8mb4'sample',_utf8mb4'local'))" },
-    { CONSTRAINT_NAME: 'chk_orders_order_kind', CHECK_CLAUSE: "(`order_kind` in (_utf8mb4'stock',_utf8mb4'sample',_utf8mb4'local'))" },
+    { CONSTRAINT_NAME: 'chk_purchase_orders_kind', CHECK_CLAUSE: "(`kind` in (_utf8mb4\\'stock\\',_utf8mb4\\'sample\\',_utf8mb4\\'local\\'))" },
+    { CONSTRAINT_NAME: 'chk_orders_order_kind', CHECK_CLAUSE: "(`order_kind` in (_utf8mb4\\'stock\\',_utf8mb4\\'sample\\',_utf8mb4\\'local\\'))" },
 ];
-const SAMPLE_ONLY_CHECKS = LOCAL_CHECKS.map(c => ({ ...c, CHECK_CLAUSE: c.CHECK_CLAUSE.replace(",_utf8mb4'local'", '') }));
+const SAMPLE_ONLY_CHECKS = LOCAL_CHECKS.map(c => ({ ...c, CHECK_CLAUSE: c.CHECK_CLAUSE.replace(",_utf8mb4\\'local\\'", '') }));
+// The same clause without the escaping, as another server version may show it.
+const UNESCAPED_LOCAL_CHECKS = LOCAL_CHECKS.map(c => ({ ...c, CHECK_CLAUSE: c.CHECK_CLAUSE.split("\\'").join("'") }));
 
 function world(over = {}) {
     return {
@@ -133,6 +138,8 @@ test('notSampleSql keeps stock and local lines and leaves samples out; stockOnly
 
 test('localReady: both kind checks must allow local; a database without them holds none', async () => {
     assert.equal(await G.localReady(conn(world())), true);
+    G.resetCaches();
+    assert.equal(await G.localReady(conn(world({ checks: UNESCAPED_LOCAL_CHECKS }))), true);
     G.resetCaches();
     assert.equal(await G.localReady(conn(world({ checks: SAMPLE_ONLY_CHECKS }))), false);
     G.resetCaches();
