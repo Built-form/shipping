@@ -53,6 +53,12 @@ async function handler(event) {
             log.info('[deposit-received] sample order; lines stay where they are', { purchaseOrderId });
             return { outcome: 'skipped', purchaseOrderId, reason: 'sample_order' };
         }
+        // Nor has a local order (docs/local-orders.md): it goes PO Sent to
+        // Arrived at Warehouse, never into production.
+        if (po && po.kind === 'local') {
+            log.info('[deposit-received] local order; lines stay where they are', { purchaseOrderId });
+            return { outcome: 'skipped', purchaseOrderId, reason: 'local_order' };
+        }
 
         await conn.beginTransaction();
         const ph = BEFORE_PRODUCTION.map(() => '?').join(', ');

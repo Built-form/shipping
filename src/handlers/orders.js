@@ -236,8 +236,9 @@ const PO_SENT_WEBHOOK_URL = process.env.MAKE_PO_SENT_WEBHOOK_URL
 async function firePoSentWebhookIfNeeded(conn, order) {
     if (!order || order.status !== 'PO_SENT') return;
     // A sample order is not production being started: the scenario behind this
-    // hook was built for stock POs, so a sample never fires it.
-    if (order.orderKind === 'sample') return;
+    // hook was built for stock POs, so a sample never fires it. Nor does a
+    // local order: it is record only, and has no production to start.
+    if (order.orderKind === 'sample' || order.orderKind === 'local') return;
     const poNumber = order.poNumber;
     const jfCode = order.jfCode;
     if (!poNumber || !jfCode) return;
@@ -855,11 +856,14 @@ app.get('/api/v1/orders', async (req, res) => {
         // not, gets stock rows and stock POs only, so nothing that was written
         // before samples existed can count, draw or price one.
         const wantsSamples = String((req.query || {}).samples || '') === '1';
-        const { orders, purchaseOrders, shipments, sampleOrdersArmed } = await withConnection(async (conn) => {
+        const { orders, purchaseOrders, shipments, sampleOrdersArmed, localOrdersReady } = await withConnection(async (conn) => {
             const [rows] = await conn.query(`${ORDER_SELECT} ORDER BY orders.created_at DESC`);
             const all = rows.map(rowToOrder);
             const orders = wantsSamples ? all : all.filter(o => o.orderKind !== 'sample');
             const sampleOrdersArmed = wantsSamples ? await sampleOrders.armed(conn) : false;
+            // May a local PO be made here (docs/local-orders.md)? Told to the
+            // same kind-aware caller.
+            const localOrdersReady = wantsSamples ? await sampleOrders.localReady(conn) : false;
             // Deduplicated side-map: every PO referenced by these orders
             // (via orders.purchase_order_id) with its full document/invoice/
             // signed-PI/payment bundle, keyed by PO id. Many order lines share
@@ -869,12 +873,12 @@ app.get('/api/v1/orders', async (req, res) => {
             // orders.shipment_id). Never fails the list: a missing table or
             // column just yields {}.
             const shipments = await shipmentSync.loadShipmentsForOrders(conn, orders);
-            return { orders, purchaseOrders, shipments, sampleOrdersArmed };
+            return { orders, purchaseOrders, shipments, sampleOrdersArmed, localOrdersReady };
         });
         res.status(200).json({
             data: orders, purchaseOrders, shipments,
             // Only for a caller that asked: may a sample order be created here now?
-            ...(wantsSamples ? { capabilities: { sampleOrders: sampleOrdersArmed } } : {}),
+            ...(wantsSamples ? { capabilities: { sampleOrders: sampleOrdersArmed, localOrders: localOrdersReady } } : {}),
         });
     } catch (error) {
         log.error('[GET /orders]', error);
@@ -913,9 +917,13 @@ app.post('/api/v1/orders', async (req, res) => {
             for (const [key, col] of Object.entries(UPDATABLE_FIELDS)) afterRow[col] = b[key] ?? (col === 'quantity' ? 0 : null);
             if (b.courierName !== undefined) afterRow.courier_name = b.courierName;
             if (b.courierTracking !== undefined) afterRow.courier_tracking = b.courierTracking;
-            const onSamplePo = (await sampleOrders.schemaReady(conn))
-                && (await sampleOrders.loadPo(conn, b.purchaseOrderId))?.kind === sampleRules.KIND_SAMPLE;
-            return sampleOrders.withSampleTx(conn, onSamplePo, async () => {
+            const lineKind = (await sampleOrders.schemaReady(conn))
+                ? (await sampleOrders.loadPo(conn, b.purchaseOrderId))?.kind : null;
+            const onSamplePo = lineKind === sampleRules.KIND_SAMPLE;
+            // A local line (docs/local-orders.md) takes its kind in the same
+            // transaction as its insert, so it is never stored as stock.
+            const onLocalPo = lineKind === sampleRules.KIND_LOCAL;
+            return sampleOrders.withSampleTx(conn, onSamplePo || onLocalPo, async () => {
             const guard = await sampleOrders.guardWrite(conn, { beforeRow: null, afterRow, via: 'create', req, lockLot: onSamplePo });
             if (guard.refusal) return { refusal: guard.refusal };
 
@@ -937,6 +945,9 @@ app.post('/api/v1/orders', async (req, res) => {
                 if (afterRow.courier_tracking !== undefined) extra.set.courier_tracking = afterRow.courier_tracking || null;
                 const { sets, values } = sampleOrders.sampleSetSql(extra);
                 await conn.query(`UPDATE orders SET ${sets.join(', ')} WHERE id = ?`, [...values, insertResult.insertId]);
+            } else if (guard.local) {
+                const { sets, values } = sampleOrders.sampleSetSql({ set: guard.set });
+                if (sets.length) await conn.query(`UPDATE orders SET ${sets.join(', ')} WHERE id = ?`, [...values, insertResult.insertId]);
             }
 
             const [rows] = await conn.query(`${ORDER_SELECT} AND orders.id = ?`, [insertResult.insertId]);
@@ -949,9 +960,9 @@ app.post('/api/v1/orders', async (req, res) => {
                 before: null, after: created, userEmail: req.userEmail,
             });
             await firePoSentWebhookIfNeeded(conn, created);
-            // A sample is in no shipment, and this hook must not run inside the
-            // sample's transaction.
-            const linked = guard.sample ? null : await shipmentSync.shadow(conn, {
+            // A sample or a local line is in no shipment, and this hook must not
+            // run inside their transaction.
+            const linked = guard.sample || guard.local ? null : await shipmentSync.shadow(conn, {
                 site: 'POST /orders', inTx: false, ...membershipKey([created]),
             }, c => shipmentSync.syncOrderMembership(c, [created.id], { userEmail: req.userEmail }));
             patchShipmentIds([created], linked);
@@ -1832,7 +1843,8 @@ app.post('/api/v1/orders/:id/split', async (req, res) => {
                 const original = existing[0];
                 const beforeOriginal = rowToOrder(original);
                 // A sample is never split into a container.
-                const sampleRefusal = sampleOrders.refuseSample(original, 'split into a container');
+                const sampleRefusal = sampleOrders.refuseSample(original, 'split into a container')
+                    || sampleOrders.refuseLocal(original, 'split into a container');
                 if (sampleRefusal) {
                     await conn.rollback();
                     return { refusal: sampleRefusal };
@@ -1947,7 +1959,8 @@ app.post('/api/v1/containers/pack', async (req, res) => {
                     const beforeOrder = rowToOrder(order);
                     // A sample travels alone: it is never packed. Nothing of
                     // this request is written.
-                    const sampleRefusal = sampleOrders.refuseSample(order, 'packed into a container');
+                    const sampleRefusal = sampleOrders.refuseSample(order, 'packed into a container')
+                        || sampleOrders.refuseLocal(order, 'packed into a container');
                     if (sampleRefusal) {
                         await conn.rollback();
                         return { refusal: sampleRefusal };
@@ -4398,8 +4411,9 @@ app.get('/api/v1/stock-snapshots/sum', async (req, res) => {
         const orderParams = [snapshotFreshness, ...idParams];
         // Sample orders are not stock: they are in no total and no list here
         // (docs/sample-orders.md). Cashboard reads these figures, so this one
-        // filter keeps a sample out of every stock number it shows.
-        const stockOnly = await sampleOrders.stockOnlySql(pool);
+        // filter keeps a sample out of every stock number it shows. A local
+        // order is stock (docs/local-orders.md) and is counted.
+        const stockOnly = await sampleOrders.notSampleSql(pool);
 
         const [msRows, amzRows, orderRows, onSeaRows, onAirRows, ordersBreakdownRows, msHistoryRows, amzHistoryRows, tagRows, msSkuRows] = await withTimeout(
             Promise.all([
@@ -4607,8 +4621,9 @@ app.get('/api/v1/stock-snapshots/sum/all-asins', async (req, res) => {
             return res.status(400).json({ error: 'company query parameter is required.' });
         }
 
-        // Sample orders are not stock (docs/sample-orders.md).
-        const stockOnly = await sampleOrders.stockOnlySql(pool);
+        // Sample orders are not stock (docs/sample-orders.md); local orders
+        // are (docs/local-orders.md).
+        const stockOnly = await sampleOrders.notSampleSql(pool);
         const [
             [asinsFromOrders], [asinsFromMintsoft], [asinsFromAmazon],
         ] = await withTimeout(
@@ -6351,9 +6366,10 @@ function rowToPurchaseOrder(row) {
         currency: row.currency || 'USD',
         shippingTotal: row.shipping_total != null ? Number(row.shipping_total) : 0,
         companyId: row.company_id ?? null,
-        // 'stock' or 'sample' (docs/sample-orders.md). A database without the
-        // column reads every PO as stock.
-        kind: row.kind === 'sample' ? 'sample' : 'stock',
+        // 'stock', 'sample' (docs/sample-orders.md) or 'local'
+        // (docs/local-orders.md). A database without the column reads every
+        // PO as stock.
+        kind: row.kind === 'sample' || row.kind === 'local' ? row.kind : 'stock',
         createdAt: row.created_at?.toISOString?.() ?? row.created_at,
         updatedAt: row.updated_at?.toISOString?.() ?? row.updated_at,
     };
@@ -6617,6 +6633,11 @@ app.post('/api/v1/purchase-orders', async (req, res) => {
             if (kind === sampleRules.KIND_SAMPLE && !await sampleOrders.armed(conn, { fresh: true })) {
                 return { samplesDisabled: true };
             }
+            // A local PO only where the database's kind checks allow the word
+            // (migration 2026-11-27_30): a 409 rather than a CHECK failure.
+            if (kind === sampleRules.KIND_LOCAL && !await sampleOrders.localReady(conn)) {
+                return { localUnavailable: true };
+            }
             const [cRows] = await conn.query('SELECT name FROM companies WHERE id = ?', [cid]);
             if (!cRows.length) return { companyNotFound: true };
             const letter = (cRows[0].name || '').trim().charAt(0).toUpperCase();
@@ -6639,7 +6660,7 @@ app.post('/api/v1/purchase-orders', async (req, res) => {
                 await conn.query('UPDATE purchase_orders SET po_number = ? WHERE id = ?', [poNumber, newId]);
                 // Only a sample PO names the column: a stock PO is written
                 // exactly as before, on a database with or without it.
-                if (kind === sampleRules.KIND_SAMPLE) {
+                if (kind === sampleRules.KIND_SAMPLE || kind === sampleRules.KIND_LOCAL) {
                     await conn.query('UPDATE purchase_orders SET kind = ? WHERE id = ?', [kind, newId]);
                 }
 
@@ -6660,6 +6681,9 @@ app.post('/api/v1/purchase-orders', async (req, res) => {
 
         if (result.samplesDisabled) {
             return res.status(409).json({ error: 'Sample orders are not switched on here.', code: 'SAMPLES_DISABLED' });
+        }
+        if (result.localUnavailable) {
+            return res.status(409).json({ error: 'This database cannot hold a local order yet: its migration has not been run.', code: 'LOCAL_ORDERS_UNAVAILABLE' });
         }
         if (result.companyNotFound) return res.status(400).json({ error: `Company ${cid} not found.` });
         if (result.invalidLetter) return res.status(400).json({ error: 'Cannot derive letter — company name must start with A-Z.' });
@@ -6705,7 +6729,7 @@ app.put('/api/v1/purchase-orders/:id', async (req, res) => {
                         { isAdmin: sampleOrders.isAdmin(req), reason: sampleOrders.reasonOf(req) }
                     );
                     if (!verdict.ok) return { refusal: verdict };
-                } else if (body.kind !== undefined && sampleRules.normalizeKind(body.kind) !== sampleRules.KIND_STOCK) {
+                } else if (body.kind !== undefined && sampleRules.normalizeKind(body.kind) !== beforePo.kind) {
                     return { refusal: { ok: false, http: 409, code: 'SAMPLE_KIND_FIXED', message: 'The kind of a purchase order never changes.' } };
                 }
 
@@ -7172,6 +7196,12 @@ app.post('/api/v1/purchase-order-documents/:id/email', async (req, res) => {
             );
             if (!docRows.length) return { notFound: true };
             const doc = docRows[0];
+            // A local order is record only (docs/local-orders.md): this send
+            // gives the supplier portal access and links the order there, so
+            // it is not for one. Its PDF can still be made and downloaded.
+            if ((await sampleOrders.loadPo(conn, doc.purchase_order_id))?.kind === sampleRules.KIND_LOCAL) {
+                return { localNoSend: true };
+            }
             const poUrl = poPortalEmail.poPortalUrl(portalBase, doc.purchase_order_id);
 
             // Pre-approve first, in its own committed transaction, so the
@@ -7305,6 +7335,9 @@ app.post('/api/v1/purchase-order-documents/:id/email', async (req, res) => {
         });
 
         if (result.notFound) return res.status(404).json({ error: `Purchase order document ${id} not found.` });
+        if (result.localNoSend) {
+            return res.status(409).json({ error: 'A local order is not sent through the portal. Download its PDF instead.', code: 'LOCAL_NO_SEND' });
+        }
         if (result.frontError) {
             return res.status(502).json({
                 error: 'The email service (SES) rejected the message.',
@@ -10100,7 +10133,8 @@ app.patch('/api/v1/alerts/:id/approve', async (req, res) => {
                 // The importer raises no suggestion for a sample; one that
                 // names a sample anyway is never applied (this route writes
                 // with no transition check of its own).
-                const sampleRefusal = sampleOrders.refuseSample(existing[0], 'moved by an email suggestion');
+                const sampleRefusal = sampleOrders.refuseSample(existing[0], 'moved by an email suggestion')
+                    || sampleOrders.refuseLocal(existing[0], 'moved by an email suggestion');
                 if (sampleRefusal) { await conn.rollback(); return { refusal: sampleRefusal }; }
                 if (RECEIVED_TERMINAL_STATUSES.includes(beforeOrder.status)) {
                     await conn.rollback();

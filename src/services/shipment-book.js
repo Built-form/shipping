@@ -227,6 +227,10 @@ function makeBookShipment(deps) {
             if (order.order_kind === 'sample') {
                 throw new ShipmentError(409, 'SAMPLE_NOT_STOCK', `Order ${p.orderId} is a sample order; it cannot be booked into a container.`, { orderId: p.orderId });
             }
+            // A local order is delivered by its supplier (docs/local-orders.md).
+            if (order.order_kind === 'local') {
+                throw new ShipmentError(409, 'LOCAL_NOT_SHIPPED', `Order ${p.orderId} is a local order; the supplier delivers it, so it is booked into no container.`, { orderId: p.orderId });
+            }
             const partial = p.qty < orderQty;
             if (partial && (received[p.orderId] || 0) > 0) {
                 throw new ShipmentError(409, 'SPLIT_BLOCKED_BY_RECEIPTS',

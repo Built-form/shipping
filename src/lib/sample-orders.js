@@ -28,7 +28,11 @@
 
 const KIND_STOCK = 'stock';
 const KIND_SAMPLE = 'sample';
-const KINDS = [KIND_STOCK, KIND_SAMPLE];
+// A third kind, 'local' (docs/local-orders.md): stock a supplier delivers to the
+// warehouse. Its rules are src/lib/local-orders.js; here it is only a word a PO
+// may be made with.
+const { KIND_LOCAL } = require('./local-orders');
+const KINDS = [KIND_STOCK, KIND_SAMPLE, KIND_LOCAL];
 
 // A typo guard, not an abuse control: nobody orders 500 samples of one thing.
 const QTY_MAX = 50;
@@ -393,6 +397,7 @@ function isArmed(rowNames, stage) {
 module.exports = {
     KIND_STOCK,
     KIND_SAMPLE,
+    KIND_LOCAL,
     KINDS,
     QTY_MAX,
     COURIER_MAX,

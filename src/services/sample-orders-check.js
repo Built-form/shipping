@@ -173,7 +173,7 @@ const DATA_CHECKS = [
           WHERE o.order_kind = 'sample' AND o.purchase_order_id IS NULL AND ${COUNTED} ORDER BY o.id LIMIT ${LIST_LIMIT}`],
     ['data: no unknown kind',
         `SELECT o.id, o.order_kind FROM orders o
-          WHERE o.order_kind NOT IN ('stock', 'sample') ORDER BY o.id LIMIT ${LIST_LIMIT}`],
+          WHERE o.order_kind NOT IN ('stock', 'sample', 'local') ORDER BY o.id LIMIT ${LIST_LIMIT}`],
     ['data: no sample in a container, AWB or shipment',
         `SELECT o.id, o.container_number, o.awb_number, o.external_container_number, o.shipment_id FROM orders o
           WHERE o.order_kind = 'sample' AND o.deleted_at IS NULL

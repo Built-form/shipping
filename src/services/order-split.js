@@ -41,6 +41,12 @@ function makeSplitOrder({ ORDER_INSERT_COLS, ORDER_INSERT_PLACEHOLDERS, orderIns
             throw new SplitError('SAMPLE_NOT_STOCK', `Order ${order.id} is a sample order and cannot be split.`, 409,
                 { orderId: order.id });
         }
+        // A local order is delivered by its supplier, never in a container
+        // (docs/local-orders.md), and a split here is always into one.
+        if (order.order_kind === 'local') {
+            throw new SplitError('LOCAL_NOT_SHIPPED', `Order ${order.id} is a local order; it is never split into a container.`, 409,
+                { orderId: order.id });
+        }
         const qty = Number(splitQuantity);
         const orderQty = Number(order.quantity);
         if (!Number.isFinite(qty) || qty <= 0 || qty >= orderQty) {

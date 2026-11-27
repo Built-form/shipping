@@ -14,6 +14,7 @@
 
 const { getProductsByJfCode, createAsn, receiveAsnItems, quarantineStock } = require('./mintsoft');
 const { norm, normLot } = require('./qc-report-check');
+const { missingForBookIn } = require('../lib/local-orders');
 const { ORDER_SELECT, rowToOrder, receiptToJson, parseDates, normalizeExpiry } = require('../lib/order-shape');
 const { recordAudit } = require('../lib/audit');
 const log = require('../lib/logger');
@@ -223,9 +224,9 @@ async function receiveOrderStock(conn, params) {
         const existingExpiry = normalizeExpiry(orderRow.exp_date) || null;
         const orderLot = suppliedLot ?? existingLot;
         const orderExpiry = suppliedExpiry ?? existingExpiry;
-        const missingFields = [];
-        if (!orderLot) missingFields.push('lot_number');
-        if (!orderExpiry) missingFields.push('exp_date');
+        // A local order is booked in with whatever it has: the dialog asks in
+        // case the product carries a batch or an expiry (docs/local-orders.md).
+        const missingFields = missingForBookIn({ kind: orderRow.order_kind, lot: orderLot, expiry: orderExpiry });
         if (missingFields.length) {
             await conn.rollback();
             committed = true;
@@ -335,7 +336,8 @@ async function receiveOrderStock(conn, params) {
             [
                 id, jfCode, qty, params.locationId, params.warehouseId,
                 asn.ID, asnItemId, idemKey,
-                orderLot,
+                // NULL, not '', for a local order booked in with no batch.
+                orderLot || null,
                 orderExpiry,
                 // Records what Mintsoft actually did, not what was asked for —
                 // a failed quarantine leaves this 0 because the stock is normal.

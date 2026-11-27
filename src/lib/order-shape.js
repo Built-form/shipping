@@ -183,9 +183,10 @@ function rowToOrder(row) {
         artworkConfirmedBySupplier: formatDate(row.artwork_confirmed_by_supplier),
         shipmentId: row.shipment_id ?? null,
         qcVisitIds,
-        // Sample orders (docs/sample-orders.md). A database without the
-        // columns reads every line as stock.
-        orderKind: row.order_kind === 'sample' ? 'sample' : 'stock',
+        // Sample orders (docs/sample-orders.md) and local orders
+        // (docs/local-orders.md). A database without the columns reads every
+        // line as stock.
+        orderKind: row.order_kind === 'sample' || row.order_kind === 'local' ? row.order_kind : 'stock',
         courierName: row.courier_name || null,
         courierTracking: row.courier_tracking || null,
         sampleReceivedQty: row.sample_received_qty != null ? Number(row.sample_received_qty) : null,

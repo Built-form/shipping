@@ -21,6 +21,7 @@
 // "stock", and nothing in the stock paths changes.
 
 const S = require('../lib/sample-orders');
+const L = require('../lib/local-orders');
 const { jportalSchema } = require('../lib/jportal');
 const log = require('../lib/logger');
 
@@ -53,6 +54,39 @@ async function stockOnlySql(conn, alias = 'orders') {
     return (await schemaReady(conn)) ? ` AND ${alias}.order_kind = 'stock'` : '';
 }
 
+// `AND orders.order_kind <> 'sample'` for a reader that counts STOCK GOODS:
+// stock lines and local lines (docs/local-orders.md), never a sample. Cashboard's
+// stock figures read through this one. stockOnlySql above is for the readers
+// that talk to a supplier about production (reminders, the email suggestions,
+// the old ready-date page), where a local order has nothing to say.
+async function notSampleSql(conn, alias = 'orders') {
+    if (!/^[a-z_]+$/i.test(alias)) throw new Error(`notSampleSql: bad alias ${alias}`);
+    return (await schemaReady(conn)) ? ` AND ${alias}.order_kind <> 'sample'` : '';
+}
+
+// ── Can this database hold a local order? ────────────────────────────────
+// Yes once both kind CHECKs allow the word (migration 2026-11-27_30). A TEST
+// rebuilt from a production without that migration says no, and POST
+// /purchase-orders refuses a local PO with a 409 instead of a CHECK error.
+let localSeen = { has: false, at: 0 };
+
+async function localReady(conn) {
+    const now = Date.now();
+    if (now - localSeen.at < CACHE_MS) return localSeen.has;
+    let has = false;
+    if (await schemaReady(conn)) {
+        const [rows] = await conn.query(
+            `SELECT CONSTRAINT_NAME, CHECK_CLAUSE FROM information_schema.CHECK_CONSTRAINTS
+              WHERE CONSTRAINT_SCHEMA = DATABASE()
+                AND CONSTRAINT_NAME IN ('chk_purchase_orders_kind', 'chk_orders_order_kind')`
+        );
+        const allows = name => rows.some(r => r.CONSTRAINT_NAME === name && /'local'/.test(String(r.CHECK_CLAUSE || '')));
+        has = allows('chk_purchase_orders_kind') && allows('chk_orders_order_kind');
+    }
+    localSeen = { has, at: now };
+    return has;
+}
+
 // ── Armed? ───────────────────────────────────────────────────────────────
 // A row in app_migrations named for THIS stage (APP_STAGE: 'dev' is
 // production, 'test' is TEST). Read fresh where a sample is about to be
@@ -76,6 +110,7 @@ async function armed(conn, { fresh = false } = {}) {
 function resetCaches() {
     schemaSeen = { has: false, at: 0 };
     armedSeen = { on: false, at: 0 };
+    localSeen = { has: false, at: 0 };
 }
 
 // ── The purchase order ───────────────────────────────────────────────────
@@ -94,7 +129,7 @@ async function loadPo(conn, poId, { lock = false } = {}) {
     const r = rows[0];
     return {
         id: Number(r.id),
-        kind: r.kind === S.KIND_SAMPLE ? S.KIND_SAMPLE : S.KIND_STOCK,
+        kind: r.kind === S.KIND_SAMPLE || r.kind === L.KIND_LOCAL ? r.kind : S.KIND_STOCK,
         supplier: r.supplier ?? null,
         currency: r.currency ?? null,
         shippingTotal: Number(r.shipping_total ?? 0),
@@ -231,7 +266,7 @@ const disabled = () => ({
  * on top of the caller's own, order_kind included on a create.
  */
 async function guardWrite(conn, { beforeRow = null, afterRow, via, req = null, lockLot = false }) {
-    const none = { sample: false, set: {}, statusChanged: false, supersedePending: false, billChanged: false, clearReceivedStamp: false };
+    const none = { sample: false, local: false, set: {}, statusChanged: false, supersedePending: false, billChanged: false, clearReceivedStamp: false };
     if (!await schemaReady(conn)) return none;
 
     const creating = !beforeRow;
@@ -239,9 +274,22 @@ async function guardWrite(conn, { beforeRow = null, afterRow, via, req = null, l
     const sample = creating ? Boolean(po && po.kind === S.KIND_SAMPLE) : S.isSample(beforeRow);
 
     if (!sample) {
+        // A local line (docs/local-orders.md) is decided like a sample: from
+        // the PO on a create, from the stored row after that. It is stock
+        // goods, so the stock rules below apply to it as well.
+        const local = creating ? Boolean(po && po.kind === L.KIND_LOCAL) : L.isLocal(beforeRow);
         // A stock line stays out of a sample PO, and out of a sample's code.
         if (po && po.kind === S.KIND_SAMPLE) {
             return { refusal: { ok: false, http: 409, code: 'SAMPLE_PO_REQUIRED', message: 'A stock line cannot be put on a sample purchase order.' } };
+        }
+        if (!local && po && po.kind === L.KIND_LOCAL) {
+            return { refusal: { ok: false, http: 409, code: 'LOCAL_PO_REQUIRED', message: 'A stock line cannot be put on a local purchase order.' } };
+        }
+        let localSet = null;
+        if (local) {
+            const verdict = L.validateLocalWrite(beforeRow, afterRow, { po: po ? { id: po.id, kind: po.kind } : null });
+            if (!verdict.ok) return { refusal: verdict };
+            localSet = verdict.set;
         }
         const lotChanged = !lotText(afterRow.lot_number)
             ? false
@@ -257,7 +305,7 @@ async function guardWrite(conn, { beforeRow = null, afterRow, via, req = null, l
             const refusal = S.stockLotRefusal({ lotIsSample: lotSample, lotChanged });
             if (refusal) return { refusal };
         }
-        return none;
+        return local ? { ...none, local: true, set: localSet } : none;
     }
 
     if (creating && !await armed(conn, { fresh: true })) return { refusal: disabled() };
@@ -348,6 +396,9 @@ function refuseSample(row, what) {
 module.exports = {
     schemaReady,
     stockOnlySql,
+    notSampleSql,
+    localReady,
+    refuseLocal: L.refuseLocal,
     armed,
     stage,
     resetCaches,

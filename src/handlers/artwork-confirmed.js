@@ -173,6 +173,11 @@ async function handler(event) {
             log.info('[artwork-confirmed] sample order; nothing to do', { purchaseOrderId });
             return { purchaseOrderId, outcome: 'skipped', reason: 'sample_order' };
         }
+        // A local order has no production stage either (docs/local-orders.md).
+        if (po && po.kind === 'local') {
+            log.info('[artwork-confirmed] local order; nothing to do', { purchaseOrderId });
+            return { purchaseOrderId, outcome: 'skipped', reason: 'local_order' };
+        }
         const result = await applyArtworkConfirmations(conn, purchaseOrderId);
         log.info('[artwork-confirmed] done', { purchaseOrderId, ...result });
         return { purchaseOrderId, ...result };

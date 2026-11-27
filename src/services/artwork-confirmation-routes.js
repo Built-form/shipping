@@ -243,6 +243,10 @@ function registerArtworkConfirmationRoutes(app, deps) {
         if (samplePo && samplePo.kind === 'sample') {
             throw new Fail(409, 'SAMPLE_NO_ARTWORK', 'A sample order has no artwork confirmation.');
         }
+        // A local order is record only (docs/local-orders.md): no portal link.
+        if (samplePo && samplePo.kind === 'local') {
+            throw new Fail(409, 'LOCAL_NO_SEND', 'A local order is not sent through the portal, so it has no artwork confirmation.');
+        }
 
         const out = await withConnection(async (conn) => {
             const po = await loadPo(conn, id);
